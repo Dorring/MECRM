@@ -170,3 +170,11 @@ models/
 # Temporary files
 tmp/
 temp/
+
+# Build artifacts & generated files
+**/.next/
+**/out/
+**/coverage/
+*.tsbuildinfo
+**/.tsbuildinfo
+next-env.d.ts
