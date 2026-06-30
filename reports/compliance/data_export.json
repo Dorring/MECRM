@@ -1,0 +1,7 @@
+{
+  "phase": "data_export",
+  "tenant_id": "d31c689f-6a49-43aa-a8a8-8453e8ca6575",
+  "customer_id": "815f3be9-1ce3-46f4-bb48-042bcbaef34b",
+  "no_cross_tenant_leakage": true,
+  "audit_logged": true
+}

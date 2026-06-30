@@ -1,0 +1,12 @@
+{
+  "phase": "rpo_rto",
+  "timestamp": "2026-01-24T18:40:08.130509Z",
+  "backup_id": "e334bcc9-fbc1-4726-8cea-203326302649",
+  "rpo_seconds": 0.099,
+  "rto_seconds": 2.416,
+  "targets": {
+    "rpo_seconds": 300,
+    "rto_seconds": 1800
+  },
+  "status": "met"
+}

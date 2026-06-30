@@ -1,0 +1,43 @@
+{
+  "phase": "dr_metrics_snapshot",
+  "timestamp": "2026-01-24T18:40:09.106619Z",
+  "prometheus_url": "http://localhost:9090",
+  "reachable": true,
+  "queries": {
+    "backup_duration_seconds": {
+      "status": "success",
+      "data": {
+        "resultType": "vector",
+        "result": []
+      }
+    },
+    "restore_duration_seconds": {
+      "status": "success",
+      "data": {
+        "resultType": "vector",
+        "result": []
+      }
+    },
+    "rebuild_duration_seconds": {
+      "status": "success",
+      "data": {
+        "resultType": "vector",
+        "result": []
+      }
+    },
+    "recovery_success_total": {
+      "status": "success",
+      "data": {
+        "resultType": "vector",
+        "result": []
+      }
+    },
+    "recovery_failure_total": {
+      "status": "success",
+      "data": {
+        "resultType": "vector",
+        "result": []
+      }
+    }
+  }
+}

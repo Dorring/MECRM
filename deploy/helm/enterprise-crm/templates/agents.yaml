@@ -1,0 +1,130 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "enterprise-crm.fullname" . }}-agents
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: agents
+    {{- include "enterprise-crm.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount.agents }}
+  selector:
+    matchLabels:
+      app: agents
+  template:
+    metadata:
+      labels:
+        app: agents
+        {{- include "enterprise-crm.labels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5010"
+    spec:
+      serviceAccountName: {{ include "enterprise-crm.serviceAccountName" . }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: agents
+          image: "{{ if .Values.global.imageRegistry }}{{ .Values.global.imageRegistry }}/{{ end }}{{ .Values.images.agents.repository }}:{{ .Values.images.agents.tag }}"
+          imagePullPolicy: {{ .Values.images.agents.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 5010
+              protocol: TCP
+          env:
+            - name: KAFKA_BROKERS
+              value: "{{ include "enterprise-crm.kafkaHost" . }}:9092"
+            - name: KAFKA_GROUP_ID
+              value: "ai-agents"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.postgresql.existingSecret }}
+                  key: connection-string
+            - name: OPA_URL
+              value: "http://{{ include "enterprise-crm.fullname" . }}-opa:8181"
+            - name: OLLAMA_URL
+              value: "http://{{ include "enterprise-crm.fullname" . }}-ollama:11434"
+            - name: WEAVIATE_URL
+              value: "http://{{ include "enterprise-crm.fullname" . }}-weaviate:8080"
+            - name: OLLAMA_MODEL
+              value: {{ .Values.ollama.model }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources.agents | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "enterprise-crm.fullname" . }}-agents
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: agents
+spec:
+  type: {{ .Values.services.agents.type }}
+  ports:
+    - port: {{ .Values.services.agents.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app: agents
+---
+{{- if .Values.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "enterprise-crm.fullname" . }}-agents
+  namespace: {{ .Values.namespace }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "enterprise-crm.fullname" . }}-agents
+  minReplicas: {{ .Values.autoscaling.agents.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.agents.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.agents.targetCPUUtilizationPercentage }}
+{{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "enterprise-crm.fullname" . }}-agents
+  namespace: {{ .Values.namespace }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.agents.minAvailable }}
+  selector:
+    matchLabels:
+      app: agents

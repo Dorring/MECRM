@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "required": ["ticketId", "changes"],
+  "properties": {
+    "ticketId": { "type": "string" },
+    "changes": { "type": "object" }
+  }
+}
+

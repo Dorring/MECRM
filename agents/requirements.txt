@@ -1,0 +1,51 @@
+# AI Agent Layer - Enterprise CRM
+# Requirements for LangGraph-based agents
+
+# Core
+langgraph>=0.0.50
+langchain>=0.1.0
+langchain-community>=0.0.10
+
+# LLM (Ollama)
+langchain-ollama>=0.0.1
+
+# Async
+asyncio
+aiohttp>=3.9.0
+
+# Kafka
+aiokafka>=0.10.0
+
+# Database
+asyncpg>=0.29.0
+sqlalchemy>=2.0.0
+
+# Vector Store
+weaviate-client>=4.4.0
+
+# HTTP
+httpx>=0.26.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+
+# Redis
+redis>=5.0.0
+
+# Metrics
+prometheus-client>=0.20.0
+
+# Utilities
+pydantic>=2.5.0
+python-dotenv>=1.0.0
+structlog>=23.2.0
+uuid6>=2023.5.2
+
+# OpenTelemetry
+opentelemetry-api>=1.21.0
+opentelemetry-sdk>=1.21.0
+opentelemetry-instrumentation>=0.42b0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0

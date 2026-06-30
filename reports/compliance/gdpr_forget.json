@@ -1,0 +1,7 @@
+{
+  "phase": "gdpr_forget",
+  "tenant_id": "ba520dd7-1c33-4589-a92f-ea3d69f8ab24",
+  "customer_id": "f9584aaa-d8b0-4978-b4a7-f6ed40930388",
+  "pii_erased": true,
+  "ai_blocked": null
+}

@@ -1,0 +1,29 @@
+{
+  "phase": "tenant_isolation_proof",
+  "timestamp": "2026-01-24T11:25:37.484312Z",
+  "results": {
+    "rls_select_blocked": true,
+    "rls_update_blocked": true,
+    "rls_delete_blocked": true,
+    "opa_policies_passed": true,
+    "jwt_tampering_blocked": true,
+    "id_enumeration_blocked": true,
+    "cache_isolation_passed": true,
+    "websocket_isolation_passed": true,
+    "no_tenant_context_leaks": true
+  },
+  "tests": {
+    "python": {
+      "passed": 5,
+      "failed": 0
+    },
+    "gateway": {
+      "passed": 6,
+      "failed": 0
+    },
+    "opa": {
+      "passed": 5,
+      "failed": 0
+    }
+  }
+}

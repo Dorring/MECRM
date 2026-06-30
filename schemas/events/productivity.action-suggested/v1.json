@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "required": ["proposal_id", "tenant_id", "user_id", "action_type", "priority", "justification", "created_at", "dedupe_key", "signal_type", "signal"],
+  "properties": {
+    "proposal_id": { "type": "string" },
+    "tenant_id": { "type": "string" },
+    "user_id": { "type": "string" },
+    "action_type": { "type": "string" },
+    "target_entity": { "type": "string" },
+    "target_id": { "type": "string" },
+    "priority": { "type": "string" },
+    "drafts": { "type": "object" },
+    "justification": { "type": "string" },
+    "created_at": { "type": "string" },
+    "dedupe_key": { "type": "string" },
+    "signal_type": { "type": "string" },
+    "signal": { "type": "object" }
+  }
+}
+

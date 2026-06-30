@@ -1,0 +1,15 @@
+{
+  "backup_id": "e334bcc9-fbc1-4726-8cea-203326302649",
+  "created_at": "2026-01-24T18:40:05.712425Z",
+  "keys": [
+    "dr/e334bcc9-fbc1-4726-8cea-203326302649/aggregate_snapshots.jsonl",
+    "dr/e334bcc9-fbc1-4726-8cea-203326302649/event_log.jsonl"
+  ],
+  "sha256": {
+    "dr/e334bcc9-fbc1-4726-8cea-203326302649/aggregate_snapshots.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "dr/e334bcc9-fbc1-4726-8cea-203326302649/event_log.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "metadata": {
+    "type": "snapshots"
+  }
+}

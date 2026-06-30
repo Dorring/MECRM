@@ -1,0 +1,17 @@
+{
+  "type": "object",
+  "required": ["leadId", "name", "status"],
+  "properties": {
+    "leadId": { "type": "string" },
+    "name": { "type": "string" },
+    "email": { "type": "string" },
+    "phone": { "type": "string" },
+    "company": { "type": "string" },
+    "source": { "type": "string" },
+    "status": { "type": "string" },
+    "score": { "type": "integer" },
+    "assignedTo": { "type": "string" },
+    "metadata": { "type": "object" }
+  }
+}
+

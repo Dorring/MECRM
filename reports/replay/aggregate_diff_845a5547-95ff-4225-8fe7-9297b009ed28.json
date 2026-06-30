@@ -1,0 +1,14 @@
+{
+  "changed_keys": [
+    "score",
+    "status"
+  ],
+  "before": {
+    "status": "new",
+    "score": null
+  },
+  "after": {
+    "status": "contacted",
+    "score": 493
+  }
+}

@@ -1,0 +1,189 @@
+# Production values for Enterprise CRM
+# High-availability replicas and bounded resource limits.
+# CI (.github/workflows/ci-cd.yml deploy-production) overrides image tags to the
+# current commit SHA via --set; tags here are fallbacks only. Production deployments
+# must use immutable image digests at the registry layer per the optimization plan
+# (Phase 4 CI/CD), which is enforced outside the chart.
+
+global:
+  domain: crm.example.com
+
+namespace: crm
+
+environment: production
+
+serviceAccount:
+  create: true
+  automount: false
+  annotations:
+    # Attach an IRSA / Workload Identity annotation here in real deployments
+    # without baking the role ARN into the image.
+
+frontend:
+  enabled: true
+  keycloakRealm: "crm"
+  keycloakClientId: "crm-frontend"
+
+# HA replica counts
+replicaCount:
+  frontend: 3
+  gateway: 5
+  agents: 3
+
+images:
+  frontend:
+    tag: latest
+    pullPolicy: IfNotPresent
+  gateway:
+    tag: latest
+    pullPolicy: IfNotPresent
+  agents:
+    tag: latest
+    pullPolicy: IfNotPresent
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    kubernetes.io/tls-acme: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/limit-connections: "100"
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+  hosts:
+    - host: crm.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          service: frontend
+        - path: /api
+          pathType: Prefix
+          service: gateway
+        - path: /ws
+          pathType: Prefix
+          service: gateway
+  tls:
+    - secretName: crm-tls
+      hosts:
+        - crm.example.com
+
+# Production resource limits with headroom for burst load
+resources:
+  frontend:
+    limits:
+      cpu: 750m
+      memory: 768Mi
+    requests:
+      cpu: 150m
+      memory: 256Mi
+  gateway:
+    limits:
+      cpu: 1500m
+      memory: 1536Mi
+    requests:
+      cpu: 400m
+      memory: 512Mi
+  agents:
+    limits:
+      cpu: 3000m
+      memory: 3Gi
+    requests:
+      cpu: 750m
+      memory: 768Mi
+
+# Autoscaling tuned for production SLO
+autoscaling:
+  enabled: true
+  gateway:
+    minReplicas: 3
+    maxReplicas: 20
+    targetCPUUtilizationPercentage: 65
+    targetMemoryUtilizationPercentage: 75
+  agents:
+    minReplicas: 3
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 75
+  frontend:
+    minReplicas: 3
+    maxReplicas: 12
+    targetCPUUtilizationPercentage: 70
+
+# HA data layer
+postgresql:
+  enabled: true
+  auth:
+    username: crm_user
+    database: enterprise_crm
+  primary:
+    persistence:
+      enabled: true
+      size: 100Gi
+  readReplicas:
+    replicaCount: 3
+
+redis:
+  enabled: true
+  architecture: replication
+  auth:
+    enabled: true
+  master:
+    persistence:
+      enabled: true
+      size: 20Gi
+  replica:
+    replicaCount: 3
+
+kafka:
+  enabled: true
+  replicaCount: 3
+  defaultReplicationFactor: 3
+  minInSyncReplicas: 2
+  persistence:
+    enabled: true
+    size: 100Gi
+  zookeeper:
+    replicaCount: 3
+    persistence:
+      enabled: true
+      size: 20Gi
+
+keycloak:
+  enabled: true
+  replicaCount: 3
+
+opa:
+  enabled: true
+  replicaCount: 3
+
+weaviate:
+  enabled: true
+  replicas: 3
+  storage:
+    size: 50Gi
+
+# NetworkPolicy enforced in production
+networkPolicy:
+  enabled: true
+
+# Stronger PDBs to protect availability during node drains
+podDisruptionBudget:
+  gateway:
+    minAvailable: 2
+  agents:
+    minAvailable: 1
+  frontend:
+    minAvailable: 2
+
+# Spread workloads across nodes
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - gateway
+          topologyKey: kubernetes.io/hostname

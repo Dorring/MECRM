@@ -1,0 +1,27 @@
+{
+  "type": "object",
+  "required": [
+    "tenant_id",
+    "entity_id",
+    "entity_type",
+    "prediction_type",
+    "probability",
+    "risk_level",
+    "explanation",
+    "created_at",
+    "model_version"
+  ],
+  "properties": {
+    "tenant_id": { "type": "string" },
+    "entity_id": { "type": "string" },
+    "entity_type": { "type": "string" },
+    "prediction_type": { "type": "string" },
+    "probability": { "type": "number" },
+    "risk_level": { "type": "string" },
+    "explanation": { "type": "string" },
+    "features": { "type": "object" },
+    "created_at": { "type": "string" },
+    "model_version": { "type": "string" }
+  }
+}
+

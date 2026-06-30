@@ -1,0 +1,26 @@
+{
+  "changed_keys": [
+    "id",
+    "metadata",
+    "name",
+    "score",
+    "status",
+    "tenantId"
+  ],
+  "before": {
+    "metadata": null,
+    "score": null,
+    "tenantId": null,
+    "status": null,
+    "id": null,
+    "name": null
+  },
+  "after": {
+    "metadata": {},
+    "score": 400,
+    "tenantId": "11111111-1111-4111-8111-111111111111",
+    "status": "qualified",
+    "id": "652e3e66-1e2d-4d80-ba27-8e0a42ba6e98",
+    "name": "Bench Lead"
+  }
+}

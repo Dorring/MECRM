@@ -1,0 +1,10 @@
+{
+  "mode": "direct",
+  "duration_s": 2,
+  "target_rps": 200,
+  "achieved_rps": 133.63366545042754,
+  "ok": 280,
+  "errors": 0,
+  "latency_ms_p50": 63,
+  "latency_ms_p95": 592
+}

@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "required": ["tenant_id", "customer_id", "stage", "confidence", "timeline_entry", "updated_at"],
+  "properties": {
+    "tenant_id": { "type": "string" },
+    "customer_id": { "type": "string" },
+    "stage": { "type": "string" },
+    "confidence": { "type": "number" },
+    "updated_at": { "type": "string" },
+    "timeline_entry": {
+      "type": "object",
+      "required": ["event_type", "event_payload", "timestamp"],
+      "properties": {
+        "event_type": { "type": "string" },
+        "event_payload": { "type": "object" },
+        "timestamp": { "type": "string" }
+      }
+    },
+    "timeline_summary": { "type": "string" }
+  }
+}
+

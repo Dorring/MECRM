@@ -1,0 +1,157 @@
+{
+  "timestamp": "2026-01-24T18:40:33.379359Z",
+  "rules": {
+    "status": "success",
+    "data": {
+      "groups": [
+        {
+          "name": "platform-slo-alerts",
+          "file": "/etc/prometheus/alerts/platform-alerts.yaml",
+          "rules": [
+            {
+              "state": "firing",
+              "name": "GatewayDown",
+              "query": "up{job=\"gateway\"} == 0",
+              "duration": 120,
+              "keepFiringFor": 0,
+              "labels": {
+                "severity": "page",
+                "team": "platform"
+              },
+              "annotations": {
+                "runbook": "file:///f:/Dev_Env/Multi-Agent-Enterprise-CRM/docs/runbooks/replay-failure.md",
+                "summary": "Gateway is down"
+              },
+              "alerts": [
+                {
+                  "labels": {
+                    "alertname": "GatewayDown",
+                    "instance": "gateway:4000",
+                    "job": "gateway",
+                    "severity": "page",
+                    "team": "platform"
+                  },
+                  "annotations": {
+                    "runbook": "file:///f:/Dev_Env/Multi-Agent-Enterprise-CRM/docs/runbooks/replay-failure.md",
+                    "summary": "Gateway is down"
+                  },
+                  "state": "firing",
+                  "activeAt": "2026-01-24T18:35:03.084138549Z",
+                  "value": "0e+00"
+                }
+              ],
+              "health": "ok",
+              "evaluationTime": 0.000352324,
+              "lastEvaluation": "2026-01-24T18:40:33.051440017Z",
+              "type": "alerting"
+            },
+            {
+              "state": "inactive",
+              "name": "GatewayHigh5xxErrorRatio",
+              "query": "(sum(rate(http_requests_total{status=~\"5..\"}[5m])) / sum(rate(http_requests_total[5m]))) > 0.01",
+              "duration": 300,
+              "keepFiringFor": 0,
+              "labels": {
+                "severity": "page",
+                "team": "platform"
+              },
+              "annotations": {
+                "runbook": "file:///f:/Dev_Env/Multi-Agent-Enterprise-CRM/docs/runbooks/kafka-outage.md",
+                "summary": "Gateway 5xx ratio is above 1% for 5m"
+              },
+              "alerts": [],
+              "health": "ok",
+              "evaluationTime": 0.000120955,
+              "lastEvaluation": "2026-01-24T18:40:33.051799599Z",
+              "type": "alerting"
+            },
+            {
+              "state": "inactive",
+              "name": "PolicyEngineUnavailable",
+              "query": "increase(cache_fail_closed_total{component=\"gateway_opa\",reason=\"opa_unavailable\"}[5m]) > 0",
+              "duration": 60,
+              "keepFiringFor": 0,
+              "labels": {
+                "severity": "page",
+                "team": "platform"
+              },
+              "annotations": {
+                "runbook": "file:///f:/Dev_Env/Multi-Agent-Enterprise-CRM/docs/runbooks/replay-failure.md",
+                "summary": "OPA policy evaluation failing closed (OPA unavailable)"
+              },
+              "alerts": [],
+              "health": "ok",
+              "evaluationTime": 3.2511e-05,
+              "lastEvaluation": "2026-01-24T18:40:33.051924041Z",
+              "type": "alerting"
+            },
+            {
+              "state": "inactive",
+              "name": "CacheFailClosedEvents",
+              "query": "increase(cache_fail_closed_total[10m]) > 0",
+              "duration": 60,
+              "keepFiringFor": 0,
+              "labels": {
+                "severity": "ticket",
+                "team": "platform"
+              },
+              "annotations": {
+                "runbook": "file:///f:/Dev_Env/Multi-Agent-Enterprise-CRM/docs/runbooks/approval-backlog.md",
+                "summary": "Fail-closed cache/auth events detected"
+              },
+              "alerts": [],
+              "health": "ok",
+              "evaluationTime": 2.4711e-05,
+              "lastEvaluation": "2026-01-24T18:40:33.051958077Z",
+              "type": "alerting"
+            },
+            {
+              "state": "inactive",
+              "name": "CircuitBreakerOpen",
+              "query": "max_over_time(circuit_breaker_state{breaker!=\"\"}[5m]) == 1",
+              "duration": 120,
+              "keepFiringFor": 0,
+              "labels": {
+                "severity": "page",
+                "team": "platform"
+              },
+              "annotations": {
+                "runbook": "file:///f:/Dev_Env/Multi-Agent-Enterprise-CRM/docs/runbooks/kafka-outage.md",
+                "summary": "Circuit breaker is OPEN"
+              },
+              "alerts": [],
+              "health": "ok",
+              "evaluationTime": 3.7643e-05,
+              "lastEvaluation": "2026-01-24T18:40:33.051984047Z",
+              "type": "alerting"
+            },
+            {
+              "state": "inactive",
+              "name": "DRRecoveryFailure",
+              "query": "increase(recovery_failure_total[30m]) > 0",
+              "duration": 60,
+              "keepFiringFor": 0,
+              "labels": {
+                "severity": "page",
+                "team": "platform"
+              },
+              "annotations": {
+                "runbook": "file:///f:/Dev_Env/Multi-Agent-Enterprise-CRM/docs/runbooks/dr-recovery.md",
+                "summary": "Disaster recovery failure detected"
+              },
+              "alerts": [],
+              "health": "ok",
+              "evaluationTime": 2.2685e-05,
+              "lastEvaluation": "2026-01-24T18:40:33.052023018Z",
+              "type": "alerting"
+            }
+          ],
+          "interval": 15,
+          "limit": 0,
+          "evaluationTime": 0.000637064,
+          "lastEvaluation": "2026-01-24T18:40:33.051410845Z"
+        }
+      ]
+    }
+  }
+}

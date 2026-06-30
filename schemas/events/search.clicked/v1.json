@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "required": ["searchId", "entityType", "entityId"],
+  "properties": {
+    "searchId": {"type": "string"},
+    "entityType": {"type": "string"},
+    "entityId": {"type": "string"},
+    "userId": {"type": "string"}
+  }
+}
+

@@ -1,0 +1,36 @@
+{
+  "phase": "cqrs_outbox_reliability",
+  "timestamp": "2026-01-24T11:48:13.809648Z",
+  "tenant_id": "500ee250-d572-468a-88ae-03197989c7ba",
+  "lead_id": "005d5951-ae91-4cbe-bc1c-f0b57b5d4622",
+  "event_id": "4087d503-953c-4cca-8acd-9f6e310df245",
+  "kafka_down_injected": true,
+  "publish_attempt_while_down": {
+    "published": 0,
+    "retried": 1,
+    "dead_lettered": 0
+  },
+  "publish_attempt_after_recovery": {
+    "published": 1,
+    "retried": 0,
+    "dead_lettered": 0
+  },
+  "outbox_row_after_down": {
+    "id": "0725ebe2-4024-43ba-924d-b30c50b88078",
+    "retry_count": 1,
+    "published_at": null,
+    "created_at": "2026-01-24T11:47:58.333656+00:00",
+    "last_error": "",
+    "dead_lettered_at": null
+  },
+  "outbox_row_after_recovery": {
+    "id": "0725ebe2-4024-43ba-924d-b30c50b88078",
+    "retry_count": 1,
+    "published_at": "2026-01-24T11:48:10.168296+00:00",
+    "created_at": "2026-01-24T11:47:58.333656+00:00",
+    "last_error": null,
+    "dead_lettered_at": null
+  },
+  "read_model_created_after_projection": true,
+  "projection_lag_seconds": 15.440199
+}

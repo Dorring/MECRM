@@ -1,0 +1,31 @@
+apiVersion: v2
+name: enterprise-crm
+description: AI-native, event-driven, multi-tenant Enterprise CRM
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+
+dependencies:
+  - name: postgresql
+    version: "14.0.0"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: postgresql.enabled
+    
+  - name: redis
+    version: "18.0.0"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: redis.enabled
+    
+  - name: kafka
+    version: "26.0.0"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: kafka.enabled
+    
+  - name: keycloak
+    version: "17.0.0"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: keycloak.enabled
+
+maintainers:
+  - name: CRM Team
+    email: crm-team@example.com

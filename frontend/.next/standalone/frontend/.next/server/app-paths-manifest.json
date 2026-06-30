@@ -1,0 +1,19 @@
+{
+  "/_global-error/page": "app/_global-error/page.js",
+  "/_not-found/page": "app/_not-found/page.js",
+  "/agents/page": "app/agents/page.js",
+  "/approvals/page": "app/approvals/page.js",
+  "/automations/page": "app/automations/page.js",
+  "/customers/[id]/page": "app/customers/[id]/page.js",
+  "/customers/page": "app/customers/page.js",
+  "/deals/page": "app/deals/page.js",
+  "/governance/page": "app/governance/page.js",
+  "/knowledge/articles/page": "app/knowledge/articles/page.js",
+  "/knowledge/page": "app/knowledge/page.js",
+  "/knowledge/review/page": "app/knowledge/review/page.js",
+  "/leads/page": "app/leads/page.js",
+  "/page": "app/page.js",
+  "/productivity/page": "app/productivity/page.js",
+  "/replay/page": "app/replay/page.js",
+  "/tickets/page": "app/tickets/page.js"
+}

@@ -1,0 +1,5 @@
+{
+  "breaker_opened": true,
+  "failures_observed": 2,
+  "recovery_time_seconds": 3.083341899968218
+}

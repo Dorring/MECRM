@@ -1,0 +1,105 @@
+{
+  "phase": "compliance_phase6",
+  "timestamp": "2026-01-24T18:37:41.274173Z",
+  "artifacts_present": {
+    "gdpr_forget": true,
+    "data_export": true,
+    "retention_policy": true
+  },
+  "artifacts": {
+    "gdpr_forget": {
+      "phase": "gdpr_forget",
+      "tenant_id": "ba520dd7-1c33-4589-a92f-ea3d69f8ab24",
+      "customer_id": "f9584aaa-d8b0-4978-b4a7-f6ed40930388",
+      "pii_erased": true,
+      "ai_blocked": null
+    },
+    "data_export": {
+      "phase": "data_export",
+      "tenant_id": "d31c689f-6a49-43aa-a8a8-8453e8ca6575",
+      "customer_id": "815f3be9-1ce3-46f4-bb48-042bcbaef34b",
+      "no_cross_tenant_leakage": true,
+      "audit_logged": true
+    },
+    "retention_policy": {
+      "phase": "retention_policy",
+      "timestamp": "2026-01-24T18:37:37.353779Z",
+      "result": {
+        "tenants": {
+          "072394b7-bc30-4a30-a704-b0d3b7138a05": {},
+          "0f8b7b5d-3479-400a-9102-3e6f3e663e22": {},
+          "2dac6644-e72d-4cc6-9f3a-a29e64017b33": {
+            "customers": {
+              "expired": 0,
+              "forgotten": 0
+            }
+          },
+          "3339b4e2-bdf4-4d80-a207-e5299440ca78": {},
+          "3514e1d3-6842-48d8-9b22-10c49b8b4c90": {},
+          "3ec0a770-1de4-4b78-b907-a36c095dcc02": {
+            "customers": {
+              "expired": 0,
+              "forgotten": 0
+            }
+          },
+          "48792b8e-071c-4737-9fd2-c972911e5c32": {},
+          "8cb247d3-abd9-41f7-8c5a-f658f5a3fe16": {},
+          "936177bb-4f96-40ec-a148-0f758d0c3b1c": {},
+          "9da55126-fcac-4f69-a0d5-2b7edcbc325e": {},
+          "b0770f05-e41d-4567-8abc-739d6ead4156": {},
+          "b2d5b005-8498-4509-8fd7-74793a573c75": {},
+          "ba520dd7-1c33-4589-a92f-ea3d69f8ab24": {},
+          "d31c689f-6a49-43aa-a8a8-8453e8ca6575": {},
+          "e0db09a2-5013-471d-80f7-d63330377dc3": {},
+          "ee67474c-4f6d-4187-8364-293a5ad7ca68": {}
+        }
+      }
+    }
+  },
+  "pii_checks": {
+    "metrics_gateway": {
+      "url": "http://localhost:4000/metrics",
+      "reachable": false,
+      "error": "All connection attempts failed"
+    },
+    "metrics_opa": {
+      "url": "http://localhost:8181/metrics",
+      "reachable": true,
+      "pii": {
+        "emails": [],
+        "phones": [
+          "999999999996",
+          "999999999998",
+          "999999999999",
+          "9999999999995",
+          "9999999999998",
+          "9999999999999",
+          "99999999999994",
+          "99999999999997",
+          "99999999999999",
+          "999999999999996",
+          "999999999999998"
+        ]
+      }
+    },
+    "audit_logs_new_value_scan": {
+      "rows_scanned": 11,
+      "violations": []
+    },
+    "artifact_scan": {
+      "gdpr_forget.json": {
+        "emails": [],
+        "phones": []
+      },
+      "data_export.json": {
+        "emails": [],
+        "phones": []
+      },
+      "retention_policy.json": {
+        "emails": [],
+        "phones": []
+      }
+    }
+  },
+  "status": "pass"
+}

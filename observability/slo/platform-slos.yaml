@@ -1,0 +1,33 @@
+slos:
+  - name: gateway_api_availability
+    description: Gateway API availability based on non-5xx responses.
+    target: 0.999
+    window: 30d
+    sli:
+      numerator: sum(rate(http_requests_total{status!~"5.."}[5m]))
+      denominator: sum(rate(http_requests_total[5m]))
+
+  - name: governance_decision_latency_p95_ms
+    description: Authorization recheck latency (cache miss path) must stay low.
+    target_p95_ms: 500
+    window: 7d
+    sli:
+      promql: histogram_quantile(0.95, sum(rate(auth_recheck_latency_ms_bucket[5m])) by (le))
+
+  - name: dr_recovery_success_rate
+    description: Disaster recovery runs succeed.
+    target: 0.9999
+    window: 30d
+    sli:
+      numerator: sum(rate(recovery_success_total[30m]))
+      denominator: sum(rate(recovery_success_total[30m])) + sum(rate(recovery_failure_total[30m]))
+
+error_budget_policy:
+  burn_rate_alerts:
+    - window: 1h
+      burn_rate_threshold: 14
+    - window: 6h
+      burn_rate_threshold: 6
+  consequences:
+    - If burn rate alerts fire repeatedly, pause non-critical releases and prioritize reliability work.
+    - If budget is exhausted, require stability approval for releases until recovered.

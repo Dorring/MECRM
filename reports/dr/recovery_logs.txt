@@ -1,0 +1,674 @@
+timestamp=2026-01-24T18:40:08.762095Z
+exit_code=0
+
+STDOUT:
+DROP DATABASE
+CREATE DATABASE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+CREATE TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+ALTER TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+ALTER TABLE
+ALTER TABLE
+DROP POLICY
+CREATE POLICY
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+ALTER TABLE
+ALTER TABLE
+DROP POLICY
+CREATE POLICY
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+ALTER TABLE
+ALTER TABLE
+DROP POLICY
+CREATE POLICY
+CREATE TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+ALTER TABLE
+ALTER TABLE
+DROP POLICY
+CREATE POLICY
+ALTER TABLE
+ALTER TABLE
+DROP POLICY
+CREATE POLICY
+CREATE TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE TABLE
+CREATE TABLE
+ALTER TABLE
+ALTER TABLE
+DROP POLICY
+CREATE POLICY
+ALTER TABLE
+ALTER TABLE
+DROP POLICY
+CREATE POLICY
+ALTER TABLE
+ALTER TABLE
+DROP POLICY
+CREATE POLICY
+ALTER TABLE
+ALTER TABLE
+DROP POLICY
+CREATE POLICY
+DO
+DO
+GRANT
+GRANT
+GRANT
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+DROP SCHEMA
+CREATE SCHEMA
+SET
+SET
+SET
+SET
+SET
+ set_config 
+------------
+ 
+(1 row)
+
+SET
+SET
+SET
+SET
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+DROP POLICY
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+DROP INDEX
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+SET
+SET
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+COPY 0
+COPY 0
+COPY 0
+COPY 0
+COPY 0
+COPY 0
+COPY 0
+COPY 0
+COPY 0
+COPY 0
+COPY 0
+COPY 0
+COPY 0
+COPY 0
+COPY 0
+COPY 1
+COPY 2
+COPY 0
+COPY 0
+COPY 0
+COPY 0
+COPY 0
+COPY 0
+COPY 0
+COPY 0
+COPY 1
+COPY 0
+COPY 0
+COPY 0
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+ALTER TABLE
+CREATE POLICY
+DROP DATABASE
+{
+  "phase": "rpo_rto",
+  "timestamp": "2026-01-24T18:40:08.130509Z",
+  "backup_id": "e334bcc9-fbc1-4726-8cea-203326302649",
+  "rpo_seconds": 0.099,
+  "rto_seconds": 2.416,
+  "targets": {
+    "rpo_seconds": 300,
+    "rto_seconds": 1800
+  },
+  "status": "met"
+}
+
+
+STDERR:
+time="2026-01-25T00:09:57+05:30" level=warning msg="F:\\Dev_Env\\Multi-Agent-Enterprise-CRM\\docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+time="2026-01-25T00:09:57+05:30" level=warning msg="No services to build"
+time="2026-01-25T00:09:57+05:30" level=warning msg="Found orphan containers ([multi-agent-enterprise-crm-chaos-migrations-1]) for this project. If you removed or renamed this service in your compose file, you can run this command with the --remove-orphans flag to clean it up."
+ Container multi-agent-enterprise-crm-postgres-1 Running 
+ Container multi-agent-enterprise-crm-redis-1 Running 
+ Container multi-agent-enterprise-crm-opa-1 Running 
+time="2026-01-25T00:09:57+05:30" level=warning msg="F:\\Dev_Env\\Multi-Agent-Enterprise-CRM\\docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+NOTICE:  database "dr_run_1efb7d21ff" does not exist, skipping
+time="2026-01-25T00:09:58+05:30" level=warning msg="F:\\Dev_Env\\Multi-Agent-Enterprise-CRM\\docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+time="2026-01-25T00:09:58+05:30" level=warning msg="F:\\Dev_Env\\Multi-Agent-Enterprise-CRM\\docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+time="2026-01-25T00:09:59+05:30" level=warning msg="F:\\Dev_Env\\Multi-Agent-Enterprise-CRM\\docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+time="2026-01-25T00:10:00+05:30" level=warning msg="F:\\Dev_Env\\Multi-Agent-Enterprise-CRM\\docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+time="2026-01-25T00:10:01+05:30" level=warning msg="F:\\Dev_Env\\Multi-Agent-Enterprise-CRM\\docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+time="2026-01-25T00:10:01+05:30" level=warning msg="F:\\Dev_Env\\Multi-Agent-Enterprise-CRM\\docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+NOTICE:  policy "event_log_tenant_isolation" for relation "event_log" does not exist, skipping
+time="2026-01-25T00:10:02+05:30" level=warning msg="F:\\Dev_Env\\Multi-Agent-Enterprise-CRM\\docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+NOTICE:  policy "aggregate_snapshots_tenant_isolation" for relation "aggregate_snapshots" does not exist, skipping
+time="2026-01-25T00:10:02+05:30" level=warning msg="F:\\Dev_Env\\Multi-Agent-Enterprise-CRM\\docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+NOTICE:  policy "replay_jobs_tenant_isolation" for relation "replay_jobs" does not exist, skipping
+time="2026-01-25T00:10:03+05:30" level=warning msg="F:\\Dev_Env\\Multi-Agent-Enterprise-CRM\\docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+NOTICE:  relation "event_streams" already exists, skipping
+NOTICE:  relation "events" already exists, skipping
+NOTICE:  relation "events_stream_lookup_idx" already exists, skipping
+NOTICE:  policy "event_streams_tenant_isolation" for relation "event_streams" does not exist, skipping
+NOTICE:  policy "events_tenant_isolation" for relation "events" does not exist, skipping
+time="2026-01-25T00:10:03+05:30" level=warning msg="F:\\Dev_Env\\Multi-Agent-Enterprise-CRM\\docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+NOTICE:  relation "processed_events" already exists, skipping
+NOTICE:  relation "lead_read_model" already exists, skipping
+NOTICE:  relation "lead_read_model_status_idx" already exists, skipping
+NOTICE:  relation "deal_pipeline_view" already exists, skipping
+NOTICE:  relation "customer_timeline_view" already exists, skipping
+NOTICE:  policy "processed_events_tenant_isolation" for relation "processed_events" does not exist, skipping
+NOTICE:  policy "lead_read_model_tenant_isolation" for relation "lead_read_model" does not exist, skipping
+NOTICE:  policy "deal_pipeline_view_tenant_isolation" for relation "deal_pipeline_view" does not exist, skipping
+NOTICE:  policy "customer_timeline_view_tenant_isolation" for relation "customer_timeline_view" does not exist, skipping
+time="2026-01-25T00:10:04+05:30" level=warning msg="F:\\Dev_Env\\Multi-Agent-Enterprise-CRM\\docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+NOTICE:  policy "users_tenant_isolation" for relation "users" does not exist, skipping
+NOTICE:  policy "roles_tenant_isolation" for relation "roles" does not exist, skipping
+NOTICE:  policy "user_roles_tenant_isolation" for relation "user_roles" does not exist, skipping
+NOTICE:  policy "policies_tenant_isolation" for relation "policies" does not exist, skipping
+NOTICE:  policy "leads_tenant_isolation" for relation "leads" does not exist, skipping
+NOTICE:  policy "deals_tenant_isolation" for relation "deals" does not exist, skipping
+NOTICE:  policy "tickets_tenant_isolation" for relation "tickets" does not exist, skipping
+NOTICE:  policy "customers_tenant_isolation" for relation "customers" does not exist, skipping
+NOTICE:  policy "agent_tasks_tenant_isolation" for relation "agent_tasks" does not exist, skipping
+NOTICE:  policy "agent_events_tenant_isolation" for relation "agent_events" does not exist, skipping
+NOTICE:  policy "agent_decisions_tenant_isolation" for relation "agent_decisions" does not exist, skipping
+NOTICE:  policy "ai_memory_tenant_isolation" for relation "ai_memory" does not exist, skipping
+NOTICE:  policy "approvals_tenant_isolation" for relation "approvals" does not exist, skipping
+NOTICE:  policy "audit_logs_tenant_isolation" for relation "audit_logs" does not exist, skipping
+NOTICE:  policy "domain_events_tenant_isolation" for relation "domain_events" does not exist, skipping
+NOTICE:  policy "outbox_events_tenant_isolation" for relation "outbox_events" does not exist, skipping
+NOTICE:  policy "security_events_tenant_isolation" for relation "security_events" does not exist, skipping
+time="2026-01-25T00:10:05+05:30" level=warning msg="F:\\Dev_Env\\Multi-Agent-Enterprise-CRM\\docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+NOTICE:  drop cascades to 29 other objects
+DETAIL:  drop cascades to table tenants
+drop cascades to table users
+drop cascades to table roles
+drop cascades to table user_roles
+drop cascades to table policies
+drop cascades to table leads
+drop cascades to table deals
+drop cascades to table tickets
+drop cascades to table customers
+drop cascades to table ai_agents
+drop cascades to table agent_tasks
+drop cascades to table agent_events
+drop cascades to table ai_memory
+drop cascades to table approvals
+drop cascades to table audit_logs
+drop cascades to table security_events
+drop cascades to table domain_events
+drop cascades to table event_streams
+drop cascades to table events
+drop cascades to table outbox_events
+drop cascades to table processed_events
+drop cascades to table lead_read_model
+drop cascades to table deal_pipeline_view
+drop cascades to table customer_timeline_view
+drop cascades to table agent_decisions
+drop cascades to table data_retention_policies
+drop cascades to table event_log
+drop cascades to table aggregate_snapshots
+drop cascades to table replay_jobs
+time="2026-01-25T00:10:06+05:30" level=warning msg="F:\\Dev_Env\\Multi-Agent-Enterprise-CRM\\docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+time="2026-01-25T00:10:08+05:30" level=warning msg="F:\\Dev_Env\\Multi-Agent-Enterprise-CRM\\docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+

@@ -1,0 +1,423 @@
+// Prisma Schema for Enterprise CRM
+// Multi-tenant, event-driven architecture
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ===================
+// Core Entities
+// ===================
+
+model Tenant {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String   @db.VarChar(255)
+  slug      String   @unique @db.VarChar(100)
+  settings  Json     @default("{}")
+  status    String   @default("active") @db.VarChar(50)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  users          User[]
+  roles          Role[]
+  policies       Policy[]
+  leads          Lead[]
+  deals          Deal[]
+  tickets        Ticket[]
+  customers      Customer[]
+  agentTasks     AgentTask[]
+  agentEvents    AgentEvent[]
+  aiMemory       AiMemory[]
+  approvals      Approval[]
+  auditLogs      AuditLog[]
+  securityEvents SecurityEvent[]
+  domainEvents   DomainEvent[]
+  userRoles      UserRole[]
+
+  @@map("tenants")
+}
+
+model User {
+  id           String    @id @default(uuid()) @db.Uuid
+  tenantId     String    @map("tenant_id") @db.Uuid
+  email        String    @db.VarChar(255)
+  passwordHash String?   @map("password_hash") @db.VarChar(255)
+  name         String    @db.VarChar(255)
+  status       String    @default("active") @db.VarChar(50)
+  lastLoginAt  DateTime? @map("last_login_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  tenant             Tenant             @relation(fields: [tenantId], references: [id])
+  userRoles          UserRole[]
+  assignedLeads      Lead[]             @relation("AssignedLeads")
+  createdLeads       Lead[]             @relation("CreatedLeads")
+  assignedDeals      Deal[]             @relation("AssignedDeals")
+  createdDeals       Deal[]             @relation("CreatedDeals")
+  assignedTickets    Ticket[]           @relation("AssignedTickets")
+  createdTickets     Ticket[]           @relation("CreatedTickets")
+  createdCustomers   Customer[]
+  assignedRoles      UserRole[]         @relation("AssignedByUser")
+  decidedApprovals   Approval[]
+  resolvedSecEvents  SecurityEvent[]
+
+  @@unique([tenantId, email])
+  @@map("users")
+}
+
+model Role {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  name        String   @db.VarChar(100)
+  description String?  @db.Text
+  permissions Json     @default("[]")
+  isSystem    Boolean  @default(false) @map("is_system")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant    Tenant     @relation(fields: [tenantId], references: [id])
+  userRoles UserRole[]
+
+  @@unique([tenantId, name])
+  @@map("roles")
+}
+
+model UserRole {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenantId   String   @map("tenant_id") @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  roleId     String   @map("role_id") @db.Uuid
+  assignedBy String?  @map("assigned_by") @db.Uuid
+  assignedAt DateTime @default(now()) @map("assigned_at")
+
+  // Relations
+  tenant       Tenant @relation(fields: [tenantId], references: [id])
+  user         User   @relation(fields: [userId], references: [id])
+  role         Role   @relation(fields: [roleId], references: [id])
+  assignedByUser User? @relation("AssignedByUser", fields: [assignedBy], references: [id])
+
+  @@unique([tenantId, userId, roleId])
+  @@map("user_roles")
+}
+
+model Policy {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  name        String   @db.VarChar(255)
+  description String?  @db.Text
+  policyType  String   @map("policy_type") @db.VarChar(50)
+  regoContent String   @map("rego_content") @db.Text
+  isActive    Boolean  @default(true) @map("is_active")
+  version     Int      @default(1)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@map("policies")
+}
+
+// ===================
+// CRM Entities
+// ===================
+
+model Lead {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenantId   String   @map("tenant_id") @db.Uuid
+  name       String   @db.VarChar(255)
+  email      String?  @db.VarChar(255)
+  phone      String?  @db.VarChar(50)
+  company    String?  @db.VarChar(255)
+  source     String?  @db.VarChar(100)
+  status     String   @default("new") @db.VarChar(50)
+  score      Int?
+  assignedTo String?  @map("assigned_to") @db.Uuid
+  metadata   Json     @default("{}")
+  createdBy  String?  @map("created_by") @db.Uuid
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant       Tenant  @relation(fields: [tenantId], references: [id])
+  assignedUser User?   @relation("AssignedLeads", fields: [assignedTo], references: [id])
+  createdByUser User?  @relation("CreatedLeads", fields: [createdBy], references: [id])
+  deals        Deal[]
+
+  @@index([tenantId, status])
+  @@map("leads")
+}
+
+model Deal {
+  id                String    @id @default(uuid()) @db.Uuid
+  tenantId          String    @map("tenant_id") @db.Uuid
+  name              String    @db.VarChar(255)
+  leadId            String?   @map("lead_id") @db.Uuid
+  customerId        String?   @map("customer_id") @db.Uuid
+  stage             String    @default("prospecting") @db.VarChar(100)
+  amount            Decimal?  @db.Decimal(15, 2)
+  currency          String    @default("USD") @db.VarChar(3)
+  probability       Int       @default(0)
+  expectedCloseDate DateTime? @map("expected_close_date") @db.Date
+  actualCloseDate   DateTime? @map("actual_close_date") @db.Date
+  won               Boolean?
+  assignedTo        String?   @map("assigned_to") @db.Uuid
+  metadata          Json      @default("{}")
+  createdBy         String?   @map("created_by") @db.Uuid
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  tenant       Tenant    @relation(fields: [tenantId], references: [id])
+  lead         Lead?     @relation(fields: [leadId], references: [id])
+  customer     Customer? @relation(fields: [customerId], references: [id])
+  assignedUser User?     @relation("AssignedDeals", fields: [assignedTo], references: [id])
+  createdByUser User?    @relation("CreatedDeals", fields: [createdBy], references: [id])
+
+  @@index([tenantId, stage])
+  @@map("deals")
+}
+
+model Ticket {
+  id          String    @id @default(uuid()) @db.Uuid
+  tenantId    String    @map("tenant_id") @db.Uuid
+  subject     String    @db.VarChar(500)
+  description String?   @db.Text
+  customerId  String?   @map("customer_id") @db.Uuid
+  priority    String    @default("medium") @db.VarChar(50)
+  status      String    @default("open") @db.VarChar(50)
+  category    String?   @db.VarChar(100)
+  assignedTo  String?   @map("assigned_to") @db.Uuid
+  slaDueAt    DateTime? @map("sla_due_at")
+  resolvedAt  DateTime? @map("resolved_at")
+  resolution  String?   @db.Text
+  metadata    Json      @default("{}")
+  createdBy   String?   @map("created_by") @db.Uuid
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  tenant       Tenant    @relation(fields: [tenantId], references: [id])
+  customer     Customer? @relation(fields: [customerId], references: [id])
+  assignedUser User?     @relation("AssignedTickets", fields: [assignedTo], references: [id])
+  createdByUser User?    @relation("CreatedTickets", fields: [createdBy], references: [id])
+
+  @@index([tenantId, status])
+  @@map("tickets")
+}
+
+model Customer {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @map("tenant_id") @db.Uuid
+  name          String   @db.VarChar(255)
+  email         String?  @db.VarChar(255)
+  phone         String?  @db.VarChar(50)
+  company       String?  @db.VarChar(255)
+  segment       String?  @db.VarChar(100)
+  lifetimeValue Decimal  @default(0) @map("lifetime_value") @db.Decimal(15, 2)
+  status        String   @default("active") @db.VarChar(50)
+  metadata      Json     @default("{}")
+  createdBy     String?  @map("created_by") @db.Uuid
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant        Tenant   @relation(fields: [tenantId], references: [id])
+  createdByUser User?    @relation(fields: [createdBy], references: [id])
+  deals         Deal[]
+  tickets       Ticket[]
+
+  @@index([tenantId])
+  @@map("customers")
+}
+
+// ===================
+// AI Agent Entities
+// ===================
+
+model AiAgent {
+  id           String   @id @default(uuid()) @db.Uuid
+  name         String   @unique @db.VarChar(100)
+  type         String   @db.VarChar(50)
+  description  String?  @db.Text
+  capabilities Json     @default("[]")
+  config       Json     @default("{}")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tasks    AgentTask[]
+  events   AgentEvent[]
+  memories AiMemory[]
+
+  @@map("ai_agents")
+}
+
+model AgentTask {
+  id            String    @id @default(uuid()) @db.Uuid
+  tenantId      String    @map("tenant_id") @db.Uuid
+  agentId       String    @map("agent_id") @db.Uuid
+  taskType      String    @map("task_type") @db.VarChar(100)
+  inputData     Json      @map("input_data")
+  outputData    Json?     @map("output_data")
+  status        String    @default("pending") @db.VarChar(50)
+  priority      Int       @default(5)
+  startedAt     DateTime? @map("started_at")
+  completedAt   DateTime? @map("completed_at")
+  errorMessage  String?   @map("error_message") @db.Text
+  correlationId String?   @map("correlation_id") @db.Uuid
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  // Relations
+  tenant Tenant  @relation(fields: [tenantId], references: [id])
+  agent  AiAgent @relation(fields: [agentId], references: [id])
+  events AgentEvent[]
+
+  @@index([tenantId, status])
+  @@map("agent_tasks")
+}
+
+model AgentEvent {
+  id               String   @id @default(uuid()) @db.Uuid
+  tenantId         String   @map("tenant_id") @db.Uuid
+  agentId          String   @map("agent_id") @db.Uuid
+  taskId           String?  @map("task_id") @db.Uuid
+  eventType        String   @map("event_type") @db.VarChar(100)
+  actionType       String?  @map("action_type") @db.VarChar(100)
+  targetEntity     String?  @map("target_entity") @db.VarChar(100)
+  targetId         String?  @map("target_id") @db.Uuid
+  reasoning        String?  @db.Text
+  confidence       Decimal? @db.Decimal(3, 2)
+  isApproved       Boolean? @map("is_approved")
+  requiresApproval Boolean  @default(false) @map("requires_approval")
+  metadata         Json     @default("{}")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  // Relations
+  tenant Tenant     @relation(fields: [tenantId], references: [id])
+  agent  AiAgent    @relation(fields: [agentId], references: [id])
+  task   AgentTask? @relation(fields: [taskId], references: [id])
+
+  @@index([tenantId, createdAt])
+  @@map("agent_events")
+}
+
+model AiMemory {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  agentId     String?  @map("agent_id") @db.Uuid
+  memoryType  String   @map("memory_type") @db.VarChar(50)
+  content     String   @db.Text
+  embeddingId String?  @map("embedding_id") @db.VarChar(255)
+  context     Json     @default("{}")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  // Relations
+  tenant Tenant   @relation(fields: [tenantId], references: [id])
+  agent  AiAgent? @relation(fields: [agentId], references: [id])
+
+  @@map("ai_memory")
+}
+
+// ===================
+// Governance Entities
+// ===================
+
+model Approval {
+  id             String    @id @default(uuid()) @db.Uuid
+  tenantId       String    @map("tenant_id") @db.Uuid
+  requestType    String    @map("request_type") @db.VarChar(100)
+  requestorType  String    @map("requestor_type") @db.VarChar(50)
+  requestorId    String    @map("requestor_id") @db.Uuid
+  actionType     String    @map("action_type") @db.VarChar(100)
+  targetEntity   String?   @map("target_entity") @db.VarChar(100)
+  targetId       String?   @map("target_id") @db.Uuid
+  context        Json
+  status         String    @default("pending") @db.VarChar(50)
+  decidedBy      String?   @map("decided_by") @db.Uuid
+  decidedAt      DateTime? @map("decided_at")
+  decisionReason String?   @map("decision_reason") @db.Text
+  expiresAt      DateTime? @map("expires_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  // Relations
+  tenant      Tenant @relation(fields: [tenantId], references: [id])
+  decidedUser User?  @relation(fields: [decidedBy], references: [id])
+
+  @@index([tenantId, status])
+  @@map("approvals")
+}
+
+model AuditLog {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @map("tenant_id") @db.Uuid
+  actorType     String   @map("actor_type") @db.VarChar(50)
+  actorId       String   @map("actor_id") @db.Uuid
+  action        String   @db.VarChar(100)
+  resourceType  String   @map("resource_type") @db.VarChar(100)
+  resourceId    String?  @map("resource_id") @db.Uuid
+  oldValue      Json?    @map("old_value")
+  newValue      Json?    @map("new_value")
+  ipAddress     String?  @map("ip_address") @db.VarChar(45)
+  userAgent     String?  @map("user_agent") @db.Text
+  correlationId String?  @map("correlation_id") @db.Uuid
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  // Relations
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId, createdAt])
+  @@map("audit_logs")
+}
+
+model SecurityEvent {
+  id          String    @id @default(uuid()) @db.Uuid
+  tenantId    String?   @map("tenant_id") @db.Uuid
+  eventType   String    @map("event_type") @db.VarChar(100)
+  severity    String    @db.VarChar(50)
+  source      String    @db.VarChar(100)
+  actorId     String?   @map("actor_id") @db.Uuid
+  description String    @db.Text
+  metadata    Json      @default("{}")
+  resolved    Boolean   @default(false)
+  resolvedAt  DateTime? @map("resolved_at")
+  resolvedBy  String?   @map("resolved_by") @db.Uuid
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  // Relations
+  tenant       Tenant? @relation(fields: [tenantId], references: [id])
+  resolvedUser User?   @relation(fields: [resolvedBy], references: [id])
+
+  @@index([createdAt, severity])
+  @@map("security_events")
+}
+
+model DomainEvent {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @map("tenant_id") @db.Uuid
+  eventType     String   @map("event_type") @db.VarChar(255)
+  aggregateType String   @map("aggregate_type") @db.VarChar(100)
+  aggregateId   String   @map("aggregate_id") @db.Uuid
+  eventData     Json     @map("event_data")
+  metadata      Json     @default("{}")
+  version       Int
+  correlationId String?  @map("correlation_id") @db.Uuid
+  causationId   String?  @map("causation_id") @db.Uuid
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  // Relations
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([aggregateType, aggregateId])
+  @@index([tenantId, createdAt])
+  @@map("domain_events")
+}

@@ -1,0 +1,52 @@
+[
+  {
+    "location": {
+      "file": "/policies/tests/tenant_isolation_test.rego",
+      "row": 5,
+      "col": 1
+    },
+    "package": "data.enterprise_crm.tenant_isolation_test",
+    "name": "test_allow_same_tenant",
+    "duration": 352230
+  },
+  {
+    "location": {
+      "file": "/policies/tests/tenant_isolation_test.rego",
+      "row": 14,
+      "col": 1
+    },
+    "package": "data.enterprise_crm.tenant_isolation_test",
+    "name": "test_deny_cross_tenant",
+    "duration": 213525
+  },
+  {
+    "location": {
+      "file": "/policies/tests/tenant_isolation_test.rego",
+      "row": 30,
+      "col": 1
+    },
+    "package": "data.enterprise_crm.tenant_isolation_test",
+    "name": "test_allow_super_admin_cross_tenant_read",
+    "duration": 126863
+  },
+  {
+    "location": {
+      "file": "/policies/tests/tenant_isolation_test.rego",
+      "row": 39,
+      "col": 1
+    },
+    "package": "data.enterprise_crm.tenant_isolation_test",
+    "name": "test_deny_super_admin_cross_tenant_write",
+    "duration": 117487
+  },
+  {
+    "location": {
+      "file": "/policies/tests/tenant_isolation_test.rego",
+      "row": 48,
+      "col": 1
+    },
+    "package": "data.enterprise_crm.tenant_isolation_test",
+    "name": "test_deny_missing_subject_tenant",
+    "duration": 171007
+  }
+]

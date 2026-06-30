@@ -1,0 +1,68 @@
+{
+  "phase": "chaos_metrics_evidence",
+  "timestamp": 1769257949.2774334,
+  "prometheus_url": "http://localhost:9090",
+  "queries": {
+    "circuit_breaker_state": {
+      "query": "max(circuit_breaker_state) by (breaker, dependency)",
+      "response": {
+        "status": "success",
+        "data": {
+          "resultType": "vector",
+          "result": []
+        }
+      }
+    },
+    "retry_attempts_total": {
+      "query": "sum(increase(retry_attempts_total[10m])) by (operation, dependency)",
+      "response": {
+        "status": "success",
+        "data": {
+          "resultType": "vector",
+          "result": []
+        }
+      }
+    },
+    "retry_failures_total": {
+      "query": "sum(increase(retry_failures_total[10m])) by (operation, dependency)",
+      "response": {
+        "status": "success",
+        "data": {
+          "resultType": "vector",
+          "result": []
+        }
+      }
+    },
+    "consumer_lag": {
+      "query": "max(consumer_lag) by (group_id, topic)",
+      "response": {
+        "status": "success",
+        "data": {
+          "resultType": "vector",
+          "result": []
+        }
+      }
+    },
+    "replay_failures": {
+      "query": "sum(increase(replay_failures[10m])) by (component, error_type)",
+      "response": {
+        "status": "success",
+        "data": {
+          "resultType": "vector",
+          "result": []
+        }
+      }
+    },
+    "recovery_time_p95": {
+      "query": "histogram_quantile(0.95, sum(rate(recovery_time_seconds_bucket[10m])) by (le, breaker, dependency))",
+      "response": {
+        "status": "success",
+        "data": {
+          "resultType": "vector",
+          "result": []
+        }
+      }
+    }
+  },
+  "query_success": true
+}

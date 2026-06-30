@@ -1,0 +1,15 @@
+{
+  "phase": "event_replay_determinism",
+  "timestamp": "2026-01-24T11:28:52.080501Z",
+  "tenant_id": "11111111-1111-4111-8111-111111111111",
+  "aggregate_id": "5612c557-6636-4ca6-a25b-81dd25708bb5",
+  "topic": "crm.leads.events",
+  "partition": 0,
+  "start_offset": 7866,
+  "events": 200,
+  "run1_ms": 76,
+  "run2_ms": 41,
+  "state_hash_1": "e6f388550b57a98458b971a2799fc6704957892a139766d30ef5fde629775ffa",
+  "state_hash_2": "e6f388550b57a98458b971a2799fc6704957892a139766d30ef5fde629775ffa",
+  "deterministic": true
+}

@@ -1,0 +1,119 @@
+{
+  "uid": "agent-governance",
+  "title": "Agent Governance",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "10s",
+  "timezone": "browser",
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Decision Latency p95 (ms)",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(agent_decision_latency_ms_bucket[5m])) by (le, agent_id))",
+          "legendFormat": "{{agent_id}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Tool Calls / sec",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum(rate(agent_tool_call_count_total[5m])) by (agent_id, tool_name)",
+          "legendFormat": "{{agent_id}} {{tool_name}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Approvals Required / sec",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum(rate(agent_approval_required_total[5m])) by (agent_id, action_type)",
+          "legendFormat": "{{agent_id}} {{action_type}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Policy Violations / sec",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum(rate(agent_policy_violations_total[5m])) by (agent_id, action_type)",
+          "legendFormat": "{{agent_id}} {{action_type}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Kill Switch Activations / sec",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum(rate(agent_kill_switch_activations_total[5m])) by (scope)",
+          "legendFormat": "{{scope}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Agent Errors / sec",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum(rate(agent_error_total[5m])) by (agent_id, error_type)",
+          "legendFormat": "{{agent_id}} {{error_type}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 }
+    }
+  ],
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  }
+}

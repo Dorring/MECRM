@@ -1,0 +1,11 @@
+{
+  "name": "enterprise-crm-integration-tests",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Staging integration test suite for M-Agent-ECRM. See ./README.md.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "UNLICENSED"
+}

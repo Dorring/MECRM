@@ -1,0 +1,192 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-crm_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-crm_password}
+      - POSTGRES_DB=${POSTGRES_DB:-enterprise_crm}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - crm-network
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-crm_user} -d ${POSTGRES_DB:-enterprise_crm}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - crm-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    ports:
+      - "9092:9092"
+      - "9094:9094"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9094
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - crm-network
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "kafka-broker-api-versions --bootstrap-server localhost:9092",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  opa:
+    image: openpolicyagent/opa:0.55.0
+    ports:
+      - "8181:8181"
+    command:
+      - "run"
+      - "--server"
+      - "--addr=0.0.0.0:8181"
+      - "/policies"
+    volumes:
+      - ./policies:/policies
+    networks:
+      - crm-network
+
+  chaos-migrations:
+    image: postgres:16-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./database/migrations:/migrations:ro
+    environment:
+      - PGPASSWORD=${POSTGRES_PASSWORD:-crm_password}
+      - POSTGRES_USER=${POSTGRES_USER:-crm_user}
+      - POSTGRES_DB=${POSTGRES_DB:-enterprise_crm}
+    entrypoint: ["/bin/sh", "-lc"]
+    command:
+      - |
+        set -e
+        for f in /migrations/*.sql; do
+          case "$$f" in
+            */02-rls-policies.sql) continue ;;
+          esac
+          echo "apply $$f"
+          psql -h postgres -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -v ON_ERROR_STOP=1 -f "$$f"
+        done
+        echo "apply /migrations/02-rls-policies.sql"
+        psql -h postgres -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -v ON_ERROR_STOP=1 -f "/migrations/02-rls-policies.sql"
+        echo "migrations done"
+    networks:
+      - crm-network
+
+  agents:
+    build:
+      context: ./agents
+      dockerfile: Dockerfile
+    ports:
+      - "5010:5010"
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - OPA_URL=http://opa:8181
+      - DATABASE_URL=postgresql://crm_user:crm_password@postgres:5432/enterprise_crm
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      chaos-migrations:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      opa:
+        condition: service_started
+    networks:
+      - crm-network
+
+  replay-service:
+    build:
+      context: ./agents
+      dockerfile: Dockerfile
+    command:
+      ["uvicorn", "replay.api:app", "--host", "0.0.0.0", "--port", "5011"]
+    ports:
+      - "5011:5011"
+    environment:
+      - DATABASE_URL=postgresql://crm_user:crm_password@postgres:5432/enterprise_crm
+      - KAFKA_BROKERS=kafka:9092
+      - ENABLE_REPLAY_INGESTOR=true
+      - REPLAY_INGESTOR_GROUP=replay-event-ingestor
+    depends_on:
+      chaos-migrations:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - crm-network
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - crm-network
+    depends_on:
+      agents:
+        condition: service_started
+      replay-service:
+        condition: service_started
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - prometheus
+    networks:
+      - crm-network
+
+networks:
+  crm-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  kafka_data:

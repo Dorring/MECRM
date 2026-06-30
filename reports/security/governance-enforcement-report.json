@@ -1,0 +1,9 @@
+{
+  "phase": "ai_governance_certification",
+  "tenant_id": "2053f6d9-8edc-4d4d-a52f-9a6dbb41910f",
+  "approval_id": "1695f7d6-1d7f-4028-aa32-19a98e486956",
+  "event_type": "crm.leads.updated",
+  "topic": "crm.leads.events",
+  "pending_replayed": true,
+  "explainability_artifact_written": true
+}

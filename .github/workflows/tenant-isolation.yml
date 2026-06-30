@@ -1,0 +1,100 @@
+name: Tenant Isolation Proof
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  POSTGRES_USER: crm_user
+  POSTGRES_PASSWORD: crm_password
+  POSTGRES_DB: enterprise_crm
+  DATABASE_URL_ADMIN: postgresql://crm_user:crm_password@localhost:5432/enterprise_crm
+  DATABASE_URL: postgresql://crm_app:crm_password@localhost:5432/enterprise_crm
+  REDIS_URL: redis://localhost:6379
+  OPA_URL: http://localhost:8181
+  JWT_SECRET: tenant-isolation-test-secret
+
+jobs:
+  tenant-isolation:
+    name: Tenant Isolation Proof Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start stack (postgres, redis, opa)
+        run: docker compose up -d postgres redis opa
+
+      - name: Wait for postgres
+        run: |
+          for i in {1..30}; do
+            if docker compose exec -T postgres pg_isready -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: gateway/package-lock.json
+
+      - name: Install gateway dependencies
+        run: npm ci
+        working-directory: gateway
+
+      - name: Run Prisma migrations
+        run: npx prisma migrate deploy
+        working-directory: gateway
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL_ADMIN }}
+
+      - name: Install postgres client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Apply RLS policies
+        run: |
+          psql "${DATABASE_URL_ADMIN}" -v ON_ERROR_STOP=1 -f database/migrations/02-rls-policies.sql
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install python dependencies
+        run: pip install -r requirements.txt pytest pytest-asyncio
+        working-directory: agents
+
+      - name: Setup OPA CLI
+        uses: open-policy-agent/setup-opa@v2
+        with:
+          version: 0.70.0
+
+      - name: Run OPA tests
+        run: |
+          mkdir -p reports/security
+          opa test policies/ -f json > reports/security/opa-results.json
+
+      - name: Run python tenant isolation tests
+        run: |
+          mkdir -p reports/security
+          pytest agents/tests/test_tenant_isolation.py -v --junitxml reports/security/pytest-results.xml
+
+      - name: Run gateway tenant isolation tests
+        run: |
+          mkdir -p reports/security
+          npm test -- --json --outputFile ../reports/security/jest-results.json
+        working-directory: gateway
+
+      - name: Generate tenant isolation report
+        run: python scripts/generate_tenant_isolation_report.py
+
+      - name: Upload tenant isolation report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tenant-isolation-report
+          path: reports/security/tenant-isolation-report.json

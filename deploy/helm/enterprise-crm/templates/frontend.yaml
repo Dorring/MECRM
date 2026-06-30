@@ -1,0 +1,134 @@
+{{- if .Values.frontend.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "enterprise-crm.fullname" . }}-frontend
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: frontend
+    {{- include "enterprise-crm.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount.frontend }}
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+        {{- include "enterprise-crm.labels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: {{ include "enterprise-crm.serviceAccountName" . }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: frontend
+          image: "{{ if .Values.global.imageRegistry }}{{ .Values.global.imageRegistry }}/{{ end }}{{ .Values.images.frontend.repository }}:{{ .Values.images.frontend.tag }}"
+          imagePullPolicy: {{ .Values.images.frontend.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          env:
+            - name: NODE_ENV
+              value: {{ .Values.environment | quote }}
+            - name: NEXT_PUBLIC_API_URL
+              value: "https://{{ .Values.global.domain }}/api"
+            - name: NEXT_PUBLIC_WS_URL
+              value: "wss://{{ .Values.global.domain }}/ws"
+            - name: NEXT_PUBLIC_KEYCLOAK_URL
+              value: {{ .Values.frontend.keycloakUrl | default (printf "https://%s/auth" .Values.global.domain) | quote }}
+            - name: NEXT_PUBLIC_KEYCLOAK_REALM
+              value: {{ .Values.frontend.keycloakRealm | default "crm" | quote }}
+            - name: NEXT_PUBLIC_KEYCLOAK_CLIENT_ID
+              value: {{ .Values.frontend.keycloakClientId | default "crm-frontend" | quote }}
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources.frontend | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "enterprise-crm.fullname" . }}-frontend
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: frontend
+spec:
+  type: {{ .Values.services.frontend.type }}
+  ports:
+    - port: {{ .Values.services.frontend.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app: frontend
+---
+{{- if and .Values.autoscaling.enabled .Values.autoscaling.frontend }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "enterprise-crm.fullname" . }}-frontend
+  namespace: {{ .Values.namespace }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "enterprise-crm.fullname" . }}-frontend
+  minReplicas: {{ .Values.autoscaling.frontend.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.frontend.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.frontend.targetCPUUtilizationPercentage }}
+{{- end }}
+---
+{{- if and .Values.podDisruptionBudget.frontend (gt (.Values.podDisruptionBudget.frontend.minAvailable | int) 0) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "enterprise-crm.fullname" . }}-frontend
+  namespace: {{ .Values.namespace }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.frontend.minAvailable }}
+  selector:
+    matchLabels:
+      app: frontend
+{{- end }}
+{{- end }}

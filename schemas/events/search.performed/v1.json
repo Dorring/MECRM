@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "required": ["searchId", "query", "resultCount", "durationMs"],
+  "properties": {
+    "searchId": {"type": "string"},
+    "query": {"type": "string"},
+    "resultCount": {"type": "integer"},
+    "durationMs": {"type": "number"},
+    "module": {"type": "string"},
+    "userId": {"type": "string"},
+    "entityType": {"type": "string"}
+  }
+}
+

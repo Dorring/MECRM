@@ -1,0 +1,497 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository }}
+
+jobs:
+  # Lint and type check
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        project: [gateway, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: ${{ matrix.project }}/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: ${{ matrix.project }}
+
+      - name: Run linter
+        run: npm run lint
+        working-directory: ${{ matrix.project }}
+
+      - name: Type check
+        run: npm run build
+        working-directory: ${{ matrix.project }}
+
+  lint-python:
+    name: Lint Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install ruff mypy
+          pip install -r requirements.txt
+        working-directory: agents
+
+      - name: Run ruff
+        run: ruff check .
+        working-directory: agents
+
+      - name: Run mypy
+        run: mypy src --ignore-missing-imports
+        working-directory: agents
+
+  # Static schema / contract validation
+  validate-schemas:
+    name: Validate Event Schemas
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install jsonschema
+        run: python -m pip install jsonschema
+
+      - name: Validate CloudEvents schemas
+        run: |
+          set -e
+          shopt -s nullglob
+          found=0
+          for f in schemas/events/*.json; do
+            found=1
+            python -c "import json,sys; json.load(open(sys.argv[1]))" "$f"
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "No event schemas found in schemas/events/" >&2
+            exit 1
+          fi
+
+  # Unit tests
+  test-gateway:
+    name: Test Gateway
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: gateway
+
+      - name: Run Prisma migrations
+        run: npx prisma migrate deploy
+        working-directory: gateway
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/test_db
+
+      - name: Run tests
+        run: npm test -- --coverage
+        working-directory: gateway
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/test_db
+          REDIS_URL: redis://localhost:6379
+          JWT_SECRET: test-secret
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v5
+        with:
+          files: gateway/coverage/lcov.info
+          flags: gateway
+
+  test-agents:
+    name: Test Agents
+    runs-on: ubuntu-latest
+    needs: lint-python
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio pytest-cov
+        working-directory: agents
+
+      - name: Run tests
+        run: pytest --cov=src --cov-report=xml
+        working-directory: agents
+        env:
+          ADMIN_DATABASE_URL: postgresql://test:test@localhost:5432/test_db
+          DATABASE_URL: postgresql://crm_app:crm_password@localhost:5432/test_db
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v5
+        with:
+          files: agents/coverage.xml
+          flags: agents
+
+  # OPA policy tests
+  test-policies:
+    name: Test OPA Policies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup OPA
+        uses: open-policy-agent/setup-opa@v2
+        with:
+          version: 0.70.0
+
+      - name: Run policy tests
+        run: opa test policies/ -v
+
+  # Helm chart validation (lint + render). Runs on every push/PR so chart
+  # regressions surface before deploy. The staging/production values files are
+  # created by the Helm phase; both must exist before this job can fully pass
+  # on a release branch.
+  helm-lint:
+    name: Helm Lint & Template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+
+      - name: Lint chart
+        run: helm lint deploy/helm/enterprise-crm
+
+      - name: Render default template
+        run: |
+          helm template enterprise-crm deploy/helm/enterprise-crm \
+            --namespace crm-default > /tmp/rendered-default.yaml
+          echo "Rendered $(wc -l < /tmp/rendered-default.yaml) lines"
+
+      - name: Lint staging values if present
+        run: |
+          if [ -f deploy/helm/enterprise-crm/values-staging.yaml ]; then
+            helm lint deploy/helm/enterprise-crm \
+              --values deploy/helm/enterprise-crm/values-staging.yaml
+          else
+            echo "values-staging.yaml not present yet; skipping staging lint (see docs/project-optimization-plan.md Phase 4)."
+          fi
+
+      - name: Lint production values if present
+        run: |
+          if [ -f deploy/helm/enterprise-crm/values-production.yaml ]; then
+            helm lint deploy/helm/enterprise-crm \
+              --values deploy/helm/enterprise-crm/values-production.yaml
+          else
+            echo "values-production.yaml not present yet; skipping production lint (see docs/project-optimization-plan.md Phase 4)."
+          fi
+
+  # Build and push images
+  build:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    needs: [test-gateway, test-agents, test-policies, validate-schemas, helm-lint]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - project: gateway
+            dockerfile: gateway/Dockerfile
+            context: gateway
+          - project: frontend
+            dockerfile: frontend/Dockerfile
+            context: frontend
+          - project: agents
+            dockerfile: agents/Dockerfile
+            context: agents
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.project }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      - name: Build and push
+        id: build-push
+        uses: docker/build-push-action@v5
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Publish the immutable image digest so deploy jobs can resolve the
+      # exact bytes that were built, instead of the mutable sha tag.
+      # Phase 4 CI/CD requirement: deploys must reference a digest, not a tag.
+      - name: Export image digest
+        id: export-digest
+        run: |
+          DIGEST="${{ steps.build-push.outputs.digest }}"
+          echo "Pushed digest: ${DIGEST}"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image=${REGISTRY}/${IMAGE_PREFIX}/${matrix.project}@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+  # Deploy to staging.
+  # NOTE: job-level `if:` cannot reference the `secrets` context reliably
+  # (`if: ${{ secrets.X != '' }}` does not evaluate as intended and makes the
+  # job silently skip on every run). Instead we assign the secret to an env
+  # var and guard it in the first step, so the job is skipped cleanly when the
+  # secret is not configured (forks, repos without a staging cluster) but
+  # actually runs when it is.
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: staging
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      KUBE_CONFIG_STAGING: ${{ secrets.KUBE_CONFIG_STAGING }}
+      STAGING_API_URL: ${{ secrets.STAGING_API_URL }}
+      TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+      TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard required staging secrets
+        run: |
+          if [ -z "${KUBE_CONFIG_STAGING}" ]; then
+            echo "KUBE_CONFIG_STAGING not set; skipping staging deploy." >&2
+            echo "SKIP_REMAINING=true" >> "$GITHUB_ENV"
+          else
+            echo "KUBE_CONFIG_STAGING is configured; continuing deploy."
+            echo "SKIP_REMAINING=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Setup Helm
+        if: ${{ env.SKIP_REMAINING != 'true' }}
+        uses: azure/setup-helm@v3
+
+      - name: Configure kubectl
+        if: ${{ env.SKIP_REMAINING != 'true' }}
+        uses: azure/k8s-set-context@v3
+        with:
+          kubeconfig: ${{ env.KUBE_CONFIG_STAGING }}
+
+      - name: Deploy with Helm
+        # Phase 4 CI/CD: deploys SHOULD reference the immutable image digest
+        # rather than the mutable `${{ github.sha }}` tag. The build job publishes
+        # `steps.build-push.outputs.digest` per matrix image; once a non-matrix
+        # build aggregation is added (or a digest map step), switch the
+        # `--set images.*.tag` lines to `--set images.*.digest=<sha256:...>`.
+        # Tag-based deploy is retained for now and tracked as a follow-up.
+        if: ${{ env.SKIP_REMAINING != 'true' }}
+        run: |
+          helm upgrade --install enterprise-crm ./deploy/helm/enterprise-crm \
+            --namespace crm-staging \
+            --create-namespace \
+            --values ./deploy/helm/enterprise-crm/values-staging.yaml \
+            --set images.gateway.tag=${{ github.sha }} \
+            --set images.frontend.tag=${{ github.sha }} \
+            --set images.agents.tag=${{ github.sha }} \
+            --wait --timeout 10m
+
+  # Integration tests on staging. Runs only when the staging API is actually
+  # configured; otherwise skipped cleanly (see deploy-staging note on why we
+  # cannot use job-level `if: ${{ secrets.X != '' }}`).
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    env:
+      STAGING_API_URL: ${{ secrets.STAGING_API_URL }}
+      TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+      TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard required integration-test secrets
+        run: |
+          if [ -z "${STAGING_API_URL}" ] || [ -z "${TEST_USER_EMAIL}" ] || [ -z "${TEST_USER_PASSWORD}" ]; then
+            echo "One or more integration-test secrets are not set; skipping integration tests." >&2
+            echo "SKIP_REMAINING=true" >> "$GITHUB_ENV"
+          else
+            echo "Integration-test secrets are configured; continuing."
+            echo "SKIP_REMAINING=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Setup Node.js
+        if: ${{ env.SKIP_REMAINING != 'true' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: tests/integration/package-lock.json
+
+      - name: Install test dependencies
+        if: ${{ env.SKIP_REMAINING != 'true' }}
+        run: npm ci
+        working-directory: tests/integration
+
+      - name: Run integration tests
+        if: ${{ env.SKIP_REMAINING != 'true' }}
+        run: npm test
+        working-directory: tests/integration
+        env:
+          API_URL: ${{ env.STAGING_API_URL }}
+          TEST_USER_EMAIL: ${{ env.TEST_USER_EMAIL }}
+          TEST_USER_PASSWORD: ${{ env.TEST_USER_PASSWORD }}
+
+  # Deploy to production (manual approval required via the `production`
+  # environment protection rule). Same secrets-context note applies.
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: integration-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      KUBE_CONFIG_PRODUCTION: ${{ secrets.KUBE_CONFIG_PRODUCTION }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard required production secrets
+        run: |
+          if [ -z "${KUBE_CONFIG_PRODUCTION}" ]; then
+            echo "KUBE_CONFIG_PRODUCTION not set; skipping production deploy." >&2
+            echo "SKIP_REMAINING=true" >> "$GITHUB_ENV"
+          else
+            echo "KUBE_CONFIG_PRODUCTION is configured; continuing deploy."
+            echo "SKIP_REMAINING=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Setup Helm
+        if: ${{ env.SKIP_REMAINING != 'true' }}
+        uses: azure/setup-helm@v3
+
+      - name: Configure kubectl
+        if: ${{ env.SKIP_REMAINING != 'true' }}
+        uses: azure/k8s-set-context@v3
+        with:
+          kubeconfig: ${{ env.KUBE_CONFIG_PRODUCTION }}
+
+      - name: Deploy with Helm
+        # Phase 4 CI/CD: production deploy SHOULD reference the immutable image
+        # digest, not the mutable `${{ github.sha }}` tag. See deploy-staging
+        # note for the migration plan. Tag-based deploy is retained for now.
+        if: ${{ env.SKIP_REMAINING != 'true' }}
+        run: |
+          helm upgrade --install enterprise-crm ./deploy/helm/enterprise-crm \
+            --namespace crm-production \
+            --create-namespace \
+            --values ./deploy/helm/enterprise-crm/values-production.yaml \
+            --set images.gateway.tag=${{ github.sha }} \
+            --set images.frontend.tag=${{ github.sha }} \
+            --set images.agents.tag=${{ github.sha }} \
+            --wait --timeout 15m
+
+      - name: Notify deployment
+        if: ${{ env.SKIP_REMAINING != 'true' }}
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "🚀 Enterprise CRM deployed to production",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Enterprise CRM* deployed to production\nCommit: `${{ github.sha }}`\nBy: ${{ github.actor }}"
+                  }
+                }
+              ]
+            }

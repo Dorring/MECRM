@@ -1,0 +1,144 @@
+# Staging values for Enterprise CRM
+# Lower replicas and resource limits for cost-conscious pre-production.
+# CI (.github/workflows/ci-cd.yml deploy-staging) overrides image tags to the
+# current commit SHA via --set, so tags here are only fallbacks.
+
+global:
+  domain: staging.crm.example.com
+
+namespace: crm-staging
+
+environment: staging
+
+serviceAccount:
+  create: true
+  automount: false
+
+frontend:
+  enabled: true
+
+# Lower replica counts for staging
+replicaCount:
+  frontend: 1
+  gateway: 2
+  agents: 1
+
+images:
+  frontend:
+    tag: latest
+  gateway:
+    tag: latest
+  agents:
+    tag: latest
+
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: staging.crm.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          service: frontend
+        - path: /api
+          pathType: Prefix
+          service: gateway
+        - path: /ws
+          pathType: Prefix
+          service: gateway
+  tls:
+    - secretName: crm-staging-tls
+      hosts:
+        - staging.crm.example.com
+
+# Reduced resource requests/limits for staging
+resources:
+  frontend:
+    limits:
+      cpu: 300m
+      memory: 384Mi
+    requests:
+      cpu: 50m
+      memory: 96Mi
+  gateway:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 192Mi
+  agents:
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+    requests:
+      cpu: 250m
+      memory: 384Mi
+
+# Autoscaling: tighter and cheaper in staging
+autoscaling:
+  enabled: true
+  gateway:
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 75
+    targetMemoryUtilizationPercentage: 80
+  agents:
+    minReplicas: 1
+    maxReplicas: 3
+    targetCPUUtilizationPercentage: 80
+  frontend:
+    minReplicas: 1
+    maxReplicas: 3
+    targetCPUUtilizationPercentage: 75
+
+# Smaller persistence for staging
+postgresql:
+  enabled: true
+  auth:
+    username: crm_user
+    database: enterprise_crm
+  primary:
+    persistence:
+      enabled: true
+      size: 20Gi
+  readReplicas:
+    replicaCount: 1
+
+redis:
+  enabled: true
+  architecture: standalone
+  auth:
+    enabled: true
+  master:
+    persistence:
+      enabled: true
+      size: 5Gi
+
+kafka:
+  enabled: true
+  replicaCount: 1
+  persistence:
+    enabled: true
+    size: 20Gi
+  zookeeper:
+    replicaCount: 1
+    persistence:
+      enabled: true
+      size: 5Gi
+
+keycloak:
+  enabled: true
+  replicaCount: 1
+
+# Staging can disable NetworkPolicy if the cluster CNI lacks support
+networkPolicy:
+  enabled: true
+
+podDisruptionBudget:
+  gateway:
+    minAvailable: 1
+  agents:
+    minAvailable: 0
+  frontend:
+    minAvailable: 0

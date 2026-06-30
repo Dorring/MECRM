@@ -1,0 +1,28 @@
+{
+  "phase": "dr_full_recovery",
+  "timestamp": "2026-01-24T18:40:08.130480Z",
+  "backup_id": "e334bcc9-fbc1-4726-8cea-203326302649",
+  "seed": {
+    "tenant_id": "d4933832-942f-45ce-acf9-e43413d090c4",
+    "lead_id": "6ea9032e-8753-41a6-88a1-a3f87abe4bf4"
+  },
+  "restore": {
+    "restore_database_seconds": 1.6863761999411508,
+    "restore_snapshots_seconds": 0.0004759000148624182,
+    "rebuild_read_models_seconds": 0.025065400055609643,
+    "integrity": {
+      "validated_at": "2026-01-24T18:40:08.107016Z",
+      "tenants": {
+        "d4933832-942f-45ce-acf9-e43413d090c4": {
+          "event_streams": 1,
+          "events": 2,
+          "lead_read_model": 1,
+          "max_event_ts": "2026-01-24 18:40:04.916000",
+          "lead_read_model_checksum": "9f0112af2b324d53077d37a531aee010"
+        }
+      },
+      "validation_seconds": 0.024984
+    }
+  },
+  "rto_seconds": 2.416
+}

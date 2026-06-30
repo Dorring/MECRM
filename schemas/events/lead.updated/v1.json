@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "required": ["leadId", "changes"],
+  "properties": {
+    "leadId": { "type": "string" },
+    "changes": { "type": "object" }
+  }
+}
+

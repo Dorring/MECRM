@@ -1,0 +1,62 @@
+groups:
+  - name: platform-slo-alerts
+    rules:
+      - alert: GatewayDown
+        expr: up{job="gateway"} == 0
+        for: 2m
+        labels:
+          severity: page
+          team: platform
+        annotations:
+          summary: Gateway is down
+          runbook: file:///f:/Dev_Env/Multi-Agent-Enterprise-CRM/docs/runbooks/replay-failure.md
+
+      - alert: GatewayHigh5xxErrorRatio
+        expr: (sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m]))) > 0.01
+        for: 5m
+        labels:
+          severity: page
+          team: platform
+        annotations:
+          summary: Gateway 5xx ratio is above 1% for 5m
+          runbook: file:///f:/Dev_Env/Multi-Agent-Enterprise-CRM/docs/runbooks/kafka-outage.md
+
+      - alert: PolicyEngineUnavailable
+        expr: increase(cache_fail_closed_total{component="gateway_opa",reason="opa_unavailable"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: page
+          team: platform
+        annotations:
+          summary: OPA policy evaluation failing closed (OPA unavailable)
+          runbook: file:///f:/Dev_Env/Multi-Agent-Enterprise-CRM/docs/runbooks/replay-failure.md
+
+      - alert: CacheFailClosedEvents
+        expr: increase(cache_fail_closed_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: ticket
+          team: platform
+        annotations:
+          summary: Fail-closed cache/auth events detected
+          runbook: file:///f:/Dev_Env/Multi-Agent-Enterprise-CRM/docs/runbooks/approval-backlog.md
+
+      - alert: CircuitBreakerOpen
+        expr: max_over_time(circuit_breaker_state{breaker!=""}[5m]) == 1
+        for: 2m
+        labels:
+          severity: page
+          team: platform
+        annotations:
+          summary: Circuit breaker is OPEN
+          runbook: file:///f:/Dev_Env/Multi-Agent-Enterprise-CRM/docs/runbooks/kafka-outage.md
+
+      - alert: DRRecoveryFailure
+        expr: increase(recovery_failure_total[30m]) > 0
+        for: 1m
+        labels:
+          severity: page
+          team: platform
+        annotations:
+          summary: Disaster recovery failure detected
+          runbook: file:///f:/Dev_Env/Multi-Agent-Enterprise-CRM/docs/runbooks/dr-recovery.md

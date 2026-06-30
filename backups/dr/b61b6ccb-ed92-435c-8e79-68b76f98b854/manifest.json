@@ -1,0 +1,15 @@
+{
+  "backup_id": "b61b6ccb-ed92-435c-8e79-68b76f98b854",
+  "created_at": "2026-01-24T18:32:54.838967Z",
+  "keys": [
+    "dr/b61b6ccb-ed92-435c-8e79-68b76f98b854/aggregate_snapshots.jsonl",
+    "dr/b61b6ccb-ed92-435c-8e79-68b76f98b854/event_log.jsonl"
+  ],
+  "sha256": {
+    "dr/b61b6ccb-ed92-435c-8e79-68b76f98b854/aggregate_snapshots.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "dr/b61b6ccb-ed92-435c-8e79-68b76f98b854/event_log.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "metadata": {
+    "type": "snapshots"
+  }
+}

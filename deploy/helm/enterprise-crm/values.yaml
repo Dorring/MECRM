@@ -1,0 +1,309 @@
+# Default values for Enterprise CRM
+# Override these for different environments
+
+# Global settings
+# global.imageRegistry is prepended to images.*.repository when non-empty
+# (consumed by templates/gateway.yaml, agents.yaml, frontend.yaml).
+# global.imagePullSecrets is rendered into pod specs when non-empty.
+# global.domain is consumed by ingress hosts and frontend NEXT_PUBLIC_* env.
+global:
+  imageRegistry: ""
+  imagePullSecrets: []
+  domain: crm.example.com
+  
+# Namespace
+namespace: crm
+
+# Environment
+environment: production
+
+# ServiceAccount
+# Consumed by templates/serviceaccount.yaml and the serviceAccountName helper in _helpers.tpl.
+# When create=false, workloads fall back to the namespace "default" service account.
+serviceAccount:
+  create: true
+  name: ""
+  automount: false
+  annotations: {}
+
+# Frontend feature flag and presentation-only config
+# Consumed by templates/frontend.yaml. Disabled here so existing installs that did not
+# include the frontend workload are not surprised; enable for full topologies.
+frontend:
+  enabled: true
+  # Keycloak public endpoints (browser-facing, non-secret)
+  keycloakUrl: ""
+  keycloakRealm: "crm"
+  keycloakClientId: "crm-frontend"
+
+# Replica counts
+replicaCount:
+  frontend: 2
+  gateway: 3
+  agents: 2
+
+# Images
+images:
+  frontend:
+    repository: enterprise-crm/frontend
+    tag: latest
+    pullPolicy: IfNotPresent
+  gateway:
+    repository: enterprise-crm/gateway
+    tag: latest
+    pullPolicy: IfNotPresent
+  agents:
+    repository: enterprise-crm/agents
+    tag: latest
+    pullPolicy: IfNotPresent
+
+# Service configurations
+services:
+  frontend:
+    type: ClusterIP
+    port: 3000
+  gateway:
+    type: ClusterIP
+    port: 4000
+  agents:
+    type: ClusterIP
+    port: 5010
+
+# Ingress
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    kubernetes.io/tls-acme: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+  hosts:
+    - host: crm.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          service: frontend
+        - path: /api
+          pathType: Prefix
+          service: gateway
+        - path: /ws
+          pathType: Prefix
+          service: gateway
+  tls:
+    - secretName: crm-tls
+      hosts:
+        - crm.example.com
+
+# Resources
+resources:
+  frontend:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  gateway:
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+    requests:
+      cpu: 200m
+      memory: 256Mi
+  agents:
+    limits:
+      cpu: 2000m
+      memory: 2Gi
+    requests:
+      cpu: 500m
+      memory: 512Mi
+
+# Autoscaling
+autoscaling:
+  enabled: true
+  gateway:
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+  agents:
+    minReplicas: 2
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 80
+  frontend:
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 75
+
+# PostgreSQL
+postgresql:
+  enabled: true
+  auth:
+    username: crm_user
+    password: ""  # Use secret
+    database: enterprise_crm
+  primary:
+    persistence:
+      enabled: true
+      size: 50Gi
+  readReplicas:
+    replicaCount: 2
+
+# Redis
+redis:
+  enabled: true
+  architecture: replication
+  auth:
+    enabled: true
+    password: ""  # Use secret
+  master:
+    persistence:
+      enabled: true
+      size: 10Gi
+  replica:
+    replicaCount: 2
+
+# Kafka
+kafka:
+  enabled: true
+  replicaCount: 3
+  persistence:
+    enabled: true
+    size: 50Gi
+  zookeeper:
+    replicaCount: 3
+    persistence:
+      enabled: true
+      size: 10Gi
+
+# External service endpoints
+# Consumed by _helpers.tpl (postgresHost/redisHost/kafkaHost) when the corresponding
+# bitnami subchart is disabled (enabled: false). Without these keys, disabling a
+# subchart would render an empty host. They hold no secrets; real connection strings
+# still come from the secrets.* references injected into workloads.
+externalPostgresql:
+  host: ""
+externalRedis:
+  host: ""
+externalKafka:
+  host: ""
+
+# OPA
+# NOTE: opa is referenced by agents.yaml/gateway.yaml (http://<fullname>-opa:8181) and by
+# templates/networkpolicy.yaml, but NO template renders an OPA Deployment/Service and OPA
+# is NOT a Chart.yaml dependency. The chart currently assumes OPA is provisioned out-of-band.
+# Declared here for documentation; consuming it requires adding an OPA template or subchart
+# (out of scope for this fix batch — tracked in Phase 4 task list).
+opa:
+  enabled: true
+  replicaCount: 2
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+# Weaviate
+# NOTE: weaviate is referenced by agents.yaml (http://<fullname>-weaviate:8080) and
+# networkpolicy.yaml, but NO template renders a Weaviate Deployment/Service and Weaviate
+# is NOT a Chart.yaml dependency. Assumed provisioned out-of-band. See OPA note above.
+weaviate:
+  enabled: true
+  replicas: 2
+  storage:
+    size: 20Gi
+
+# Ollama
+# NOTE: ollama is referenced by agents.yaml (http://<fullname>-ollama:11434) and
+# networkpolicy.yaml, and .Values.ollama.model IS consumed by agents.yaml, but NO template
+# renders an Ollama Deployment/Service and Ollama is NOT a Chart.yaml dependency. Assumed
+# provisioned out-of-band (typically on GPU node pools). See OPA note above.
+ollama:
+  enabled: true
+  model: llama3.1
+  resources:
+    limits:
+      nvidia.com/gpu: 1
+      memory: 16Gi
+    requests:
+      memory: 8Gi
+
+# Keycloak
+keycloak:
+  enabled: true
+  auth:
+    adminUser: admin
+    adminPassword: ""  # Use secret
+  replicaCount: 2
+
+# Monitoring
+# NOTE: monitoring.* is declared but NOT consumed by any template, and prometheus/grafana/loki
+# are NOT Chart.yaml dependencies. Pod annotations (prometheus.io/scrape) in gateway/agents/
+# frontend templates rely on an externally provisioned Prometheus with scrape discovery.
+# Declared for documentation; add a kube-prometheus-stack subchart or external monitoring
+# to actually consume these values. Tracked as a known alignment gap.
+monitoring:
+  enabled: true
+  prometheus:
+    enabled: true
+    retention: 15d
+    storage: 50Gi
+  grafana:
+    enabled: true
+    adminPassword: ""  # Use secret
+  loki:
+    enabled: true
+    retention: 7d
+
+# Secrets (reference existing K8s secrets)
+secrets:
+  postgresql:
+    existingSecret: crm-postgresql-secret
+    passwordKey: password
+  redis:
+    existingSecret: crm-redis-secret
+    passwordKey: password
+  jwt:
+    existingSecret: crm-jwt-secret
+    secretKey: jwt-secret
+  keycloak:
+    existingSecret: crm-keycloak-secret
+    adminPasswordKey: admin-password
+
+# Pod disruption budgets
+podDisruptionBudget:
+  gateway:
+    minAvailable: 1
+  agents:
+    minAvailable: 1
+  frontend:
+    minAvailable: 1
+
+# Node selectors
+nodeSelector: {}
+
+# Tolerations
+tolerations: []
+
+# NetworkPolicy
+# Consumed by templates/networkpolicy.yaml. Disable if the cluster CNI does not
+# support NetworkPolicy or if subcharts are disabled (external* services) and the
+# pod selectors below no longer match in-namespace pods.
+networkPolicy:
+  enabled: true
+
+# Affinity
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - gateway
+          topologyKey: kubernetes.io/hostname

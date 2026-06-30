@@ -1,0 +1,128 @@
+-- Database initialization script
+-- This runs when PostgreSQL container starts
+
+-- Create extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- Create default tenant for testing
+INSERT INTO tenants (id, name, slug, status, created_at, updated_at)
+VALUES (
+  'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+  'Demo Tenant',
+  'demo',
+  'active',
+  NOW(),
+  NOW()
+) ON CONFLICT DO NOTHING;
+
+-- Create admin role
+INSERT INTO roles (id, tenant_id, name, description, permissions, is_system, created_at, updated_at)
+VALUES (
+  'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22',
+  'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+  'admin',
+  'Administrator with full access',
+  '["*"]',
+  true,
+  NOW(),
+  NOW()
+) ON CONFLICT DO NOTHING;
+
+-- Create demo user (password: demo1234)
+INSERT INTO users (id, tenant_id, email, password_hash, name, status, created_at, updated_at)
+VALUES (
+  'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a33',
+  'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+  'demo@example.com',
+  '$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/X4.G5xK5xk5xk5xk5',
+  'Demo User',
+  'active',
+  NOW(),
+  NOW()
+) ON CONFLICT DO NOTHING;
+
+-- Assign admin role to demo user
+INSERT INTO user_roles (id, tenant_id, user_id, role_id, assigned_at)
+VALUES (
+  'd0eebc99-9c0b-4ef8-bb6d-6bb9bd380a44',
+  'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+  'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a33',
+  'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22',
+  NOW()
+) ON CONFLICT DO NOTHING;
+
+-- Register AI agents
+INSERT INTO ai_agents (id, name, type, description, capabilities, is_active, created_at, updated_at)
+VALUES 
+  (
+    'e0eebc99-9c0b-4ef8-bb6d-6bb9bd380a55',
+    'sales-agent',
+    'sales',
+    'Sales AI Agent for lead qualification and deal analysis',
+    '["leads:qualify", "leads:score", "deals:analyze", "deals:recommend"]',
+    true,
+    NOW(),
+    NOW()
+  ),
+  (
+    'e1eebc99-9c0b-4ef8-bb6d-6bb9bd380a56',
+    'support-agent',
+    'support',
+    'Support AI Agent for ticket triage and resolution',
+    '["tickets:triage", "tickets:suggest_resolution", "tickets:categorize"]',
+    true,
+    NOW(),
+    NOW()
+  ),
+  (
+    'e2eebc99-9c0b-4ef8-bb6d-6bb9bd380a57',
+    'compliance-agent',
+    'compliance',
+    'Compliance AI Agent for policy validation and audits',
+    '["audit:validate", "policy:check", "risk:assess"]',
+    true,
+    NOW(),
+    NOW()
+  ),
+  (
+    'e3eebc99-9c0b-4ef8-bb6d-6bb9bd380a58',
+    'analytics-agent',
+    'analytics',
+    'Analytics AI Agent for trends and forecasting',
+    '["reports:generate", "trends:analyze", "forecasts:create"]',
+    true,
+    NOW(),
+    NOW()
+  )
+ON CONFLICT DO NOTHING;
+
+-- Enable Row Level Security on key tables
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE leads ENABLE ROW LEVEL SECURITY;
+ALTER TABLE deals ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tickets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE customers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE approvals ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
+
+-- Create RLS policies
+CREATE POLICY tenant_isolation_users ON users
+  FOR ALL
+  USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
+
+CREATE POLICY tenant_isolation_leads ON leads
+  FOR ALL
+  USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
+
+CREATE POLICY tenant_isolation_deals ON deals
+  FOR ALL
+  USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
+
+CREATE POLICY tenant_isolation_tickets ON tickets
+  FOR ALL
+  USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
+
+CREATE POLICY tenant_isolation_customers ON customers
+  FOR ALL
+  USING (tenant_id = current_setting('app.current_tenant', true)::uuid);

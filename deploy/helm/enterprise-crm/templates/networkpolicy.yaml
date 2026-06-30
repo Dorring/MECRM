@@ -1,0 +1,255 @@
+{{- if .Values.networkPolicy.enabled -}}
+{{/*
+NetworkPolicy summary:
+- Default deny all ingress/egress for workloads labelled app in {gateway, agents, frontend}.
+- frontend: egress only to gateway (and DNS); no direct DB/Kafka access.
+- gateway: egress to postgres, redis, kafka, opa, keycloak, frontend (return traffic handled by frontend egress).
+- agents: egress to kafka, postgres, opa, ollama, weaviate, gateway (for audit/OPA sidecar), redis.
+- Ingress to gateway restricted to the ingress-nginx namespace and frontend pods.
+- Ingress to frontend restricted to the ingress-nginx namespace.
+- agents have no ingress (Kafka consumers, no serving port needed externally).
+Note: PostgreSQL/Redis/Kafka/OPA services are chart-managed (bitnami subcharts) and run
+in the same namespace; their pods are selected by app.kubernetes.io/name labels injected by
+the subcharts. The egress rules use podSelector on those names. If subcharts are disabled
+(external* enabled), update externalSvc selectors accordingly.
+*/}}
+
+# Default deny-all ingress for the CRM workloads
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "enterprise-crm.fullname" . }}-deny-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - frontend
+          - gateway
+          - agents
+  policyTypes:
+    - Ingress
+  ingress: []
+---
+# Default deny-all egress for the CRM workloads
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "enterprise-crm.fullname" . }}-deny-egress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - frontend
+          - gateway
+          - agents
+  policyTypes:
+    - Egress
+  egress: []
+---
+# DNS egress for all CRM workloads (kube-dns in kube-system)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "enterprise-crm.fullname" . }}-allow-dns
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - frontend
+          - gateway
+          - agents
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Frontend: allow ingress from ingress-nginx namespace, egress only to gateway
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "enterprise-crm.fullname" . }}-frontend
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: frontend
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow traffic from the ingress controller namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 3000
+  egress:
+    # Frontend may only call the gateway service
+    - to:
+        - podSelector:
+            matchLabels:
+              app: gateway
+      ports:
+        - protocol: TCP
+          port: 4000
+---
+# Gateway: allow ingress from ingress-nginx and frontend, egress to backing services
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "enterprise-crm.fullname" . }}-gateway
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: gateway
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - protocol: TCP
+          port: 4000
+  egress:
+    # PostgreSQL
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Redis
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # Kafka
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafka
+      ports:
+        - protocol: TCP
+          port: 9092
+    # OPA
+    - to:
+        - podSelector:
+            matchLabels:
+              app: opa
+      ports:
+        - protocol: TCP
+          port: 8181
+    # Keycloak
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: keycloak
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# Agents: no external ingress, egress to Kafka/Postgres/OPA/Ollama/Weaviate/Redis/Gateway
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "enterprise-crm.fullname" . }}-agents
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: agents
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    # Kafka (consume + produce)
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafka
+      ports:
+        - protocol: TCP
+          port: 9092
+    # PostgreSQL (read model + agent state)
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Redis (cache + kill switch state)
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # OPA (governance decisions)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: opa
+      ports:
+        - protocol: TCP
+          port: 8181
+    # Ollama (LLM inference)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: ollama
+      ports:
+        - protocol: TCP
+          port: 11434
+    # Weaviate (vector store)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: weaviate
+      ports:
+        - protocol: TCP
+          port: 8080
+    # Gateway (audit / sidecar governance calls)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: gateway
+      ports:
+        - protocol: TCP
+          port: 4000
+{{- end }}

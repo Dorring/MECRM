@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "required": ["ticketId", "subject", "status", "priority"],
+  "properties": {
+    "ticketId": { "type": "string" },
+    "subject": { "type": "string" },
+    "description": { "type": "string" },
+    "customerId": { "type": "string" },
+    "priority": { "type": "string" },
+    "status": { "type": "string" },
+    "category": { "type": "string" },
+    "assignedTo": { "type": "string" },
+    "metadata": { "type": "object" }
+  }
+}
+

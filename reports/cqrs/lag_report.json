@@ -1,0 +1,8 @@
+{
+  "sample_size": 200,
+  "lag_samples": 0,
+  "unprocessed_events": 2653,
+  "lag_seconds_median": null,
+  "lag_seconds_p50": null,
+  "lag_seconds_p95": null
+}

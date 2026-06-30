@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+#
+# M-Agent-ECRM single migration runner
+#
+# Establishes ONE fixed, idempotent, repeatable order for bringing a PostgreSQL
+# database (empty OR existing) to the platform schema:
+#
+#   1. Prisma migrate deploy        -> application tables / indexes / FK constraints
+#                                       (source of truth: gateway/prisma/schema.prisma)
+#   2. Raw SQL migrations 01-11     -> event store, outbox, read models, twins,
+#                                       governance columns that live outside Prisma
+#                                       (CREATED with IF NOT EXISTS -> idempotent)
+#   3. 02-rls-policies.sql           -> ENABLE + FORCE RLS, USING + WITH CHECK,
+#                                       crm_app role + grants
+#
+# Design notes:
+#   - Designed to run against an EMPTY database (CREATE DATABASE already done by
+#     the postgres image / POSTGRES_DB). Prisma migrate deploy will create the
+#     _prisma_migrations shadow state on a fresh DB.
+#   - All raw SQL uses CREATE TABLE IF NOT EXISTS / DROP POLICY IF EXISTS, so it
+#     can be re-run safely. Prisma migrate deploy is itself idempotent.
+#   - Runs against the high-privilege owner account (POSTGRES_USER / crm_user).
+#     This is REQUIRED for DDL and for ALTER TABLE ... FORCE ROW LEVEL SECURITY
+#     (the table owner / superuser is the only role that can FORCE RLS). The
+#     low-privilege crm_app role is granted at the END of 02-rls-policies.sql and
+#     must NOT be used to run migrations -- doing so would silently fail to apply
+#     RLS because non-owners cannot FORCE RLS, masking the security control.
+#   - Schema drift detection runs after migration and warns (does not hard-fail)
+#     when the live schema diverges from the Prisma schema.
+#
+# Usage:
+#   ./scripts/migrate.sh                 # apply all migrations
+#   ./scripts/migrate.sh --drift-only    # only run drift detection
+#   ./scripts/migrate.sh --skip-prisma   # skip Prisma step (SQL + RLS only)
+#
+# Env (read from .env if present, else from environment):
+#   DATABASE_URL            e.g. postgresql://crm_user:crm_password@localhost:5432/enterprise_crm
+#   POSTGRES_USER           owner account (default crm_user)
+#   POSTGRES_PASSWORD       owner password (default crm_password)
+#   POSTGRES_HOST           default localhost
+#   POSTGRES_PORT           default 5432
+#   POSTGRES_DB             default enterprise_crm
+#   GATEWAY_DIR             default ./gateway  (where prisma schema + migrations live)
+#
+set -euo pipefail
+
+# -----------------------------------------------------------------------------
+# Resolve repo root (script lives in <repo>/scripts/)
+# -----------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SQL_DIR="${REPO_ROOT}/database/migrations"
+
+# -----------------------------------------------------------------------------
+# Load .env if present (do not override already-exported vars)
+# -----------------------------------------------------------------------------
+if [[ -f "${REPO_ROOT}/.env" ]]; then
+  # shellcheck disable=SC1090,SC1091
+  set -a; . "${REPO_ROOT}/.env"; set +a
+fi
+
+: "${POSTGRES_USER:=crm_user}"
+: "${POSTGRES_PASSWORD:=crm_password}"
+: "${POSTGRES_HOST:=localhost}"
+: "${POSTGRES_PORT:=5432}"
+: "${POSTGRES_DB:=enterprise_crm}"
+: "${GATEWAY_DIR:=${REPO_ROOT}/gateway}"
+
+if [[ -z "${DATABASE_URL:-}" ]]; then
+  DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
+  export DATABASE_URL
+fi
+
+# Fixed SQL execution order. 02-rls-policies is deliberately kept in this
+# numeric order (it defensively skips tables that do not yet exist via
+# to_regclass, so it is safe even before some tables are created; it is also
+# the grant step that must run last among the RLS-bearing files, but the
+# per-table RLS in 03-11 re-applies ENABLE+FORCE so the end state is stable).
+SQL_FILES=(
+  "01-core-tables.sql"
+  "02-rls-policies.sql"
+  "03-event-log.sql"
+  "04-aggregate-snapshots.sql"
+  "05-replay-jobs.sql"
+  "06-event-store.sql"
+  "07-outbox.sql"
+  "08-read-models.sql"
+  "09-agent-decisions.sql"
+  "10-data-governance.sql"
+  "11-intelligence-twins.sql"
+)
+
+log() { printf '\033[1;34m[migrate]\033[0m %s\n' "$*"; }
+warn(){ printf '\033[1;33m[migrate][warn]\033[0m %s\n' "$*" >&2; }
+err() { printf '\033[1;31m[migrate][error]\033[0m %s\n' "$*" >&2; }
+
+require() {
+  command -v "$1" >/dev/null 2>&1 || { err "required tool not found: $1"; exit 1; }
+}
+
+run_prisma_migrate() {
+  require npx
+  [[ -d "${GATEWAY_DIR}/prisma" ]] || { err "gateway prisma dir not found: ${GATEWAY_DIR}/prisma"; exit 1; }
+  log "Prisma migrate deploy (schema source: ${GATEWAY_DIR}/prisma/schema.prisma)"
+  log "DATABASE_URL=${DATABASE_URL}"
+  ( cd "${GATEWAY_DIR}" && npx prisma migrate deploy )
+}
+
+run_sql_migrations() {
+  require psql
+  local f
+  for f in "${SQL_FILES[@]}"; do
+    local path="${SQL_DIR}/${f}"
+    [[ -f "${path}" ]] || { err "missing SQL migration: ${path}"; exit 1; }
+    log "Applying ${f}"
+    PGPASSWORD="${POSTGRES_PASSWORD}" psql \
+      -v ON_ERROR_STOP=1 \
+      -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT}" \
+      -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+      -f "${path}"
+  done
+}
+
+# -----------------------------------------------------------------------------
+# Basic schema drift detection.
+# Compares the set of tables Prisma expects (parsed from schema.prisma @@map)
+# against the tables actually present in information_schema.tables. Prints any
+# Prisma-declared table missing from the DB, and any unexpected extra table.
+# This is a coarse check (columns/types are NOT compared); for full fidelity use
+# `npx prisma migrate diff` against a shadow DB. Does not fail the run -- it
+# only reports -- because extra non-Prisma tables (event_log, customer_twins,
+# devx_insights, ...) are intentionally managed by the raw SQL track.
+# -----------------------------------------------------------------------------
+detect_drift() {
+  require psql
+  log "Schema drift detection (table-presence level)"
+  local schema_file="${GATEWAY_DIR}/prisma/schema.prisma"
+  [[ -f "${schema_file}" ]] || { warn "schema.prisma not found, skipping drift check"; return 0; }
+
+  # Tables Prisma owns (from @@map("..."))
+  local prisma_tables
+  prisma_tables=$(grep -oE '@@map\("[a-z_]+"' "${schema_file}" | sed -E 's/@@map\("([^"]+)"/\1/' | sort -u)
+
+  # Tables actually in the DB (public schema)
+  local db_tables
+  db_tables=$(PGPASSWORD="${POSTGRES_PASSWORD}" psql -At \
+      -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT}" \
+      -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+      -c "SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY 1;" \
+    | sort -u)
+
+  local missing=0 extra_reported=0
+  log "Prisma-declared tables missing from DB:"
+  while IFS= read -r t; do
+    [[ -z "${t}" ]] && continue
+    if ! printf '%s\n' "${db_tables}" | grep -qx "${t}"; then
+      printf '  - MISSING: %s\n' "${t}"; missing=$((missing+1))
+    fi
+  done <<< "${prisma_tables}"
+  [[ ${missing} -eq 0 ]] && log "  (none)"
+
+  # Tables managed ONLY by the raw SQL track (legitimately absent from Prisma).
+  local sql_only_allowlist='^(_prisma_migrations|event_log|aggregate_snapshots|replay_jobs|customer_twins|twin_simulation_log|devx_insights)$'
+
+  log "DB tables not declared in Prisma schema (raw-SQL track or unknown):"
+  while IFS= read -r t; do
+    [[ -z "${t}" ]] && continue
+    if [[ "${t}" =~ ${sql_only_allowlist} ]]; then
+      continue   # expected, owned by the raw SQL track
+    fi
+    if ! printf '%s\n' "${prisma_tables}" | grep -qx "${t}"; then
+      printf '  - EXTRA: %s\n' "${t}"; extra_reported=$((extra_reported+1))
+    fi
+  done <<< "${db_tables}"
+  [[ ${extra_reported} -eq 0 ]] && log "  (none beyond known raw-SQL tables)"
+
+  # RLS enforcement audit: any tenant table that has ENABLE but not FORCE.
+  log "RLS enforcement audit (tenant tables missing ENABLE or FORCE):"
+  local rls_issues
+  rls_issues=$(PGPASSWORD="${POSTGRES_PASSWORD}" psql -At \
+      -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT}" \
+      -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+      -c "SELECT relname,
+                 CASE WHEN relrowsecurity THEN 'on' ELSE 'OFF' END AS enabled,
+                 CASE WHEN relforcerowsecurity THEN 'on' ELSE 'OFF' END AS forced
+          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname='public' AND c.relkind='r'
+            AND (relrowsecurity = false OR relforcerowsecurity = false)
+          ORDER BY relname;" 2>/dev/null || true)
+  if [[ -n "${rls_issues}" ]]; then
+    printf '  %s\n' "${rls_issues}"
+  else
+    log "  (all tables either FORCE RLS or correctly unscoped)"
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Argument parsing
+# -----------------------------------------------------------------------------
+DRIFT_ONLY=0
+SKIP_PRISMA=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --drift-only) DRIFT_ONLY=1; shift ;;
+    --skip-prisma) SKIP_PRISMA=1; shift ;;
+    -h|--help)
+      sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    *) err "unknown argument: $1"; exit 2 ;;
+  esac
+done
+
+log "repo root: ${REPO_ROOT}"
+log "sql dir:   ${SQL_DIR}"
+log "target DB: ${POSTGRES_DB} @ ${POSTGRES_HOST}:${POSTGRES_PORT} (user ${POSTGRES_USER})"
+
+if [[ ${DRIFT_ONLY} -eq 1 ]]; then
+  detect_drift
+  exit 0
+fi
+
+[[ ${SKIP_PRISMA} -eq 0 ]] && run_prisma_migrate || warn "skipping Prisma step (--skip-prisma)"
+run_sql_migrations
+detect_drift
+
+log "Migration complete."

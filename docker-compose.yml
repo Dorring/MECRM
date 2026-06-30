@@ -1,0 +1,525 @@
+version: "3.8"
+
+services:
+  # ===================
+  # Frontend
+  # ===================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:4000}
+      - NEXT_PUBLIC_WS_URL=${NEXT_PUBLIC_WS_URL:-ws://localhost:4000}
+    depends_on:
+      - gateway
+    networks:
+      - crm-network
+
+  # ===================
+  # API Gateway
+  # ===================
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    ports:
+      - "${GATEWAY_PORT:-4000}:4000"
+    environment:
+      - NODE_ENV=${NODE_ENV:-development}
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+      - KAFKA_BROKERS=${KAFKA_BROKERS:-kafka:9092}
+      - OPA_URL=${OPA_URL:-http://opa:8181}
+      # JWT_SECRET must be provided via .env; missing secret fails startup (no default).
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required}
+      - KEYCLOAK_URL=${KEYCLOAK_URL:-http://keycloak:8080}
+      - REPLAY_SERVICE_URL=http://replay-service:5011
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      opa:
+        condition: service_started
+    networks:
+      - crm-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ===================
+  # Core Services
+  # ===================
+  # NOTE: The following domain services (leads/deals/tickets/customers) reference
+  # build contexts that do not exist in the repository yet. They are intentionally
+  # left commented out to avoid enabling empty services. Once ./services/<name>/
+  # Dockerfiles are added, uncomment and wire them into the topology.
+  # TODO: service implementation pending (leads-service)
+  # leads-service:
+  #   build:
+  #     context: ./services/leads
+  #     dockerfile: Dockerfile
+  #   ports:
+  #     - "${LEADS_SERVICE_PORT:-5001}:5001"
+  #   environment:
+  #     - DATABASE_URL=${DATABASE_URL}
+  #     - REDIS_URL=${REDIS_URL}
+  #     - KAFKA_BROKERS=${KAFKA_BROKERS:-kafka:9092}
+  #     - OPA_URL=${OPA_URL:-http://opa:8181}
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     kafka:
+  #       condition: service_healthy
+  #   networks:
+  #     - crm-network
+
+  # TODO: service implementation pending (deals-service)
+  # deals-service:
+  #   build:
+  #     context: ./services/deals
+  #     dockerfile: Dockerfile
+  #   ports:
+  #     - "${DEALS_SERVICE_PORT:-5002}:5002"
+  #   environment:
+  #     - DATABASE_URL=${DATABASE_URL}
+  #     - REDIS_URL=${REDIS_URL}
+  #     - KAFKA_BROKERS=${KAFKA_BROKERS:-kafka:9092}
+  #     - OPA_URL=${OPA_URL:-http://opa:8181}
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     kafka:
+  #       condition: service_healthy
+  #   networks:
+  #     - crm-network
+
+  # TODO: service implementation pending (tickets-service)
+  # tickets-service:
+  #   build:
+  #     context: ./services/tickets
+  #     dockerfile: Dockerfile
+  #   ports:
+  #     - "${TICKETS_SERVICE_PORT:-5003}:5003"
+  #   environment:
+  #     - DATABASE_URL=${DATABASE_URL}
+  #     - REDIS_URL=${REDIS_URL}
+  #     - KAFKA_BROKERS=${KAFKA_BROKERS:-kafka:9092}
+  #     - OPA_URL=${OPA_URL:-http://opa:8181}
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     kafka:
+  #       condition: service_healthy
+  #   networks:
+  #     - crm-network
+
+  # TODO: service implementation pending (customers-service)
+  # customers-service:
+  #   build:
+  #     context: ./services/customers
+  #     dockerfile: Dockerfile
+  #   ports:
+  #     - "${CUSTOMERS_SERVICE_PORT:-5004}:5004"
+  #   environment:
+  #     - DATABASE_URL=${DATABASE_URL}
+  #     - REDIS_URL=${REDIS_URL}
+  #     - KAFKA_BROKERS=${KAFKA_BROKERS:-kafka:9092}
+  #     - OPA_URL=${OPA_URL:-http://opa:8181}
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     kafka:
+  #       condition: service_healthy
+  #   networks:
+  #     - crm-network
+
+  # ===================
+  # AI Agents
+  # ===================
+  agents:
+    build:
+      context: ./agents
+      dockerfile: Dockerfile
+    # Replaced fixed `sleep 30` with ordered, health-conditioned depends_on.
+    # The orchestrator applies its own internal retry/backoff for Kafka/Weaviate,
+    # so we only block on dependency readiness, not a fixed delay.
+    command: ["python", "-m", "src.orchestrator.main"]
+    ports:
+      - "${AGENTS_PORT:-5010}:5010"
+    environment:
+      - KAFKA_BROKERS=${KAFKA_BROKERS:-kafka:9092}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - OLLAMA_URL=${OLLAMA_URL:-http://ollama:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1}
+      - WEAVIATE_URL=${WEAVIATE_URL:-http://weaviate:8080}
+      - OPA_URL=${OPA_URL:-http://opa:8181}
+      - DATABASE_URL=${DATABASE_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      weaviate:
+        condition: service_started
+      opa:
+        condition: service_started
+    networks:
+      - crm-network
+
+  # Replay service: implementation exists at agents/src/replay/{api,event_ingestor,...}.
+  # Enabled. Uses the agents image and runs the FastAPI replay API on :5011.
+  replay-service:
+    build:
+      context: ./agents
+      dockerfile: Dockerfile
+    command: ["uvicorn", "replay.api:app", "--host", "0.0.0.0", "--port", "5011"]
+    ports:
+      - "${REPLAY_SERVICE_PORT:-5011}:5011"
+    environment:
+      - DATABASE_URL=${REPLAY_DATABASE_URL:-${DATABASE_URL}}
+      - KAFKA_BROKERS=${KAFKA_BROKERS:-kafka:9092}
+      - ENABLE_REPLAY_INGESTOR=${ENABLE_REPLAY_INGESTOR:-true}
+      - REPLAY_INGESTOR_GROUP=${REPLAY_INGESTOR_GROUP:-replay-event-ingestor}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - crm-network
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import httpx; httpx.get('http://localhost:5011/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+
+  # ===================
+  # Infrastructure
+  # ===================
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-crm_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-crm_password}
+      - POSTGRES_DB=${POSTGRES_DB:-enterprise_crm}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d
+    networks:
+      - crm-network
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-crm_user} -d ${POSTGRES_DB:-enterprise_crm}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    environment:
+      - DATA_SOURCE_NAME=postgresql://${POSTGRES_USER:-crm_user}:${POSTGRES_PASSWORD:-crm_password}@postgres:5432/${POSTGRES_DB:-enterprise_crm}?sslmode=disable
+    depends_on:
+      - postgres
+    networks:
+      - crm-network
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - crm-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis-exporter:
+    image: oliver006/redis_exporter:latest
+    environment:
+      - REDIS_ADDR=redis://redis:6379
+    depends_on:
+      - redis
+    networks:
+      - crm-network
+
+  # Kafka with KRaft (no Zookeeper)
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    ports:
+      - "9092:9092"
+      - "9094:9094"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9094
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - crm-network
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "kafka-broker-api-versions --bootstrap-server localhost:9092",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    command:
+      - "--kafka.server=kafka:9092"
+    depends_on:
+      - kafka
+    networks:
+      - crm-network
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=enterprise-crm
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
+    depends_on:
+      - kafka
+    networks:
+      - crm-network
+
+  # ===================
+  # Policy Engine
+  # ===================
+  opa:
+    image: openpolicyagent/opa:latest
+    ports:
+      - "8181:8181"
+    command:
+      - "run"
+      - "--server"
+      - "--addr=0.0.0.0:8181"
+      - "/policies"
+    volumes:
+      - ./policies:/policies
+    networks:
+      - crm-network
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8181/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ===================
+  # AI/LLM
+  # ===================
+  # Ollama: defaults to NVIDIA GPU via deploy.resources.devices.
+  # On machines WITHOUT an NVIDIA GPU, this reservation makes the container fail
+  # to start with Docker's default runtime. CPU-mode alternatives:
+  #   1) Comment out the entire `deploy.resources` block below to run on CPU, or
+  #   2) Install the NVIDIA Container Toolkit only where GPUs are available, and
+  #      drive this profile via an override file (e.g. docker-compose.gpu.yml).
+  # CPU mode is significantly slower for llama3.1 and not recommended for production.
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - crm-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:11434/api/version || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    # GPU reservation (NVIDIA only). See CPU-mode note above.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  weaviate:
+    image: semitechnologies/weaviate:1.23.0
+    ports:
+      - "8082:8080"
+    environment:
+      - QUERY_DEFAULTS_LIMIT=25
+      - AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true
+      - PERSISTENCE_DATA_PATH=/var/lib/weaviate
+      - DEFAULT_VECTORIZER_MODULE=none
+      - CLUSTER_HOSTNAME=node1
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    networks:
+      - crm-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/v1/.well-known/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ===================
+  # Authentication
+  # ===================
+  keycloak:
+    image: quay.io/keycloak/keycloak:23.0
+    ports:
+      - "8081:8080"
+    environment:
+      - KEYCLOAK_ADMIN=admin
+      - KEYCLOAK_ADMIN_PASSWORD=admin
+      - KC_DB=postgres
+      - KC_DB_URL=jdbc:postgresql://postgres:5432/${POSTGRES_DB:-enterprise_crm}
+      - KC_DB_USERNAME=${POSTGRES_USER:-crm_user}
+      - KC_DB_PASSWORD=${POSTGRES_PASSWORD:-crm_password}
+    command: start-dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - crm-network
+
+  # ===================
+  # One-shot migration runner
+  # ===================
+  # Runs Prisma migrations + RLS SQL once, then exits. Idempotent: Prisma tracks
+  # applied migrations in _prisma_migrations; the RLS SQL uses CREATE POLICY IF NOT EXISTS
+  # / CREATE ROLE IF NOT EXISTS-style guards where available, so re-runs are safe.
+  # Use: docker-compose run --rm migrate
+  migrate:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    command: ["sh", "-c", "npx prisma migrate deploy && psql \"$$DATABASE_URL\" -f /docker-entrypoint-initdb.d/02-rls-policies.sql"]
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - crm-network
+    profiles: ["migrate"]
+
+  # ===================
+  # Observability
+  # ===================
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./observability/alerts:/etc/prometheus/alerts
+      - prometheus_data:/prometheus
+    networks:
+      - crm-network
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - prometheus
+    networks:
+      - crm-network
+
+  loki:
+    image: grafana/loki:latest
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki_data:/loki
+    networks:
+      - crm-network
+
+  # ===================
+  # Smoke test profile
+  # ===================
+  # Activate with: docker-compose --profile smoke-test up --exit-code-from smoke-test
+  #
+  # This service is a placeholder harness for end-to-end smoke verification.
+  # It depends on gateway being healthy and is expected to:
+  #   1. Verify gateway health endpoint returns 200 (liveness).
+  #   2. Perform a basic authenticated write (e.g. create a Lead) and assert 201/202.
+  #   3. Optionally poll a read-model query to confirm event projection occurred.
+  # Replace the inline `command` below with a real script (e.g. ./scripts/smoke_test.sh)
+  # once that script exists. The compose-level wiring (profile, depends_on health,
+  # exit-code propagation) is provided now so the harness is runnable.
+  smoke-test:
+    image: alpine:3.19
+    command:
+      - "sh"
+      - "-c"
+      - |
+        echo "SMOKE TEST: gateway health check";
+        wget -qO- --tries=10 --timeout=5 http://gateway:4000/health || { echo "gateway health failed"; exit 1; };
+        echo "SMOKE TEST: TODO replace with authenticated write + read-model projection check";
+        echo "See docs/project-optimization-plan.md Phase 4 smoke-test profile section.";
+        exit 0
+    depends_on:
+      gateway:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - crm-network
+    profiles: ["smoke-test"]
+
+networks:
+  crm-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  kafka_data:
+  ollama_data:
+  weaviate_data:
+  prometheus_data:
+  grafana_data:
+  loki_data:

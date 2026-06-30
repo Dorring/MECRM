@@ -1,0 +1,9 @@
+{
+  "timestamp": "2026-01-24T18:39:19.175021Z",
+  "iterations": 200,
+  "tenant_id": "ace54d05-66ae-409f-80c2-5c55f7b4df32",
+  "policy_id": "enterprise_crm/rbac",
+  "p95_before_ms": 450.217,
+  "p95_after_ms": 1.908,
+  "improvement_pct": 99.58
+}

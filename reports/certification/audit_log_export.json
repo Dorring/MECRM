@@ -1,0 +1,115 @@
+{
+  "rows": [
+    {
+      "created_at": "2026-01-24 18:37:36.391000",
+      "tenant_id": "3339b4e2-bdf4-4d80-a207-e5299440ca78",
+      "action": "ai.data_access_violation",
+      "resource_type": "customer",
+      "resource_id": "cc7126a8-15c4-4d5c-98cf-8ce2eb7f034e",
+      "actor_type": "agent",
+      "actor_id": "600da401-8ef3-5905-9a39-a10bfdfc9353",
+      "new_value": "{\"reason\": \"soft_deleted\", \"subject_id\": \"cc7126a8-15c4-4d5c-98cf-8ce2eb7f034e\", \"subject_type\": \"customer\"}"
+    },
+    {
+      "created_at": "2026-01-24 18:37:32.841000",
+      "tenant_id": "3ec0a770-1de4-4b78-b907-a36c095dcc02",
+      "action": "gdpr.forget_customer",
+      "resource_type": "customer",
+      "resource_id": "5b2c0472-ec85-49d6-b6e0-7b45d08f62c0",
+      "actor_type": "system",
+      "actor_id": "00000000-0000-0000-0000-000000000000",
+      "new_value": "{\"reason\": \"retention_policy\", \"deletion_type\": \"gdpr_forget\", \"erased_fields\": [\"email\", \"phone\", \"name\"]}"
+    },
+    {
+      "created_at": "2026-01-24 18:37:28.726000",
+      "tenant_id": "d31c689f-6a49-43aa-a8a8-8453e8ca6575",
+      "action": "gdpr.export_customer",
+      "resource_type": "customer",
+      "resource_id": "815f3be9-1ce3-46f4-bb48-042bcbaef34b",
+      "actor_type": "user",
+      "actor_id": "00000000-0000-0000-0000-000000000000",
+      "new_value": "{\"subject_id\": \"815f3be9-1ce3-46f4-bb48-042bcbaef34b\", \"subject_type\": \"customer\"}"
+    },
+    {
+      "created_at": "2026-01-24 18:37:25.048000",
+      "tenant_id": "ba520dd7-1c33-4589-a92f-ea3d69f8ab24",
+      "action": "gdpr.forget_customer",
+      "resource_type": "customer",
+      "resource_id": "f9584aaa-d8b0-4978-b4a7-f6ed40930388",
+      "actor_type": "user",
+      "actor_id": "00000000-0000-0000-0000-000000000000",
+      "new_value": "{\"reason\": \"dsar_test\", \"deletion_type\": \"gdpr_forget\", \"erased_fields\": [\"email\", \"phone\", \"name\"]}"
+    },
+    {
+      "created_at": "2026-01-24 13:20:36.565000",
+      "tenant_id": "ee67474c-4f6d-4187-8364-293a5ad7ca68",
+      "action": "gdpr.forget_customer",
+      "resource_type": "customer",
+      "resource_id": "dc6aa2f5-2bee-424b-8c0d-44eb171b475e",
+      "actor_type": "user",
+      "actor_id": "00000000-0000-0000-0000-000000000000",
+      "new_value": "{\"reason\": \"dsar_test\", \"deletion_type\": \"gdpr_forget\", \"erased_fields\": [\"email\", \"phone\", \"name\"]}"
+    },
+    {
+      "created_at": "2026-01-24 13:20:23.181000",
+      "tenant_id": "072394b7-bc30-4a30-a704-b0d3b7138a05",
+      "action": "ai.data_access_violation",
+      "resource_type": "customer",
+      "resource_id": "01641836-8048-4780-ab3c-b2b9d3dfe087",
+      "actor_type": "agent",
+      "actor_id": "600da401-8ef3-5905-9a39-a10bfdfc9353",
+      "new_value": "{\"reason\": \"soft_deleted\", \"subject_id\": \"01641836-8048-4780-ab3c-b2b9d3dfe087\", \"subject_type\": \"customer\"}"
+    },
+    {
+      "created_at": "2026-01-24 13:20:11.120000",
+      "tenant_id": "2dac6644-e72d-4cc6-9f3a-a29e64017b33",
+      "action": "gdpr.forget_customer",
+      "resource_type": "customer",
+      "resource_id": "efc4204d-58c6-4cb6-a45f-c0740a439285",
+      "actor_type": "system",
+      "actor_id": "00000000-0000-0000-0000-000000000000",
+      "new_value": "{\"reason\": \"retention_policy\", \"deletion_type\": \"gdpr_forget\", \"erased_fields\": [\"email\", \"phone\", \"name\"]}"
+    },
+    {
+      "created_at": "2026-01-24 13:19:58.057000",
+      "tenant_id": "48792b8e-071c-4737-9fd2-c972911e5c32",
+      "action": "gdpr.export_customer",
+      "resource_type": "customer",
+      "resource_id": "e3cb7330-1a16-440e-bb19-6477134327cb",
+      "actor_type": "user",
+      "actor_id": "00000000-0000-0000-0000-000000000000",
+      "new_value": "{\"subject_id\": \"e3cb7330-1a16-440e-bb19-6477134327cb\", \"subject_type\": \"customer\"}"
+    },
+    {
+      "created_at": "2026-01-24 13:19:19.720000",
+      "tenant_id": "b2d5b005-8498-4509-8fd7-74793a573c75",
+      "action": "gdpr.export_customer",
+      "resource_type": "customer",
+      "resource_id": "a11a3be4-269b-4998-bac7-83b75e0a5304",
+      "actor_type": "user",
+      "actor_id": "00000000-0000-0000-0000-000000000000",
+      "new_value": "{\"subject_id\": \"a11a3be4-269b-4998-bac7-83b75e0a5304\", \"subject_type\": \"customer\"}"
+    },
+    {
+      "created_at": "2026-01-24 13:18:48.597000",
+      "tenant_id": "936177bb-4f96-40ec-a148-0f758d0c3b1c",
+      "action": "gdpr.export_customer",
+      "resource_type": "customer",
+      "resource_id": "fc190220-b862-48b0-b56a-d42b6c18a053",
+      "actor_type": "user",
+      "actor_id": "00000000-0000-0000-0000-000000000000",
+      "new_value": "{\"subject_id\": \"fc190220-b862-48b0-b56a-d42b6c18a053\", \"subject_type\": \"customer\"}"
+    },
+    {
+      "created_at": "2026-01-24 13:18:35.269000",
+      "tenant_id": "b0770f05-e41d-4567-8abc-739d6ead4156",
+      "action": "gdpr.forget_customer",
+      "resource_type": "customer",
+      "resource_id": "714c7ec0-d7a0-459c-abbd-13ea1673211a",
+      "actor_type": "user",
+      "actor_id": "00000000-0000-0000-0000-000000000000",
+      "new_value": "{\"reason\": \"dsar_test\", \"deletion_type\": \"gdpr_forget\", \"erased_fields\": [\"email\", \"phone\", \"name\"]}"
+    }
+  ],
+  "violations": []
+}

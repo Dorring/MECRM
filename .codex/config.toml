@@ -1,0 +1,6 @@
+# Codex Configuration
+
+# Per-skill enablement (Experimental)
+# [[skills.config]]
+# path = "/path/to/skill"
+# enabled = false

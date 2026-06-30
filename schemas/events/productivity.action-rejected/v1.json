@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "required": ["proposal_id", "tenant_id", "user_id", "decision", "decided_by", "decided_at"],
+  "properties": {
+    "proposal_id": { "type": "string" },
+    "tenant_id": { "type": "string" },
+    "user_id": { "type": "string" },
+    "decision": { "type": "string" },
+    "decided_by": { "type": "string" },
+    "decided_at": { "type": "string" },
+    "decision_reason": { "type": "string" }
+  }
+}
+

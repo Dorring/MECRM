@@ -1,0 +1,19 @@
+{
+  "/_global-error/page": "/_global-error",
+  "/_not-found/page": "/_not-found",
+  "/agents/page": "/agents",
+  "/approvals/page": "/approvals",
+  "/automations/page": "/automations",
+  "/customers/[id]/page": "/customers/[id]",
+  "/customers/page": "/customers",
+  "/deals/page": "/deals",
+  "/governance/page": "/governance",
+  "/knowledge/articles/page": "/knowledge/articles",
+  "/knowledge/page": "/knowledge",
+  "/knowledge/review/page": "/knowledge/review",
+  "/leads/page": "/leads",
+  "/page": "/",
+  "/productivity/page": "/productivity",
+  "/replay/page": "/replay",
+  "/tickets/page": "/tickets"
+}

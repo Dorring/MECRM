@@ -1,0 +1,6 @@
+{
+  "tenant_id": "157ea2de-e0f2-4ddd-a3a6-a008c360c3f2",
+  "event_id": "0d51e5d1-1c43-4c5f-b6d9-676ddc465c74",
+  "topic": "chaos.outbox.test.92d68472-1ad2-4455-b052-b5a0d9715217",
+  "outbox_published": true
+}
