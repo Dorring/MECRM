@@ -12,6 +12,7 @@ import signal
 import os
 import uuid
 from datetime import datetime, timezone
+from typing import cast
 
 import structlog
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -35,6 +36,7 @@ from intelligence.compliance.compliance_agent import (
     ComplianceIntelligenceAgent, AuditSearchFilters,
 )
 from intelligence.i18n.graph import process_multilingual_input
+from intelligence.i18n.voice_ingest import AudioFormat
 
 from dotenv import load_dotenv
 load_dotenv()  # Load .env file after all imports
@@ -569,7 +571,9 @@ async def voice_handler(request: web.Request) -> web.Response:
 
     tenant_id = request.headers.get("X-Tenant-Id") or ""
     user_id = request.headers.get("X-User-Id") or ""
-    audio_format = request.headers.get("X-Audio-Format") or "webm"
+    audio_format = _normalize_audio_format(
+        request.headers.get("X-Audio-Format"),
+    )
 
     if not tenant_id or not user_id:
         return web.json_response({"error": "missing_context"}, status=400)
@@ -634,7 +638,9 @@ async def voice_query_handler(request: web.Request) -> web.Response:
     module = request.headers.get("X-Client-Module")
     correlation_id = request.headers.get("X-Correlation-Id")
     # authorization = request.headers.get("Authorization")
-    audio_format = request.headers.get("X-Audio-Format") or "webm"
+    audio_format = _normalize_audio_format(
+        request.headers.get("X-Audio-Format"),
+    )
 
     if not tenant_id or not user_id:
         return web.json_response({"error": "missing_context"}, status=400)
@@ -770,6 +776,18 @@ async def audit_search_handler(request: web.Request) -> web.Response:
 def _env(key: str, default: str) -> str:
     val = os.getenv(key)
     return val.strip() if val and val.strip() else default
+
+
+_AUDIO_FORMATS: set[AudioFormat] = {
+    "webm", "wav", "mp3", "ogg", "flac", "m4a",
+}
+
+
+def _normalize_audio_format(fmt: str | None) -> AudioFormat:
+    """Return a valid AudioFormat, defaulting to webm."""
+    if fmt in _AUDIO_FORMATS:
+        return cast(AudioFormat, fmt)
+    return "webm"
 
 
 async def main():

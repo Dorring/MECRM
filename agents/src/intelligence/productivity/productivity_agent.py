@@ -197,6 +197,8 @@ class ProductivitySignalsAgent(BaseAgent):
             member = f"{target_entity}:{target_id}:{user_id or 'unknown'}"
             ts = data.get("timestamp") or data.get("ts")
             sent_ms = _parse_dt_ms(str(ts)) if ts else t_ms
+            if sent_ms is None:
+                return
             if activity_type in ("followup_sent", "email_sent", "whatsapp_sent") or (direction == "outbound" and activity_type == "message"):
                 await self._redis.zadd(_k_followup_sent(tenant_id), {member: int(sent_ms)})
                 await self._redis.hset(_k_followup_meta(tenant_id, member), mapping={"target_entity": target_entity, "target_id": target_id, "user_id": user_id})

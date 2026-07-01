@@ -10,6 +10,7 @@ from typing import Any
 
 import structlog
 from langgraph.graph import StateGraph, END
+from langgraph.graph.state import CompiledStateGraph
 from opentelemetry import trace
 
 from .anomaly_detector import AnomalyDetector, Anomaly
@@ -141,7 +142,7 @@ async def format_response(state: DevXState) -> DevXState:
     return state
 
 
-def build_devx_graph() -> StateGraph:
+def build_devx_graph() -> CompiledStateGraph:
     """Build the LangGraph workflow for DevX analysis."""
     
     # Build graph

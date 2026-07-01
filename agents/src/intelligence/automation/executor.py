@@ -37,10 +37,14 @@ def _eval_condition(payload: dict[str, Any], cond: dict[str, Any]) -> bool:
     op = str(cond.get("operator") or "")
     value = cond.get("value")
     actual = _get_field(payload, field)
+    if not op:
+        return False
     if op == "==":
         return actual == value
     if op == "!=":
         return actual != value
+    if actual is None or value is None:
+        return False
     try:
         if op == ">":
             return float(actual) > float(value)
@@ -53,8 +57,6 @@ def _eval_condition(payload: dict[str, Any], cond: dict[str, Any]) -> bool:
     except Exception:
         return False
     if op == "contains":
-        if actual is None:
-            return False
         return str(value) in str(actual)
     if op == "in":
         try:

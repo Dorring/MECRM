@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from langgraph.graph import StateGraph
+from langgraph.graph.state import CompiledStateGraph
 
 from .language_detector import LanguageResult, adetect_language
 from .translator import TranslationResult, translate_to_english, translate_from_english
@@ -182,37 +183,37 @@ async def _translate_response_node(state: I18nState) -> dict[str, Any]:
     }
 
 
-def build_i18n_ingest_graph(*, deps: I18nDeps | None = None) -> StateGraph:
+def build_i18n_ingest_graph(*, deps: I18nDeps | None = None) -> CompiledStateGraph:
     """Build the i18n ingest graph (STT → Detect → Translate to canonical).
-    
+
     This graph processes input and prepares it for agent routing.
     """
     graph = StateGraph(I18nState)
-    
+
     graph.add_node("transcribe", _transcribe_node)
     graph.add_node("detect_language", _detect_language_node)
     graph.add_node("translate_to_canonical", _translate_to_canonical_node)
-    
+
     graph.set_entry_point("transcribe")
     graph.add_edge("transcribe", "detect_language")
     graph.add_edge("detect_language", "translate_to_canonical")
     graph.set_finish_point("translate_to_canonical")
-    
+
     return graph.compile()
 
 
-def build_i18n_response_graph(*, deps: I18nDeps | None = None) -> StateGraph:
+def build_i18n_response_graph(*, deps: I18nDeps | None = None) -> CompiledStateGraph:
     """Build the i18n response graph (Translate response back).
-    
+
     This graph processes agent response for output.
     """
     graph = StateGraph(I18nState)
-    
+
     graph.add_node("translate_response", _translate_response_node)
-    
+
     graph.set_entry_point("translate_response")
     graph.set_finish_point("translate_response")
-    
+
     return graph.compile()
 
 

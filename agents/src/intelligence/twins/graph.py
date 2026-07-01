@@ -11,6 +11,7 @@ from typing import Any
 import asyncpg
 import structlog
 from langgraph.graph import StateGraph, END
+from langgraph.graph.state import CompiledStateGraph
 from opentelemetry import trace
 
 from .twin_builder import TwinBuilder, TwinProfile
@@ -137,7 +138,7 @@ async def format_response(state: TwinState, deps: TwinDeps) -> TwinState:
     return state
 
 
-def build_twin_graph(deps: TwinDeps) -> StateGraph:
+def build_twin_graph(deps: TwinDeps) -> CompiledStateGraph:
     """Build the LangGraph workflow for twin simulation."""
     
     async def load_twin_node(state: TwinState) -> TwinState:

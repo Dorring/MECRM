@@ -31,7 +31,7 @@ SERVICE_DEPENDENCIES = {
 }
 
 # Common root cause patterns
-ROOT_CAUSE_PATTERNS = {
+ROOT_CAUSE_PATTERNS: dict[str, dict[str, Any]] = {
     "kafka_lag_with_high_latency": {
         "conditions": [AnomalyType.KAFKA_LAG, AnomalyType.LATENCY_SPIKE],
         "likely_cause": "Consumer processing bottleneck",

@@ -49,7 +49,7 @@ class Anomaly:
 
 
 # Threshold configurations (would typically come from config)
-THRESHOLDS = {
+THRESHOLDS: dict[str, dict[str, float]] = {
     "latency_p99_ms": {"warning": 500, "critical": 2000},
     "error_rate_percent": {"warning": 1.0, "critical": 5.0},
     "kafka_lag_messages": {"warning": 1000, "critical": 10000},

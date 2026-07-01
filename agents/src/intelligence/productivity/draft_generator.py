@@ -22,9 +22,12 @@ class DraftOutput:
 
 def parse_drafts(raw: str) -> DraftOutput:
     obj = _parse_json_obj(raw)
-    email = obj.get("email") if isinstance(obj.get("email"), dict) else {}
-    whatsapp = obj.get("whatsapp") if isinstance(obj.get("whatsapp"), dict) else {}
-    task = obj.get("task") if isinstance(obj.get("task"), dict) else {}
+    email_raw = obj.get("email")
+    email = email_raw if isinstance(email_raw, dict) else {}
+    whatsapp_raw = obj.get("whatsapp")
+    whatsapp = whatsapp_raw if isinstance(whatsapp_raw, dict) else {}
+    task_raw = obj.get("task")
+    task = task_raw if isinstance(task_raw, dict) else {}
     return DraftOutput(
         email_subject=_s(email.get("subject")),
         email_body=_s(email.get("body")),
