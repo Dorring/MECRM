@@ -178,3 +178,6 @@ temp/
 *.tsbuildinfo
 **/.tsbuildinfo
 next-env.d.ts
+
+# Local Claude settings (may contain permission overrides)
+.claude/settings.local.json
