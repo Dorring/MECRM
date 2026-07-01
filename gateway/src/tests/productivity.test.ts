@@ -7,7 +7,7 @@ import { generateToken } from '../middleware/auth';
 
 const describeDb = process.env.CRM_DB_AVAILABLE === '1' ? describe : describe.skip;
 
-describeDb('Productivity API', () => {
+describeDb('Productivity API [requires DB]', () => {
   let adminToken: string;
   let tenantId: string;
   let adminUserId: string;

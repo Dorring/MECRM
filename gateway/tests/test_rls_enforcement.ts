@@ -25,7 +25,7 @@ function signToken(payload: Record<string, any>): string {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '1h' });
 }
 
-describeDb('Tenant isolation proof (gateway)', () => {
+describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
   beforeAll(async () => {
     await prisma.tenant.deleteMany({ where: { id: { in: [tenantA, tenantB] } } });
     await prisma.tenant.deleteMany({ where: { slug: { in: [tenantASlug, tenantBSlug] } } });

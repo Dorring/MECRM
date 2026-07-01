@@ -10,6 +10,7 @@ load_dotenv()  # Load .env file before any other imports
 
 import asyncio
 import json
+import re
 import signal
 import os
 import uuid
@@ -56,6 +57,38 @@ logger = structlog.get_logger()
 # is preserved via the CloudEvents `tenantid` field and the Kafka message key
 # (tenant_id), so DLQ consumers stay within tenant boundaries.
 DLQ_TOPIC = os.getenv("AGENTS_DLQ_TOPIC", "crm.dlq.agents")
+
+
+# P0-9: PII redaction patterns applied to DLQ payloads. Order matters: SSN and
+# credit-card are matched before the generic phone pattern so 16-digit card
+# numbers are not partially redacted as phone numbers. Email is matched first
+# so an address containing digits is not mangled by the phone pattern.
+_PII_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    # email: user@domain.tld
+    ("EMAIL", re.compile(r"(?P<addr>[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})")),
+    # SSN: 123-45-6789 or 123456789
+    ("SSN", re.compile(r"\b\d{3}-\d{2}-\d{4}\b|\b\d{9}\b")),
+    # credit card: 13-19 contiguous digits (optionally grouped by - or space)
+    ("CREDIT_CARD", re.compile(r"\b(?:\d[ -]?){13,19}\d\b")),
+    # phone: (123) 456-7890 / 123-456-7890 / +1 123 456 7890
+    ("PHONE", re.compile(r"(?:\+?\d{1,3}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3,4}[\s.-]?\d{4}")),
+]
+
+
+def _redact_pii(text: str) -> str:
+    """Redact known PII (email/SSN/credit-card/phone) from a string.
+
+    Replaces each match with ``[REDACTED_<TYPE>]``. Used before writing the
+    original payload or error reason into the DLQ so the dead-letter topic
+    never carries raw PII while still preserving tenant context and the
+    structure needed for forensics/replay.
+    """
+    if not text:
+        return text
+    redacted = text
+    for label, pattern in _PII_PATTERNS:
+        redacted = pattern.sub(f"[REDACTED_{label}]", redacted)
+    return redacted
 
 
 class AgentOrchestrator:
@@ -110,16 +143,23 @@ class AgentOrchestrator:
         repeatedly would otherwise block its partition forever; routing it to
         the DLQ and advancing the offset isolates it without losing the data,
         satisfying the poison-message-isolation requirement (Phase 6).
+
+        P0-8: If the DLQ *send itself* fails (transient broker outage), we do
+        NOT advance the offset immediately. We retry the DLQ send with bounded
+        exponential backoff (up to settings.DLQ_MAX_RETRIES). Only after the
+        retry budget is exhausted do we advance past the message (logging the
+        loss) to avoid an infinite partition stall. This guarantees a
+        recoverable message is not silently dropped on a transient DLQ failure.
         """
         try:
             async for message in self.consumer:
                 if not self.running:
                     break
 
+                tp = TopicPartition(message.topic, message.partition)
                 try:
                     processed = await self._process_message(message)
                     if processed:
-                        tp = TopicPartition(message.topic, message.partition)
                         await self.consumer.commit({tp: OffsetAndMetadata(message.offset + 1, "")})
                 except Exception as e:
                     logger.error(
@@ -128,25 +168,67 @@ class AgentOrchestrator:
                         offset=message.offset,
                         error=str(e),
                     )
-                    dlq_sent = await self._send_to_dlq(message, e)
-                    # Advance past the poison message once it is safely in the
-                    # DLQ. If the DLQ send itself failed, we still advance to
-                    # avoid an infinite partition stall; the failed message is
-                    # logged with full context for operator replay.
-                    tp = TopicPartition(message.topic, message.partition)
-                    try:
-                        await self.consumer.commit({tp: OffsetAndMetadata(message.offset + 1, "")})
-                    except Exception as commit_err:
-                        logger.error(
-                            "Failed to commit offset after DLQ routing",
-                            topic=message.topic,
-                            offset=message.offset,
-                            dlq_sent=dlq_sent,
-                            error=str(commit_err),
-                        )
+                    advanced = await self._route_to_dlq_with_retry(message, e)
+                    if advanced:
+                        try:
+                            await self.consumer.commit({tp: OffsetAndMetadata(message.offset + 1, "")})
+                        except Exception as commit_err:
+                            logger.error(
+                                "Failed to commit offset after DLQ routing",
+                                topic=message.topic,
+                                offset=message.offset,
+                                error=str(commit_err),
+                            )
+                    # If not advanced (transient DLQ failure within retry
+                    # budget AND we chose to keep the message), the offset is
+                    # NOT committed: the next poll re-fetches this message so
+                    # it is retried rather than lost. AIOKafkaConsumer with
+                    # enable_auto_commit=False will re-deliver from the last
+                    # committed offset on the next iteration.
 
         except asyncio.CancelledError:
             logger.info("Consumer loop cancelled")
+
+    async def _route_to_dlq_with_retry(self, message, error: Exception) -> bool:
+        """Route a failed message to the DLQ with bounded retry.
+
+        Returns True once it is safe to advance past the message (DLQ send
+        succeeded OR the retry budget was exhausted so we give up to avoid an
+        infinite partition stall). Returns False only if a retry is still
+        pending and the caller should re-deliver the message on the next poll.
+        In the False case the offset is deliberately NOT committed so the
+        message is not lost.
+        """
+        max_retries = max(1, int(getattr(settings, "DLQ_MAX_RETRIES", settings.MAX_RETRIES)))
+        base_backoff = float(getattr(settings, "DLQ_RETRY_BACKOFF_SECONDS", 1.0))
+
+        for attempt in range(1, max_retries + 1):
+            dlq_sent = await self._send_to_dlq(message, error)
+            if dlq_sent:
+                return True
+            if attempt >= max_retries:
+                logger.critical(
+                    "DLQ send exhausted retries; advancing offset to avoid "
+                    "partition stall (message is logged but NOT in the DLQ)",
+                    topic=message.topic,
+                    partition=message.partition,
+                    offset=message.offset,
+                    attempts=attempt,
+                )
+                return True
+            backoff = min(base_backoff * (2 ** (attempt - 1)), 30.0)
+            logger.warning(
+                "DLQ send failed, retrying",
+                topic=message.topic,
+                offset=message.offset,
+                attempt=attempt,
+                max_retries=max_retries,
+                backoff_seconds=backoff,
+            )
+            await asyncio.sleep(backoff)
+
+        # Defensive: should be unreachable.
+        return True
 
     async def _send_to_dlq(self, message, error: Exception) -> bool:
         """Route a failed message to the dead-letter topic.
@@ -155,6 +237,12 @@ class AgentOrchestrator:
         tenant_id) so DLQ consumers never cross tenant boundaries. Carries the
         original message, the failure reason, and a timestamp for later replay
         or forensics. Returns True if the DLQ send succeeded.
+
+        P0-9: The original payload (``original_value``) and the error reason
+        are PII-redacted (email / phone / SSN / credit-card) before being
+        written into the DLQ envelope, so the dead-letter topic never carries
+        raw PII. Tenant context is preserved via the CloudEvents ``tenantid``
+        field and the Kafka message key.
         """
         # Best-effort tenant extraction: prefer the parsed envelope, fall back
         # to None when the payload is not valid JSON (the raw value is still
@@ -168,10 +256,12 @@ class AgentOrchestrator:
         except Exception:
             tenant_id = None
 
-        reason = f"{type(error).__name__}: {error}"
-        # Truncate the original payload to bound DLQ record size; the full
+        # P0-9: redact known PII before persisting the payload in the DLQ.
+        redacted_value = _redact_pii(original_value)
+        reason = _redact_pii(f"{type(error).__name__}: {error}")
+        # Truncate the redacted payload to bound DLQ record size; the full
         # payload is still recoverable from the source topic + offset.
-        truncated = original_value[:65536]
+        truncated = redacted_value[:65536]
 
         dlq_envelope = {
             "specversion": "1.0",

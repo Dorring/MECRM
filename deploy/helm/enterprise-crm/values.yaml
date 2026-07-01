@@ -258,13 +258,20 @@ monitoring:
     retention: 7d
 
 # Secrets (reference existing K8s secrets)
+# P0-3: secretKeyRef `key` in gateway.yaml/agents.yaml MUST match the key name
+# declared here. The referenced Secret must contain the FULL connection string
+# (a usable DSN, e.g. postgresql://crm_user:...@host:5432/enterprise_crm) under
+# this key, because the workload mounts it directly into DATABASE_URL / REDIS_URL.
+# The key was renamed from `passwordKey` to `connectionStringKey` to reflect that
+# the Secret holds a connection string, not a bare password. Update the actual
+# K8s Secret's data key to match when deploying.
 secrets:
   postgresql:
     existingSecret: crm-postgresql-secret
-    passwordKey: password
+    connectionStringKey: connection-string
   redis:
     existingSecret: crm-redis-secret
-    passwordKey: password
+    connectionStringKey: connection-string
   jwt:
     existingSecret: crm-jwt-secret
     secretKey: jwt-secret

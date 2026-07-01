@@ -13,7 +13,7 @@ import axios from 'axios';
 
 const describeDb = process.env.CRM_DB_AVAILABLE === '1' ? describe : describe.skip;
 
-describeDb('Audit APIs', () => {
+describeDb('Audit APIs [requires DB]', () => {
   let accessToken: string;
 
   beforeAll(async () => {

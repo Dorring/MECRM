@@ -68,5 +68,11 @@ class Settings:
     MAX_RETRIES: int = 3
     TASK_TIMEOUT_SECONDS: int = 300
 
+    # DLQ retry policy (P0-8): when the DLQ send itself fails on a transient
+    # broker outage, retry with exponential backoff before advancing the
+    # offset, so a recoverable message is not silently dropped.
+    DLQ_MAX_RETRIES: int = int(os.getenv("DLQ_MAX_RETRIES", "3"))
+    DLQ_RETRY_BACKOFF_SECONDS: float = float(os.getenv("DLQ_RETRY_BACKOFF_SECONDS", "1.0"))
+
 
 settings = Settings()

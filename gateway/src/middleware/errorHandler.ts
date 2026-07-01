@@ -29,8 +29,12 @@ export const errorHandler = (
   // Determine status code
   const statusCode = err.statusCode || 500;
 
-  // Sanitize error message for production
-  const message = process.env.NODE_ENV === 'production' && statusCode === 500
+  // Sanitize error message AND details for any server-side (5xx) error in
+  // production. Client errors (4xx) can keep their message for usability, but
+  // 5xx messages may contain Prisma errors, SQL fragments, connection strings,
+  // hostnames or stack traces that must not leak.
+  const isProd = process.env.NODE_ENV === 'production';
+  const message = isProd && statusCode >= 500
     ? 'Internal server error'
     : err.message;
 
@@ -39,7 +43,9 @@ export const errorHandler = (
     error: {
       code: err.code || 'INTERNAL_ERROR',
       message,
-      details: process.env.NODE_ENV !== 'production' ? err.details : undefined,
+      // Details are never returned for 5xx in production; for 4xx they may help
+      // callers fix requests, but only in non-production.
+      details: (!isProd || statusCode < 500) ? err.details : undefined,
       correlationId,
     },
   });

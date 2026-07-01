@@ -91,7 +91,7 @@ def admin_database_url() -> str:
         return "postgresql://crm_user:crm_password@localhost:5432/enterprise_crm"
     return url
 
-@pytest_asyncio.fixture(scope="session", autouse=True)
+@pytest_asyncio.fixture(scope="session", loop_scope="session", autouse=True)
 async def init_schema(admin_database_url: str):
     """
     Apply database migrations to the test database.

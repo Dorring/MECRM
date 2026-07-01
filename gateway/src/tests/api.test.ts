@@ -5,7 +5,7 @@ import { prisma, withTenantDb } from '../services/prisma';
 
 const describeDb = process.env.CRM_DB_AVAILABLE === '1' ? describe : describe.skip;
 
-describeDb('Authentication API', () => {
+describeDb('Authentication API [requires DB]', () => {
   let accessToken: string;
   let refreshToken: string;
   let tenantId: string | undefined;
@@ -135,7 +135,7 @@ describeDb('Authentication API', () => {
   });
 });
 
-describeDb('Leads API', () => {
+describeDb('Leads API [requires DB]', () => {
   let accessToken: string;
   let leadId: string;
 
@@ -256,7 +256,10 @@ describeDb('Leads API', () => {
   });
 });
 
-describeDb('Health Checks', () => {
+// Health checks do not require a live DB: /health never touches Postgres, and
+// /ready short-circuits to { stubbed: true } when JEST_WORKER_ID is set, so they
+// run unconditionally and prove the process boots + responds.
+describe('Health Checks', () => {
   describe('GET /health', () => {
     it('should return healthy status', async () => {
       const response = await request(app)

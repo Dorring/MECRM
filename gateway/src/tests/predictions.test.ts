@@ -6,7 +6,7 @@ import { withTenantDb } from '../services/prisma';
 
 const describeDb = process.env.CRM_DB_AVAILABLE === '1' ? describe : describe.skip;
 
-describeDb('Predictions API', () => {
+describeDb('Predictions API [requires DB]', () => {
   let adminToken: string;
   let tenantId: string;
   let customerId: string;

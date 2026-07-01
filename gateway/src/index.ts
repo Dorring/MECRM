@@ -54,7 +54,8 @@ import { prisma } from './services/prisma';
 import { redisClient } from './services/redis';
 // Importing this module resolves & validates JWT_SECRET at boot. In production
 // a missing/insecure secret throws here and is caught by startServer -> exit(1).
-import { JWT_SECRET } from './config/jwt';
+// Side-effect import: the validation runs at module load; no binding needed.
+import './config/jwt';
 
 const app: Application = express();
 const PORT = process.env.GATEWAY_PORT || 4000;
@@ -135,7 +136,13 @@ app.get('/ready', async (req: Request, res: Response) => {
 
     res.json({ status: 'ready' });
   } catch (error) {
-    res.status(503).json({ status: 'not ready', error: String(error) });
+    // P0-1: never expose raw dependency errors (connection strings, hosts, SQL)
+    // to unauthenticated callers. Log full details server-side only.
+    logger.error('Readiness check failed', {
+      reason: error instanceof Error ? error.message : 'unknown',
+      path: req.path,
+    });
+    res.status(503).json({ status: 'not ready' });
   }
 });
 

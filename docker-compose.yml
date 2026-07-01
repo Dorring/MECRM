@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   # ===================
   # Frontend
@@ -29,7 +27,7 @@ services:
       - "${GATEWAY_PORT:-4000}:4000"
     environment:
       - NODE_ENV=${NODE_ENV:-development}
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=postgresql://crm_app:${CRM_APP_PASSWORD:?CRM_APP_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-enterprise_crm}
       - REDIS_URL=${REDIS_URL}
       - KAFKA_BROKERS=${KAFKA_BROKERS:-kafka:9092}
       - OPA_URL=${OPA_URL:-http://opa:8181}
@@ -37,6 +35,8 @@ services:
       - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required}
       - KEYCLOAK_URL=${KEYCLOAK_URL:-http://keycloak:8080}
       - REPLAY_SERVICE_URL=http://replay-service:5011
+    volumes:
+      - ./policies:/app/policies:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -152,7 +152,8 @@ services:
     # Replaced fixed `sleep 30` with ordered, health-conditioned depends_on.
     # The orchestrator applies its own internal retry/backoff for Kafka/Weaviate,
     # so we only block on dependency readiness, not a fixed delay.
-    command: ["python", "-m", "src.orchestrator.main"]
+    # P0-5: must match agents/Dockerfile (PYTHONPATH=/app/src, CMD python -m orchestrator.main).
+    command: ["python", "-m", "orchestrator.main"]
     ports:
       - "${AGENTS_PORT:-5010}:5010"
     environment:
@@ -162,7 +163,8 @@ services:
       - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1}
       - WEAVIATE_URL=${WEAVIATE_URL:-http://weaviate:8080}
       - OPA_URL=${OPA_URL:-http://opa:8181}
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=postgresql://crm_app:${CRM_APP_PASSWORD:?CRM_APP_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-enterprise_crm}
+      - GATEWAY_URL=http://gateway:4000
     depends_on:
       postgres:
         condition: service_healthy
@@ -187,7 +189,7 @@ services:
     ports:
       - "${REPLAY_SERVICE_PORT:-5011}:5011"
     environment:
-      - DATABASE_URL=${REPLAY_DATABASE_URL:-${DATABASE_URL}}
+      - DATABASE_URL=${REPLAY_DATABASE_URL:-postgresql://${POSTGRES_USER:-crm_user}:${POSTGRES_PASSWORD:-crm_password}@postgres:5432/${POSTGRES_DB:-enterprise_crm}}
       - KAFKA_BROKERS=${KAFKA_BROKERS:-kafka:9092}
       - ENABLE_REPLAY_INGESTOR=${ENABLE_REPLAY_INGESTOR:-true}
       - REPLAY_INGESTOR_GROUP=${REPLAY_INGESTOR_GROUP:-replay-event-ingestor}
@@ -199,7 +201,9 @@ services:
     networks:
       - crm-network
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import httpx; httpx.get('http://localhost:5011/health')\""]
+      # P0-6: check status code, not just that the request completed.
+      # httpx.get() returns even on HTTP 500; a 5xx endpoint must be marked unhealthy.
+      test: ["CMD-SHELL", "python -c \"import httpx,sys; r=httpx.get('http://localhost:5011/health'); sys.exit(0 if r.is_success else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -335,7 +339,9 @@ services:
     networks:
       - crm-network
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8181/health"]
+      # The minimal OPA image does not include wget/curl. Use OPA itself to
+      # verify the binary is runnable and all mounted policies compile.
+      test: ["CMD", "/opa", "eval", "--data", "/policies", "--fail", "--format=discard", "true"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -353,6 +359,10 @@ services:
   # CPU mode is significantly slower for llama3.1 and not recommended for production.
   ollama:
     image: ollama/ollama:latest
+    # Local inference is optional. The default stack does not pull or start the
+    # multi-gigabyte Ollama image; enable explicitly with:
+    #   docker compose --profile local-llm up -d ollama
+    profiles: ["local-llm"]
     ports:
       - "11434:11434"
     volumes:
@@ -403,8 +413,8 @@ services:
     ports:
       - "8081:8080"
     environment:
-      - KEYCLOAK_ADMIN=admin
-      - KEYCLOAK_ADMIN_PASSWORD=admin
+      - KEYCLOAK_ADMIN=${KEYCLOAK_ADMIN:-admin}
+      - KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD:?KEYCLOAK_ADMIN_PASSWORD is required (set in .env)}
       - KC_DB=postgres
       - KC_DB_URL=jdbc:postgresql://postgres:5432/${POSTGRES_DB:-enterprise_crm}
       - KC_DB_USERNAME=${POSTGRES_USER:-crm_user}
@@ -417,25 +427,99 @@ services:
       - crm-network
 
   # ===================
-  # One-shot migration runner
+  # One-shot migration runner (single, complete)
   # ===================
-  # Runs Prisma migrations + RLS SQL once, then exits. Idempotent: Prisma tracks
-  # applied migrations in _prisma_migrations; the RLS SQL uses CREATE POLICY IF NOT EXISTS
-  # / CREATE ROLE IF NOT EXISTS-style guards where available, so re-runs are safe.
-  # Use: docker-compose run --rm migrate
+  # Runs the FULL migration sequence in fixed order and exits:
+  #   1. npx prisma migrate deploy   (application tables: leads, deals, tickets,
+  #      customers, users, roles, agent_decisions, outbox_events, event_streams, ...)
+  #   2. raw SQL 01-11               (RLS policies, crm_app role, event_log,
+  #      aggregate_snapshots, replay_jobs, customer_twins, devx_insights -- the
+  #      infra/RLS track Prisma cannot express). CREATE TABLE IF NOT EXISTS makes
+  #      this idempotent against Prisma-created tables.
+  #   3. RLS verification query      (asserts ENABLE + FORCE on tenant tables).
+  # Uses database/Dockerfile.migrate (node + prisma + postgresql-client) so one
+  # image has both tools. P0-2: the old version used the postgres image (no
+  # Prisma) and only ran SQL -- it silently skipped the Prisma track and the
+  # docs falsely called it a complete entry. Order is Prisma -> SQL -> verify.
+  # Usage: docker-compose --profile migrate run --rm migrate
   migrate:
     build:
-      context: ./gateway
-      dockerfile: Dockerfile
-    command: ["sh", "-c", "npx prisma migrate deploy && psql \"$$DATABASE_URL\" -f /docker-entrypoint-initdb.d/02-rls-policies.sql"]
+      context: .
+      dockerfile: database/Dockerfile.migrate
+    command:
+      - "sh"
+      - "-c"
+      - |
+        set -e
+        echo "=== 1/3 Prisma migrate deploy ==="
+        npx prisma migrate deploy
+        echo "=== 2/3 Raw SQL 01-11 ==="
+        for f in /migrations/01-core-tables.sql \
+                 /migrations/02-rls-policies.sql \
+                 /migrations/03-event-log.sql \
+                 /migrations/04-aggregate-snapshots.sql \
+                 /migrations/05-replay-jobs.sql \
+                 /migrations/06-event-store.sql \
+                 /migrations/07-outbox.sql \
+                 /migrations/08-read-models.sql \
+                 /migrations/09-agent-decisions.sql \
+                 /migrations/10-data-governance.sql \
+                 /migrations/11-intelligence-twins.sql; do
+          echo "applying $$f";
+          psql "$$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$$f";
+        done
+        echo "=== 3/3 RLS verification ==="
+        EXPECTED=6
+        FOUND=$(psql "$$DATABASE_URL" -tA -c "SELECT count(*) FROM pg_class WHERE relname IN ('leads','customers','agent_decisions','data_retention_policies','outbox_events','event_streams');")
+        if [ "$$FOUND" != "$$EXPECTED" ]; then echo "FAIL: expected $$EXPECTED tenant tables, found $$FOUND"; exit 1; fi
+        BAD=$(psql "$$DATABASE_URL" -tA -c "SELECT count(*) FROM pg_class WHERE relname IN ('leads','customers','agent_decisions','data_retention_policies','outbox_events','event_streams') AND NOT (relrowsecurity AND relforcerowsecurity);")
+        if [ "$$BAD" != "0" ]; then echo "FAIL: $$BAD tenant table(s) missing ENABLE+FORCE RLS"; exit 1; fi
+        echo "RLS OK: all $$EXPECTED tenant tables have ENABLE+FORCE RLS"
+        echo "=== migrate runner OK ==="
     environment:
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-crm_user}:${POSTGRES_PASSWORD:-crm_password}@postgres:5432/${POSTGRES_DB:-enterprise_crm}
+    volumes:
+      - ./database/migrations:/migrations:ro
     depends_on:
       postgres:
         condition: service_healthy
     networks:
       - crm-network
     profiles: ["migrate"]
+
+  # ===================
+  # Gateway test runner (profile: test)
+  # ===================
+  # The gateway PRODUCTION image (final stage) runs `npm ci --omit=dev` and does
+  # not COPY test source, so `docker compose exec gateway npm test` cannot run
+  # Jest. This service builds the `builder` stage (full devDependencies + test
+  # source + generated Prisma client) and runs the Jest suite against the live
+  # postgres/redis. DB-dependent suites (RLS enforcement, CRUD) run here with
+  # CRM_TEST_REQUIRE_DB=1 (jest.setup.ts maps it to CRM_DB_AVAILABLE=1).
+  # Usage: docker-compose --profile test run --rm test-gateway
+  test-gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+      target: builder
+    command: ["sh", "-c", "npm test"]
+    environment:
+      - NODE_ENV=test
+      - CRM_TEST_REQUIRE_DB=1
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-crm_user}:${POSTGRES_PASSWORD:-crm_password}@postgres:5432/${POSTGRES_DB:-enterprise_crm}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - KAFKA_BROKERS=${KAFKA_BROKERS:-kafka:9092}
+      - OPA_URL=${OPA_URL:-http://opa:8181}
+    volumes:
+      - ./policies:/app/policies:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - crm-network
+    profiles: ["test"]
 
   # ===================
   # Observability
@@ -456,7 +540,7 @@ services:
     ports:
       - "${GRAFANA_PORT:-3001}:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD is required (set in .env)}
     volumes:
       - grafana_data:/var/lib/grafana
       - ./observability/grafana/provisioning:/etc/grafana/provisioning
@@ -478,31 +562,27 @@ services:
   # ===================
   # Smoke test profile
   # ===================
-  # Activate with: docker-compose --profile smoke-test up --exit-code-from smoke-test
+  # Activate with: docker-compose --profile smoke-test run --rm smoke-test
   #
-  # This service is a placeholder harness for end-to-end smoke verification.
-  # It depends on gateway being healthy and is expected to:
-  #   1. Verify gateway health endpoint returns 200 (liveness).
-  #   2. Perform a basic authenticated write (e.g. create a Lead) and assert 201/202.
-  #   3. Optionally poll a read-model query to confirm event projection occurred.
-  # Replace the inline `command` below with a real script (e.g. ./scripts/smoke_test.sh)
-  # once that script exists. The compose-level wiring (profile, depends_on health,
-  # exit-code propagation) is provided now so the harness is runnable.
+  # REAL smoke test: register tenant+user -> login -> create lead -> list leads
+  # -> assert 401 without token. Runs scripts/smoke-test.sh in a curl-enabled
+  # image. The script is the single source of truth (also runnable on the host
+  # via scripts/smoke-test.ps1). Exit code propagates via --exit-code-from.
+  # NOTE: this verifies the request path (auth, tenant isolation, CRUD). It does
+  # NOT verify async event projection -- the Lead route still publishes directly
+  # to Kafka and the Outbox Publisher is not yet wired into Compose. Outbox /
+  # projection verification is an Iteration 3 exit criterion, NOT Batch 1.
   smoke-test:
     image: alpine:3.19
-    command:
-      - "sh"
-      - "-c"
-      - |
-        echo "SMOKE TEST: gateway health check";
-        wget -qO- --tries=10 --timeout=5 http://gateway:4000/health || { echo "gateway health failed"; exit 1; };
-        echo "SMOKE TEST: TODO replace with authenticated write + read-model projection check";
-        echo "See docs/project-optimization-plan.md Phase 4 smoke-test profile section.";
-        exit 0
+    entrypoint: ["sh", "-c", "apk add --no-cache curl >/dev/null 2>&1 && sh /scripts/smoke-test.sh http://gateway:4000"]
+    volumes:
+      - ./scripts/smoke-test.sh:/scripts/smoke-test.sh:ro
     depends_on:
       gateway:
         condition: service_healthy
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       kafka:
         condition: service_healthy

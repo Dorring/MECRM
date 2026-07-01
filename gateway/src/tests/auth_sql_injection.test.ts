@@ -2,9 +2,9 @@ import { describe, it, expect } from '@jest/globals';
 import request from 'supertest';
 import app from '../index';
 
-const describeDb = process.env.CRM_DB_AVAILABLE === '1' ? describe : describe.skip;
-
-describeDb('Auth SQL injection guard', () => {
+// This is a pure input-validation guard: express-validator rejects the illegal
+// tenantSlug BEFORE any Prisma query runs, so it does not require a live DB.
+describe('Auth SQL injection guard', () => {
   it('rejects tenantSlug with illegal characters', async () => {
     const resp = await request(app)
       .post('/api/v1/auth/login')

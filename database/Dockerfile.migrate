@@ -1,0 +1,25 @@
+# Single-purpose migration runner: has BOTH Prisma (node) and psql, so one
+# service can run the full Prisma -> SQL 01-11 -> RLS verification sequence.
+# Lighter than the full gateway image (no app build).
+FROM node:20-bullseye-slim
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends postgresql-client \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Prisma schema + migrations (gateway owns the application schema).
+# NOTE: `prisma` CLI is in gateway/devDependencies, so we MUST NOT use
+# --omit=dev here -- otherwise `npx prisma migrate deploy` would download an
+# UNLOCKED prisma version at runtime (not pinned by package-lock). Full `npm ci`
+# keeps the CLI pinned. This is a one-shot tool image; size is a non-blocker
+# (agents/frontend production multi-stage is tracked separately as P1).
+COPY gateway/package*.json ./
+COPY gateway/prisma ./prisma
+RUN npm ci
+
+# Raw SQL migrations are mounted at runtime via ./database/migrations:/migrations:ro
+# (see docker-compose.yml migrate service).
+
+CMD ["npx", "prisma", "migrate", "deploy"]

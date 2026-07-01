@@ -46,12 +46,12 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.secrets.postgresql.existingSecret }}
-                  key: connection-string
+                  key: {{ .Values.secrets.postgresql.connectionStringKey }}
             - name: REDIS_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.secrets.redis.existingSecret }}
-                  key: connection-string
+                  key: {{ .Values.secrets.redis.connectionStringKey }}
             - name: KAFKA_BROKERS
               value: "{{ include "enterprise-crm.kafkaHost" . }}:9092"
             - name: JWT_SECRET

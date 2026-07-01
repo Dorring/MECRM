@@ -494,6 +494,161 @@ class TestAnalyticsForecast:
         assert result["status"] == "failed"
 
 
+class TestAnalyticsForecastValidation:
+    """P0-7 regression: malformed LLM output must not drive a downstream emit.
+
+    generate_forecast must Pydantic-validate the LLM response and return
+    status="failed" (reason="invalid_model_output") when the model emits a
+    shape we do not trust (predictions not a list, confidence not a number,
+    missing required fields). On failure emit_event must never be called.
+    """
+
+    @pytest.fixture
+    def analytics_agent(self):
+        from agents.analytics import AnalyticsAgent
+        agent = AnalyticsAgent()
+        agent.producer = AsyncMock()
+        agent.http_client = AsyncMock()
+        agent.emit_event = AsyncMock()
+        return agent
+
+    @pytest.mark.asyncio
+    async def test_malformed_predictions_not_list_returns_failed(self, analytics_agent):
+        analytics_agent.call_llm = AsyncMock(return_value=json.dumps({
+            "forecast_type": "revenue",
+            "time_range": "next_30_days",
+            "predictions": "not-a-list",
+            "factors": [],
+            "confidence": 0.7,
+        }))
+
+        result = await analytics_agent.generate_forecast(
+            tenant_id="test-tenant", forecast_type="revenue", time_range="next_30_days"
+        )
+
+        assert result["status"] == "failed"
+        assert result["reason"] == "invalid_model_output"
+        analytics_agent.emit_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_malformed_confidence_not_number_returns_failed(self, analytics_agent):
+        analytics_agent.call_llm = AsyncMock(return_value=json.dumps({
+            "forecast_type": "revenue",
+            "time_range": "next_30_days",
+            "predictions": [
+                {"period": "w1", "value": 100, "confidence_range": [80, 120]}
+            ],
+            "factors": [],
+            "confidence": "high",
+        }))
+
+        result = await analytics_agent.generate_forecast(
+            tenant_id="test-tenant", forecast_type="revenue", time_range="next_30_days"
+        )
+
+        assert result["status"] == "failed"
+        assert result["reason"] == "invalid_model_output"
+        analytics_agent.emit_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_json_llm_output_returns_failed(self, analytics_agent):
+        analytics_agent.call_llm = AsyncMock(return_value="the forecast is sunny with no json")
+
+        result = await analytics_agent.generate_forecast(
+            tenant_id="test-tenant", forecast_type="revenue", time_range="next_30_days"
+        )
+
+        assert result["status"] == "failed"
+        assert result["reason"] == "invalid_model_output"
+        analytics_agent.emit_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_valid_forecast_passes_validation(self, analytics_agent):
+        analytics_agent.call_llm = AsyncMock(return_value=json.dumps({
+            "forecast_type": "revenue",
+            "time_range": "next_30_days",
+            "predictions": [
+                {"period": "w1", "value": 12000, "confidence_range": [10000, 14000]}
+            ],
+            "factors": ["seasonal uptick"],
+            "confidence": 0.72,
+        }))
+
+        result = await analytics_agent.generate_forecast(
+            tenant_id="test-tenant", forecast_type="revenue", time_range="next_30_days"
+        )
+
+        assert result["status"] == "completed"
+        assert result["forecast"]["confidence"] == 0.72
+        assert result["forecast"]["predictions"][0]["value"] == 12000
+
+
+class TestForecastRouterEmitGating:
+    """P0-7 router-level regression: a failed forecast must not be re-emitted
+    as crm.analytics.prediction-generated; a completed forecast must be."""
+
+    def _make_router(self):
+        from orchestrator.router import AgentRouter
+        router = AgentRouter()
+        # Stub governance/data guards to allow execution.
+        router.guard = AsyncMock()
+        router.guard.ensure_allowed = AsyncMock(return_value=None)
+        router.data_guard = AsyncMock()
+        router.data_guard.ensure_allowed = AsyncMock(return_value=None)
+        # Stub the analytics agent and capture emit_event.
+        router.analytics_agent = AsyncMock()
+        router.analytics_agent.agent_id = "analytics-agent"
+        router.analytics_agent.emit_event = AsyncMock()
+        # productivity signals agent is touched on the forecast route.
+        router.productivity_signals_agent = AsyncMock()
+        router.productivity_signals_agent.ingest_event = AsyncMock()
+        return router
+
+    def _forecast_event(self):
+        return {
+            "specversion": "1.0",
+            "type": "crm.analytics.forecast-requested",
+            "tenantid": "test-tenant",
+            "correlationid": "corr-fc-1",
+            "data": {"forecastType": "revenue", "timeRange": "next_30_days"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_failed_forecast_is_not_emitted(self):
+        router = self._make_router()
+        router.analytics_agent.generate_forecast = AsyncMock(
+            return_value={"status": "failed", "reason": "invalid_model_output"}
+        )
+
+        await router._handle_forecast_requested(self._forecast_event())
+
+        # No prediction-generated event must be emitted when forecast failed.
+        router.analytics_agent.emit_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_completed_forecast_is_emitted(self):
+        router = self._make_router()
+        router.analytics_agent.generate_forecast = AsyncMock(return_value={
+            "status": "completed",
+            "forecast": {
+                "forecast_type": "revenue",
+                "time_range": "next_30_days",
+                "predictions": [{"period": "w1", "value": 12000, "confidence_range": [10000, 14000]}],
+                "factors": ["seasonal uptick"],
+                "confidence": 0.72,
+            },
+        })
+
+        await router._handle_forecast_requested(self._forecast_event())
+
+        assert router.analytics_agent.emit_event.await_count == 1
+        kwargs = router.analytics_agent.emit_event.await_args.kwargs
+        assert kwargs["topic"] == "crm.analytics.prediction-generated"
+        assert kwargs["event_type"] == "crm.analytics.forecast-generated"
+        assert kwargs["tenant_id"] == "test-tenant"
+        assert kwargs["data"]["probability"] == 0.72
+
+
 class TestOrchestratorDLQ:
     """Tests for the orchestrator dead-letter routing (Phase 6 P1 fix)."""
 
@@ -567,3 +722,139 @@ class TestOrchestratorDLQ:
         sent = await orch._send_to_dlq(msg, RuntimeError("orig"))
 
         assert sent is False
+
+
+class TestOrchestratorDLQRetry:
+    """P0-8 regression: a transient DLQ send failure must not silently drop
+    the message. The orchestrator retries the DLQ send with bounded backoff;
+    only after the retry budget is exhausted does it advance the offset."""
+
+    def _make_orchestrator(self):
+        from orchestrator.main import AgentOrchestrator
+        orch = AgentOrchestrator()
+        orch.producer = AsyncMock()
+        return orch
+
+    def _make_message(self, value, topic="crm.tickets.created", partition=0, offset=5):
+        from types import SimpleNamespace
+        return SimpleNamespace(topic=topic, partition=partition, offset=offset, value=value)
+
+    @pytest.mark.asyncio
+    async def test_persistent_dlq_failure_retries_then_advances(self, monkeypatch):
+        """producer.send_and_wait keeps failing -> retried up to DLQ_MAX_RETRIES,
+        then _route_to_dlq_with_retry returns True (advance to avoid stall).
+        The message is retried (send attempted N times), not dropped on first failure."""
+        from orchestrator import main as main_mod
+        orch = self._make_orchestrator()
+        orch.producer.send_and_wait = AsyncMock(side_effect=RuntimeError("kafka down"))
+
+        monkeypatch.setattr(main_mod.settings, "DLQ_MAX_RETRIES", 3)
+        monkeypatch.setattr(main_mod.settings, "DLQ_RETRY_BACKOFF_SECONDS", 0.0)
+
+        msg = self._make_message(value=json.dumps({"tenantid": "t1", "data": {}}))
+
+        advanced = await orch._route_to_dlq_with_retry(msg, RuntimeError("processing failed"))
+
+        # Exhausted retries -> safe to advance (returns True), but the send was
+        # attempted DLQ_MAX_RETRIES times, proving the message was retried and
+        # not silently dropped on the first transient failure.
+        assert advanced is True
+        assert orch.producer.send_and_wait.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_transient_dlq_failure_recovers_on_retry(self, monkeypatch):
+        """First DLQ send fails, second succeeds -> message is delivered and
+        advance is permitted on the retry (no offset loss)."""
+        from orchestrator import main as main_mod
+        orch = self._make_orchestrator()
+        # Fail once, then succeed.
+        orch.producer.send_and_wait = AsyncMock(
+            side_effect=[RuntimeError("kafka blip"), None]
+        )
+
+        monkeypatch.setattr(main_mod.settings, "DLQ_MAX_RETRIES", 3)
+        monkeypatch.setattr(main_mod.settings, "DLQ_RETRY_BACKOFF_SECONDS", 0.0)
+
+        msg = self._make_message(value=json.dumps({"tenantid": "t1", "data": {}}))
+
+        advanced = await orch._route_to_dlq_with_retry(msg, RuntimeError("processing failed"))
+
+        assert advanced is True
+        # Two attempts: the first failed, the second succeeded.
+        assert orch.producer.send_and_wait.await_count == 2
+
+
+class TestOrchestratorDLQPIIRedaction:
+    """P0-9 regression: PII in the original payload and error reason must be
+    redacted before being written to the DLQ envelope. Tenant context preserved."""
+
+    def _make_orchestrator(self):
+        from orchestrator.main import AgentOrchestrator
+        orch = AgentOrchestrator()
+        orch.producer = AsyncMock()
+        return orch
+
+    def _make_message(self, value, topic="crm.tickets.created", partition=0, offset=5):
+        from types import SimpleNamespace
+        return SimpleNamespace(topic=topic, partition=partition, offset=offset, value=value)
+
+    @pytest.mark.asyncio
+    async def test_pii_in_payload_is_redacted(self):
+        orch = self._make_orchestrator()
+        original = json.dumps({
+            "specversion": "1.0",
+            "type": "crm.leads.created",
+            "tenantid": "tenant-abc",
+            "data": {
+                "leadId": "123",
+                "name": "John Smith",
+                "ssn": "123-45-6789",
+                "email": "john@acme.com",
+                "credit_card": "4111111111111111",
+                "phone": "555-123-4567",
+            },
+        })
+        msg = self._make_message(value=original)
+
+        sent = await orch._send_to_dlq(msg, RuntimeError("processing failed"))
+
+        assert sent is True
+        _, kwargs = orch.producer.send_and_wait.await_args
+        envelope = json.loads(kwargs["value"])
+        # Tenant context preserved.
+        assert envelope["tenantid"] == "tenant-abc"
+        assert kwargs["key"] == b"tenant-abc"
+        original_value = envelope["data"]["original_value"]
+        # Raw PII must not appear in the DLQ payload.
+        assert "123-45-6789" not in original_value
+        assert "john@acme.com" not in original_value
+        assert "4111111111111111" not in original_value
+        assert "555-123-4567" not in original_value
+        # Redaction markers present.
+        assert "[REDACTED_SSN]" in original_value
+        assert "[REDACTED_EMAIL]" in original_value
+        assert "[REDACTED_CREDIT_CARD]" in original_value
+        assert "[REDACTED_PHONE]" in original_value
+        # Non-PII content is preserved.
+        assert "John Smith" in original_value
+        assert "tenant-abc" in original_value
+
+    @pytest.mark.asyncio
+    async def test_pii_in_error_reason_is_redacted(self):
+        """PII leaking into exception messages must also be redacted."""
+        orch = self._make_orchestrator()
+        original = json.dumps({"tenantid": "t1", "data": {"leadId": "9"}})
+        msg = self._make_message(value=original)
+
+        sent = await orch._send_to_dlq(
+            msg, ValueError("failed to parse record for john@acme.com (ssn 123-45-6789)")
+        )
+
+        assert sent is True
+        _, kwargs = orch.producer.send_and_wait.await_args
+        envelope = json.loads(kwargs["value"])
+        error_reason = envelope["data"]["error_reason"]
+        assert "john@acme.com" not in error_reason
+        assert "123-45-6789" not in error_reason
+        assert "[REDACTED_EMAIL]" in error_reason
+        assert "[REDACTED_SSN]" in error_reason

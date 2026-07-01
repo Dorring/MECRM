@@ -21,8 +21,10 @@ ENV PYTHONPATH=/app/src
 EXPOSE 5010
 
 # Health check
+# P0-6: check the response status code, not just that the request completed.
+# A bare httpx.get() returns even on HTTP 500; a failing endpoint must be unhealthy.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-  CMD python -c "import httpx; httpx.get('http://localhost:5010/health')" || exit 1
+  CMD python -c "import httpx,sys; r=httpx.get('http://localhost:5010/health'); sys.exit(0 if r.is_success else 1)"
 
 # Run the orchestrator
 CMD ["python", "-m", "orchestrator.main"]

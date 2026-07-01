@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 from uuid import uuid4
 
@@ -6,8 +7,18 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
-from write.db import create_db_pool, tenant_transaction
-from write.event_store import ConcurrencyError, EventStore, NewEvent
+# P1-11: this is an integration test for the core_services event store. The
+# `write` package lives in core_services/src, which is deliberately NOT on the
+# global sys.path (it ships a conflicting `governance` package). Append it
+# here (not insert) so `governance` still resolves to the agents package first,
+# while `write` resolves to core_services. Scoped to this test module only.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_CORE_SRC = _REPO_ROOT / "core_services" / "src"
+if _CORE_SRC.is_dir() and str(_CORE_SRC) not in sys.path:
+    sys.path.append(str(_CORE_SRC))
+
+from write.db import create_db_pool, tenant_transaction  # noqa: E402
+from write.event_store import ConcurrencyError, EventStore, NewEvent  # noqa: E402
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

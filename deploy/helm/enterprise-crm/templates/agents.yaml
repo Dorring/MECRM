@@ -45,7 +45,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.secrets.postgresql.existingSecret }}
-                  key: connection-string
+                  key: {{ .Values.secrets.postgresql.connectionStringKey }}
             - name: OPA_URL
               value: "http://{{ include "enterprise-crm.fullname" . }}-opa:8181"
             - name: OLLAMA_URL

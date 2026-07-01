@@ -3,6 +3,7 @@ import { IncomingMessage } from 'http';
 import jwt from 'jsonwebtoken';
 import { logger } from '../utils/logger';
 import { TokenPayload } from '../middleware/auth';
+import { JWT_SECRET } from '../config/jwt';
 
 interface AuthenticatedWebSocket extends WebSocket {
   userId?: string;
@@ -46,7 +47,7 @@ export const setupWebSocket = (wss: WebSocketServer): void => {
     try {
       const decoded = jwt.verify(
         token,
-        process.env.JWT_SECRET || 'development-secret-change-in-production'
+        JWT_SECRET
       ) as TokenPayload;
       const tenantId = decoded.tenantId || decoded.tenant_id;
       if (!tenantId) {
