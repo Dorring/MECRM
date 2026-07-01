@@ -5,9 +5,6 @@ Main entry point for the AI agent layer.
 Consumes events from Kafka and routes them to appropriate agents.
 """
 
-from dotenv import load_dotenv
-load_dotenv()  # Load .env file before any other imports
-
 import asyncio
 import json
 import re
@@ -29,11 +26,18 @@ from governance.agent_telemetry import audit_queries_total, inc_dlq_routed
 from intelligence.search.search_agent import SearchAgent
 from intelligence.chat.chat_agent import ChatAgent
 from intelligence.chat.tool_executor import ChatToolExecutor
-from intelligence.chat.tools import CrmReader, CrmWriter, SearchAdapter, VectorSearch
+from intelligence.chat.tools import (
+    CrmReader, CrmWriter, SearchAdapter, VectorSearch,
+)
 from intelligence.automation.automation_agent import AutomationAgent
 from intelligence.compliance.audit_indexer import AuditIndexer
-from intelligence.compliance.compliance_agent import ComplianceIntelligenceAgent, AuditSearchFilters
-from intelligence.i18n.graph import process_multilingual_input, process_multilingual_response
+from intelligence.compliance.compliance_agent import (
+    ComplianceIntelligenceAgent, AuditSearchFilters,
+)
+from intelligence.i18n.graph import process_multilingual_input
+
+from dotenv import load_dotenv
+load_dotenv()  # Load .env file after all imports
 
 # Configure structured logging
 structlog.configure(
@@ -65,14 +69,20 @@ DLQ_TOPIC = os.getenv("AGENTS_DLQ_TOPIC", "crm.dlq.agents")
 # so an address containing digits is not mangled by the phone pattern.
 _PII_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # email: user@domain.tld
-    ("EMAIL", re.compile(r"(?P<addr>[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})")),
+    ("EMAIL", re.compile(
+        r"(?P<addr>[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})")),
     # SSN: 123-45-6789 or 123456789
     ("SSN", re.compile(r"\b\d{3}-\d{2}-\d{4}\b|\b\d{9}\b")),
     # credit card: 13-19 contiguous digits (optionally grouped by - or space)
     ("CREDIT_CARD", re.compile(r"\b(?:\d[ -]?){13,19}\d\b")),
     # phone: (123) 456-7890 / 123-456-7890 / +1 123 456 7890
-    ("PHONE", re.compile(r"(?:\+?\d{1,3}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3,4}[\s.-]?\d{4}")),
+    ("PHONE", re.compile(
+        r"(?:\+?\d{1,3}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3,4}[\s.-]?\d{4}")),
 ]
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _redact_pii(text: str) -> str:
@@ -93,7 +103,7 @@ def _redact_pii(text: str) -> str:
 
 class AgentOrchestrator:
     """Main orchestrator that routes events to agents."""
-    
+
     def __init__(self):
         self.consumer: AIOKafkaConsumer = None
         self.producer: AIOKafkaProducer = None
@@ -101,11 +111,11 @@ class AgentOrchestrator:
         self.running = False
         self._paused_partitions: dict[TopicPartition, str] = {}
         self._resume_task: asyncio.Task | None = None
-        
+
     async def start(self):
         """Start the orchestrator."""
         logger.info("Starting Agent Orchestrator")
-        
+
         # Initialize Kafka consumer
         self.consumer = AIOKafkaConsumer(
             *settings.CONSUME_TOPICS,
@@ -115,26 +125,27 @@ class AgentOrchestrator:
             enable_auto_commit=False,
             value_deserializer=lambda m: m.decode("utf-8"),
         )
-        
+
         # Initialize Kafka producer
         self.producer = AIOKafkaProducer(
             bootstrap_servers=settings.KAFKA_BROKERS,
             value_serializer=lambda v: v.encode("utf-8"),
         )
-        
+
         await self.consumer.start()
         await self.producer.start()
         await self.router.initialize(self.producer)
-        
+
         self.running = True
         agents_running.set(1)
-        logger.info("Agent Orchestrator started", topics=settings.CONSUME_TOPICS)
+        logger.info("Agent Orchestrator started",
+                    topics=settings.CONSUME_TOPICS)
 
         self._resume_task = asyncio.create_task(self._resume_loop())
-        
+
         # Start consuming
         await self._consume_loop()
-        
+
     async def _consume_loop(self):
         """Main consumption loop.
 
@@ -160,7 +171,9 @@ class AgentOrchestrator:
                 try:
                     processed = await self._process_message(message)
                     if processed:
-                        await self.consumer.commit({tp: OffsetAndMetadata(message.offset + 1, "")})
+                        await self.consumer.commit({
+                            tp: OffsetAndMetadata(message.offset + 1, ""),
+                        })
                 except Exception as e:
                     logger.error(
                         "Failed to process message",
@@ -171,7 +184,9 @@ class AgentOrchestrator:
                     advanced = await self._route_to_dlq_with_retry(message, e)
                     if advanced:
                         try:
-                            await self.consumer.commit({tp: OffsetAndMetadata(message.offset + 1, "")})
+                            await self.consumer.commit({
+                                tp: OffsetAndMetadata(message.offset + 1, ""),
+                            })
                         except Exception as commit_err:
                             logger.error(
                                 "Failed to commit offset after DLQ routing",
@@ -189,7 +204,8 @@ class AgentOrchestrator:
         except asyncio.CancelledError:
             logger.info("Consumer loop cancelled")
 
-    async def _route_to_dlq_with_retry(self, message, error: Exception) -> bool:
+    async def _route_to_dlq_with_retry(
+            self, message, error: Exception) -> bool:
         """Route a failed message to the DLQ with bounded retry.
 
         Returns True once it is safe to advance past the message (DLQ send
@@ -199,8 +215,10 @@ class AgentOrchestrator:
         In the False case the offset is deliberately NOT committed so the
         message is not lost.
         """
-        max_retries = max(1, int(getattr(settings, "DLQ_MAX_RETRIES", settings.MAX_RETRIES)))
-        base_backoff = float(getattr(settings, "DLQ_RETRY_BACKOFF_SECONDS", 1.0))
+        max_retries = max(
+            1, int(getattr(settings, "DLQ_MAX_RETRIES", settings.MAX_RETRIES)))
+        base_backoff = float(
+            getattr(settings, "DLQ_RETRY_BACKOFF_SECONDS", 1.0))
 
         for attempt in range(1, max_retries + 1):
             dlq_sent = await self._send_to_dlq(message, error)
@@ -248,11 +266,14 @@ class AgentOrchestrator:
         # to None when the payload is not valid JSON (the raw value is still
         # preserved in the DLQ envelope).
         tenant_id: str | None = None
-        original_value: str = message.value if isinstance(message.value, str) else ""
+        original_value: str = message.value if isinstance(
+            message.value, str) else ""
         try:
-            event = json.loads(message.value) if isinstance(message.value, str) else None
+            event = json.loads(message.value) if isinstance(
+                message.value, str) else None
             if isinstance(event, dict):
-                tenant_id = event.get("tenantid") or event.get("tenantId") or (event.get("data", {}) or {}).get("tenantId")
+                tenant_id = event.get("tenantid") or event.get("tenantId") or (
+                    event.get("data", {}) or {}).get("tenantId")
         except Exception:
             tenant_id = None
 
@@ -268,7 +289,7 @@ class AgentOrchestrator:
             "type": "crm.agents.dlq",
             "source": "/agents/orchestrator",
             "id": str(uuid.uuid4()),
-            "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "time": _utc_now_iso(),
             "datacontenttype": "application/json",
             "tenantid": str(tenant_id) if tenant_id else "",
             "correlationid": str(uuid.uuid4()),
@@ -278,14 +299,17 @@ class AgentOrchestrator:
                 "original_offset": message.offset,
                 "original_value": truncated,
                 "error_reason": reason[:2000],
-                "failed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "failed_at": _utc_now_iso(),
                 "routed_by": "agent-orchestrator",
             },
         }
 
         try:
             if not self.producer:
-                logger.error("Cannot send to DLQ: producer not initialized", topic=message.topic)
+                logger.error(
+                    "Cannot send to DLQ: producer not initialized",
+                    topic=message.topic,
+                )
                 return False
             await self.producer.send_and_wait(
                 DLQ_TOPIC,
@@ -327,12 +351,16 @@ class AgentOrchestrator:
         tenant_id = None
         try:
             event = json.loads(message.value)
-            tenant_id = event.get("tenantid") or event.get("tenantId") or event.get("data", {}).get("tenantId")
+            tenant_id = event.get("tenantid") or event.get(
+                "tenantId") or event.get("data", {}).get("tenantId")
         except Exception:
             tenant_id = None
 
         if tenant_id:
-            decision = await self.router.kill_switch.decision(tenant_id=str(tenant_id), agent_id="agent-orchestrator")
+            decision = await self.router.kill_switch.decision(
+                tenant_id=str(tenant_id),
+                agent_id="agent-orchestrator",
+            )
             if decision.blocked:
                 tp = TopicPartition(message.topic, message.partition)
                 self.consumer.pause([tp])
@@ -344,13 +372,16 @@ class AgentOrchestrator:
                     topic=message.topic,
                     partition=message.partition,
                     scope_key=decision.scope_key,
-                    state=decision.status.state.value if decision.status else None,
+                    state=(
+                        decision.status.state.value
+                        if decision.status else None
+                    ),
                 )
                 return False
 
         await self.router.route(message.topic, message.value)
         return True
-        
+
     async def stop(self):
         """Stop the orchestrator."""
         logger.info("Stopping Agent Orchestrator")
@@ -360,13 +391,13 @@ class AgentOrchestrator:
         if self._resume_task:
             self._resume_task.cancel()
             self._resume_task = None
-        
+
         if self.consumer:
             await self.consumer.stop()
-            
+
         if self.producer:
             await self.producer.stop()
-            
+
         logger.info("Agent Orchestrator stopped")
 
     async def _resume_loop(self) -> None:
@@ -377,7 +408,10 @@ class AgentOrchestrator:
 
             items = list(self._paused_partitions.items())
             for tp, tenant_id in items:
-                decision = await self.router.kill_switch.decision(tenant_id=tenant_id, agent_id="agent-orchestrator")
+                decision = await self.router.kill_switch.decision(
+                    tenant_id=tenant_id,
+                    agent_id="agent-orchestrator",
+                )
                 if not decision.blocked:
                     self.consumer.resume([tp])
                     self._paused_partitions.pop(tp, None)
@@ -395,10 +429,15 @@ async def health_handler(request):
     """Health check endpoint."""
     return web.json_response({"status": "healthy"})
 
+
 async def metrics_handler(request):
     resp = metrics_response()
     # aiohttp rejects charset inside content_type; set header directly
-    return web.Response(body=resp.body, headers={"Content-Type": resp.content_type})
+    return web.Response(
+        body=resp.body,
+        headers={"Content-Type": resp.content_type},
+    )
+
 
 async def run_health_server():
     """Run the health check HTTP server."""
@@ -410,9 +449,11 @@ async def run_health_server():
     app["compliance_intelligence_agent"] = ComplianceIntelligenceAgent()
     app.router.add_get("/health", health_handler)
     app.router.add_get("/metrics", metrics_handler)
-    app.router.add_post("/api/v1/intelligence/query", intelligence_query_handler)
+    app.router.add_post("/api/v1/intelligence/query",
+                        intelligence_query_handler)
     app.router.add_post("/api/v1/intelligence/voice", voice_handler)
-    app.router.add_post("/api/v1/intelligence/voice/query", voice_query_handler)
+    app.router.add_post("/api/v1/intelligence/voice/query",
+                        voice_query_handler)
     app.router.add_post("/api/v1/automation/parse", automation_parse_handler)
     app.router.add_post("/api/v1/audit/search", audit_search_handler)
 
@@ -427,7 +468,8 @@ async def run_health_server():
                 vector_search=VectorSearch(
                     weaviate_url=settings.WEAVIATE_URL,
                     ollama_url=settings.OLLAMA_URL,
-                    embedding_model=_env("OLLAMA_EMBED_MODEL", "nomic-embed-text"),
+                    embedding_model=_env(
+                        "OLLAMA_EMBED_MODEL", "nomic-embed-text"),
                 ),
                 search_adapter=SearchAdapter(search_agent=search_agent),
             )
@@ -449,13 +491,13 @@ async def run_health_server():
 
     app.on_startup.append(_startup)
     app.on_cleanup.append(_cleanup)
-    
+
     runner = web.AppRunner(app)
     await runner.setup()
-    
+
     site = web.TCPSite(runner, "0.0.0.0", settings.HEALTH_PORT)
     await site.start()
-    
+
     logger.info("Health server started", port=settings.HEALTH_PORT)
     return runner
 
@@ -476,7 +518,8 @@ async def intelligence_query_handler(request: web.Request) -> web.Response:
     user_id = request.headers.get("X-User-Id")
     roles_raw = request.headers.get("X-User-Roles") or ""
     roles = [r.strip() for r in roles_raw.split(",") if r.strip()]
-    module = request.headers.get("X-Client-Module") or (body or {}).get("module")
+    module = request.headers.get(
+        "X-Client-Module") or (body or {}).get("module")
     correlation_id = request.headers.get("X-Correlation-Id")
     authorization = request.headers.get("Authorization")
 
@@ -490,7 +533,8 @@ async def intelligence_query_handler(request: web.Request) -> web.Response:
         or (body or {}).get("mode") == "chat"
     )
     if is_chat and chat_agent:
-        conversation_id = (body or {}).get("conversation_id") or (body or {}).get("conversationId")
+        conversation_id = (body or {}).get("conversation_id") or (
+            body or {}).get("conversationId")
         resp = await chat_agent.chat(
             tenant_id=str(tenant_id),
             user_id=str(user_id),
@@ -541,11 +585,18 @@ async def voice_handler(request: web.Request) -> web.Response:
 
         return web.json_response({
             "transcript": {
-                "text": state.transcript.text if state.transcript else "",
-                "language": state.transcript.language if state.transcript else None,
-                "confidence": state.transcript.confidence if state.transcript else 0,
-                "duration_seconds": state.transcript.duration_seconds if state.transcript else 0,
-                "processing_time_ms": state.transcript.processing_time_ms if state.transcript else 0,
+                "text": (
+                    state.transcript.text if state.transcript else ""),
+                "language": (
+                    state.transcript.language if state.transcript else None),
+                "confidence": (
+                    state.transcript.confidence if state.transcript else 0),
+                "duration_seconds": (
+                    state.transcript.duration_seconds
+                    if state.transcript else 0),
+                "processing_time_ms": (
+                    state.transcript.processing_time_ms
+                    if state.transcript else 0),
             } if state.transcript else None,
             "original_language": state.original_language,
             "canonical_query": state.canonical_query,
@@ -556,13 +607,17 @@ async def voice_handler(request: web.Request) -> web.Response:
         })
     except Exception as e:
         logger.error("Voice transcription failed", error=str(e))
-        return web.json_response({"error": "transcription_failed", "details": str(e)}, status=500)
+        return web.json_response(
+            {"error": "transcription_failed", "details": str(e)}, status=500)
 
 
 async def voice_query_handler(request: web.Request) -> web.Response:
-    """Handle full voice query pipeline: transcribe, detect, translate, search/chat."""
+    """Handle full voice query pipeline: transcribe, detect, translate.
+
+    Routes the canonical query to search/chat.
+    """
     search_agent: SearchAgent = request.app["search_agent"]
-    chat_agent: ChatAgent | None = request.app.get("chat_agent")
+    # chat_agent: ChatAgent | None = request.app.get("chat_agent")
 
     try:
         audio_bytes = await request.read()
@@ -578,7 +633,7 @@ async def voice_query_handler(request: web.Request) -> web.Response:
     roles = [r.strip() for r in roles_raw.split(",") if r.strip()]
     module = request.headers.get("X-Client-Module")
     correlation_id = request.headers.get("X-Correlation-Id")
-    authorization = request.headers.get("Authorization")
+    # authorization = request.headers.get("Authorization")
     audio_format = request.headers.get("X-Audio-Format") or "webm"
 
     if not tenant_id or not user_id:
@@ -596,7 +651,8 @@ async def voice_query_handler(request: web.Request) -> web.Response:
         if not state.canonical_query:
             return web.json_response({
                 "error": "no_transcript",
-                "transcript": state.transcript.text if state.transcript else "",
+                "transcript": (
+                    state.transcript.text if state.transcript else ""),
                 "original_language": state.original_language,
             }, status=400)
 
@@ -624,7 +680,8 @@ async def voice_query_handler(request: web.Request) -> web.Response:
 
     except Exception as e:
         logger.error("Voice query failed", error=str(e))
-        return web.json_response({"error": "voice_query_failed", "details": str(e)}, status=500)
+        return web.json_response(
+            {"error": "voice_query_failed", "details": str(e)}, status=500)
 
 
 async def automation_parse_handler(request: web.Request) -> web.Response:
@@ -634,7 +691,8 @@ async def automation_parse_handler(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response({"error": "invalid_json"}, status=400)
 
-    nl_rule_text = str((body or {}).get("nl_rule_text") or (body or {}).get("nlRuleText") or "").strip()
+    nl_rule_text = str((body or {}).get("nl_rule_text") or (
+        body or {}).get("nlRuleText") or "").strip()
     if not nl_rule_text:
         return web.json_response({"error": "missing_nl_rule_text"}, status=400)
 
@@ -648,7 +706,12 @@ async def automation_parse_handler(request: web.Request) -> web.Response:
         return web.json_response({"error": "forbidden"}, status=403)
 
     try:
-        out = await automation_agent.parse(tenant_id=str(tenant_id), user_id=str(user_id), roles=roles, nl_rule_text=nl_rule_text)
+        out = await automation_agent.parse(
+            tenant_id=str(tenant_id),
+            user_id=str(user_id),
+            roles=roles,
+            nl_rule_text=nl_rule_text,
+        )
         return web.json_response(out)
     except Exception as e:
         logger.error("Automation parse failed", error=str(e))
@@ -656,7 +719,9 @@ async def automation_parse_handler(request: web.Request) -> web.Response:
 
 
 async def audit_search_handler(request: web.Request) -> web.Response:
-    agent: ComplianceIntelligenceAgent = request.app["compliance_intelligence_agent"]
+    agent: ComplianceIntelligenceAgent = request.app[
+        "compliance_intelligence_agent"
+    ]
     try:
         body = await request.json()
     except Exception:
@@ -672,20 +737,29 @@ async def audit_search_handler(request: web.Request) -> web.Response:
     roles = [r.strip() for r in roles_raw.split(",") if r.strip()]
     if not tenant_id or not user_id:
         return web.json_response({"error": "missing_context"}, status=400)
-    if "admin" not in roles and "super_admin" not in roles and "auditor" not in roles:
+    allowed_roles = {"admin", "super_admin", "auditor"}
+    if not allowed_roles.intersection(roles):
         return web.json_response({"error": "forbidden"}, status=403)
 
     filters = AuditSearchFilters(
         from_ts=(body or {}).get("from_ts") or (body or {}).get("fromTs"),
         to_ts=(body or {}).get("to_ts") or (body or {}).get("toTs"),
-        agent_name=(body or {}).get("agent_name") or (body or {}).get("agentName"),
-        action_type=(body or {}).get("action_type") or (body or {}).get("actionType"),
+        agent_name=(body or {}).get("agent_name") or (
+            body or {}).get("agentName"),
+        action_type=(body or {}).get("action_type") or (
+            body or {}).get("actionType"),
         status=(body or {}).get("status"),
-        risk_level=(body or {}).get("risk_level") or (body or {}).get("riskLevel"),
+        risk_level=(body or {}).get("risk_level") or (
+            body or {}).get("riskLevel"),
     )
 
     try:
-        out = await agent.semantic_audit_search(tenant_id=str(tenant_id), query=query, filters=filters, top_k=20)
+        out = await agent.semantic_audit_search(
+            tenant_id=str(tenant_id),
+            query=query,
+            filters=filters,
+            top_k=20,
+        )
         audit_queries_total.labels(type="semantic").inc()
         return web.json_response(out)
     except Exception as e:
@@ -702,14 +776,14 @@ async def main():
     """Main entry point."""
     orchestrator = AgentOrchestrator()
     health_runner = None
-    
+
     # Setup signal handlers (platform-specific)
     loop = asyncio.get_event_loop()
-    
+
     def signal_handler(*args):
         logger.info("Received shutdown signal")
         loop.create_task(orchestrator.stop())
-    
+
     # Windows doesn't support add_signal_handler, use signal.signal instead
     if os.name == 'nt':  # Windows
         signal.signal(signal.SIGINT, signal_handler)
@@ -717,18 +791,18 @@ async def main():
     else:  # Unix
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, signal_handler)
-    
+
     try:
         # Start health check server
         health_runner = await run_health_server()
-        
+
         # Start orchestrator
         await orchestrator.start()
-        
+
     except Exception as e:
         logger.error("Orchestrator failed", error=str(e))
         raise
-        
+
     finally:
         if health_runner:
             await health_runner.cleanup()
