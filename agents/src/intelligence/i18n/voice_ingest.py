@@ -4,9 +4,7 @@ Speech-to-Text pipeline using Whisper via Ollama or standalone.
 """
 from __future__ import annotations
 
-import asyncio
 import base64
-import io
 import logging
 import os
 import tempfile
@@ -225,7 +223,7 @@ class WhisperSTT:
                 # Clean up temp file
                 try:
                     os.unlink(temp_path)
-                except:
+                except Exception:
                     pass
                     
         except Exception as e:

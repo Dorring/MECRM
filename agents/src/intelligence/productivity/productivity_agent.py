@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import time
+import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -620,6 +620,4 @@ def _env(key: str, default: str) -> str:
     v = os.getenv(key)
     return v.strip() if v and v.strip() else default
 
-
-import contextlib
 

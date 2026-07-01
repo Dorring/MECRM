@@ -6,7 +6,7 @@ Monitors for latency spikes, error storms, consumer lag, and DB contention.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 

@@ -283,7 +283,9 @@ Prioritize customer satisfaction. Flag escalation for complex or urgent issues."
                 kb_articles = []
 
         kb_context = self._format_kb_context(kb_articles)
-        source_ids = [str(a.get("id")) for a in kb_articles if a.get("id")]
+        # source_ids reserved for future citation in decision evidence / explainability
+        # source_ids = [str(a.get("id")) for a in kb_articles if a.get("id")]
+        _ = kb_articles  # keep bound for potential future use
 
         # 2. Ask the LLM for step-by-step resolution grounded in the KB hits.
         prompt = f"""You are a senior support engineer. Produce a step-by-step

@@ -1,5 +1,4 @@
 import pytest
-import pytest_asyncio
 
 from intelligence.chat.graph import ChatDeps, ChatState, ToolCall, ToolResult, build_chat_graph
 

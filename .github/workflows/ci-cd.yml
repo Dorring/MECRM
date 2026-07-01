@@ -83,14 +83,14 @@ jobs:
       - name: Validate CloudEvents schemas
         run: |
           set -e
-          shopt -s nullglob
+          shopt -s globstar nullglob
           found=0
-          for f in schemas/events/*.json; do
+          for f in schemas/events/**/*.json; do
             found=1
             python -c "import json,sys; json.load(open(sys.argv[1]))" "$f"
           done
           if [ "$found" -eq 0 ]; then
-            echo "No event schemas found in schemas/events/" >&2
+            echo "No event schemas found in schemas/events/**/*.json" >&2
             exit 1
           fi
 

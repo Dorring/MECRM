@@ -11,7 +11,7 @@ from typing import Any
 import structlog
 from opentelemetry import trace
 
-from .anomaly_detector import AnomalyType, Severity
+from .anomaly_detector import AnomalyType
 from .root_cause import RootCauseAnalysis
 
 logger = structlog.get_logger()

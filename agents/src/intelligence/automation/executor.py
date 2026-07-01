@@ -174,7 +174,8 @@ class AutomationExecutorAgent(BaseAgent):
                 for idx, a in enumerate(actions):
                     if not isinstance(a, dict):
                         continue
-                    action_type = str(a.get("type") or "")
+                    # action_type reserved for future filtering/audit
+                    # action_type = str(a.get("type") or "")
                     payload = dict(a)
                     emitted_actions.append(payload)
                     await self.emit_event(

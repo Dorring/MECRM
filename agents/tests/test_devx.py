@@ -2,16 +2,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
 
-import pytest
 
 from intelligence.devx.anomaly_detector import (
     AnomalyDetector,
     Anomaly,
     AnomalyType,
     Severity,
-    THRESHOLDS,
 )
 from intelligence.devx.root_cause import (
     RootCauseAnalyzer,

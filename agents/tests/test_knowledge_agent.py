@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -224,7 +223,7 @@ class TestKnowledgeAgentIntegration:
     @pytest.mark.asyncio
     async def test_deduplication_prevents_duplicate_drafts(self):
         """Test that existing drafts are not recreated."""
-        from unittest.mock import patch, AsyncMock
+        from unittest.mock import AsyncMock
 
         # Mock the agent's _find_existing_draft to return an existing ID
         with patch("intelligence.knowledge.knowledge_agent.KnowledgeAgent") as MockAgent:
@@ -258,15 +257,6 @@ class TestKnowledgePublisher:
 
     def test_weaviate_schema_structure(self):
         """Verify expected Weaviate schema properties."""
-        expected_properties = [
-            "article_id",
-            "tenant_id",
-            "title",
-            "content",
-            "tags",
-            "created_at",
-        ]
-
         # This is a structural test - verifying the schema is correct
         from intelligence.knowledge.publisher import KnowledgePublisher
 

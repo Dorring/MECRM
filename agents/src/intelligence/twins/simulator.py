@@ -13,7 +13,7 @@ import asyncpg
 import structlog
 from opentelemetry import trace
 
-from .twin_builder import TwinBuilder, TwinProfile
+from .twin_builder import TwinBuilder
 from .behavior_model import BehaviorModel
 
 logger = structlog.get_logger()
