@@ -10,6 +10,9 @@ env:
   POSTGRES_USER: crm_user
   POSTGRES_PASSWORD: crm_password
   POSTGRES_DB: enterprise_crm
+  CRM_APP_PASSWORD: crm_password
+  KEYCLOAK_ADMIN_PASSWORD: tenant-isolation-keycloak-test
+  GRAFANA_ADMIN_PASSWORD: tenant-isolation-grafana-test
   DATABASE_URL_ADMIN: postgresql://crm_user:crm_password@localhost:5432/enterprise_crm
   DATABASE_URL: postgresql://crm_app:crm_password@localhost:5432/enterprise_crm
   REDIS_URL: redis://localhost:6379
@@ -22,6 +25,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate compose config
+        run: docker compose config --quiet
 
       - name: Start stack (postgres, redis, opa)
         run: docker compose up -d postgres redis opa
