@@ -293,12 +293,26 @@ jobs:
 
       - name: Start stack and run real smoke test
         run: |
-          docker compose up -d
+          # Only start services the smoke test actually needs to reduce
+          # resource contention and unrelated failures. kafka-init will be
+          # wired here once the dedicated kafka-init work lands.
+          docker compose up -d --wait postgres redis kafka opa gateway
           docker compose --profile smoke-test run --rm smoke-test
 
-      - name: Show service health on failure
+      - name: Show service diagnostics on failure
         if: failure()
-        run: docker compose ps
+        run: |
+          docker compose ps
+          echo "--- gateway logs ---"
+          docker compose logs --tail=200 gateway || true
+          echo "--- kafka logs ---"
+          docker compose logs --tail=200 kafka || true
+          echo "--- postgres logs ---"
+          docker compose logs --tail=100 postgres || true
+          echo "--- opa logs ---"
+          docker compose logs --tail=100 opa || true
+          echo "--- smoke-test logs ---"
+          docker compose logs --tail=100 smoke-test || true
 
   # OPA policy tests
   test-policies:
