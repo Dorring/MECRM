@@ -13,7 +13,6 @@ env:
   CRM_APP_PASSWORD: crm_password
   KEYCLOAK_ADMIN_PASSWORD: tenant-isolation-keycloak-test
   GRAFANA_ADMIN_PASSWORD: tenant-isolation-grafana-test
-  DATABASE_URL_ADMIN: postgresql://crm_user:crm_password@localhost:5432/enterprise_crm
   DATABASE_URL: postgresql://crm_app:crm_password@localhost:5432/enterprise_crm
   REDIS_URL: redis://localhost:6379
   OPA_URL: http://localhost:8181
@@ -57,14 +56,17 @@ jobs:
         run: npx prisma migrate deploy
         working-directory: gateway
         env:
-          DATABASE_URL: ${{ env.DATABASE_URL_ADMIN }}
+          # Use the database owner for DDL migrations; tests use crm_app via DATABASE_URL.
+          DATABASE_URL: postgresql://crm_user:crm_password@localhost:5432/enterprise_crm
 
       - name: Install postgres client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
 
       - name: Apply RLS policies
         run: |
-          psql "${DATABASE_URL_ADMIN}" -v ON_ERROR_STOP=1 -f database/migrations/02-rls-policies.sql
+          psql "postgresql://crm_user:crm_password@localhost:5432/enterprise_crm" \
+            -v ON_ERROR_STOP=1 \
+            -f database/migrations/02-rls-policies.sql
 
       - name: Setup Python
         uses: actions/setup-python@v5
