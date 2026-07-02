@@ -42,8 +42,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      kafka:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       opa:
         condition: service_started
     networks:
@@ -170,8 +170,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      kafka:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       weaviate:
         condition: service_started
       opa:
@@ -196,8 +196,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      kafka:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
     networks:
       - crm-network
     healthcheck:
@@ -285,7 +285,7 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
     volumes:
       - kafka_data:/var/lib/kafka/data
@@ -300,6 +300,29 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+
+  # One-shot topic initialization (ADR-001).
+  # Creates all CRM topics explicitly and waits for partition leaders before
+  # allowing gateway/agents to start. Runs with the same Kafka image so no
+  # extra image is pulled.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    entrypoint: ["bash", "/scripts/kafka-init.sh"]
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - KAFKA_REPLICATION_FACTOR=${KAFKA_REPLICATION_FACTOR:-1}
+      - KAFKA_DEFAULT_RETENTION_MS=${KAFKA_DEFAULT_RETENTION_MS:-604800000}
+      - KAFKA_AUDIT_RETENTION_MS=${KAFKA_AUDIT_RETENTION_MS:-2592000000}
+      - KAFKA_DLQ_RETENTION_MS=${KAFKA_DLQ_RETENTION_MS:-1209600000}
+      - KAFKA_LEADER_TIMEOUT=${KAFKA_LEADER_TIMEOUT:-120}
+      - KAFKA_LEADER_INTERVAL=${KAFKA_LEADER_INTERVAL:-2}
+    volumes:
+      - ./scripts/kafka-init.sh:/scripts/kafka-init.sh:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - crm-network
 
   kafka-exporter:
     image: danielqsj/kafka-exporter:latest
@@ -584,8 +607,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      kafka:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
     networks:
       - crm-network
     profiles: ["smoke-test"]

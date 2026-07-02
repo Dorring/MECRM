@@ -20,8 +20,9 @@ const kafka = new Kafka({
 export const kafkaClient = kafka;
 
 // Create producer
+// ADR-001: topics are created explicitly by kafka-init; do not auto-create.
 export const kafkaProducer: Producer = kafka.producer({
-  allowAutoTopicCreation: true,
+  allowAutoTopicCreation: false,
   transactionTimeout: 30000,
 });
 
@@ -83,10 +84,12 @@ export const publishEvent = async (
 
 // Create consumer
 export const createConsumer = (groupId: string): Consumer => {
+  // ADR-001: topics are created explicitly by kafka-init; do not auto-create.
   return kafka.consumer({
     groupId,
     sessionTimeout: 30000,
     heartbeatInterval: 3000,
+    allowAutoTopicCreation: false,
   });
 };
 
