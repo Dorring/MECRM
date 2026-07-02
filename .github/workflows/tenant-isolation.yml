@@ -10,8 +10,14 @@ env:
   POSTGRES_USER: crm_user
   POSTGRES_PASSWORD: crm_password
   POSTGRES_DB: enterprise_crm
-  DATABASE_URL_ADMIN: postgresql://crm_user:crm_password@localhost:5432/enterprise_crm
+
+  ADMIN_DATABASE_URL: postgresql://crm_user:crm_password@localhost:5432/enterprise_crm
   DATABASE_URL: postgresql://crm_app:crm_password@localhost:5432/enterprise_crm
+
+  CRM_APP_PASSWORD: crm_password
+  KEYCLOAK_ADMIN_PASSWORD: tenant-isolation-keycloak-test
+  GRAFANA_ADMIN_PASSWORD: tenant-isolation-grafana-test
+  CRM_TEST_REQUIRE_DB: "1"
   REDIS_URL: redis://localhost:6379
   OPA_URL: http://localhost:8181
   JWT_SECRET: tenant-isolation-test-secret
@@ -22,6 +28,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate compose config
+        run: docker compose config --quiet
 
       - name: Start stack (postgres, redis, opa)
         run: docker compose up -d postgres redis opa
@@ -51,14 +60,17 @@ jobs:
         run: npx prisma migrate deploy
         working-directory: gateway
         env:
-          DATABASE_URL: ${{ env.DATABASE_URL_ADMIN }}
+          # Use the database owner for DDL migrations; tests use crm_app via DATABASE_URL.
+          DATABASE_URL: ${{ env.ADMIN_DATABASE_URL }}
 
       - name: Install postgres client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
 
       - name: Apply RLS policies
         run: |
-          psql "${DATABASE_URL_ADMIN}" -v ON_ERROR_STOP=1 -f database/migrations/02-rls-policies.sql
+          psql "${ADMIN_DATABASE_URL}" \
+            -v ON_ERROR_STOP=1 \
+            -f database/migrations/02-rls-policies.sql
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -87,14 +99,35 @@ jobs:
       - name: Run gateway tenant isolation tests
         run: |
           mkdir -p reports/security
-          npm test -- --json --outputFile ../reports/security/jest-results.json
+
+          echo "CRM_TEST_REQUIRE_DB=${CRM_TEST_REQUIRE_DB}"
+          test "${CRM_TEST_REQUIRE_DB}" = "1"
+
+          npx jest tests/test_rls_enforcement.ts \
+            --json \
+            --outputFile ../reports/security/jest-results.json
+
+          echo "=== Jest raw results (first 200 lines) ==="
+          head -n 200 ../reports/security/jest-results.json || true
         working-directory: gateway
 
       - name: Generate tenant isolation report
         run: python scripts/generate_tenant_isolation_report.py
 
       - name: Upload tenant isolation report artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tenant-isolation-report
           path: reports/security/tenant-isolation-report.json
+
+      - name: Upload raw tenant isolation inputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tenant-isolation-raw-inputs
+          path: |
+            reports/security/pytest-results.xml
+            reports/security/jest-results.json
+            reports/security/opa-results.json
+          if-no-files-found: ignore

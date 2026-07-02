@@ -1,9 +1,15 @@
 import json
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Any
+
+
+def _normalize_test_name(name: str) -> str:
+    """Strip test labels (e.g. [requires DB]) so required IDs stay stable."""
+    return re.sub(r"\s*\[[^\]]+\]\s*", " ", name).strip()
 
 
 def _read_json(path: str) -> Any | None:
@@ -30,9 +36,22 @@ def _parse_junit(path: str) -> dict[str, dict[str, Any]]:
     for tc in root.iter("testcase"):
         classname = tc.attrib.get("classname", "")
         name = tc.attrib.get("name", "")
-        test_id = f"{classname}::{name}" if classname else name
         failed = tc.find("failure") is not None or tc.find("error") is not None
-        out[test_id] = {"passed": not failed}
+        passed = not failed
+
+        # Register the canonical ID and aliases with/without the leading "agents."
+        # prefix, so required IDs stay stable regardless of pytest invocation path.
+        ids = set()
+        if classname:
+            ids.add(f"{classname}::{name}")
+            if classname.startswith("agents."):
+                ids.add(f"{classname[7:]}::{name}")
+            else:
+                ids.add(f"agents.{classname}::{name}")
+        ids.add(name)
+
+        for test_id in ids:
+            out[test_id] = {"passed": passed}
     return out
 
 
@@ -45,6 +64,7 @@ def _parse_jest(path: str) -> dict[str, dict[str, Any]]:
     for suite in data.get("testResults", []):
         for a in suite.get("assertionResults", []):
             name = a.get("fullName") or a.get("title") or "unknown"
+            name = _normalize_test_name(name)
             status = a.get("status")
             out[name] = {"passed": status == "passed"}
     return out
@@ -171,8 +191,20 @@ def main() -> int:
         },
     }
 
-    out_path = os.path.join(repo_root, "reports", "security", "tenant-isolation-report.json")
+    out_path = os.environ.get(
+        "TENANT_ISO_REPORT_OUT",
+        os.path.join(repo_root, "reports", "security", "tenant-isolation-report.json"),
+    )
     _write_json(out_path, report)
+
+    failed_proofs = [name for name, passed in report["results"].items() if not passed]
+    if failed_proofs:
+        print("Tenant isolation proof failed or missing:")
+        for name in failed_proofs:
+            print(f"  - {name}")
+        print("Available Jest test IDs:")
+        for test_id in sorted(js):
+            print(f"  - {test_id}")
 
     all_true = all(report["results"].values())
     return 0 if all_true else 2
