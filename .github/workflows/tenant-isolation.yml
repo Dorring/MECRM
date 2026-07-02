@@ -10,10 +10,13 @@ env:
   POSTGRES_USER: crm_user
   POSTGRES_PASSWORD: crm_password
   POSTGRES_DB: enterprise_crm
+
+  ADMIN_DATABASE_URL: postgresql://crm_user:crm_password@localhost:5432/enterprise_crm
+  DATABASE_URL: postgresql://crm_app:crm_password@localhost:5432/enterprise_crm
+
   CRM_APP_PASSWORD: crm_password
   KEYCLOAK_ADMIN_PASSWORD: tenant-isolation-keycloak-test
   GRAFANA_ADMIN_PASSWORD: tenant-isolation-grafana-test
-  DATABASE_URL: postgresql://crm_app:crm_password@localhost:5432/enterprise_crm
   REDIS_URL: redis://localhost:6379
   OPA_URL: http://localhost:8181
   JWT_SECRET: tenant-isolation-test-secret
@@ -57,14 +60,14 @@ jobs:
         working-directory: gateway
         env:
           # Use the database owner for DDL migrations; tests use crm_app via DATABASE_URL.
-          DATABASE_URL: postgresql://crm_user:crm_password@localhost:5432/enterprise_crm
+          DATABASE_URL: ${{ env.ADMIN_DATABASE_URL }}
 
       - name: Install postgres client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
 
       - name: Apply RLS policies
         run: |
-          psql "postgresql://crm_user:crm_password@localhost:5432/enterprise_crm" \
+          psql "${ADMIN_DATABASE_URL}" \
             -v ON_ERROR_STOP=1 \
             -f database/migrations/02-rls-policies.sql
 
