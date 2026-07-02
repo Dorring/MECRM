@@ -46,22 +46,25 @@ and do **not** read `database/prisma/schema.prisma`.
 The runner applies, in this exact order, on every invocation:
 
 ```
-1.  npx prisma migrate deploy                      (gateway/prisma)
-2.  01-core-tables.sql          leads, customers (idempotent backstop)
-3.  02-rls-policies.sql         ENABLE+FORCE RLS loop, crm_app role + grants
-4.  03-event-log.sql            event_log + RLS
-5.  04-aggregate-snapshots.sql  aggregate_snapshots + RLS
-6.  05-replay-jobs.sql          replay_jobs + RLS
-7.  06-event-store.sql          event_streams, events + RLS
-8.  07-outbox.sql               outbox_events + RLS
-9.  08-read-models.sql          processed_events, lead_read_model,
+ 0.  Session-level PostgreSQL advisory lock (held for entire runner lifetime)
+ 1.  npx prisma migrate deploy                      (gateway/prisma)
+ 2.  00-advisory-lock.sql      lock semantics documentation
+ 3.  01-core-tables.sql          leads, customers (idempotent backstop)
+ 4.  02-rls-policies.sql         ENABLE+FORCE RLS loop, crm_app role + grants
+ 5.  03-event-log.sql            event_log + RLS
+ 6.  04-aggregate-snapshots.sql  aggregate_snapshots + RLS
+ 7.  05-replay-jobs.sql          replay_jobs + RLS
+ 8.  06-event-store.sql          event_streams, events + RLS
+ 9.  07-outbox.sql               outbox_events + RLS
+10.  08-read-models.sql          processed_events, lead_read_model,
                                 deal_pipeline_view, customer_timeline_view + RLS
-10. 09-agent-decisions.sql      agent_decisions + RLS (inline, see note below)
-11. 10-data-governance.sql      soft-delete cols on customers/users,
+11.  09-agent-decisions.sql      agent_decisions + RLS (inline, see note below)
+12.  10-data-governance.sql      soft-delete cols on customers/users,
                                 data_retention_policies + RLS
-12. 11-intelligence-twins.sql   customer_twins, twin_simulation_log (+ RLS),
+13.  11-intelligence-twins.sql   customer_twins, twin_simulation_log (+ RLS),
                                 devx_insights (NO RLS — system-wide)
-13. drift detection             (report only, see below)
+14.  12-type-convergence.sql     timestamp-type authority guard
+15.  drift + RLS audit           (fails on missing tenant RLS, see below)
 ```
 
 ### Why `02-rls-policies.sql` runs early but RLS still works
@@ -92,6 +95,12 @@ Every tenant-scoped table MUST have, verified by the runner's RLS audit:
 3. A policy covering **both** `USING` (reads/updates/deletes) **and**
    `WITH CHECK` (inserts/updates) — so a session cannot write a row for a
    different tenant than `current_setting('app.tenant_id')`.
+
+The RLS audit checks an explicit tenant-table allowlist (declared in
+`scripts/migrate.sh` and `scripts/migrate.ps1`). Missing `ENABLE`, `FORCE`, or
+`FOR ALL` policy on any allowlisted table causes the runner to exit non-zero.
+Tables that are intentionally not tenant-scoped are allowlisted separately and
+are not required to have RLS.
 
 Standard policy (applied to all tenant tables):
 
@@ -157,7 +166,14 @@ To add a **new** raw SQL migration: name it `NN-<topic>.sql` (next number,
 e.g. `12-...`), add it to `SQL_FILES` in both `migrate.sh` and `migrate.ps1`,
 and follow the RLS contract above for any tenant-scoped table.
 
-## Schema drift detection
+## Advisory lock
+
+The runner holds a single PostgreSQL session-level advisory lock for the entire
+duration of `Prisma -> SQL -> audit`. The lock key is `405011`. This prevents
+two CI jobs or operators from running migrations concurrently on the same
+database. The lock is released by a `trap`/`finally` even if the runner fails.
+
+## Schema drift and RLS audit
 
 `scripts/migrate.sh --drift-only` (or `-DriftOnly` on PowerShell) reports:
 
@@ -167,9 +183,10 @@ and follow the RLS contract above for any tenant-scoped table.
    tables known to be owned by the raw SQL track (`event_log`,
    `aggregate_snapshots`, `replay_jobs`, `customer_twins`,
    `twin_simulation_log`, `devx_insights`) plus `_prisma_migrations`.
-3. **RLS enforcement audit** — any `public` table where `relrowsecurity` or
-   `relforcerowsecurity` is `false`, surfacing tables that are missing
-   `ENABLE` or `FORCE` RLS.
+3. **RLS enforcement audit** — for every table in the explicit tenant-table
+   allowlist, verifies `ENABLE`, `FORCE`, and a `FOR ALL` policy. Any failure
+   causes the runner to exit non-zero. Use `--audit-warn` in development to
+   downgrade to a warning.
 
 This is a **coarse, table-presence** check (it does not compare column types).
 For full-fidelity drift use:
@@ -180,15 +197,25 @@ cd gateway && npx prisma migrate diff \
   --to-schema-datamodel prisma/schema.prisma
 ```
 
-Drift detection **reports only** — it does not fail the run, because extra
-raw-SQL-track tables are expected.
+## Timestamp type authority
+
+All timestamp columns in the platform schema use `timestamptz`:
+
+- Prisma-managed tables are converted by the forward migration
+  `gateway/prisma/migrations/20260702000000_timestamptz_convergence`.
+- Raw-SQL-track tables are guarded by `12-type-convergence.sql`, which raises
+  an error if any plain `timestamp` column remains.
+
+See `docs/migration-type-convergence.md` for upgrade, rollback, vacuum/analyze,
+and lock-risk notes.
 
 ## File inventory
 
 | File | Tables / concern |
 |---|---|
+| `00-advisory-lock.sql` | Advisory lock semantics (documentation) |
 | `01-core-tables.sql` | `tenants`, `leads`, `customers` (backstop for Prisma) |
-| `02-rls-policies.sql` | RLS loop over 23 tenant tables; `crm_app` role + grants |
+| `02-rls-policies.sql` | RLS loop over tenant tables; `crm_app` role + grants |
 | `03-event-log.sql` | `event_log` + RLS |
 | `04-aggregate-snapshots.sql` | `aggregate_snapshots` + RLS |
 | `05-replay-jobs.sql` | `replay_jobs` + RLS |
@@ -198,3 +225,4 @@ raw-SQL-track tables are expected.
 | `09-agent-decisions.sql` | `agent_decisions` + inline RLS |
 | `10-data-governance.sql` | soft-delete cols on `customers`/`users`, `data_retention_policies` + RLS |
 | `11-intelligence-twins.sql` | `customer_twins`, `twin_simulation_log` (+ RLS), `devx_insights` (no RLS) |
+| `12-type-convergence.sql` | Timestamp-type authority guard |

@@ -30,7 +30,7 @@ BEGIN
 END $$;
 
 CREATE TABLE IF NOT EXISTS data_retention_policies (
-  id uuid PRIMARY KEY,
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id uuid NOT NULL,
   entity_type text NOT NULL,
   retention_days integer NOT NULL CHECK (retention_days > 0),
@@ -52,7 +52,7 @@ BEGIN
     CREATE POLICY data_retention_policies_tenant_isolation
       ON data_retention_policies
       FOR ALL
-      USING (tenant_id::text = current_setting('app.tenant_id', true))
-      WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
+      USING (tenant_id = current_setting('app.tenant_id')::uuid)
+      WITH CHECK (tenant_id = current_setting('app.tenant_id')::uuid);
   END IF;
 END $$;

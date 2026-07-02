@@ -449,60 +449,26 @@ services:
     networks:
       - crm-network
 
-  # ===================
   # One-shot migration runner (single, complete)
-  # ===================
   # Runs the FULL migration sequence in fixed order and exits:
-  #   1. npx prisma migrate deploy   (application tables: leads, deals, tickets,
-  #      customers, users, roles, agent_decisions, outbox_events, event_streams, ...)
-  #   2. raw SQL 01-11               (RLS policies, crm_app role, event_log,
-  #      aggregate_snapshots, replay_jobs, customer_twins, devx_insights -- the
-  #      infra/RLS track Prisma cannot express). CREATE TABLE IF NOT EXISTS makes
-  #      this idempotent against Prisma-created tables.
-  #   3. RLS verification query      (asserts ENABLE + FORCE on tenant tables).
-  # Uses database/Dockerfile.migrate (node + prisma + postgresql-client) so one
-  # image has both tools. P0-2: the old version used the postgres image (no
-  # Prisma) and only ran SQL -- it silently skipped the Prisma track and the
-  # docs falsely called it a complete entry. Order is Prisma -> SQL -> verify.
+  #   1. npx prisma migrate deploy   (application tables)
+  #   2. raw SQL 00-12               (advisory lock doc, RLS policies, event store,
+  #                                   outbox, read models, twins, type convergence)
+  #   3. drift + RLS enforcement audit (fails if tenant tables missing ENABLE+FORCE+ALL policy)
+  # Uses scripts/migrate.sh which holds a session-level advisory lock for the entire
+  # runner lifetime and releases it via trap/finally.
   # Usage: docker-compose --profile migrate run --rm migrate
   migrate:
     build:
       context: .
       dockerfile: database/Dockerfile.migrate
-    command:
-      - "sh"
-      - "-c"
-      - |
-        set -e
-        echo "=== 1/3 Prisma migrate deploy ==="
-        npx prisma migrate deploy
-        echo "=== 2/3 Raw SQL 01-11 ==="
-        for f in /migrations/01-core-tables.sql \
-                 /migrations/02-rls-policies.sql \
-                 /migrations/03-event-log.sql \
-                 /migrations/04-aggregate-snapshots.sql \
-                 /migrations/05-replay-jobs.sql \
-                 /migrations/06-event-store.sql \
-                 /migrations/07-outbox.sql \
-                 /migrations/08-read-models.sql \
-                 /migrations/09-agent-decisions.sql \
-                 /migrations/10-data-governance.sql \
-                 /migrations/11-intelligence-twins.sql; do
-          echo "applying $$f";
-          psql "$$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$$f";
-        done
-        echo "=== 3/3 RLS verification ==="
-        EXPECTED=6
-        FOUND=$(psql "$$DATABASE_URL" -tA -c "SELECT count(*) FROM pg_class WHERE relname IN ('leads','customers','agent_decisions','data_retention_policies','outbox_events','event_streams');")
-        if [ "$$FOUND" != "$$EXPECTED" ]; then echo "FAIL: expected $$EXPECTED tenant tables, found $$FOUND"; exit 1; fi
-        BAD=$(psql "$$DATABASE_URL" -tA -c "SELECT count(*) FROM pg_class WHERE relname IN ('leads','customers','agent_decisions','data_retention_policies','outbox_events','event_streams') AND NOT (relrowsecurity AND relforcerowsecurity);")
-        if [ "$$BAD" != "0" ]; then echo "FAIL: $$BAD tenant table(s) missing ENABLE+FORCE RLS"; exit 1; fi
-        echo "RLS OK: all $$EXPECTED tenant tables have ENABLE+FORCE RLS"
-        echo "=== migrate runner OK ==="
+    command: ["/scripts/migrate.sh"]
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-crm_user}:${POSTGRES_PASSWORD:-crm_password}@postgres:5432/${POSTGRES_DB:-enterprise_crm}
+      - GATEWAY_DIR=/app
     volumes:
-      - ./database/migrations:/migrations:ro
+      - ./database/migrations:/database/migrations:ro
+      - ./scripts/migrate.sh:/scripts/migrate.sh:ro
     depends_on:
       postgres:
         condition: service_healthy

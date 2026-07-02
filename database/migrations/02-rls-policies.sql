@@ -24,7 +24,17 @@ DECLARE
     'lead_read_model',
     'deal_pipeline_view',
     'customer_timeline_view',
-    'security_events'
+    'security_events',
+    'data_retention_policies',
+    'automation_policies',
+    'automation_simulations',
+    'automation_executions',
+    'customer_profiles',
+    'customer_timelines',
+    'knowledge_articles',
+    'knowledge_drafts',
+    'productivity_proposals',
+    'predictions'
   ];
 BEGIN
   FOREACH t IN ARRAY tenant_tables LOOP
