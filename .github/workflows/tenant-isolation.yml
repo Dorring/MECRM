@@ -17,7 +17,7 @@ env:
   CRM_APP_PASSWORD: crm_password
   KEYCLOAK_ADMIN_PASSWORD: tenant-isolation-keycloak-test
   GRAFANA_ADMIN_PASSWORD: tenant-isolation-grafana-test
-  CRM_DB_AVAILABLE: "1"
+  CRM_TEST_REQUIRE_DB: "1"
   REDIS_URL: redis://localhost:6379
   OPA_URL: http://localhost:8181
   JWT_SECRET: tenant-isolation-test-secret
@@ -100,8 +100,8 @@ jobs:
         run: |
           mkdir -p reports/security
 
-          echo "CRM_DB_AVAILABLE=${CRM_DB_AVAILABLE}"
-          test "${CRM_DB_AVAILABLE}" = "1"
+          echo "CRM_TEST_REQUIRE_DB=${CRM_TEST_REQUIRE_DB}"
+          test "${CRM_TEST_REQUIRE_DB}" = "1"
 
           npx jest tests/test_rls_enforcement.ts \
             --json \
