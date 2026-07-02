@@ -105,6 +105,7 @@ jobs:
         run: python scripts/generate_tenant_isolation_report.py
 
       - name: Upload tenant isolation report artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tenant-isolation-report
