@@ -81,7 +81,7 @@ async def test_structured_search_is_tenant_scoped(database_url: str, seeded: dic
         results = await r.structured_search(
             tenant_id=seeded["tenant_a"],
             query="Acme",
-            entity=None,
+            entity="lead",
             filters=None,
             limit=20,
         )
