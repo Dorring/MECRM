@@ -15,7 +15,7 @@
   - `gateway/prisma/schema.prisma` 所有 `DateTime` 字段加 `@db.Timestamptz(6)`。
 - **租户隔离方式**: RLS policy 统一为 UUID 比较；tenant table allowlist 强制 ENABLE+FORCE+FOR ALL policy。
 - **OPA/权限影响**: 无。
-- **PII/审计影响**: migration runner 仍打印 DATABASE_URL（含密码）到日志；这是已知限制，生产应通过 secret 注入并避免日志持久化。
+- **PII/审计影响**: 已从 migrate.sh / migrate.ps1 中删除 `DATABASE_URL` 日志；仅输出非敏感的目标 DB 摘要（host/port/db/user）。密码仍通过环境变量/secret 注入，runner 不打印凭据。
 - **失败模式**:
   - 并发 migration：第二个 runner 无法获取 advisory lock，30s 后非零退出。
   - 租户表缺失 ENABLE/FORCE/policy：`detect_drift` 非零退出（`--audit-warn` 仅告警）。
@@ -31,11 +31,12 @@
   - 无新增运行时指标。
   - Runbook: `docs/migration-type-convergence.md`（锁风险、升级、回滚、vacuum/analyze）。
 - **新增测试**:
-  - 未新增单元测试；验证依赖现有 `test_schema_contract.py`（需 DB）与 migration runner 真实执行。
+  - `tests/infra/test_compose_config.py` 新增/更新 migrate command 回归测试：断言使用 `bash`、挂载 `/scripts/migrate.sh`、不再将 RLS SQL 内联在 compose command 中。
 - **实际执行的验证命令**:
   - `bash -n scripts/migrate.sh` → OK
   - PowerShell tokenizer → OK（有环境字符集告警但无语法错误）
   - `docker compose config` → OK
+  - `pytest tests/infra/` → 55 passed / 1 skipped / 10 subtests passed
   - `cd gateway && npx prisma generate && npm run build` → OK
   - `cd gateway && npm run lint` → OK
   - `cd gateway && npm test` → 22 passed / 30 skipped / 0 failed
