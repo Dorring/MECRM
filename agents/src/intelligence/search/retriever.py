@@ -85,7 +85,7 @@ class HybridRetriever:
 
         out: list[RetrievedResult] = []
         async with self._pool.acquire() as conn:
-            await conn.execute("SELECT set_config('app.tenant_id', $1, true)", tenant_id)
+            await conn.execute("SELECT set_config('app.tenant_id', $1, false)", tenant_id)
             if entity in (None, "lead"):
                 rows = await conn.fetch(
                     """
