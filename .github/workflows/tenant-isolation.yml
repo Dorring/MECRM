@@ -17,6 +17,7 @@ env:
   CRM_APP_PASSWORD: crm_password
   KEYCLOAK_ADMIN_PASSWORD: tenant-isolation-keycloak-test
   GRAFANA_ADMIN_PASSWORD: tenant-isolation-grafana-test
+  CRM_DB_AVAILABLE: "1"
   REDIS_URL: redis://localhost:6379
   OPA_URL: http://localhost:8181
   JWT_SECRET: tenant-isolation-test-secret
@@ -96,13 +97,18 @@ jobs:
           pytest agents/tests/test_tenant_isolation.py -v --junitxml reports/security/pytest-results.xml
 
       - name: Run gateway tenant isolation tests
-        env:
-          CRM_DB_AVAILABLE: "1"
         run: |
           mkdir -p reports/security
-          npm test -- tests/test_rls_enforcement.ts \
+
+          echo "CRM_DB_AVAILABLE=${CRM_DB_AVAILABLE}"
+          test "${CRM_DB_AVAILABLE}" = "1"
+
+          npx jest tests/test_rls_enforcement.ts \
             --json \
             --outputFile ../reports/security/jest-results.json
+
+          echo "=== Jest raw results (first 200 lines) ==="
+          head -n 200 ../reports/security/jest-results.json || true
         working-directory: gateway
 
       - name: Generate tenant isolation report
@@ -114,3 +120,14 @@ jobs:
         with:
           name: tenant-isolation-report
           path: reports/security/tenant-isolation-report.json
+
+      - name: Upload raw tenant isolation inputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tenant-isolation-raw-inputs
+          path: |
+            reports/security/pytest-results.xml
+            reports/security/jest-results.json
+            reports/security/opa-results.json
+          if-no-files-found: ignore
