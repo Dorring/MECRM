@@ -153,7 +153,7 @@ jobs:
             psql "postgresql://test:test@localhost:5432/test_db" -v ON_ERROR_STOP=1 -f "$f"
           done
           # RLS enforcement check: fail the build if any tenant table lacks ENABLE+FORCE RLS.
-          BAD=$(psql "postgresql://test:test@localhost:5432/test_db" -tA -c "SELECT count(*) FROM pg_class WHERE relname IN ('leads','customers','agent_decisions','data_retention_policies','outbox_events','event_streams') AND NOT (relrowsecurity AND relforcerowsecurity);")
+          BAD=$(psql "postgresql://test:test@localhost:5432/test_db" -tA -c "SELECT count(*) FROM pg_class WHERE relname IN ('leads','deals','tickets','customers','agent_decisions','data_retention_policies','outbox_events','event_streams') AND NOT (relrowsecurity AND relforcerowsecurity);")
           if [ "$BAD" != "0" ]; then echo "FAIL: $BAD tenant table(s) missing ENABLE+FORCE RLS"; exit 1; fi
           echo "RLS OK"
 
@@ -193,12 +193,49 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install gateway dependencies
+        run: npm ci
+        working-directory: gateway
+
+      - name: Run Prisma migrations
+        run: npx prisma migrate deploy
+        working-directory: gateway
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/test_db
+
+      - name: Apply raw SQL migrations + RLS policies
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client
+          for f in database/migrations/01-core-tables.sql \
+                   database/migrations/02-rls-policies.sql \
+                   database/migrations/03-event-log.sql \
+                   database/migrations/04-aggregate-snapshots.sql \
+                   database/migrations/05-replay-jobs.sql \
+                   database/migrations/06-event-store.sql \
+                   database/migrations/07-outbox.sql \
+                   database/migrations/08-read-models.sql \
+                   database/migrations/09-agent-decisions.sql \
+                   database/migrations/10-data-governance.sql \
+                   database/migrations/11-intelligence-twins.sql; do
+            echo "Applying $f"
+            psql "postgresql://test:test@localhost:5432/test_db" -v ON_ERROR_STOP=1 -f "$f"
+          done
+          # RLS enforcement check: fail the build if any tenant table lacks ENABLE+FORCE RLS.
+          BAD=$(psql "postgresql://test:test@localhost:5432/test_db" -tA -c "SELECT count(*) FROM pg_class WHERE relname IN ('leads','deals','tickets','customers','agent_decisions','data_retention_policies','outbox_events','event_streams') AND NOT (relrowsecurity AND relforcerowsecurity);")
+          if [ "$BAD" != "0" ]; then echo "FAIL: $BAD tenant table(s) missing ENABLE+FORCE RLS"; exit 1; fi
+          echo "RLS OK"
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install agents dependencies
         run: |
           pip install -r requirements.txt
           pip install pytest pytest-asyncio pytest-cov
