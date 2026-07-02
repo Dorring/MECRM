@@ -462,7 +462,7 @@ services:
     build:
       context: .
       dockerfile: database/Dockerfile.migrate
-    command: ["/scripts/migrate.sh"]
+    command: ["bash", "/scripts/migrate.sh"]
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-crm_user}:${POSTGRES_PASSWORD:-crm_password}@postgres:5432/${POSTGRES_DB:-enterprise_crm}
       - GATEWAY_DIR=/app

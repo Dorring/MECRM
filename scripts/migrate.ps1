@@ -191,7 +191,6 @@ function Invoke-PrismaMigrate {
   $prismaDir = Join-Path $env:GATEWAY_DIR 'prisma'
   if (-not (Test-Path $prismaDir)) { Write-Err2 "gateway prisma dir not found: $prismaDir"; exit 1 }
   Write-Log "Prisma migrate deploy (schema source: $(Join-Path $prismaDir 'schema.prisma'))"
-  Write-Log "DATABASE_URL=$($env:DATABASE_URL)"
   Push-Location $env:GATEWAY_DIR
   try { npx prisma migrate deploy }
   finally { Pop-Location }

@@ -195,7 +195,6 @@ run_prisma_migrate() {
   require npx
   [[ -d "${GATEWAY_DIR}/prisma" ]] || { err "gateway prisma dir not found: ${GATEWAY_DIR}/prisma"; exit 1; }
   log "Prisma migrate deploy (schema source: ${GATEWAY_DIR}/prisma/schema.prisma)"
-  log "DATABASE_URL=${DATABASE_URL}"
   ( cd "${GATEWAY_DIR}" && npx prisma migrate deploy )
 }
 
