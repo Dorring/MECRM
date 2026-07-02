@@ -272,9 +272,10 @@ jobs:
         run: |
           cp .env.example .env
           # Replace weak defaults with random values.
-          sed -i "s/^JWT_SECRET=.*/JWT_SECRET=$(openssl rand -base64 48)/" .env
-          sed -i "s/^KEYCLOAK_ADMIN_PASSWORD=.*/KEYCLOAK_ADMIN_PASSWORD=$(openssl rand -base64 24)/" .env
-          sed -i "s/^GRAFANA_ADMIN_PASSWORD=.*/GRAFANA_ADMIN_PASSWORD=$(openssl rand -base64 24)/" .env
+          # Use '#' as sed delimiter because base64 output may contain '/'.
+          sed -i "s#^JWT_SECRET=.*#JWT_SECRET=$(openssl rand -base64 48)#" .env
+          sed -i "s#^KEYCLOAK_ADMIN_PASSWORD=.*#KEYCLOAK_ADMIN_PASSWORD=$(openssl rand -base64 24)#" .env
+          sed -i "s#^GRAFANA_ADMIN_PASSWORD=.*#GRAFANA_ADMIN_PASSWORD=$(openssl rand -base64 24)#" .env
 
       - name: Validate compose config
         run: |
