@@ -36,9 +36,22 @@ def _parse_junit(path: str) -> dict[str, dict[str, Any]]:
     for tc in root.iter("testcase"):
         classname = tc.attrib.get("classname", "")
         name = tc.attrib.get("name", "")
-        test_id = f"{classname}::{name}" if classname else name
         failed = tc.find("failure") is not None or tc.find("error") is not None
-        out[test_id] = {"passed": not failed}
+        passed = not failed
+
+        # Register the canonical ID and aliases with/without the leading "agents."
+        # prefix, so required IDs stay stable regardless of pytest invocation path.
+        ids = set()
+        if classname:
+            ids.add(f"{classname}::{name}")
+            if classname.startswith("agents."):
+                ids.add(f"{classname[7:]}::{name}")
+            else:
+                ids.add(f"agents.{classname}::{name}")
+        ids.add(name)
+
+        for test_id in ids:
+            out[test_id] = {"passed": passed}
     return out
 
 
@@ -178,7 +191,10 @@ def main() -> int:
         },
     }
 
-    out_path = os.path.join(repo_root, "reports", "security", "tenant-isolation-report.json")
+    out_path = os.environ.get(
+        "TENANT_ISO_REPORT_OUT",
+        os.path.join(repo_root, "reports", "security", "tenant-isolation-report.json"),
+    )
     _write_json(out_path, report)
 
     failed_proofs = [name for name, passed in report["results"].items() if not passed]

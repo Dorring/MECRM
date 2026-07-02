@@ -96,9 +96,13 @@ jobs:
           pytest agents/tests/test_tenant_isolation.py -v --junitxml reports/security/pytest-results.xml
 
       - name: Run gateway tenant isolation tests
+        env:
+          CRM_DB_AVAILABLE: "1"
         run: |
           mkdir -p reports/security
-          npm test -- --json --outputFile ../reports/security/jest-results.json
+          npm test -- tests/test_rls_enforcement.ts \
+            --json \
+            --outputFile ../reports/security/jest-results.json
         working-directory: gateway
 
       - name: Generate tenant isolation report
