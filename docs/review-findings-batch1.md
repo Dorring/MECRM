@@ -61,10 +61,10 @@
 | P1-3 | `docker-compose.yml:158-165` + `agents/config.py:57` | agents 容器未注入 GATEWAY_URL → 回退 localhost:4000，CrmReader 必失败 | ✅ 已修复（compose agents 环境加 GATEWAY_URL=http://gateway:4000，infra 测试断言） |
 | P1-4 | `docker-compose.yml:48,174,176` | gateway/agents 对 opa/weaviate 用 service_started 而非 service_healthy | 未修复 |
 | P1-5 | `.env.example` | 缺 REPLAY_DATABASE_URL / ENABLE_REPLAY_INGESTOR / GATEWAY_URL / OLLAMA_EMBED_MODEL 等变量 | 未修复 |
-| P1-6 | `database/migrations/10-data-governance.sql:55-56` | RLS policy 用 `current_setting('app.tenant_id', true)::text` 与其他表 `::uuid` 不一致，语义分裂 | 未修复 |
-| P1-7 | `.github/workflows/ci-cd.yml` test-gateway | 仅 prisma migrate deploy，不跑 SQL migrations → CI 测试库无 RLS/event_log/twins 表 | 未修复 |
-| P1-8 | `gateway/prisma/migrations/20260131062707_init` | 文件名暗示初始化，实为 DROP/ALTER/RENAME，误导 | 未修复 |
-| P1-9 | Prisma `TIMESTAMP(3)` vs SQL `timestamptz` | 共享表时间列类型在两轨道间不一致 | 未修复 |
+| P1-6 | `database/migrations/10-data-governance.sql:55-56` | RLS policy 用 `current_setting('app.tenant_id', true)::text` 与其他表 `::uuid` 不一致，语义分裂 | ✅ 已修复（policy 改为 UUID 比较；id 加 `DEFAULT gen_random_uuid()`）见 `hardening/db-migration` |
+| P1-7 | `.github/workflows/ci-cd.yml` test-gateway | 仅 prisma migrate deploy，不跑 SQL migrations → CI 测试库无 RLS/event_log/twins 表 | ✅ 已修复（CI 与 smoke 均执行完整 Prisma→SQL→RLS） |
+| P1-8 | `gateway/prisma/migrations/20260131062707_init` | 文件名暗示初始化，实为 DROP/ALTER/RENAME，误导 | ⏳ 未修复，已明确列入 Group G backlog：补迁移说明/基线策略，不得改写已发布 migration |
+| P1-9 | Prisma `TIMESTAMP(3)` vs SQL `timestamptz` | 共享表时间列类型在两轨道间不一致 | ✅ 已修复（Prisma 字段加 `@db.Timestamptz(6)`；新增 forward migration `20260702000000_timestamptz_convergence`；SQL guard `12-type-convergence.sql`）见 `hardening/db-migration` |
 | P1-10 | `agents/src/agents/base.py:131-157` | data_guard 对无 customerId/userId 的 LLM 衍生事件形同虚设 | 未修复（设计边界，待文档说明） |
 | P1-11 | `agents/tests/test_event_store.py:9` | `from write.db import ...` 破损导入，全量 pytest 收集中断 | ✅ 已修复（sys.path.append core_services/src，collection 通过；DB 不可达时 skip） |
 | P1-12 | `agents/tests/test_i18n.py` | 3 失败：langdetect/fasttext 未在 requirements.txt | ✅ 已修复（requirements.txt 加 langdetect>=1.0.9，fasttext 标可选；24 i18n 用例全通过） |
@@ -75,12 +75,12 @@
 - `gateway/src/index.ts:360-364` — uncaughtException 无法捕获 JWT_SECRET 模块加载期抛错（时序），脱敏日志意图未生效
 - `gateway/src/services/websocket.ts:38-78` — WS 鉴权不查 token 黑名单，注销后 token 仍可建 WS
 - `gateway/src/middleware/auth.ts:52` — 黑名单 key 用整条 token，无法按用户批量撤销
-- `scripts/migrate.sh` / `migrate.ps1` — 无 advisory lock，并发执行竞态
-- `scripts/migrate.sh:190-194` — RLS audit 仅 warn 不 fail，FORCE 缺失不阻断部署
+- `scripts/migrate.sh` / `migrate.ps1` — ✅ 已修复（session-level advisory lock）见 `hardening/db-migration`
+- `scripts/migrate.sh:190-194` — ✅ 已修复（强制 RLS audit；`--audit-warn` 仅开发用）见 `hardening/db-migration`
 - Helm values — opa/weaviate/ollama/monitoring/secrets.keycloak 声明但无模板消费；agents.yaml 硬编码服务名
 - `docker-compose.yml:222` — postgres 挂载 `database/init/01-init.sql.disabled`（地雷文件，RLS 合约错误）
 - `docker-compose.yml:284` — Kafka `AUTO_CREATE_TOPICS_ENABLE=true`（生产反模式）
-- `database/migrations/02-rls-policies.sql` — tenant_tables 数组缺 data_retention_policies
+- `database/migrations/02-rls-policies.sql` — ✅ 已修复（tenant_tables 数组扩展至全部租户表）见 `hardening/db-migration`
 - `agents/src/orchestrator/main.py:162-169` — 非 JSON poison message tenant="" 可能在 DLQ 堆积
 - `agents/src/agents/support.py:96-116` — triage_ticket LLM 输出未强校验（与 suggest_resolution 不一致）
 - `agents/src/orchestrator/router.py:443-464` — forecast 重 emit 的 prediction_type 不在 productivity projector 白名单 → 静默忽略

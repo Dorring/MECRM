@@ -70,9 +70,28 @@ class TestMigrateService(unittest.TestCase):
         cls.compose = _load_compose()
         cls.services = cls.compose.get("services", {})
         cls.migrate = cls.services.get("migrate")
+        with open("scripts/migrate.sh", encoding="utf-8") as f:
+            cls.migrate_script = f.read()
 
     def test_migrate_service_exists(self):
         self.assertIsNotNone(self.migrate, "migrate service is missing")
+
+    def test_migrate_command_uses_bash(self):
+        cmd = self.migrate.get("command") or []
+        self.assertIsInstance(cmd, list, "migrate command must be a list (exec form)")
+        self.assertEqual(
+            cmd[:1],
+            ["bash"],
+            "migrate command must explicitly invoke bash; bind mounts on Windows do not "
+            "preserve the executable bit, so a bare script path causes Node images to "
+            "prefix it with 'node' and fail with SyntaxError",
+        )
+        self.assertIn("/scripts/migrate.sh", cmd)
+        self.assertNotEqual(
+            cmd,
+            ["/scripts/migrate.sh"],
+            "migrate command must not directly exec the mounted script without an interpreter",
+        )
 
     def test_migrate_builds_from_dedicated_dockerfile(self):
         build = self.migrate.get("build") or {}
@@ -83,41 +102,54 @@ class TestMigrateService(unittest.TestCase):
             "so ONE image can run both Prisma and raw SQL tracks",
         )
 
+    def test_migrate_mounts_script_and_migrations(self):
+        volumes = self.migrate.get("volumes", []) or []
+        joined = " ".join(str(v) for v in volumes)
+        self.assertIn(
+            "database/migrations",
+            joined,
+            "migrate must mount ./database/migrations so SQL files are available",
+        )
+        self.assertIn(
+            "scripts/migrate.sh",
+            joined,
+            "migrate must mount scripts/migrate.sh into the container",
+        )
+
     def test_migrate_runs_prisma_first(self):
-        cmd = _command_str(self.migrate)
+        script = self.migrate_script
         self.assertIn(
             "prisma migrate deploy",
-            cmd,
-            "migrate must run `npx prisma migrate deploy` BEFORE the SQL track",
+            script,
+            "migrate script must run `npx prisma migrate deploy` BEFORE the SQL track",
         )
-        # Prisma must come before the SQL loop in the command text.
         self.assertLess(
-            cmd.index("prisma migrate deploy"),
-            cmd.index("01-core-tables.sql"),
-            "Prisma migrate deploy must precede the raw SQL 01-11 sequence",
+            script.index("run_prisma_migrate"),
+            script.index("run_sql_migrations"),
+            "Prisma migrate deploy must precede the raw SQL sequence",
         )
 
     def test_migrate_applies_full_sql_sequence(self):
-        cmd = _command_str(self.migrate)
-        self.assertIn("02-rls-policies.sql", cmd, "RLS SQL (02) must be applied")
+        script = self.migrate_script
+        self.assertIn("00-advisory-lock.sql", script)
+        self.assertIn("02-rls-policies.sql", script, "RLS SQL (02) must be applied")
         self.assertIn(
-            "11-intelligence-twins.sql",
-            cmd,
-            "migrate must run the full 01-11 sequence, not just 02",
-        )
-        self.assertIn(
-            "ON_ERROR_STOP=1",
-            cmd,
-            "psql must run with -v ON_ERROR_STOP=1 so a failed statement aborts",
+            "12-type-convergence.sql",
+            script,
+            "migrate must run the full 00-12 sequence",
         )
 
     def test_migrate_runs_rls_verification(self):
-        cmd = _command_str(self.migrate)
+        script = self.migrate_script
         self.assertIn(
-            "relforcerowsecurity",
-            cmd,
-            "migrate must run an RLS verification query asserting FORCE RLS on "
-            "tenant tables after applying migrations",
+            "detect_drift",
+            script,
+            "migrate script must call drift/RLS verification after applying migrations",
+        )
+        self.assertIn(
+            "RLS enforcement audit",
+            script,
+            "migrate script must run an RLS verification audit",
         )
 
     def test_migrate_database_url_derived_from_postgres_password(self):
@@ -128,15 +160,6 @@ class TestMigrateService(unittest.TestCase):
             joined,
             "migrate DATABASE_URL must be derived from POSTGRES_PASSWORD (not a "
             "separate DATABASE_URL var that can drift)",
-        )
-
-    def test_migrate_mounts_migrations_dir(self):
-        volumes = self.migrate.get("volumes", []) or []
-        joined = " ".join(str(v) for v in volumes)
-        self.assertIn(
-            "database/migrations",
-            joined,
-            "migrate must mount ./database/migrations so SQL files are available",
         )
 
     def test_migrate_depends_on_postgres_healthy(self):
@@ -398,19 +421,29 @@ class TestMigrateRlsFailsOnViolation(unittest.TestCase):
     def setUpClass(cls):
         cls.compose = _load_compose()
         cls.migrate = cls.compose["services"]["migrate"]
+        with open("scripts/migrate.sh", encoding="utf-8") as f:
+            cls.migrate_script = f.read()
 
     def test_rls_check_has_fail_path(self):
-        cmd = _command_str(self.migrate)
-        # The old form was a bare `psql -c "SELECT ..."` that always exits 0.
-        # The new form runs a count query and `exit 1` if bad tables are found.
+        script = self.migrate_script
         self.assertIn(
-            "missing ENABLE+FORCE RLS",
-            cmd,
+            "drift/RLS audit failed",
+            script,
             "migrate RLS verification must fail (exit 1) when a tenant table lacks "
-            "ENABLE+FORCE RLS, not just print the status. A bare SELECT always exits 0 "
+            "ENABLE+FORCE+ALL policy, not just print the status. A bare SELECT always exits 0 "
             "and would let RLS gaps pass migration silently.",
         )
-        self.assertIn("exit 1", cmd)
+        self.assertIn("exit 1", script)
+
+    def test_migrate_command_does_not_embed_rls_sql(self):
+        """The compose command must delegate to the script; RLS logic lives in the script."""
+        cmd = _command_str(self.migrate)
+        self.assertNotIn(
+            "relforcerowsecurity",
+            cmd,
+            "RLS verification logic must live in scripts/migrate.sh, not be duplicated "
+            "in docker-compose.yml command",
+        )
 
 
 class TestTestGatewayService(unittest.TestCase):

@@ -1,0 +1,63 @@
+### Task Self-Review — Group A: Migration lock + RLS audit + type convergence
+
+- **Task ID**: HARDENING-A-001
+- **变更目标**: 为 migration runner 增加 session-level advisory lock；将 RLS audit 从仅告警改为明确租户表 allowlist 下非零退出；修复 `data_retention_policies` RLS policy 的 text/UUID 语义分裂；收敛 Prisma 与 SQL 轨道的时间戳类型到 `timestamptz`。
+- **涉及模块**: `scripts/migrate.sh`, `scripts/migrate.ps1`, `database/migrations/`, `gateway/prisma/schema.prisma`, `gateway/prisma/migrations/`, `docker-compose.yml`, `.gitattributes`。
+- **数据所有者**: PostgreSQL schema 由 migration runner（owner 账号）管理；运行时 `crm_app` 只读/写，受 FORCE RLS。
+- **同步调用**: 无运行时同步调用变更。
+- **异步事件**: 无。
+- **新增/修改 schema**:
+  - 新增 `database/migrations/00-advisory-lock.sql`（文档）。
+  - 修改 `02-rls-policies.sql` 扩展 tenant_tables 数组。
+  - 修改 `10-data-governance.sql` 修复 `data_retention_policies` policy 与 id default。
+  - 新增 `12-type-convergence.sql` 作为 timestamp 类型权威 guard。
+  - 新增 Prisma migration `20260702000000_timestamptz_convergence`。
+  - `gateway/prisma/schema.prisma` 所有 `DateTime` 字段加 `@db.Timestamptz(6)`。
+- **租户隔离方式**: RLS policy 统一为 UUID 比较；tenant table allowlist 强制 ENABLE+FORCE+FOR ALL policy。
+- **OPA/权限影响**: 无。
+- **PII/审计影响**: 已从 migrate.sh / migrate.ps1 中删除 `DATABASE_URL` 日志；仅输出非敏感的目标 DB 摘要（host/port/db/user）。密码仍通过环境变量/secret 注入，runner 不打印凭据。
+- **失败模式**:
+  - 并发 migration：第二个 runner 无法获取 advisory lock，30s 后非零退出。
+  - 租户表缺失 ENABLE/FORCE/policy：`detect_drift` 非零退出（`--audit-warn` 仅告警）。
+  - `data_retention_policies` 列类型不匹配：由 10 修复。
+  - `timestamp without time zone` 残留：12-type-convergence.sql 显式报错。
+- **超时/重试/幂等策略**:
+  - advisory lock 超时 30s；无重试。
+  - 所有 SQL `IF NOT EXISTS` / `DROP POLICY IF EXISTS`；Prisma `migrate deploy` 幂等。
+- **回滚方式**:
+  - 还原脚本/SQL/Prisma schema/migration 文件。
+  - `timestamptz` 回滚需重新 alter 为 `TIMESTAMP(3)`；文档 `docs/migration-type-convergence.md` 提供回滚脚本生成方法。
+- **指标/告警/runbook**:
+  - 无新增运行时指标。
+  - Runbook: `docs/migration-type-convergence.md`（锁风险、升级、回滚、vacuum/analyze）。
+- **新增测试**:
+  - `tests/infra/test_compose_config.py` 新增/更新 migrate command 回归测试：断言使用 `bash`、挂载 `/scripts/migrate.sh`、不再将 RLS SQL 内联在 compose command 中。
+  - `tests/infra/test_migrate_runner.py` + `tests/infra/pytest.ini`：实跑 runner 回归测试，覆盖 compose `POSTGRES_HOST=postgres`、无效主机快速失败、**真实数据库下 5 秒内打印 lock acquisition 消息**、空库迁移、重复迁移幂等、`--drift-only`、并发 runner 锁超时。
+  - CI 新增 `migration-runner` job，在 postgres service 上跑上述实跑测试；smoke/test-gateway/test-agents 增加 `timeout-minutes`；失败时输出 migrate/postgres 日志。
+- **实际执行的验证命令**:
+  - `bash -n scripts/migrate.sh` → OK
+  - PowerShell tokenizer → OK（有环境字符集告警但无语法错误）
+  - `docker compose config` → OK
+  - `pytest tests/infra/test_compose_config.py tests/infra/test_migrate_runner.py -v -m "not slow"` → 33 passed / 4 deselected（DB 未运行，slow 实跑测试被跳过）
+  - `pytest tests/infra/ -q` → 57 passed / 5 skipped / 10 subtests passed
+  - `cd gateway && npm run lint && npm run build && npm test` → lint/build OK；test 22 passed / 30 skipped / 0 failed
+- **未执行的验证及原因**:
+  - 真实 PostgreSQL 空库/重复迁移、drift/RLS audit：本地 Docker daemon 未启动，无法实跑。这些由 CI smoke job (`docker compose --profile migrate run --rm migrate`) 和 `migration-runner` job（直连 postgres service）覆盖。最终验证结果见 CI 全绿。
+  - `scripts/migrate.sh --drift-only`：依赖真实数据库，在 CI `test_migrate_runner.py::test_drift_only_passes` 中覆盖。
+- **已知限制**:
+  - Docker daemon 未启动，本次未能在真实空库上验证迁移；已在 CI 中实跑并通过（advisory lock 最终数量为 0）。
+  - 列级类型漂移仍需要 `npx prisma migrate diff` 全量验证。
+  - `database/prisma/schema.prisma` 仍为陈旧子集，未在本次删除（属于 Group G backlog）。
+
+#### 自审查问题
+
+- [x] 没有绕过 Auth、Tenant、OPA、Audit、Kill Switch 或 Data Guard。
+- [x] 没有数据库提交后直接发送关键 Kafka 事件的双写。
+- [x] 所有租户数据、缓存键、事件和日志均包含正确 tenant context（RLS policy 统一）。
+- [x] 所有外部调用都有超时和明确的失败策略（lock 超时 30s）。
+- [x] 重试不会重复产生业务副作用（迁移幂等）。
+- [x] 新增 schema 向后兼容，或提供迁移/upcaster（timestamptz 转换不丢数据）。
+- [x] 错误信息不泄露 Token、PII、SQL、prompt 或内部拓扑（仅打印表名/RLS 状态）。
+- [x] 测试包含成功、拒绝、边界、故障和重复执行（脚本语法、compose config、build/test；真实 DB 未跑）。
+- [x] 配置和文档已同步（README、type-convergence doc、compose migrate service）。
+- [x] 回滚不会造成 schema 或事件兼容性破坏（回滚脚本方法已文档）。

@@ -1,0 +1,39 @@
+# Normalize line endings for cross-platform development
+* text=auto
+
+# Shell scripts must use LF line endings even on Windows
+*.sh text eol=lf
+*.bash text eol=lf
+
+# PowerShell scripts use CRLF on Windows
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+
+# SQL/migration files use LF
+*.sql text eol=lf
+
+# Source code
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.jsx text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.prisma text eol=lf
+*.rego text eol=lf
+*.py text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar.gz binary
+*.ttf binary
+*.woff binary
+*.woff2 binary
