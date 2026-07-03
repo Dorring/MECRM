@@ -16,6 +16,7 @@ Coverage:
 """
 
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -55,6 +56,76 @@ def db_available(database_url: str):
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"PostgreSQL not available ({exc})")
     return database_url
+
+
+def _psql(database_url: str, *, app_name: str = "mecrm-test", sql: str) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    env["DATABASE_URL"] = database_url
+    env["PGAPPNAME"] = app_name
+    return subprocess.run(
+        ["psql", database_url, "-At", "-c", sql],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+def _any_lock_holder(database_url: str) -> str:
+    """Return diagnostic text if advisory lock 405011 is held; empty string if free."""
+    result = _psql(
+        database_url,
+        app_name="mecrm-test-lock-inspector",
+        sql="SELECT a.pid || ':' || a.application_name || ':' || a.state "
+            "FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid "
+            "WHERE l.locktype = 'advisory' AND l.objid = 405011",
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+@pytest.fixture(autouse=True)
+def ensure_no_leaked_lock(database_url: str):
+    """Function-scoped autouse fixture: assert advisory lock 405011 is free before/after test.
+
+    If psql is unavailable (no PostgreSQL client installed), silently passes.
+    """
+    try:
+        lock_before = _any_lock_holder(database_url)
+    except Exception:
+        return  # psql not available; skip lock check
+    if lock_before:
+        try:
+            diag = _psql(database_url, app_name="mecrm-test-diag",
+                         sql="SELECT a.pid, a.application_name, a.state, a.query, l.granted "
+                             "FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid "
+                             "WHERE l.locktype = 'advisory' AND l.objid = 405011")
+            diag_text = diag.stdout if diag.returncode == 0 else diag.stderr
+        except Exception as e:
+            diag_text = str(e)
+        pytest.fail(
+            f"Advisory lock 405011 held before test — previous test leaked a lock holder.\n"
+            f"Lock info: {lock_before}\n"
+            f"Diagnostics:\n{diag_text}"
+        )
+    yield
+    try:
+        lock_after = _any_lock_holder(database_url)
+    except Exception:
+        return
+    if lock_after:
+        try:
+            diag = _psql(database_url, app_name="mecrm-test-diag",
+                         sql="SELECT a.pid, a.application_name, a.state, a.query, l.granted "
+                             "FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid "
+                             "WHERE l.locktype = 'advisory' AND l.objid = 405011")
+            diag_text = diag.stdout if diag.returncode == 0 else diag.stderr
+        except Exception as e:
+            diag_text = str(e)
+        pytest.fail(
+            f"Advisory lock 405011 held after test — runner cleanup did not release.\n"
+            f"Lock info: {lock_after}\n"
+            f"Diagnostics:\n{diag_text}"
+        )
 
 
 def _run_migrate(
@@ -210,21 +281,46 @@ class TestRunnerWithDatabase:
 
     def test_concurrent_runner_times_out(self, db_available: str):
         """Second runner must timeout while first holds lock; third succeeds after first exits."""
-        # Hold the lock for only 10 seconds so the test finishes quickly.
         hold_env = {"MIGRATE_LOCK_HOLD_SECONDS": "10"}
+
+        first_env = os.environ.copy()
+        first_env["DATABASE_URL"] = db_available
+        first_env["MIGRATE_LOCK_HOLD_SECONDS"] = "10"
+        first_env.setdefault("POSTGRES_USER", os.environ.get("POSTGRES_USER", "crm_user"))
+        first_env.setdefault("POSTGRES_PASSWORD", os.environ.get("POSTGRES_PASSWORD", "crm_password"))
+        first_env.setdefault("POSTGRES_HOST", os.environ.get("POSTGRES_HOST", "localhost"))
+        first_env.setdefault("POSTGRES_PORT", os.environ.get("POSTGRES_PORT", "5432"))
+        first_env.setdefault("POSTGRES_DB", os.environ.get("POSTGRES_DB", "enterprise_crm"))
+        first_env.setdefault("GATEWAY_DIR", str(REPO_ROOT / "gateway"))
 
         first = subprocess.Popen(
             ["bash", str(MIGRATE_SH)],
             cwd=str(REPO_ROOT),
-            env={**os.environ, "DATABASE_URL": db_available, **hold_env},
+            env=first_env,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
         )
 
         try:
-            # Give the first runner time to acquire the advisory lock.
-            time.sleep(3)
+            # Wait for the first runner to acquire the lock (print LOCK_ACQUIRED:<pid>).
+            deadline = time.monotonic() + 30
+            marker_found = False
+            pid_extracted = None
+            while time.monotonic() < deadline:
+                line = first.stdout.readline()
+                if not line:
+                    break
+                m = re.search(r"LOCK_ACQUIRED:(\d+)", line)
+                if m:
+                    marker_found = True
+                    pid_extracted = m.group(1)
+                    break
+            assert marker_found, (
+                f"First runner did not emit LOCK_ACQUIRED:<pid> within 30s.\n"
+                f"Remaining stdout:\n{first.stdout.read()}"
+            )
+            print(f"First runner acquired lock (backend pid={pid_extracted}), starting second")
 
             second = _run_migrate(
                 database_url=db_available,
@@ -237,8 +333,8 @@ class TestRunnerWithDatabase:
             )
             assert (
                 "failed to acquire advisory lock" in second.stderr
-                or "another migration" in second.stderr.lower()
-            )
+                or "failed to acquire advisory lock" in second.stdout
+            ), f"Second runner error did not mention lock failure:\n{second.stderr}"
         finally:
             first.wait(timeout=30)
 

@@ -133,7 +133,7 @@ jobs:
       - name: Apply migrations via single runner
         run: |
           sudo apt-get update && sudo apt-get install -y postgresql-client
-          ./scripts/migrate.sh
+          bash ./scripts/migrate.sh
         env:
           DATABASE_URL: postgresql://test:test@localhost:5432/test_db
           POSTGRES_USER: test
@@ -192,7 +192,7 @@ jobs:
       - name: Apply migrations via single runner
         run: |
           sudo apt-get update && sudo apt-get install -y postgresql-client
-          ./scripts/migrate.sh
+          bash ./scripts/migrate.sh
         env:
           DATABASE_URL: postgresql://test:test@localhost:5432/test_db
           POSTGRES_USER: test
@@ -284,6 +284,10 @@ jobs:
       - name: Show diagnostics on failure
         if: failure()
         run: |
+          echo "--- pg_stat_activity advisory locks ---"
+          psql "$DATABASE_URL" -c "SELECT a.pid, a.application_name, a.state, a.query, l.granted FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid WHERE l.locktype = 'advisory' AND l.objid = 405011;" || true
+          echo "--- pg_stat_activity mecrm-migration-lock backends ---"
+          psql "$DATABASE_URL" -c "SELECT pid, state, query FROM pg_stat_activity WHERE application_name = 'mecrm-migration-lock';" || true
           echo "--- migrate runner output not captured per-test; rerun manually ---"
 
   # Compose config validation and local smoke test.

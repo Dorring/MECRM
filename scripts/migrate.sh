@@ -136,13 +136,66 @@ require() {
 # ---------------------------------------------------------------------------
 LOCK_PID=""
 LOCK_OUT=""
+LOCK_BACKEND_PID=""
 LOCK_HOLD_SECONDS="${MIGRATE_LOCK_HOLD_SECONDS:-3600}"
 
+_psql() {
+  PGPASSWORD="${POSTGRES_PASSWORD}" PGAPPNAME="${1:-mecrm-migration}" psql \
+    -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT}" \
+    -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+    "${@:2}"
+}
+
 cleanup_lock() {
+  # 1. Terminate the local psql client process with escalating signals.
   if [[ -n "${LOCK_PID:-}" ]] && kill -0 "${LOCK_PID}" 2>/dev/null; then
-    kill "${LOCK_PID}" 2>/dev/null || true
-    wait "${LOCK_PID}" 2>/dev/null || true
+    kill -TERM "${LOCK_PID}" 2>/dev/null || true
+    local waited=0
+    while [[ ${waited} -lt 20 ]] && kill -0 "${LOCK_PID}" 2>/dev/null; do
+      sleep 0.25
+      waited=$((waited + 1))
+    done
+    if kill -0 "${LOCK_PID}" 2>/dev/null; then
+      kill -KILL "${LOCK_PID}" 2>/dev/null || true
+      wait "${LOCK_PID}" 2>/dev/null || true
+    fi
   fi
+
+  # 2. If we know the database backend PID, verify it is gone and terminate only
+  #    that specific backend if needed. Never mass-kill by LOCK_KEY.
+  if [[ -n "${LOCK_BACKEND_PID:-}" ]]; then
+    local db_backend_still
+    db_backend_still=$(_psql mecrm-migration-cleanup -At \
+      -c "SELECT 1 FROM pg_stat_activity WHERE pid = ${LOCK_BACKEND_PID} AND application_name = 'mecrm-migration-lock'" 2>/dev/null || true)
+
+    if [[ "${db_backend_still}" == "1" ]]; then
+      warn "terminating lingering migration lock backend pid=${LOCK_BACKEND_PID}"
+      _psql mecrm-migration-cleanup -At \
+        -c "SELECT pg_terminate_backend(${LOCK_BACKEND_PID})" >/dev/null 2>&1 || true
+
+      local waited=0
+      while [[ ${waited} -lt 40 ]]; do
+        db_backend_still=$(_psql mecrm-migration-cleanup -At \
+          -c "SELECT 1 FROM pg_stat_activity WHERE pid = ${LOCK_BACKEND_PID} AND application_name = 'mecrm-migration-lock'" 2>/dev/null || true)
+        [[ "${db_backend_still}" != "1" ]] && break
+        sleep 0.25
+        waited=$((waited + 1))
+      done
+
+      if [[ "${db_backend_still}" == "1" ]]; then
+        err "backend pid=${LOCK_BACKEND_PID} still exists after pg_terminate_backend"
+      fi
+    fi
+  fi
+
+  # 3. Defensive verification: no advisory-lock holder with our app name remains.
+  local lock_still
+  lock_still=$(_psql mecrm-migration-cleanup -At \
+    -c "SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid WHERE l.locktype = 'advisory' AND l.objid = ${LOCK_KEY} AND a.application_name = 'mecrm-migration-lock'" 2>/dev/null || true)
+  if [[ "${lock_still}" == "1" ]]; then
+    warn "advisory lock ${LOCK_KEY} still held by a mecrm-migration-lock backend after cleanup"
+  fi
+
   if [[ -n "${LOCK_OUT:-}" && -e "${LOCK_OUT}" ]]; then
     rm -f "${LOCK_OUT}"
   fi
@@ -159,7 +212,7 @@ acquire_and_hold_lock() {
   # confirmation marker *after* the lock is acquired and statement_timeout is
   # cleared, but *before* the long pg_sleep hold. A single -c would batch all
   # statements and only return after pg_sleep completes, hiding the marker.
-  PGPASSWORD="${POSTGRES_PASSWORD}" stdbuf -oL -eL psql \
+  PGPASSWORD="${POSTGRES_PASSWORD}" PGAPPNAME=mecrm-migration-lock stdbuf -oL -eL psql \
     -v ON_ERROR_STOP=1 \
     -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT}" \
     -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
@@ -167,7 +220,7 @@ acquire_and_hold_lock() {
 SET statement_timeout = '${LOCK_TIMEOUT_SECONDS}s';
 SELECT pg_advisory_lock(${LOCK_KEY});
 SET statement_timeout = '0';
-\echo LOCK_ACQUIRED
+SELECT 'LOCK_ACQUIRED:' || pg_backend_pid();
 SELECT pg_sleep(${LOCK_HOLD_SECONDS});
 SQL
 
@@ -189,9 +242,14 @@ SQL
       exit 1
     fi
 
-    if [[ -f "${LOCK_OUT}" ]] && grep -q "LOCK_ACQUIRED" "${LOCK_OUT}" 2>/dev/null; then
-      acquired=1
-      break
+    if [[ -f "${LOCK_OUT}" ]]; then
+      local marker
+      marker=$(grep -oE 'LOCK_ACQUIRED:[0-9]+' "${LOCK_OUT}" 2>/dev/null | tail -n1 || true)
+      if [[ -n "${marker}" ]]; then
+        LOCK_BACKEND_PID="${marker#LOCK_ACQUIRED:}"
+        acquired=1
+        break
+      fi
     fi
 
     sleep 0.25
@@ -203,7 +261,7 @@ SQL
     exit 1
   fi
 
-  log "advisory lock acquired and held (pid=${LOCK_PID})"
+  log "advisory lock acquired and held (local pid=${LOCK_PID}, backend pid=${LOCK_BACKEND_PID})"
 }
 
 run_prisma_migrate() {

@@ -135,12 +135,53 @@ function Require-Tool([string]$Name) {
 # ---------------------------------------------------------------------------
 $LockProcess = $null
 $LockOutputFile = $null
+$LockErrorFile = $null
+$LockSqlFile = $null
+$LockBackendPid = $null
+
+function Invoke-Psql {
+  param(
+    [string]$AppName = 'mecrm-migration',
+    [Parameter(ValueFromRemainingArguments=$true)]$Arguments
+  )
+  $env:PGPASSWORD = $env:POSTGRES_PASSWORD
+  $env:PGAPPNAME = $AppName
+  return & psql @Arguments
+}
 
 function Clear-Lock {
+  # 1. Terminate the local psql client process.
   if ($script:LockProcess -and -not $script:LockProcess.HasExited) {
     $script:LockProcess | Stop-Process -Force -ErrorAction SilentlyContinue
     $null = $script:LockProcess.WaitForExit(5000)
   }
+
+  # 2. If we know the database backend PID, verify it is gone and terminate only
+  #    that specific backend if needed.
+  if ($script:LockBackendPid) {
+    $still = Invoke-Psql -AppName mecrm-migration-cleanup -Arguments '-At', '-c', "SELECT 1 FROM pg_stat_activity WHERE pid = $($script:LockBackendPid) AND application_name = 'mecrm-migration-lock'" 2>$null
+    if ($still -eq '1') {
+      Write-Warn2 "terminating lingering migration lock backend pid=$($script:LockBackendPid)"
+      Invoke-Psql -AppName mecrm-migration-cleanup -Arguments '-At', '-c', "SELECT pg_terminate_backend($($script:LockBackendPid))" >$null 2>&1
+      $waited = 0
+      while ($waited -lt 40) {
+        $still = Invoke-Psql -AppName mecrm-migration-cleanup -Arguments '-At', '-c', "SELECT 1 FROM pg_stat_activity WHERE pid = $($script:LockBackendPid) AND application_name = 'mecrm-migration-lock'" 2>$null
+        if ($still -ne '1') { break }
+        Start-Sleep -Milliseconds 250
+        $waited++
+      }
+      if ($still -eq '1') {
+        Write-Err2 "backend pid=$($script:LockBackendPid) still exists after pg_terminate_backend"
+      }
+    }
+  }
+
+  # 3. Defensive verification: no advisory-lock holder with our app name remains.
+  $lockStill = Invoke-Psql -AppName mecrm-migration-cleanup -Arguments '-At', '-c', "SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid WHERE l.locktype = 'advisory' AND l.objid = $LockKey AND a.application_name = 'mecrm-migration-lock'" 2>$null
+  if ($lockStill -eq '1') {
+    Write-Warn2 "advisory lock $LockKey still held by a mecrm-migration-lock backend after cleanup"
+  }
+
   if ($script:LockOutputFile -and (Test-Path $script:LockOutputFile)) {
     Remove-Item $script:LockOutputFile -Force -ErrorAction SilentlyContinue
   }
@@ -170,21 +211,20 @@ function Lock-Held {
 SET statement_timeout = '${LockTimeoutSeconds}s';
 SELECT pg_advisory_lock($LockKey);
 SET statement_timeout = '0';
-\echo LOCK_ACQUIRED
+SELECT 'LOCK_ACQUIRED:' || pg_backend_pid();
 SELECT pg_sleep($holdSeconds);
 "@ | Set-Content -Path $script:LockSqlFile -Encoding UTF8 -NoNewline
 
-  $argList = @(
+  $env:PGPASSWORD = $env:POSTGRES_PASSWORD
+  $env:PGAPPNAME = 'mecrm-migration-lock'
+  $script:LockProcess = Start-Process -FilePath 'psql' -ArgumentList @(
     '-v', 'ON_ERROR_STOP=1',
     '-h', $env:POSTGRES_HOST,
     '-p', $env:POSTGRES_PORT,
     '-U', $env:POSTGRES_USER,
     '-d', $env:POSTGRES_DB,
     '-f', $script:LockSqlFile
-  )
-  $env:PGPASSWORD = $env:POSTGRES_PASSWORD
-  $script:LockProcess = Start-Process -FilePath 'psql' -ArgumentList $argList `
-    -RedirectStandardOutput $script:LockOutputFile `
+  ) -RedirectStandardOutput $script:LockOutputFile `
     -RedirectStandardError  $script:LockErrorFile `
     -NoNewWindow -PassThru
 
@@ -206,9 +246,13 @@ SELECT pg_sleep($holdSeconds);
 
     if (Test-Path $script:LockOutputFile) {
       $content = Get-Content $script:LockOutputFile -Raw -ErrorAction SilentlyContinue
-      if ($content -and $content.Contains('LOCK_ACQUIRED')) {
-        $acquired = $true
-        break
+      if ($content) {
+        $match = [regex]::Match($content, 'LOCK_ACQUIRED:(\d+)')
+        if ($match.Success) {
+          $script:LockBackendPid = $match.Groups[1].Value
+          $acquired = $true
+          break
+        }
       }
     }
     Start-Sleep -Milliseconds 250
@@ -221,7 +265,7 @@ SELECT pg_sleep($holdSeconds);
     exit 1
   }
 
-  Write-Log "advisory lock acquired and held (pid=$($LockProcess.Id))"
+  Write-Log "advisory lock acquired and held (local pid=$($LockProcess.Id), backend pid=$($script:LockBackendPid))"
 }
 
 function Invoke-PrismaMigrate {
@@ -260,11 +304,7 @@ function Invoke-DriftDetection {
     ForEach-Object { $_.Groups[1].Value } |
     Sort-Object -Unique
 
-  $env:PGPASSWORD = $env:POSTGRES_PASSWORD
-  $dbTables = & psql -At `
-    -h $env:POSTGRES_HOST -p $env:POSTGRES_PORT `
-    -U $env:POSTGRES_USER -d $env:POSTGRES_DB `
-    -c "SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY 1;"
+  $dbTables = Invoke-Psql -AppName mecrm-migration-cleanup -Arguments '-At', '-c', "SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY 1;"
   if ($LASTEXITCODE -ne 0) { Write-Warn2 "could not query information_schema; skipping drift"; return }
   $dbTables = $dbTables | Where-Object { $_ } | Sort-Object -Unique
 
@@ -309,10 +349,7 @@ function Invoke-DriftDetection {
     WHERE NOT (enabled AND forced AND has_all_policy)
     ORDER BY relname;
 "@
-  $rlsIssues = & psql -At `
-    -h $env:POSTGRES_HOST -p $env:POSTGRES_PORT `
-    -U $env:POSTGRES_USER -d $env:POSTGRES_DB `
-    -c $rlsQuery 2>$null
+  $rlsIssues = Invoke-Psql -AppName mecrm-migration-cleanup -Arguments '-At', '-c', $rlsQuery 2>$null
 
   $rlsFailed = 0
   if ($rlsIssues) { $rlsIssues | ForEach-Object { Write-Host "  $_" }; $rlsFailed = 1 }
