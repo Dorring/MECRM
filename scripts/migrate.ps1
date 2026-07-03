@@ -146,7 +146,10 @@ function Invoke-Psql {
   )
   $env:PGPASSWORD = $env:POSTGRES_PASSWORD
   $env:PGAPPNAME = $AppName
-  return & psql @Arguments
+  return & psql `
+    -h $env:POSTGRES_HOST -p $env:POSTGRES_PORT `
+    -U $env:POSTGRES_USER -d $env:POSTGRES_DB `
+    @Arguments
 }
 
 function Clear-Lock {

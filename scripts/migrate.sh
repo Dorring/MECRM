@@ -262,6 +262,7 @@ SQL
   fi
 
   log "advisory lock acquired and held (local pid=${LOCK_PID}, backend pid=${LOCK_BACKEND_PID})"
+  log "LOCK_ACQUIRED:${LOCK_BACKEND_PID}"
 }
 
 run_prisma_migrate() {

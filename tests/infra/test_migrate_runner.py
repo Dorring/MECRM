@@ -85,14 +85,15 @@ def _any_lock_holder(database_url: str) -> str:
 
 @pytest.fixture(autouse=True)
 def ensure_no_leaked_lock(database_url: str):
-    """Function-scoped autouse fixture: assert advisory lock 405011 is free before/after test.
-
-    If psql is unavailable (no PostgreSQL client installed), silently passes.
-    """
+    """Assert advisory lock 405011 is free before/after each test."""
     try:
         lock_before = _any_lock_holder(database_url)
-    except Exception:
-        return  # psql not available; skip lock check
+    except FileNotFoundError:
+        yield
+        return
+    except Exception as exc:
+        pytest.fail(f"psql error in lock-before check: {exc}")
+        return
     if lock_before:
         try:
             diag = _psql(database_url, app_name="mecrm-test-diag",
@@ -103,13 +104,15 @@ def ensure_no_leaked_lock(database_url: str):
         except Exception as e:
             diag_text = str(e)
         pytest.fail(
-            f"Advisory lock 405011 held before test — previous test leaked a lock holder.\n"
+            f"Advisory lock 405011 held before test.\n"
             f"Lock info: {lock_before}\n"
             f"Diagnostics:\n{diag_text}"
         )
     yield
     try:
         lock_after = _any_lock_holder(database_url)
+    except FileNotFoundError:
+        return
     except Exception:
         return
     if lock_after:
@@ -224,18 +227,18 @@ class TestRunnerWithDatabase:
         )
 
         try:
-            start = time.monotonic()
+            deadline = time.monotonic() + 5
             found = False
-            while time.monotonic() - start < 5:
+            while time.monotonic() < deadline:
                 line = proc.stdout.readline()
                 if not line:
                     break
-                if "advisory lock acquired and held" in line:
+                if "LOCK_ACQUIRED:" in line:
                     found = True
                     break
 
             assert found, (
-                "Runner did not print 'advisory lock acquired and held' within 5s; "
+                "Runner did not print 'LOCK_ACQUIRED:<pid>' within 5s; "
                 "the lock marker may be hidden by batched psql output."
             )
 
@@ -280,67 +283,63 @@ class TestRunnerWithDatabase:
         assert "all tenant tables have ENABLE+FORCE+ALL policy" in result.stdout
 
     def test_concurrent_runner_times_out(self, db_available: str):
-        """Second runner must timeout while first holds lock; third succeeds after first exits."""
-        hold_env = {"MIGRATE_LOCK_HOLD_SECONDS": "10"}
+        """Second runner must timeout while an independent holder holds the lock.
 
-        first_env = os.environ.copy()
-        first_env["DATABASE_URL"] = db_available
-        first_env["MIGRATE_LOCK_HOLD_SECONDS"] = "10"
-        first_env.setdefault("POSTGRES_USER", os.environ.get("POSTGRES_USER", "crm_user"))
-        first_env.setdefault("POSTGRES_PASSWORD", os.environ.get("POSTGRES_PASSWORD", "crm_password"))
-        first_env.setdefault("POSTGRES_HOST", os.environ.get("POSTGRES_HOST", "localhost"))
-        first_env.setdefault("POSTGRES_PORT", os.environ.get("POSTGRES_PORT", "5432"))
-        first_env.setdefault("POSTGRES_DB", os.environ.get("POSTGRES_DB", "enterprise_crm"))
-        first_env.setdefault("GATEWAY_DIR", str(REPO_ROOT / "gateway"))
-
-        first = subprocess.Popen(
-            ["bash", str(MIGRATE_SH)],
-            cwd=str(REPO_ROOT),
-            env=first_env,
+        An independent psql session holds the advisory lock for longer than the
+        runner's LOCK_TIMEOUT_SECONDS (30s), so the second runner deterministically
+        times out regardless of the first's runtime. After killing the holder, a
+        third runner must succeed.
+        """
+        # Start an independent psql holder that holds lock 405011 for 45s.
+        holder_sql = (
+            "SELECT pg_advisory_lock(405011);\n"
+            "\\echo LOCK_ACQUIRED\n"
+            "SELECT pg_sleep(45);\n"
+        )
+        holder = subprocess.Popen(
+            ["psql", db_available, "-v", "ON_ERROR_STOP=1", "-f", "-"],
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
         )
+        holder.stdin.write(holder_sql)
+        holder.stdin.close()
 
-        try:
-            # Wait for the first runner to acquire the lock (print LOCK_ACQUIRED:<pid>).
-            deadline = time.monotonic() + 30
-            marker_found = False
-            pid_extracted = None
-            while time.monotonic() < deadline:
-                line = first.stdout.readline()
-                if not line:
-                    break
-                m = re.search(r"LOCK_ACQUIRED:(\d+)", line)
-                if m:
-                    marker_found = True
-                    pid_extracted = m.group(1)
-                    break
-            assert marker_found, (
-                f"First runner did not emit LOCK_ACQUIRED:<pid> within 30s.\n"
-                f"Remaining stdout:\n{first.stdout.read()}"
-            )
-            print(f"First runner acquired lock (backend pid={pid_extracted}), starting second")
+        # Wait for holder to acquire the lock.
+        deadline = time.monotonic() + 15
+        acquired = False
+        while time.monotonic() < deadline:
+            line = holder.stdout.readline()
+            if "LOCK_ACQUIRED" in line:
+                acquired = True
+                break
+        assert acquired, "Independent lock holder did not acquire lock in time"
 
-            second = _run_migrate(
-                database_url=db_available,
-                extra_env=hold_env,
-                timeout=45,
-            )
-            assert second.returncode != 0, (
-                "Second concurrent runner should have timed out, but it exited 0.\n"
-                f"stdout:\n{second.stdout}\nstderr:\n{second.stderr}"
-            )
-            assert (
-                "failed to acquire advisory lock" in second.stderr
-                or "failed to acquire advisory lock" in second.stdout
-            ), f"Second runner error did not mention lock failure:\n{second.stderr}"
-        finally:
-            first.wait(timeout=30)
+        # Second runner must time out within 30+5s.
+        second = _run_migrate(
+            database_url=db_available,
+            timeout=40,
+        )
+        assert second.returncode != 0, (
+            "Second concurrent runner should have timed out "
+            f"(holder holds lock), but exited 0.\n{second.stdout}\n{second.stderr}"
+        )
+        assert (
+            "failed to acquire advisory lock" in second.stderr
+            or "failed to acquire advisory lock" in second.stdout
+        ), f"Second runner did not mention lock failure:\n{second.stderr}"
 
-        assert first.returncode == 0, (
-            f"First runner failed unexpectedly:\nstdout:\n{first.stdout.read()}\n"
-            f"stderr:\n{first.stderr.read()}"
+        # Kill the independent holder.
+        holder.kill()
+        holder.wait(timeout=5)
+
+    def test_runner_succeeds_after_lock_released(self, db_available: str):
+        """After a lock holder exits, a new runner should succeed."""
+        # Verify that the autouse fixture already asserts no leaked lock.
+        third = _run_migrate(database_url=db_available, timeout=180)
+        assert third.returncode == 0, (
+            f"Third runner failed after lock released:\n{third.stdout}\n{third.stderr}"
         )
 
         # After the first runner released the lock, a third runner should succeed.
