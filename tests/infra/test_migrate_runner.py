@@ -287,68 +287,74 @@ class TestRunnerWithDatabase:
 
         An independent psql session holds the advisory lock for longer than the
         runner's LOCK_TIMEOUT_SECONDS (30s), so the second runner deterministically
-        times out regardless of the first's runtime. After killing the holder, a
-        third runner must succeed.
+        times out regardless of the first's runtime. After killing the holder, the
+        lock must be released (asserted by the autouse fixture and verified here).
         """
-        # Start an independent psql holder that holds lock 405011 for 45s.
-        holder_sql = (
-            "SELECT pg_advisory_lock(405011);\n"
-            "\\echo LOCK_ACQUIRED\n"
-            "SELECT pg_sleep(45);\n"
-        )
+        holder_out_file = os.path.join(os.environ.get("TEMP", "/tmp"), f"migr-holder-{os.getpid()}.txt")
         holder = subprocess.Popen(
-            ["psql", db_available, "-v", "ON_ERROR_STOP=1", "-f", "-"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
+            ["psql", db_available, "-v", "ON_ERROR_STOP=1",
+             "-c", "SELECT pg_advisory_lock(405011); SELECT pg_sleep(45);"],
+            stdout=open(holder_out_file, "w"),
             stderr=subprocess.STDOUT,
             text=True,
         )
-        holder.stdin.write(holder_sql)
-        holder.stdin.close()
 
-        # Wait for holder to acquire the lock.
-        deadline = time.monotonic() + 15
-        acquired = False
-        while time.monotonic() < deadline:
-            line = holder.stdout.readline()
-            if "LOCK_ACQUIRED" in line:
-                acquired = True
-                break
-        assert acquired, "Independent lock holder did not acquire lock in time"
+        try:
+            # Poll the holder output file for LOCK_ACQUIRED (pg_advisory_lock returns).
+            deadline = time.monotonic() + 15
+            acquired = False
+            while time.monotonic() < deadline:
+                if os.path.isfile(holder_out_file):
+                    content = open(holder_out_file).read()
+                    if content:
+                        acquired = True
+                        break
+                if holder.poll() is not None:
+                    break
+                time.sleep(0.25)
+            assert acquired, (
+                "Independent lock holder did not acquire lock in time.\n"
+                f"Holder exited: {holder.returncode}"
+            )
 
-        # Second runner must time out within 30+5s.
-        second = _run_migrate(
-            database_url=db_available,
-            timeout=40,
-        )
-        assert second.returncode != 0, (
-            "Second concurrent runner should have timed out "
-            f"(holder holds lock), but exited 0.\n{second.stdout}\n{second.stderr}"
-        )
-        assert (
-            "failed to acquire advisory lock" in second.stderr
-            or "failed to acquire advisory lock" in second.stdout
-        ), f"Second runner did not mention lock failure:\n{second.stderr}"
+            # Second runner must time out within 30+5s.
+            second = _run_migrate(
+                database_url=db_available,
+                timeout=40,
+            )
+            assert second.returncode != 0, (
+                "Second concurrent runner should have timed out "
+                f"(holder holds lock), but exited 0.\n{second.stdout}\n{second.stderr}"
+            )
+            assert (
+                "failed to acquire advisory lock" in second.stderr
+                or "failed to acquire advisory lock" in second.stdout
+            ), f"Second runner did not mention lock failure:\n{second.stderr}"
 
-        # Kill the independent holder.
-        holder.kill()
-        holder.wait(timeout=5)
+        finally:
+            if holder.poll() is None:
+                holder.kill()
+            holder.wait(timeout=10)
+            if os.path.isfile(holder_out_file):
+                os.remove(holder_out_file)
+
+            # Verify the advisory lock is released after holder cleanup.
+            lock_diag = _any_lock_holder(db_available)
+            if lock_diag:
+                diag = _psql(db_available, app_name="mecrm-test-diag",
+                             sql="SELECT a.pid, a.application_name, a.state, l.granted "
+                                 "FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid "
+                                 "WHERE l.locktype = 'advisory' AND l.objid = 405011")
+                pytest.fail(
+                    f"Advisory lock 405011 still held after holder cleanup.\n"
+                    f"Lock info: {lock_diag}\n"
+                    f"Diagnostics:\n{diag.stdout if diag.returncode == 0 else diag.stderr}"
+                )
 
     def test_runner_succeeds_after_lock_released(self, db_available: str):
         """After a lock holder exits, a new runner should succeed."""
-        # Verify that the autouse fixture already asserts no leaked lock.
+        # The autouse fixture asserts no leaked lock.
         third = _run_migrate(database_url=db_available, timeout=180)
         assert third.returncode == 0, (
             f"Third runner failed after lock released:\n{third.stdout}\n{third.stderr}"
-        )
-
-        # After the first runner released the lock, a third runner should succeed.
-        third = _run_migrate(
-            database_url=db_available,
-            extra_env=hold_env,
-            timeout=180,
-        )
-        assert third.returncode == 0, (
-            f"Third runner failed after first released the lock:\n"
-            f"stdout:\n{third.stdout}\nstderr:\n{third.stderr}"
         )

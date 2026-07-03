@@ -236,12 +236,22 @@ SELECT pg_sleep($holdSeconds);
   while ($sw.Elapsed.TotalSeconds -lt ($LockTimeoutSeconds + 5)) {
     # If the lock-holder exited before we saw LOCK_ACQUIRED, fail fast.
     if ($script:LockProcess.HasExited) {
-      Write-Err2 "lock-holder psql exited before lock acquisition"
+      # Collect lock-holder output for analysis.
+      $lockOutput = ""
       if (Test-Path $script:LockOutputFile) {
-        Get-Content $script:LockOutputFile | ForEach-Object { Write-Err2 "  $_" }
+        $lockOutput = Get-Content $script:LockOutputFile -Raw -ErrorAction SilentlyContinue
       }
       if (Test-Path $script:LockErrorFile) {
-        Get-Content $script:LockErrorFile | ForEach-Object { Write-Err2 "  $_" }
+        $lockOutput += Get-Content $script:LockErrorFile -Raw -ErrorAction SilentlyContinue
+      }
+      # Detect statement_timeout (another migration held the lock) -> stable error.
+      if ($lockOutput -match "canceling statement due to statement timeout") {
+        Write-Err2 "failed to acquire advisory lock within ${LockTimeoutSeconds}s (another migration may be running)"
+      } else {
+        Write-Err2 "lock-holder psql exited before lock acquisition"
+      }
+      if ($lockOutput) {
+        $lockOutput.Split("`n") | ForEach-Object { Write-Err2 "  $_" }
       }
       Clear-Lock
       exit 1

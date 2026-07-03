@@ -233,10 +233,19 @@ SQL
     # If the lock-holder exited before we saw LOCK_ACQUIRED, something failed
     # (wrong host, auth error, another lock holder blocking past statement_timeout).
     if ! kill -0 "${LOCK_PID}" 2>/dev/null; then
-      err "lock-holder psql exited before lock acquisition"
-      if [[ -s "${LOCK_OUT}" ]]; then
+      local holder_output=""
+      [[ -s "${LOCK_OUT}" ]] && holder_output=$(cat "${LOCK_OUT}")
+      # Detect whether the lock-holder exited because PostgreSQL enforced the
+      # statement_timeout (i.e. another migration held the lock).  Map this to
+      # a stable error message rather than leaking the raw PostgreSQL text.
+      if echo "${holder_output}" | grep -qi "canceling statement due to statement timeout" 2>/dev/null; then
+        err "failed to acquire advisory lock within ${LOCK_TIMEOUT_SECONDS}s (another migration may be running)"
+      else
+        err "lock-holder psql exited before lock acquisition"
+      fi
+      if [[ -n "${holder_output}" ]]; then
         err "lock-holder output:"
-        sed 's/^/  /' "${LOCK_OUT}" >&2
+        echo "${holder_output}" | sed 's/^/  /' >&2
       fi
       cleanup_lock
       exit 1
