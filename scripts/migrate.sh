@@ -153,25 +153,24 @@ acquire_and_hold_lock() {
   log "acquiring session-level advisory lock (key=${LOCK_KEY}, timeout=${LOCK_TIMEOUT_SECONDS}s)"
 
   LOCK_OUT="$(mktemp /tmp/migrate-lock.XXXXXX)"
-  local lock_sql
-  lock_sql=$(cat <<SQL
+
+  # Start a background psql session that holds the advisory lock.
+  # Statements are fed via stdin so each returns independently; \echo emits the
+  # confirmation marker *after* the lock is acquired and statement_timeout is
+  # cleared, but *before* the long pg_sleep hold. A single -c would batch all
+  # statements and only return after pg_sleep completes, hiding the marker.
+  PGPASSWORD="${POSTGRES_PASSWORD}" stdbuf -oL -eL psql \
+    -v ON_ERROR_STOP=1 \
+    -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT}" \
+    -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+    >"${LOCK_OUT}" 2>&1 <<SQL &
 SET statement_timeout = '${LOCK_TIMEOUT_SECONDS}s';
 SELECT pg_advisory_lock(${LOCK_KEY});
-SELECT 'LOCK_ACQUIRED' AS status;
 SET statement_timeout = '0';
+\echo LOCK_ACQUIRED
 SELECT pg_sleep(${LOCK_HOLD_SECONDS});
 SQL
-)
 
-  # Start a background psql that holds the lock for the configured duration.
-  # stdbuf -oL -eL ensures line-buffered output so we can poll the temp file.
-  (
-    PGPASSWORD="${POSTGRES_PASSWORD}" stdbuf -oL -eL psql \
-      -v ON_ERROR_STOP=1 \
-      -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT}" \
-      -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
-      -c "${lock_sql}"
-  ) > "${LOCK_OUT}" 2>&1 &
   LOCK_PID=$!
 
   local acquired=0

@@ -32,7 +32,7 @@
   - Runbook: `docs/migration-type-convergence.md`（锁风险、升级、回滚、vacuum/analyze）。
 - **新增测试**:
   - `tests/infra/test_compose_config.py` 新增/更新 migrate command 回归测试：断言使用 `bash`、挂载 `/scripts/migrate.sh`、不再将 RLS SQL 内联在 compose command 中。
-  - `tests/infra/test_migrate_runner.py` + `tests/infra/pytest.ini`：实跑 runner 回归测试，覆盖 compose `POSTGRES_HOST=postgres`、无效主机快速失败、空库迁移、重复迁移幂等、`--drift-only`、并发 runner 锁超时。
+  - `tests/infra/test_migrate_runner.py` + `tests/infra/pytest.ini`：实跑 runner 回归测试，覆盖 compose `POSTGRES_HOST=postgres`、无效主机快速失败、**真实数据库下 5 秒内打印 lock acquisition 消息**、空库迁移、重复迁移幂等、`--drift-only`、并发 runner 锁超时。
   - CI 新增 `migration-runner` job，在 postgres service 上跑上述实跑测试；smoke/test-gateway/test-agents 增加 `timeout-minutes`；失败时输出 migrate/postgres 日志。
 - **实际执行的验证命令**:
   - `bash -n scripts/migrate.sh` → OK

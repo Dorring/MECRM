@@ -132,6 +132,51 @@ class TestRunnerFailureModes:
 class TestRunnerWithDatabase:
     """Real-database integration tests for the migration runner."""
 
+    def test_lock_acquisition_printed_within_5_seconds(self, db_available: str):
+        """With a real database the runner must emit the lock-hold message within 5s."""
+        env = os.environ.copy()
+        env["DATABASE_URL"] = db_available
+        env.setdefault("POSTGRES_USER", os.environ.get("POSTGRES_USER", "crm_user"))
+        env.setdefault("POSTGRES_PASSWORD", os.environ.get("POSTGRES_PASSWORD", "crm_password"))
+        env.setdefault("POSTGRES_HOST", os.environ.get("POSTGRES_HOST", "localhost"))
+        env.setdefault("POSTGRES_PORT", os.environ.get("POSTGRES_PORT", "5432"))
+        env.setdefault("POSTGRES_DB", os.environ.get("POSTGRES_DB", "enterprise_crm"))
+        env.setdefault("GATEWAY_DIR", str(REPO_ROOT / "gateway"))
+
+        proc = subprocess.Popen(
+            ["bash", str(MIGRATE_SH)],
+            cwd=str(REPO_ROOT),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        try:
+            start = time.monotonic()
+            found = False
+            while time.monotonic() - start < 5:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                if "advisory lock acquired and held" in line:
+                    found = True
+                    break
+
+            assert found, (
+                "Runner did not print 'advisory lock acquired and held' within 5s; "
+                "the lock marker may be hidden by batched psql output."
+            )
+
+            proc.wait(timeout=180)
+            assert proc.returncode == 0, (
+                f"Migration failed after lock acquisition:\n{proc.stdout.read()}"
+            )
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+
     def test_empty_database_migration(self, db_available: str):
         result = _run_migrate(database_url=db_available, timeout=180)
         assert result.returncode == 0, (

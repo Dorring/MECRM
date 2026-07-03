@@ -147,6 +147,9 @@ function Clear-Lock {
   if ($script:LockErrorFile -and (Test-Path $script:LockErrorFile)) {
     Remove-Item $script:LockErrorFile -Force -ErrorAction SilentlyContinue
   }
+  if ($script:LockSqlFile -and (Test-Path $script:LockSqlFile)) {
+    Remove-Item $script:LockSqlFile -Force -ErrorAction SilentlyContinue
+  }
 }
 
 function Lock-Held {
@@ -155,19 +158,29 @@ function Lock-Held {
 
   $script:LockOutputFile = Join-Path $env:TEMP "migrate-lock-out-$(Get-Random).txt"
   $script:LockErrorFile  = Join-Path $env:TEMP "migrate-lock-err-$(Get-Random).txt"
+  $script:LockSqlFile    = Join-Path $env:TEMP "migrate-lock-sql-$(Get-Random).txt"
   $holdSeconds = if ($env:MIGRATE_LOCK_HOLD_SECONDS) { $env:MIGRATE_LOCK_HOLD_SECONDS } else { 3600 }
-  $sql = "SET statement_timeout = '${LockTimeoutSeconds}s'; " +
-         "SELECT pg_advisory_lock($LockKey); " +
-         "SELECT 'LOCK_ACQUIRED' AS status; " +
-         "SET statement_timeout = '0'; " +
-         "SELECT pg_sleep($holdSeconds);"
+
+  # Write the lock SQL to a temp file and execute it with -f.  This is required
+  # because psql -c batches all statements into one request and only returns
+  # output after pg_sleep() finishes, hiding the LOCK_ACQUIRED marker.  A file
+  # (-f) sends statements sequentially, so \echo emits the marker immediately
+  # after the lock is acquired and statement_timeout is cleared.
+  @"
+SET statement_timeout = '${LockTimeoutSeconds}s';
+SELECT pg_advisory_lock($LockKey);
+SET statement_timeout = '0';
+\echo LOCK_ACQUIRED
+SELECT pg_sleep($holdSeconds);
+"@ | Set-Content -Path $script:LockSqlFile -Encoding UTF8 -NoNewline
+
   $argList = @(
     '-v', 'ON_ERROR_STOP=1',
     '-h', $env:POSTGRES_HOST,
     '-p', $env:POSTGRES_PORT,
     '-U', $env:POSTGRES_USER,
     '-d', $env:POSTGRES_DB,
-    '-c', $sql
+    '-f', $script:LockSqlFile
   )
   $env:PGPASSWORD = $env:POSTGRES_PASSWORD
   $script:LockProcess = Start-Process -FilePath 'psql' -ArgumentList $argList `
