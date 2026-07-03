@@ -29,7 +29,10 @@ jobs:
           cache-dependency-path: ${{ matrix.project }}/package-lock.json
 
       - name: Install dependencies
-        run: npm ci
+        run: |
+          for i in 1 2 3; do
+            npm ci && break || sleep $((i * 15))
+          done
         working-directory: ${{ matrix.project }}
 
       - name: Run linter
@@ -127,7 +130,10 @@ jobs:
           node-version: "20"
 
       - name: Install dependencies
-        run: npm ci
+        run: |
+          for i in 1 2 3; do
+            npm ci && break || sleep $((i * 15))
+          done
         working-directory: gateway
 
       - name: Apply migrations via single runner
@@ -186,7 +192,10 @@ jobs:
           node-version: "20"
 
       - name: Install gateway dependencies
-        run: npm ci
+        run: |
+          for i in 1 2 3; do
+            npm ci && break || sleep $((i * 15))
+          done
         working-directory: gateway
 
       - name: Apply migrations via single runner
@@ -253,7 +262,10 @@ jobs:
           node-version: "20"
 
       - name: Install gateway dependencies
-        run: npm ci
+        run: |
+          for i in 1 2 3; do
+            npm ci && break || sleep $((i * 15))
+          done
         working-directory: gateway
 
       - name: Setup Python
@@ -607,7 +619,10 @@ jobs:
 
       - name: Install test dependencies
         if: ${{ env.SKIP_REMAINING != 'true' }}
-        run: npm ci
+        run: |
+          for i in 1 2 3; do
+            npm ci && break || sleep $((i * 15))
+          done
         working-directory: tests/integration
 
       - name: Run integration tests

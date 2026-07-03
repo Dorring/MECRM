@@ -53,7 +53,10 @@ jobs:
           cache-dependency-path: gateway/package-lock.json
 
       - name: Install gateway dependencies
-        run: npm ci
+        run: |
+          for i in 1 2 3; do
+            npm ci && break || sleep $((i * 15))
+          done
         working-directory: gateway
 
       - name: Run Prisma migrations
