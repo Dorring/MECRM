@@ -2,12 +2,16 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { IncomingMessage } from 'http';
 import jwt from 'jsonwebtoken';
 import { logger } from '../utils/logger';
-import { TokenPayload } from '../middleware/auth';
 import { JWT_SECRET } from '../config/jwt';
+import type { TokenRevocationService, DecodedToken } from './authSession';
 
 interface AuthenticatedWebSocket extends WebSocket {
   userId?: string;
   tenantId?: string;
+  jti?: string;
+  sid?: string;
+  uv?: number;
+  sexp?: number;
   isAlive?: boolean;
 }
 
@@ -19,6 +23,13 @@ interface WebSocketMessage {
 // Store connections by tenant and user
 const connections = new Map<string, Map<string, Set<AuthenticatedWebSocket>>>();
 const subscriptions = new WeakMap<AuthenticatedWebSocket, Set<string>>();
+
+// Revocation service (injected at startup via setRevocationServiceForWS)
+let _revocationService: TokenRevocationService | null = null;
+
+export function setRevocationServiceForWS(svc: TokenRevocationService): void {
+  _revocationService = svc;
+}
 
 export const setupWebSocket = (wss: WebSocketServer): void => {
   // Heartbeat interval
@@ -48,22 +59,22 @@ export const setupWebSocket = (wss: WebSocketServer): void => {
       const decoded = jwt.verify(
         token,
         JWT_SECRET
-      ) as TokenPayload;
-      const tenantId = decoded.tenantId || decoded.tenant_id;
+      ) as Record<string, unknown>;
+      const tenantId = String(decoded.tenantId || decoded.tenant_id || '');
       if (!tenantId) {
         ws.close(4001, 'Invalid token');
         return;
       }
       
-      ws.userId = decoded.sub;
+      ws.userId = decoded.sub as string | undefined;
       ws.tenantId = tenantId;
       ws.isAlive = true;
       
       // Add to connections map
-      addConnection(tenantId, decoded.sub, ws);
+      addConnection(tenantId, String(decoded.sub), ws);
       
       logger.info('WebSocket connected', {
-        userId: decoded.sub,
+        userId: String(decoded.sub),
         tenantId,
       });
       

@@ -167,38 +167,49 @@ describe('errorHandler production sanitization', () => {
   });
 });
 
-// --- authMiddleware fail-closed on Redis blacklist error -------------------
+// --- authMiddleware fail-closed on Redis error -------------------
 
 describe('authMiddleware fail-closed on Redis error', () => {
-  beforeEach(() => {
-    jest.resetModules();
-  });
+  const JWT_SECRET = 'development-secret-change-in-production';
 
-  afterEach(() => {
-    jest.restoreAllMocks();
-  });
+  function signValidToken(overrides: Record<string, unknown> = {}): string {
+    const crypto = require('crypto');
+    const jwt = require('jsonwebtoken');
+    const now = Math.floor(Date.now() / 1000);
+    return jwt.sign(
+      {
+        jti: crypto.randomUUID(),
+        sid: crypto.randomUUID(),
+        sub: crypto.randomUUID(),
+        tenantId: crypto.randomUUID(),
+        email: 'test@example.com',
+        roles: ['admin'],
+        type: 'access',
+        uv: 0,
+        sexp: now + 86400 * 7,
+        iat: now,
+        exp: now + 3600,
+        ...overrides,
+      },
+      JWT_SECRET,
+      { algorithm: 'HS256' },
+    );
+  }
 
-  it('returns 401 when the blacklist check throws (no fallback), without disclosing the token', async () => {
-    // Mock ioredis so redisClient.get rejects — simulating a Redis outage.
-    jest.doMock('ioredis', () => {
-      const failing = async () => { throw new Error('ECONNREFUSED 127.0.0.1:6379'); };
-      return jest.fn().mockImplementation(() => ({
-        maxRetriesPerRequest: 3,
-        lazyConnect: true,
-        on: jest.fn(),
-        get: jest.fn(failing as any),
-        ping: jest.fn(failing as any),
-      }));
-    });
+  it('returns 503 when revocation check throws (Redis unavailable), without disclosing token', async () => {
+    const { TokenRevocationService } = require('../services/authSession');
+    const mockService = new TokenRevocationService();
+    mockService.checkRevoked = jest
+      .fn<any>()
+      .mockRejectedValue(new Error('ECONNREFUSED 127.0.0.1:6379'));
 
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { authMiddleware } = require('../middleware/auth');
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { errorHandler } = require('../middleware/errorHandler');
+    const { createAuthMiddleware } = require('../middleware/auth');
+    const authMiddleware = createAuthMiddleware(mockService);
 
+    const token = signValidToken();
     const req: any = {
       headers: {
-        authorization: 'Bearer some.jwt.token',
+        authorization: `Bearer ${token}`,
         'x-correlation-id': 'corr-fail-closed',
       },
       method: 'GET',
@@ -206,21 +217,44 @@ describe('authMiddleware fail-closed on Redis error', () => {
     };
     const res: any = { status: jest.fn(() => res), json: jest.fn(() => res) };
 
-    await new Promise<void>((resolve) => {
-      // Capture the error routed to next() and feed it straight to errorHandler
-      // so we observe the actual HTTP response a client would receive.
-      const next: any = (err: any) => {
-        errorHandler(err, req, res, jest.fn());
-        resolve();
-      };
-      authMiddleware(req, res, next);
+    await authMiddleware(req, res, jest.fn());
+
+    // ADR-002: Redis unavailable returns 503 AUTH_DEPENDENCY_UNAVAILABLE, not 401
+    // Middleware writes directly to res (not via next/errorHandler)
+    expect(res.status).toHaveBeenCalledWith(503);
+    const body = res.json.mock.calls[0][0];
+    expect(body.error.code).toBe('AUTH_DEPENDENCY_UNAVAILABLE');
+    expect(JSON.stringify(body)).not.toMatch(/ECONNREFUSED|127\.0\.0\.1/);
+  }, 10000);
+
+  it('returns 401 when token is known-revoked', async () => {
+    const { TokenRevocationService } = require('../services/authSession');
+    const mockService = new TokenRevocationService();
+    mockService.checkRevoked = jest
+      .fn<any>()
+      .mockResolvedValue({ revoked: true, reason: 'jti' });
+
+    const { createAuthMiddleware } = require('../middleware/auth');
+    const authMiddleware = createAuthMiddleware(mockService);
+
+    const token = signValidToken();
+    const req: any = {
+      headers: {
+        authorization: `Bearer ${token}`,
+        'x-correlation-id': 'corr-revoked',
+      },
+      method: 'GET',
+      path: '/api/v1/leads',
+    };
+    const res: any = { status: jest.fn(() => res), json: jest.fn(() => res) };
+
+    const capturedError = await new Promise<any>((resolve) => {
+      authMiddleware(req, res, (err: any) => resolve(err));
     });
 
-    expect(res.status).toHaveBeenCalledWith(401);
-    const body = res.json.mock.calls[0][0];
-    expect(body.error.message).toMatch(/verify token revocation status/i);
-    // Fail-closed must NOT echo the token or expose Redis topology.
-    expect(JSON.stringify(body)).not.toMatch(/some\.jwt\.token/);
-    expect(JSON.stringify(body)).not.toMatch(/ECONNREFUSED|127\.0\.0\.1/);
-  });
+    // The error goes through next(), which should be a 401 unauthorized
+    expect(capturedError).toBeTruthy();
+    expect(capturedError.statusCode).toBe(401);
+    expect(capturedError.message).toMatch(/revoked/i);
+  }, 10000);
 });

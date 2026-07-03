@@ -15,7 +15,6 @@ import { opaMiddleware } from './middleware/opa';
 import { auditMiddleware } from './middleware/audit';
 import { requestLogger } from './middleware/requestLogger';
 
-import authRoutes from './routes/auth';
 import leadsRoutes from './routes/leads';
 import dealsRoutes from './routes/deals';
 import ticketsRoutes from './routes/tickets';
@@ -36,7 +35,7 @@ import voiceRoutes from './routes/voice';
 import twinsRoutes from './routes/twins';
 import devxRoutes from './routes/devx';
 
-import { setupWebSocket } from './services/websocket';
+import { setupWebSocket, setRevocationServiceForWS } from './services/websocket';
 import { kafkaProducer, kafkaClient } from './services/kafka';
 import { setupMetrics } from './services/metrics';
 import { startApprovalsRequiredIngestor } from './consumers/approvalsRequired';
@@ -56,6 +55,21 @@ import { redisClient } from './services/redis';
 // a missing/insecure secret throws here and is caught by startServer -> exit(1).
 // Side-effect import: the validation runs at module load; no binding needed.
 import './config/jwt';
+
+// ---------------------------------------------------------------------------
+// Auth dependencies — constructed at module load so that middleware and routes
+// are available when app is created. The underlying Redis client uses
+// lazyConnect: true so no TCP connection is opened until the first command.
+// ---------------------------------------------------------------------------
+import { TokenRevocationService } from './services/authSession';
+import { initAuthModule } from './middleware/auth';
+import { createAuthRoutes } from './routes/auth';
+
+const _revocationSubscriber = redisClient.duplicate();
+const revocationService = new TokenRevocationService(redisClient, _revocationSubscriber);
+initAuthModule(revocationService);
+const authRoutes = createAuthRoutes(revocationService);
+setRevocationServiceForWS(revocationService);
 
 const app: Application = express();
 const PORT = process.env.GATEWAY_PORT || 4000;
@@ -280,7 +294,10 @@ const shutdown = async () => {
 
   // Disconnect Kafka
   await kafkaProducer.disconnect();
-  
+
+  // Shutdown revocation service (unsubscribe + disconnect subscriber)
+  await revocationService.shutdown();
+
   // Close HTTP server
   server.close(() => {
     logger.info('HTTP server closed');
@@ -308,6 +325,19 @@ const startServer = async () => {
       logger.info('JWT_SECRET validated (length-ok, non-default) for production');
     } else if (!process.env.JWT_SECRET) {
       logger.warn('Running with insecure development JWT_SECRET — production will refuse to start without JWT_SECRET');
+    }
+
+    // Connect to Redis subscriber and initialize revocation event handler
+    try {
+      await revocationService.initSubscriber((event) => {
+        // Will be wired to close matching WS connections (B4)
+        logger.debug('Revocation event received', { type: event.type, tenantId: event.tenantId });
+      });
+      logger.info('Revocation subscriber initialized');
+    } catch (err) {
+      logger.error('Failed to initialize revocation subscriber', {
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
 
     // Connect to Kafka
