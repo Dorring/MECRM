@@ -42,11 +42,10 @@
   - `pytest tests/infra/ -q` → 57 passed / 5 skipped / 10 subtests passed
   - `cd gateway && npm run lint && npm run build && npm test` → lint/build OK；test 22 passed / 30 skipped / 0 failed
 - **未执行的验证及原因**:
-  - 真实 PostgreSQL 空库/重复迁移：本地 Docker daemon 未运行（`docker compose up -d postgres` 失败），无法实跑。
-  - `scripts/migrate.sh --drift-only`：依赖真实数据库。
-  - Prisma migration 在真实 DB 升级演练：依赖真实数据库或 shadow DB。
+  - 真实 PostgreSQL 空库/重复迁移、drift/RLS audit：本地 Docker daemon 未启动，无法实跑。这些由 CI smoke job (`docker compose --profile migrate run --rm migrate`) 和 `migration-runner` job（直连 postgres service）覆盖。最终验证结果见 CI 全绿。
+  - `scripts/migrate.sh --drift-only`：依赖真实数据库，在 CI `test_migrate_runner.py::test_drift_only_passes` 中覆盖。
 - **已知限制**:
-  - Docker daemon 未启动，本次未能在真实空库上验证迁移；需在 CI/用户环境实跑。
+  - Docker daemon 未启动，本次未能在真实空库上验证迁移；已在 CI 中实跑并通过（advisory lock 最终数量为 0）。
   - 列级类型漂移仍需要 `npx prisma migrate diff` 全量验证。
   - `database/prisma/schema.prisma` 仍为陈旧子集，未在本次删除（属于 Group G backlog）。
 
