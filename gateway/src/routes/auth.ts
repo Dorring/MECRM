@@ -11,13 +11,13 @@ import {
   AuthenticatedRequest,
 } from '../middleware/auth';
 import { badRequest, unauthorized } from '../middleware/errorHandler';
-import { redisClient } from '../services/redis';
 import { logger } from '../utils/logger';
 import { Prisma } from '@prisma/client';
 import {
   TokenRevocationService,
   DecodedToken,
 } from '../services/authSession';
+import { closeConnectionsByEvent } from '../services/websocket';
 
 const SYSTEM_TENANT_ID = '00000000-0000-0000-0000-000000000000';
 
@@ -323,6 +323,14 @@ export function createAuthRoutes(revocationService: TokenRevocationService): Rou
             accessDecoded.sid,
             accessDecoded.sexp,
           );
+
+          // Close local WebSocket connections for this session
+          closeConnectionsByEvent({
+            type: 'sid',
+            tenantId: accessDecoded.tenantId,
+            id: accessDecoded.sid,
+            userId: accessDecoded.sub,
+          });
         } catch (redisError) {
           logger.error('Logout failed — unable to persist revocation', {
             error: redisError instanceof Error ? redisError.message : String(redisError),

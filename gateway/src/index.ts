@@ -35,7 +35,7 @@ import voiceRoutes from './routes/voice';
 import twinsRoutes from './routes/twins';
 import devxRoutes from './routes/devx';
 
-import { setupWebSocket, setRevocationServiceForWS } from './services/websocket';
+import { setupWebSocket, setRevocationServiceForWS, closeConnectionsByEvent } from './services/websocket';
 import { kafkaProducer, kafkaClient } from './services/kafka';
 import { setupMetrics } from './services/metrics';
 import { startApprovalsRequiredIngestor } from './consumers/approvalsRequired';
@@ -330,8 +330,7 @@ const startServer = async () => {
     // Connect to Redis subscriber and initialize revocation event handler
     try {
       await revocationService.initSubscriber((event) => {
-        // Will be wired to close matching WS connections (B4)
-        logger.debug('Revocation event received', { type: event.type, tenantId: event.tenantId });
+        closeConnectionsByEvent(event);
       });
       logger.info('Revocation subscriber initialized');
     } catch (err) {
