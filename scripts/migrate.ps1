@@ -144,30 +144,55 @@ function Clear-Lock {
   if ($script:LockOutputFile -and (Test-Path $script:LockOutputFile)) {
     Remove-Item $script:LockOutputFile -Force -ErrorAction SilentlyContinue
   }
+  if ($script:LockErrorFile -and (Test-Path $script:LockErrorFile)) {
+    Remove-Item $script:LockErrorFile -Force -ErrorAction SilentlyContinue
+  }
 }
 
 function Lock-Held {
   Require-Tool 'psql'
   Write-Log "acquiring session-level advisory lock (key=$LockKey, timeout=${LockTimeoutSeconds}s)"
 
-  $script:LockOutputFile = Join-Path $env:TEMP "migrate-lock-$(Get-Random).txt"
+  $script:LockOutputFile = Join-Path $env:TEMP "migrate-lock-out-$(Get-Random).txt"
+  $script:LockErrorFile  = Join-Path $env:TEMP "migrate-lock-err-$(Get-Random).txt"
+  $holdSeconds = if ($env:MIGRATE_LOCK_HOLD_SECONDS) { $env:MIGRATE_LOCK_HOLD_SECONDS } else { 3600 }
+  $sql = "SET statement_timeout = '${LockTimeoutSeconds}s'; " +
+         "SELECT pg_advisory_lock($LockKey); " +
+         "SELECT 'LOCK_ACQUIRED' AS status; " +
+         "SET statement_timeout = '0'; " +
+         "SELECT pg_sleep($holdSeconds);"
   $argList = @(
     '-v', 'ON_ERROR_STOP=1',
     '-h', $env:POSTGRES_HOST,
     '-p', $env:POSTGRES_PORT,
     '-U', $env:POSTGRES_USER,
     '-d', $env:POSTGRES_DB,
-    '-c', "SET statement_timeout = '${LockTimeoutSeconds}s'; SELECT pg_advisory_lock($LockKey); SELECT 'LOCK_ACQUIRED' AS status; SELECT pg_sleep(3600);"
+    '-c', $sql
   )
   $env:PGPASSWORD = $env:POSTGRES_PASSWORD
   $script:LockProcess = Start-Process -FilePath 'psql' -ArgumentList $argList `
-    -RedirectStandardOutput $LockOutputFile -NoNewWindow -PassThru
+    -RedirectStandardOutput $script:LockOutputFile `
+    -RedirectStandardError  $script:LockErrorFile `
+    -NoNewWindow -PassThru
 
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   $acquired = $false
   while ($sw.Elapsed.TotalSeconds -lt ($LockTimeoutSeconds + 5)) {
-    if (Test-Path $LockOutputFile) {
-      $content = Get-Content $LockOutputFile -Raw -ErrorAction SilentlyContinue
+    # If the lock-holder exited before we saw LOCK_ACQUIRED, fail fast.
+    if ($script:LockProcess.HasExited) {
+      Write-Err2 "lock-holder psql exited before lock acquisition"
+      if (Test-Path $script:LockOutputFile) {
+        Get-Content $script:LockOutputFile | ForEach-Object { Write-Err2 "  $_" }
+      }
+      if (Test-Path $script:LockErrorFile) {
+        Get-Content $script:LockErrorFile | ForEach-Object { Write-Err2 "  $_" }
+      }
+      Clear-Lock
+      exit 1
+    }
+
+    if (Test-Path $script:LockOutputFile) {
+      $content = Get-Content $script:LockOutputFile -Raw -ErrorAction SilentlyContinue
       if ($content -and $content.Contains('LOCK_ACQUIRED')) {
         $acquired = $true
         break
@@ -183,7 +208,7 @@ function Lock-Held {
     exit 1
   }
 
-  Write-Log "advisory lock acquired and held in background (pid=$($LockProcess.Id))"
+  Write-Log "advisory lock acquired and held (pid=$($LockProcess.Id))"
 }
 
 function Invoke-PrismaMigrate {

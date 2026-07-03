@@ -135,15 +135,16 @@ require() {
 # Session-level advisory lock
 # ---------------------------------------------------------------------------
 LOCK_PID=""
-LOCK_FIFO=""
+LOCK_OUT=""
+LOCK_HOLD_SECONDS="${MIGRATE_LOCK_HOLD_SECONDS:-3600}"
 
 cleanup_lock() {
   if [[ -n "${LOCK_PID:-}" ]] && kill -0 "${LOCK_PID}" 2>/dev/null; then
     kill "${LOCK_PID}" 2>/dev/null || true
     wait "${LOCK_PID}" 2>/dev/null || true
   fi
-  if [[ -n "${LOCK_FIFO:-}" && -e "${LOCK_FIFO}" ]]; then
-    rm -f "${LOCK_FIFO}"
+  if [[ -n "${LOCK_OUT:-}" && -e "${LOCK_OUT}" ]]; then
+    rm -f "${LOCK_OUT}"
   fi
 }
 
@@ -151,35 +152,50 @@ acquire_and_hold_lock() {
   require psql
   log "acquiring session-level advisory lock (key=${LOCK_KEY}, timeout=${LOCK_TIMEOUT_SECONDS}s)"
 
-  LOCK_FIFO="$(mktemp -u /tmp/migrate-lock.XXXXXX)"
-  mkfifo "${LOCK_FIFO}"
-
-  (
-    PGPASSWORD="${POSTGRES_PASSWORD}" psql \
-      -v ON_ERROR_STOP=1 \
-      -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT}" \
-      -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
-      <<SQL
+  LOCK_OUT="$(mktemp /tmp/migrate-lock.XXXXXX)"
+  local lock_sql
+  lock_sql=$(cat <<SQL
 SET statement_timeout = '${LOCK_TIMEOUT_SECONDS}s';
 SELECT pg_advisory_lock(${LOCK_KEY});
 SELECT 'LOCK_ACQUIRED' AS status;
-SELECT pg_sleep(3600);
+SET statement_timeout = '0';
+SELECT pg_sleep(${LOCK_HOLD_SECONDS});
 SQL
-  ) > "${LOCK_FIFO}" &
+)
+
+  # Start a background psql that holds the lock for the configured duration.
+  # stdbuf -oL -eL ensures line-buffered output so we can poll the temp file.
+  (
+    PGPASSWORD="${POSTGRES_PASSWORD}" stdbuf -oL -eL psql \
+      -v ON_ERROR_STOP=1 \
+      -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT}" \
+      -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+      -c "${lock_sql}"
+  ) > "${LOCK_OUT}" 2>&1 &
   LOCK_PID=$!
 
-  # Wait for the 'LOCK_ACQUIRED' signal or timeout.
   local acquired=0
-  local line
-  local waited=0
-  while [[ ${waited} -lt $((LOCK_TIMEOUT_SECONDS + 5)) ]]; do
-    if read -r -t 1 line < "${LOCK_FIFO}"; then
-      if [[ "${line}" == *"LOCK_ACQUIRED"* ]]; then
-        acquired=1
-        break
+  local deadline=$((SECONDS + LOCK_TIMEOUT_SECONDS + 5))
+
+  while [[ ${SECONDS} -lt ${deadline} ]]; do
+    # If the lock-holder exited before we saw LOCK_ACQUIRED, something failed
+    # (wrong host, auth error, another lock holder blocking past statement_timeout).
+    if ! kill -0 "${LOCK_PID}" 2>/dev/null; then
+      err "lock-holder psql exited before lock acquisition"
+      if [[ -s "${LOCK_OUT}" ]]; then
+        err "lock-holder output:"
+        sed 's/^/  /' "${LOCK_OUT}" >&2
       fi
+      cleanup_lock
+      exit 1
     fi
-    waited=$((waited + 1))
+
+    if [[ -f "${LOCK_OUT}" ]] && grep -q "LOCK_ACQUIRED" "${LOCK_OUT}" 2>/dev/null; then
+      acquired=1
+      break
+    fi
+
+    sleep 0.25
   done
 
   if [[ ${acquired} -ne 1 ]]; then
@@ -188,7 +204,7 @@ SQL
     exit 1
   fi
 
-  log "advisory lock acquired and held in background (pid=${LOCK_PID})"
+  log "advisory lock acquired and held (pid=${LOCK_PID})"
 }
 
 run_prisma_migrate() {
