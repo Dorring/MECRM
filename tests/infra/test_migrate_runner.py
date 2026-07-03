@@ -285,46 +285,58 @@ class TestRunnerWithDatabase:
     def test_concurrent_runner_times_out(self, db_available: str):
         """Second runner must timeout while an independent holder holds the lock.
 
-        An independent psql session holds the advisory lock for longer than the
-        runner's LOCK_TIMEOUT_SECONDS (30s), so the second runner deterministically
-        times out regardless of the first's runtime. After killing the holder, the
-        lock must be released (asserted by the autouse fixture and verified here).
+        The holder keeps a psql connection open *after* acquiring the advisory lock
+        (stdin stays open, no pg_sleep).  This is how PostgreSQL session-level locks
+        are meant to be held in tests — via an idle-in-transaction connection that
+        can be torn down instantly by closing stdin / pg_terminate_backend.
         """
-        holder_out_file = os.path.join(os.environ.get("TEMP", "/tmp"), f"migr-holder-{os.getpid()}.txt")
+        holder_env = os.environ.copy()
+        holder_env["PGAPPNAME"] = "mecrm-test-independent-lock-holder"
+
         holder = subprocess.Popen(
-            ["psql", db_available, "-v", "ON_ERROR_STOP=1",
-             "-c", "SELECT pg_advisory_lock(405011); SELECT pg_sleep(45);"],
-            stdout=open(holder_out_file, "w"),
-            stderr=subprocess.STDOUT,
+            ["psql", db_available, "-v", "ON_ERROR_STOP=1", "-f", "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
+            env=holder_env,
         )
+        holder_backend_pid = None
 
         try:
-            # Poll the holder output file for LOCK_ACQUIRED (pg_advisory_lock returns).
+            # Acquire the lock, then leave stdin open — the connection stays alive
+            # and holds the lock until we close stdin or kill the connection.
+            holder.stdin.write("SELECT pg_advisory_lock(405011);\n")
+            holder.stdin.flush()
+
+            # Poll pg_locks until the lock appears, saving the backend PID.
             deadline = time.monotonic() + 15
-            acquired = False
             while time.monotonic() < deadline:
-                if os.path.isfile(holder_out_file):
-                    content = open(holder_out_file).read()
-                    if content:
-                        acquired = True
-                        break
+                lock_info = _psql(db_available, app_name="mecrm-test-lock-scanner",
+                                  sql="SELECT pid FROM pg_locks "
+                                      "WHERE locktype='advisory' AND objid=405011 "
+                                      "AND granted='t'")  # noqa: E501
+                if lock_info.returncode == 0 and lock_info.stdout.strip():
+                    holder_backend_pid = lock_info.stdout.strip()
+                    break
                 if holder.poll() is not None:
                     break
                 time.sleep(0.25)
-            assert acquired, (
-                "Independent lock holder did not acquire lock in time.\n"
-                f"Holder exited: {holder.returncode}"
+
+            assert holder_backend_pid, (
+                f"Independent lock holder did not acquire lock within 15s.\n"
+                f"Holder stderr: {holder.stderr.read() if holder.stderr else 'N/A'}"
             )
 
-            # Second runner must time out within 30+5s.
+            # Second runner must time out within 30+5s (statement_timeout).
             second = _run_migrate(
                 database_url=db_available,
                 timeout=40,
             )
             assert second.returncode != 0, (
                 "Second concurrent runner should have timed out "
-                f"(holder holds lock), but exited 0.\n{second.stdout}\n{second.stderr}"
+                f"(holder pid={holder_backend_pid} holds lock), but exited 0.\n"
+                f"{second.stdout}\n{second.stderr}"
             )
             assert (
                 "failed to acquire advisory lock" in second.stderr
@@ -332,11 +344,21 @@ class TestRunnerWithDatabase:
             ), f"Second runner did not mention lock failure:\n{second.stderr}"
 
         finally:
+            # Graceful: send \q to the holder so it releases the lock cleanly.
+            try:
+                if holder.stdin and not holder.stdin.closed:
+                    holder.stdin.write("\\q\n")
+                    holder.stdin.close()
+            except OSError:
+                pass
+
+            # If still alive, terminate its specific backend directly.
             if holder.poll() is None:
+                if holder_backend_pid:
+                    _psql(db_available, app_name="mecrm-test-cleanup",
+                          sql=f"SELECT pg_terminate_backend({holder_backend_pid})")
                 holder.kill()
-            holder.wait(timeout=10)
-            if os.path.isfile(holder_out_file):
-                os.remove(holder_out_file)
+            holder.wait(timeout=5)
 
             # Verify the advisory lock is released after holder cleanup.
             lock_diag = _any_lock_holder(db_available)
