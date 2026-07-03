@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
+import { randomUUID } from 'crypto';
 
 /**
  * Pure-logic regression tests that run WITHOUT a database, Redis, or Kafka.
@@ -173,15 +174,14 @@ describe('authMiddleware fail-closed on Redis error', () => {
   const JWT_SECRET = 'development-secret-change-in-production';
 
   function signValidToken(overrides: Record<string, unknown> = {}): string {
-    const crypto = require('crypto');
     const jwt = require('jsonwebtoken');
     const now = Math.floor(Date.now() / 1000);
     return jwt.sign(
       {
-        jti: crypto.randomUUID(),
-        sid: crypto.randomUUID(),
-        sub: crypto.randomUUID(),
-        tenantId: crypto.randomUUID(),
+        jti: randomUUID(),
+        sid: randomUUID(),
+        sub: randomUUID(),
+        tenantId: randomUUID(),
         email: 'test@example.com',
         roles: ['admin'],
         type: 'access',

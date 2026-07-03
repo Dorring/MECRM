@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll } from '@jest/globals';
 import request from 'supertest';
 import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'crypto';
 import app from '../index';
 import { withTenantDb } from '../services/prisma';
 import { generateToken } from '../middleware/auth';
@@ -44,9 +45,13 @@ describeDb('Productivity API [requires DB]', () => {
       });
     });
 
+    const now = Math.floor(Date.now() / 1000);
     user2Token = generateToken({
       sub: user2Id,
       tenantId,
+      sid: randomUUID(),
+      uv: 0,
+      sexp: now + 86400 * 7,
       email: 'prod-user@example.com',
       roles: ['sales_rep'],
     });
@@ -145,7 +150,8 @@ describeDb('Productivity API [requires DB]', () => {
         data: { id: otherId, tenantId, email: `prod-other-${Date.now()}@example.com`, name: 'Other', status: 'active', passwordHash: null },
       });
     });
-    const otherToken = generateToken({ sub: otherId, tenantId, email: 'x@example.com', roles: ['sales_rep'] });
+    const now2 = Math.floor(Date.now() / 1000);
+    const otherToken = generateToken({ sub: otherId, tenantId, sid: randomUUID(), uv: 0, sexp: now2 + 86400 * 7, email: 'x@example.com', roles: ['sales_rep'] });
 
     const pOther = uuidv4();
     await withTenantDb(tenantId, async (db) => {
