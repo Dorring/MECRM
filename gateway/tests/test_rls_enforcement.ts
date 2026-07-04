@@ -9,6 +9,7 @@ import app from '../src/index';
 import { prisma, withTenantDb } from '../src/services/prisma';
 import { setupWebSocket } from '../src/services/websocket';
 import { cache, tenantKey } from '../src/services/redis';
+import { TokenRevocationService } from '../src/services/authSession';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'development-secret-change-in-production';
 
@@ -22,7 +23,21 @@ const tenantASlug = `tenant-a-${tenantA.slice(0, 8)}`;
 const tenantBSlug = `tenant-b-${tenantB.slice(0, 8)}`;
 
 function signToken(payload: Record<string, any>): string {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: '1h' });
+  const now = Math.floor(Date.now() / 1000);
+  return jwt.sign(
+    {
+      jti: payload.jti || require('crypto').randomUUID(),
+      sid: payload.sid || require('crypto').randomUUID(),
+      type: payload.type || 'access',
+      uv: payload.uv ?? 0,
+      sexp: payload.sexp || now + 86400 * 7,
+      iat: now,
+      exp: now + 3600,
+      ...payload,
+    },
+    JWT_SECRET,
+    { algorithm: 'HS256' },
+  );
 }
 
 describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
@@ -169,7 +184,11 @@ describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
 
     const server = createServer(app);
     const wss = new WebSocketServer({ server, path: '/ws' });
-    setupWebSocket(wss);
+    const mockRevocation = new TokenRevocationService(
+      { get: async () => null, pipeline: () => ({ get: () => {}, exec: async () => [[null, null], [null, null], [null, null]] }), duplicate: () => ({ on: () => {}, subscribe: async () => {}, unsubscribe: async () => {}, disconnect: () => {} }), publish: async () => 0 } as any,
+      undefined,
+    );
+    setupWebSocket(wss, mockRevocation);
 
     const port = await new Promise<number>((resolve) => {
       server.listen(0, () => {

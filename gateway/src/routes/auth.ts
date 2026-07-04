@@ -186,13 +186,24 @@ export function createAuthRoutes(revocationService: TokenRevocationService): Rou
         }
 
         // Verify user exists and is active
-        let user: { id: string; tenantId: string; status: string; email?: string } | null;
+        let user: {
+          id: string;
+          tenantId: string;
+          status: string;
+          email?: string;
+          userRoles?: Array<{ role: { name: string } }>;
+        } | null;
         try {
           const result = await prisma.$transaction(
             async (db: Prisma.TransactionClient) => {
               await db.$executeRaw`SELECT set_config('app.tenant_id', ${decoded.tenantId}, true)`;
               return db.user.findFirst({
                 where: { id: decoded.sub, tenantId: decoded.tenantId },
+                include: {
+                  userRoles: {
+                    include: { role: true },
+                  },
+                },
               });
             },
           );
@@ -447,9 +458,17 @@ export function createAuthRoutes(revocationService: TokenRevocationService): Rou
             result.tenant.id,
             result.user.id,
           );
-        } catch {
-          // New user, version is 0
-          uv = 0;
+        } catch (redisError) {
+          logger.error('Registration failed — unable to read user version', {
+            error: redisError instanceof Error ? redisError.message : String(redisError),
+          });
+          res.status(503).json({
+            error: {
+              code: 'AUTH_DEPENDENCY_UNAVAILABLE',
+              message: 'Unable to complete registration',
+            },
+          });
+          return;
         }
 
         const sid = TokenRevocationService.generateId();

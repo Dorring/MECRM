@@ -85,7 +85,13 @@ export function createAuthMiddleware(
         throw unauthorized('Invalid token type');
       }
 
-      // 5. Build DecodedToken for revocation check
+      // 5. Validate session expiry (sexp)
+      const now = Math.floor(Date.now() / 1000);
+      if ((decoded.sexp as number) <= now) {
+        throw unauthorized('Session has expired');
+      }
+
+      // 6. Build DecodedToken for revocation check
       const tokenInfo: DecodedToken = {
         jti: decoded.jti as string,
         sid: decoded.sid as string,
@@ -156,35 +162,10 @@ export function createAuthMiddleware(
 }
 
 // ---------------------------------------------------------------------------
-// Export the singleton middleware (set up by initAuthModule at startup)
+// The exported middleware creator — call at startup and use the result
 // ---------------------------------------------------------------------------
 
-let _authMiddleware: ReturnType<typeof createAuthMiddleware> | null = null;
-
-/**
- * Initialize the auth module with a revocation service.
- * Must be called at Gateway startup before any requests are handled.
- */
-export function initAuthModule(revocationService: TokenRevocationService): void {
-  _authMiddleware = createAuthMiddleware(revocationService);
-}
-
-/**
- * The auth middleware used by the Express app.
- * Throws if called before initAuthModule().
- */
-export const authMiddleware: ReturnType<typeof createAuthMiddleware> = (
-  req,
-  res,
-  next,
-) => {
-  if (!_authMiddleware) {
-    throw new Error(
-      'authMiddleware called before initAuthModule() — ensure initAuthModule is called at startup',
-    );
-  }
-  return _authMiddleware(req, res, next);
-};
+export { createAuthMiddleware as authMiddleware };
 
 // ---------------------------------------------------------------------------
 // Token generation helpers
@@ -202,7 +183,14 @@ interface GenerateTokenParams {
 
 /** Generate a signed access JWT with full claim set. */
 export function generateToken(params: GenerateTokenParams): string {
-  const expiresIn = (process.env.JWT_EXPIRES_IN || '1h') as jwt.SignOptions['expiresIn'];
+  const configuredTtl = (process.env.JWT_EXPIRES_IN || '1h') as jwt.SignOptions['expiresIn'];
+  // Cap access token expiry at sexp
+  const sexpDeadline = new Date(params.sexp * 1000);
+  const now = Date.now();
+  const maxMs = Math.max(0, sexpDeadline.getTime() - now);
+  const maxSeconds = Math.floor(maxMs / 1000);
+  const expiresIn = maxSeconds < 3600 ? `${Math.max(60, maxSeconds)}s` : configuredTtl;
+
   return jwt.sign(
     {
       jti: TokenRevocationService.generateId(),

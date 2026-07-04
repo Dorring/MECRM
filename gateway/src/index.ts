@@ -9,7 +9,6 @@ import { v4 as uuidv4 } from 'uuid';
 
 import { logger } from './utils/logger';
 import { errorHandler } from './middleware/errorHandler';
-import { authMiddleware } from './middleware/auth';
 import { tenantMiddleware } from './middleware/tenant';
 import { opaMiddleware } from './middleware/opa';
 import { auditMiddleware } from './middleware/audit';
@@ -35,7 +34,7 @@ import voiceRoutes from './routes/voice';
 import twinsRoutes from './routes/twins';
 import devxRoutes from './routes/devx';
 
-import { setupWebSocket, setRevocationServiceForWS, closeConnectionsByEvent } from './services/websocket';
+import { setupWebSocket, closeConnectionsByEvent } from './services/websocket';
 import { kafkaProducer, kafkaClient } from './services/kafka';
 import { setupMetrics } from './services/metrics';
 import { startApprovalsRequiredIngestor } from './consumers/approvalsRequired';
@@ -62,14 +61,13 @@ import './config/jwt';
 // lazyConnect: true so no TCP connection is opened until the first command.
 // ---------------------------------------------------------------------------
 import { TokenRevocationService } from './services/authSession';
-import { initAuthModule } from './middleware/auth';
+import { createAuthMiddleware } from './middleware/auth';
 import { createAuthRoutes } from './routes/auth';
 
 const _revocationSubscriber = redisClient.duplicate();
 const revocationService = new TokenRevocationService(redisClient, _revocationSubscriber);
-initAuthModule(revocationService);
+const authMiddleware = createAuthMiddleware(revocationService);
 const authRoutes = createAuthRoutes(revocationService);
-setRevocationServiceForWS(revocationService);
 
 const app: Application = express();
 const PORT = process.env.GATEWAY_PORT || 4000;
@@ -247,7 +245,7 @@ const server = createServer(app);
 
 // Setup WebSocket
 const wss = new WebSocketServer({ server, path: '/ws' });
-setupWebSocket(wss);
+setupWebSocket(wss, revocationService);
 
 // Graceful shutdown
 const shutdown = async () => {
