@@ -10,6 +10,14 @@ export const prisma = new PrismaClient({
   ],
 });
 
+if (process.env.JEST_WORKER_ID) {
+  const cleanupGlobal = globalThis as typeof globalThis & {
+    __gatewayTestCleanups?: Array<() => void | Promise<void>>;
+  };
+  cleanupGlobal.__gatewayTestCleanups ??= [];
+  cleanupGlobal.__gatewayTestCleanups.push(() => prisma.$disconnect());
+}
+
 // Log slow queries in development
 if (process.env.NODE_ENV !== 'production') {
   prisma.$on('query' as never, (e: { duration: number; query: string }) => {

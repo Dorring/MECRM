@@ -2,6 +2,7 @@ module.exports = {
   preset: 'ts-jest',
   testEnvironment: 'node',
   setupFiles: ['<rootDir>/src/jest.setup.ts'],
+  setupFilesAfterEnv: ['<rootDir>/src/jest.cleanup.ts'],
   testMatch: [
     '<rootDir>/src/tests/**/*.test.ts',
     '**/tests/test_rls_enforcement.ts',

@@ -172,7 +172,8 @@ describe('errorHandler production sanitization', () => {
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 describe('authMiddleware fail-closed on Redis error', () => {
-  const JWT_SECRET = 'development-secret-change-in-production';
+  const JWT_SECRET =
+    process.env.JWT_SECRET || 'development-secret-change-in-production';
 
   function signValidToken(overrides: Record<string, unknown> = {}): string {
     const jwt = require('jsonwebtoken');

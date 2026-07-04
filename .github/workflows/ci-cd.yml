@@ -150,7 +150,7 @@ jobs:
           GATEWAY_DIR: ./gateway
 
       - name: Run tests
-        run: npm test -- --coverage
+        run: npm test -- --coverage --detectOpenHandles
         working-directory: gateway
         env:
           DATABASE_URL: postgresql://test:test@localhost:5432/test_db
