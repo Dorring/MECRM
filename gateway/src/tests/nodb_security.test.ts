@@ -170,6 +170,7 @@ describe('errorHandler production sanitization', () => {
 
 // --- authMiddleware fail-closed on Redis error -------------------
 
+/* eslint-disable @typescript-eslint/no-var-requires */
 describe('authMiddleware fail-closed on Redis error', () => {
   const JWT_SECRET = 'development-secret-change-in-production';
 

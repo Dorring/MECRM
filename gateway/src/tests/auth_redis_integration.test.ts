@@ -5,7 +5,7 @@
  * Set CRM_REDIS_AVAILABLE=1 to run them.
  */
 
-import { describe, it, expect, beforeAll, afterAll, jest } from '@jest/globals';
+import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 import { randomUUID } from 'crypto';
 import Redis from 'ioredis';
 
@@ -13,7 +13,7 @@ const describeRedis = process.env.CRM_REDIS_AVAILABLE === '1' ? describe : descr
 
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 
-import { TokenRevocationService, authKeys, computeTtl } from '../services/authSession';
+import { TokenRevocationService, authKeys } from '../services/authSession';
 
 describeRedis('TokenRevocationService (real Redis)', () => {
   let redis: Redis;

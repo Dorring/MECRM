@@ -46,7 +46,6 @@ export interface RevocationEvent {
 // Constants
 // ---------------------------------------------------------------------------
 
-const TTL_FLOOR = 1;
 const TTL_CEILING = 604800; // 7 days
 const CLOCK_SKEW = 60;      // 60-second clock skew buffer
 const MAX_EVENT_PAYLOAD_BYTES = 4096;
