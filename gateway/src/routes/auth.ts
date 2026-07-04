@@ -323,7 +323,7 @@ export function createAuthRoutes(revocationService: TokenRevocationService): Rou
             }
           } catch (err) {
             if ((err as any).statusCode === 401) throw err;
-            // Invalid/malformed refresh token supplied — ignore, still revoke by access
+            throw unauthorized('Invalid refresh token');
           }
         }
 

@@ -125,7 +125,7 @@ Tests:       61 passed, 91 total (30 DB-dependent skipped)
 | Redis outage fail-closed | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
 | Pub/Sub event propagation | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
 | TTL correctness | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
-| Two-instance WS closure | ⏳ Requires two Gateway processes | CI enhancement needed |
+| Two-instance WS closure | ✅ Implemented and locally passed | Two child Gateway processes + real Redis |
 
 ## 6. Redis Durability Configuration
 
@@ -150,12 +150,48 @@ Production Helm/Redis must provide:
 | Limitation | Impact | ETA |
 |---|---|---|
 | WebSocket token in query string | Token visible in server logs, referrer headers | Group C |
-| No integration tests in CI | Redis-dependent features not validated in CI | B5 CI job (pending) |
+| Redis integration coverage | Enabled in Gateway CI with `CRM_REDIS_AVAILABLE=1` | 13 real-Redis tests |
 | No HttpOnly cookie for refresh | Token accessible to JS | Group C |
 | No CSRF protection | POST endpoints could be targeted by CSRF | Group C |
 | Pub/Sub is fire-and-forget | Missed events bounded by 30s heartbeat | B4 heartbeat mitigates |
-| No metrics implementation | Per ADR-002 §11 (observability counters) | Post-hardening iteration |
+| Metrics | Implemented for revocation checks, refresh outcomes, Pub/Sub lifecycle, WS revocation closure and heartbeat | Low-cardinality labels only |
 | Lua script not loadable via SHA | Sent as text every call | Optimization for follow-up |
+
+### 8.1 Independent Review Addendum
+
+The post-implementation review corrected the following issues before merge:
+
+- Token lifetimes are capped in seconds and cannot exceed absolute session
+  expiry (`sexp`), including short sessions.
+- Malformed user-version values and inconsistent `iat`/`exp`/`sexp` claims
+  fail closed.
+- Redis Cluster keys use a tenant hash tag so the four-key refresh Lua script
+  executes in one slot.
+- Subscriber initialization is startup-critical and `/ready` includes
+  subscriber readiness.
+- Logout rejects a supplied malformed refresh token instead of silently
+  ignoring it.
+- WebSocket heartbeat work uses bounded concurrency and prevents overlapping
+  runs.
+- Jest no longer uses `--forceExit`; open handles are detected instead of
+  hidden.
+- CI executes the real Redis integration suite.
+- A real two-process Gateway WebSocket test proves that a revocation issued by
+  instance A closes the matching socket on instance B.
+- Prometheus metrics cover the ADR-002 observability contract without exposing
+  token, jti or sid values.
+
+Local verification after the review:
+
+```text
+Gateway lint: passed
+Gateway build: passed
+Gateway full suite with Redis: 81 passed, 30 DB-dependent skipped
+Redis integration: 13 passed
+Two-process WS revocation: 1 passed
+Redis AOF/noeviction runtime config: verified
+Redis restart persistence: manually verified with Docker Compose
+```
 
 ## 9. Boundary with Group C
 

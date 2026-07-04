@@ -144,6 +144,9 @@ app.get('/ready', async (req: Request, res: Response) => {
     await prisma.$queryRaw`SELECT 1`;
     // Check Redis
     await redisClient.ping();
+    if (!process.env.JEST_WORKER_ID && !revocationService.isSubscriberReady()) {
+      throw new Error('Revocation subscriber is not ready');
+    }
     // Check Kafka
     const kafkaAdmin = kafkaClient.admin();
     await kafkaAdmin.connect();
@@ -333,17 +336,11 @@ const startServer = async () => {
       logger.warn('Running with insecure development JWT_SECRET — production will refuse to start without JWT_SECRET');
     }
 
-    // Connect to Redis subscriber and initialize revocation event handler
-    try {
-      await revocationService.initSubscriber((event) => {
-        closeConnectionsByEvent(event);
-      });
-      logger.info('Revocation subscriber initialized');
-    } catch (err) {
-      logger.error('Failed to initialize revocation subscriber', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+    // Revocation notification is a security dependency. Startup fails if the
+    // dedicated subscriber cannot be established.
+    await revocationService.initSubscriber((event) => {
+      closeConnectionsByEvent(event);
+    });
 
     // Connect to Kafka
     await kafkaProducer.connect();

@@ -116,7 +116,7 @@ function signToken(overrides: Record<string, any> = {}): string {
     {
       jti: randomUUID(),
       sid: randomUUID(),
-      sub: 'user-1',
+      sub: '00000000-0000-4000-8000-000000000001',
       tenantId: '00000000-0000-0000-0000-000000000000',
       email: 'u@example.com',
       roles: ['sales_rep'],

@@ -262,9 +262,10 @@ describeRedis('TokenRevocationService (real Redis)', () => {
   });
 
   // -----------------------------------------------------------------------
-  // Redis restart persistence (simulate with FLUSHALL then restore)
+  // Revocation remains effective while the persisted key exists.
+  // An actual Redis process restart is covered by the Docker acceptance suite.
   // -----------------------------------------------------------------------
-  it('revoked token stays revoked after Redis key persists (no flush)', async () => {
+  it('revoked token stays revoked while its Redis key exists', async () => {
     const tenant = randomUUID();
     const jti = randomUUID();
     const exp = Math.floor(Date.now() / 1000) + 3600;
@@ -284,8 +285,12 @@ describeRedis('TokenRevocationService (real Redis)', () => {
   // Redis outage: checkRevoked fails closed
   // -----------------------------------------------------------------------
   it('checkRevoked throws when Redis is disconnected (fail-closed)', async () => {
-    const broke = new Redis(REDIS_URL, { lazyConnect: true, maxRetriesPerRequest: 1 });
-    // Don't connect — the client is not connected
+    const broke = new Redis('redis://127.0.0.1:6399', {
+      lazyConnect: true,
+      connectTimeout: 100,
+      maxRetriesPerRequest: 1,
+      retryStrategy: () => null,
+    });
 
     const brokenService = new TokenRevocationService(broke);
 

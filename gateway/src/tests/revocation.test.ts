@@ -92,6 +92,16 @@ describe('validateDecodedToken', () => {
     expect(result.valid).toBe(true);
   });
 
+  it('rejects non-UUID security identifiers', () => {
+    const token = makeValidToken();
+    const result = validateDecodedToken({
+      ...token,
+      tenantId: 'tenant-with-cluster-slot-injection}',
+    });
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain('tenantId');
+  });
+
   it('rejects missing jti', () => {
     const now = Math.floor(Date.now() / 1000);
     const result = validateDecodedToken({
@@ -499,7 +509,7 @@ describe('TokenRevocationService revocation writes', () => {
     const exp = Math.floor(Date.now() / 1000) + 3600;
     await service.revokeJti('tenant-1', 'test-jti', exp);
     expect(mockRedisClient.setex).toHaveBeenCalledWith(
-      expect.stringContaining('auth:tenant-1:revoked:jti:test-jti'),
+      expect.stringContaining('auth:{tenant-1}:revoked:jti:test-jti'),
       expect.any(Number),
       '1',
     );
@@ -509,7 +519,7 @@ describe('TokenRevocationService revocation writes', () => {
     const sexp = Math.floor(Date.now() / 1000) + 86400 * 7;
     await service.revokeSid('tenant-1', 'test-sid', sexp);
     expect(mockRedisClient.setex).toHaveBeenCalledWith(
-      expect.stringContaining('auth:tenant-1:revoked:sid:test-sid'),
+      expect.stringContaining('auth:{tenant-1}:revoked:sid:test-sid'),
       expect.any(Number),
       '1',
     );
@@ -519,7 +529,7 @@ describe('TokenRevocationService revocation writes', () => {
     mockRedisClient.incr.mockResolvedValue(1);
     const result = await service.revokeUser('tenant-1', 'user-1');
     expect(mockRedisClient.incr).toHaveBeenCalledWith(
-      'auth:tenant-1:user:user-1:version',
+      'auth:{tenant-1}:user:user-1:version',
     );
     expect(result).toBe(1);
   });
@@ -538,6 +548,13 @@ describe('TokenRevocationService revocation writes', () => {
 
   it('getUserVersion throws on malformed value', async () => {
     mockRedisClient.get.mockResolvedValue('not-a-number');
+    await expect(
+      service.getUserVersion('tenant-1', 'user-1'),
+    ).rejects.toThrow(/malformed/i);
+  });
+
+  it('getUserVersion rejects a numeric prefix with trailing garbage', async () => {
+    mockRedisClient.get.mockResolvedValue('1garbage');
     await expect(
       service.getUserVersion('tenant-1', 'user-1'),
     ).rejects.toThrow(/malformed/i);

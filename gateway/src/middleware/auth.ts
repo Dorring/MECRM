@@ -181,15 +181,59 @@ interface GenerateTokenParams {
   roles: string[];
 }
 
+function parseDurationSeconds(
+  value: string | undefined,
+  fallbackSeconds: number,
+  variableName: string,
+): number {
+  if (!value) return fallbackSeconds;
+  if (/^\d+$/.test(value)) {
+    const seconds = Number(value);
+    if (Number.isSafeInteger(seconds) && seconds > 0) return seconds;
+  }
+  const match = value.match(/^(\d+)(s|m|h|d)$/i);
+  if (!match) {
+    throw new Error(`${variableName} must be a positive duration such as 30m, 1h, or 7d`);
+  }
+  const amount = Number(match[1]);
+  const units: Record<string, number> = {
+    s: 1,
+    m: 60,
+    h: 3600,
+    d: 86400,
+  };
+  const seconds = amount * units[match[2].toLowerCase()];
+  if (!Number.isSafeInteger(seconds) || seconds <= 0) {
+    throw new Error(`${variableName} is outside the supported duration range`);
+  }
+  return seconds;
+}
+
+function cappedTokenLifetime(
+  sexp: number,
+  configuredValue: string | undefined,
+  fallbackSeconds: number,
+  variableName: string,
+): number {
+  const now = Math.floor(Date.now() / 1000);
+  const remainingSessionSeconds = sexp - now;
+  if (remainingSessionSeconds <= 0) {
+    throw new Error('Cannot issue a token for an expired session');
+  }
+  return Math.min(
+    parseDurationSeconds(configuredValue, fallbackSeconds, variableName),
+    remainingSessionSeconds,
+  );
+}
+
 /** Generate a signed access JWT with full claim set. */
 export function generateToken(params: GenerateTokenParams): string {
-  const configuredTtl = (process.env.JWT_EXPIRES_IN || '1h') as jwt.SignOptions['expiresIn'];
-  // Cap access token expiry at sexp
-  const sexpDeadline = new Date(params.sexp * 1000);
-  const now = Date.now();
-  const maxMs = Math.max(0, sexpDeadline.getTime() - now);
-  const maxSeconds = Math.floor(maxMs / 1000);
-  const expiresIn = maxSeconds < 3600 ? `${Math.max(60, maxSeconds)}s` : configuredTtl;
+  const expiresIn = cappedTokenLifetime(
+    params.sexp,
+    process.env.JWT_EXPIRES_IN,
+    3600,
+    'JWT_EXPIRES_IN',
+  );
 
   return jwt.sign(
     {
@@ -216,14 +260,12 @@ export function generateRefreshToken(params: {
   uv: number;
   sexp: number;
 }): string {
-  const configuredTtl = process.env.JWT_REFRESH_EXPIRES_IN || '7d';
-  // Cap refresh expiry at sexp
-  const sexpDeadline = new Date(params.sexp * 1000);
-  const now = Date.now();
-  const maxMs = Math.max(0, sexpDeadline.getTime() - now);
-  const maxDays = Math.floor(maxMs / 86400000);
-  const expiresIn =
-    maxDays < 7 ? `${Math.max(1, maxDays)}d` : (configuredTtl as jwt.SignOptions['expiresIn']);
+  const expiresIn = cappedTokenLifetime(
+    params.sexp,
+    process.env.JWT_REFRESH_EXPIRES_IN,
+    7 * 86400,
+    'JWT_REFRESH_EXPIRES_IN',
+  );
 
   return jwt.sign(
     {

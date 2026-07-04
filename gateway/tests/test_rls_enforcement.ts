@@ -19,6 +19,8 @@ const tenantA = '11111111-1111-4111-8111-111111111111';
 const tenantB = '22222222-2222-4222-8222-222222222222';
 const customerA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const customerB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const userA = 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa';
+const superAdmin = 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb';
 const tenantASlug = `tenant-a-${tenantA.slice(0, 8)}`;
 const tenantBSlug = `tenant-b-${tenantB.slice(0, 8)}`;
 
@@ -96,7 +98,7 @@ describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
 
   it('blocks cross-tenant resource access (tenant A cannot read tenant B)', async () => {
     const tokenA = signToken({
-      sub: 'user-a',
+      sub: userA,
       tenant_id: tenantA,
       email: 'a@example.com',
       roles: ['admin'],
@@ -110,7 +112,7 @@ describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
 
   it('blocks tenant override for non-super-admin (JWT tampering attempt)', async () => {
     const tokenA = signToken({
-      sub: 'user-a',
+      sub: userA,
       tenant_id: tenantA,
       email: 'a@example.com',
       roles: ['admin'],
@@ -125,7 +127,7 @@ describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
 
   it('allows super_admin cross-tenant READ only (OPA enforced)', async () => {
     const superToken = signToken({
-      sub: 'super-admin',
+      sub: superAdmin,
       tenant_id: tenantA,
       email: 'sa@example.com',
       roles: ['super_admin'],
@@ -143,7 +145,7 @@ describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
 
   it('denies super_admin cross-tenant WRITE (OPA enforced)', async () => {
     const superToken = signToken({
-      sub: 'super-admin',
+      sub: superAdmin,
       tenant_id: tenantA,
       email: 'sa@example.com',
       roles: ['super_admin'],
@@ -176,7 +178,7 @@ describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
 
   it('blocks websocket cross-tenant channel subscription', async () => {
     const tokenA = signToken({
-      sub: 'user-a',
+      sub: userA,
       tenant_id: tenantA,
       email: 'a@example.com',
       roles: ['admin'],
@@ -225,4 +227,3 @@ describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 });
-

@@ -5,6 +5,11 @@ import { logger } from '../utils/logger';
 import { JWT_SECRET } from '../config/jwt';
 import type { TokenRevocationService, DecodedToken } from './authSession';
 import { validateDecodedToken } from './authSession';
+import {
+  websocketAuthHeartbeatDuration,
+  websocketAuthHeartbeatTotal,
+  websocketRevocationClosesTotal,
+} from './metrics';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -44,6 +49,11 @@ const connections = new Map<string, Map<string, Set<AuthenticatedWebSocket>>>();
 const jtiIndex = new Map<string, AuthenticatedWebSocket>();
 const sidIndex = new Map<string, Set<AuthenticatedWebSocket>>();
 const subscriptions = new WeakMap<AuthenticatedWebSocket, Set<string>>();
+const HEARTBEAT_CONCURRENCY = 25;
+
+function scopedIndexKey(tenantId: string, id: string): string {
+  return `${tenantId}:${id}`;
+}
 
 // ---------------------------------------------------------------------------
 // Setup — revocation service is required
@@ -53,19 +63,19 @@ export function setupWebSocket(
   wss: WebSocketServer,
   revocationService: TokenRevocationService,
 ): void {
-  _revocationService = revocationService;
-
   // Heartbeat — re-checks revocation and token/session expiry
   let heartbeatRunning = false;
   const heartbeatInterval = setInterval(async () => {
     if (heartbeatRunning) {
+      websocketAuthHeartbeatTotal.inc({ result: 'overlap_prevented' });
       logger.warn('Heartbeat cycle skipped — previous run still in progress');
       return;
     }
     heartbeatRunning = true;
+    const heartbeatEnd = websocketAuthHeartbeatDuration.startTimer();
 
     try {
-      const promises: Promise<void>[] = [];
+      const checks: Array<() => Promise<void>> = [];
       wss.clients.forEach((client: WebSocket) => {
         const ws = client as unknown as AuthenticatedWebSocket;
         if (ws.isAlive === false) {
@@ -83,7 +93,7 @@ export function setupWebSocket(
         }
 
         // Re-check revocation
-        promises.push(
+        checks.push(() =>
           revocationService
             .checkRevoked({
               jti: ws.jti,
@@ -107,8 +117,21 @@ export function setupWebSocket(
         );
       });
 
-      await Promise.all(promises);
+      for (let i = 0; i < checks.length; i += HEARTBEAT_CONCURRENCY) {
+        await Promise.all(
+          checks
+            .slice(i, i + HEARTBEAT_CONCURRENCY)
+            .map((check) => check()),
+        );
+      }
+      websocketAuthHeartbeatTotal.inc({ result: 'completed' });
+    } catch (err) {
+      websocketAuthHeartbeatTotal.inc({ result: 'failed' });
+      logger.error('WebSocket auth heartbeat failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
     } finally {
+      heartbeatEnd();
       heartbeatRunning = false;
     }
   }, HEARTBEAT_INTERVAL_MS);
@@ -186,6 +209,7 @@ function authenticateAndRegister(
         rawWs.close(4401, 'Token revoked');
         return;
       }
+      if (rawWs.readyState !== WebSocket.OPEN) return;
 
       // Auth succeeded — cast to AuthenticatedWebSocket and store metadata
       const ws = rawWs as unknown as AuthenticatedWebSocket;
@@ -199,8 +223,8 @@ function authenticateAndRegister(
       ws.isAlive = true;
 
       addConnection(tenantId, sub, ws);
-      jtiIndex.set(jti, ws);
-      addToSidIndex(sid, ws);
+      jtiIndex.set(scopedIndexKey(tenantId, jti), ws);
+      addToSidIndex(tenantId, sid, ws);
 
       logger.info('WebSocket connected', { userId: sub, tenantId });
 
@@ -208,7 +232,7 @@ function authenticateAndRegister(
         JSON.stringify({ type: 'connected', payload: { message: 'Connected to CRM WebSocket' } }),
       );
 
-      setupEventHandlers(ws);
+      setupEventHandlers(ws, revocationService);
     })
     .catch(() => {
       rawWs.close(1013, 'Service unavailable');
@@ -219,7 +243,10 @@ function authenticateAndRegister(
 // Event handlers
 // ---------------------------------------------------------------------------
 
-function setupEventHandlers(ws: AuthenticatedWebSocket): void {
+function setupEventHandlers(
+  ws: AuthenticatedWebSocket,
+  revocationService: TokenRevocationService,
+): void {
   ws.on('pong', () => {
     ws.isAlive = true;
   });
@@ -227,7 +254,7 @@ function setupEventHandlers(ws: AuthenticatedWebSocket): void {
   ws.on('message', (data) => {
     try {
       const message: WebSocketMessage = JSON.parse(data.toString());
-      handleMessage(ws, message);
+      handleMessage(ws, message, revocationService);
     } catch (error) {
       logger.error('Invalid WebSocket message', { error });
     }
@@ -250,28 +277,38 @@ function setupEventHandlers(ws: AuthenticatedWebSocket): void {
 
 function cleanupSocket(ws: AuthenticatedWebSocket): void {
   removeConnection(ws.tenantId, ws.userId, ws);
-  jtiIndex.delete(ws.jti);
-  removeFromSidIndex(ws.sid, ws);
+  jtiIndex.delete(scopedIndexKey(ws.tenantId, ws.jti));
+  removeFromSidIndex(ws.tenantId, ws.sid, ws);
 }
 
 // ---------------------------------------------------------------------------
 // Index helpers
 // ---------------------------------------------------------------------------
 
-function addToSidIndex(sid: string, ws: AuthenticatedWebSocket): void {
-  let set = sidIndex.get(sid);
+function addToSidIndex(
+  tenantId: string,
+  sid: string,
+  ws: AuthenticatedWebSocket,
+): void {
+  const key = scopedIndexKey(tenantId, sid);
+  let set = sidIndex.get(key);
   if (!set) {
     set = new Set();
-    sidIndex.set(sid, set);
+    sidIndex.set(key, set);
   }
   set.add(ws);
 }
 
-function removeFromSidIndex(sid: string, ws: AuthenticatedWebSocket): void {
-  const set = sidIndex.get(sid);
+function removeFromSidIndex(
+  tenantId: string,
+  sid: string,
+  ws: AuthenticatedWebSocket,
+): void {
+  const key = scopedIndexKey(tenantId, sid);
+  const set = sidIndex.get(key);
   if (!set) return;
   set.delete(ws);
-  if (set.size === 0) sidIndex.delete(sid);
+  if (set.size === 0) sidIndex.delete(key);
 }
 
 function extractToken(request: IncomingMessage): string | null {
@@ -308,13 +345,17 @@ function removeConnection(tenantId: string, userId: string, ws: AuthenticatedWeb
 // Message handling
 // ---------------------------------------------------------------------------
 
-function handleMessage(ws: AuthenticatedWebSocket, message: WebSocketMessage): void {
+function handleMessage(
+  ws: AuthenticatedWebSocket,
+  message: WebSocketMessage,
+  revocationService: TokenRevocationService,
+): void {
   switch (message.type) {
     case 'ping':
       ws.send(JSON.stringify({ type: 'pong', payload: {} }));
       break;
     case 'subscribe':
-      handleSubscribe(ws, message.payload?.topic);
+      handleSubscribe(ws, message.payload?.topic, revocationService);
       break;
     default:
       logger.warn('Unknown message type', { type: message.type });
@@ -325,7 +366,11 @@ function handleMessage(ws: AuthenticatedWebSocket, message: WebSocketMessage): v
 // Subscribe (with revocation re-check)
 // ---------------------------------------------------------------------------
 
-function handleSubscribe(ws: AuthenticatedWebSocket, topic: unknown): void {
+function handleSubscribe(
+  ws: AuthenticatedWebSocket,
+  topic: unknown,
+  revocationService: TokenRevocationService,
+): void {
   if (typeof topic !== 'string' || topic.length === 0) {
     ws.send(JSON.stringify({ type: 'error', payload: { code: 'INVALID_TOPIC' } }));
     return;
@@ -350,30 +395,18 @@ function handleSubscribe(ws: AuthenticatedWebSocket, topic: unknown): void {
     exp: ws.exp,
   };
 
-  // We need access to revocationService here. Since this is called from message
-  // handlers, we don't have direct access. Instead, we pass it through the WS
-  // instance or use a module-level reference set at setupWebSocket.
-  // For subscribe, we store the service from the setup closure:
-  // ... handled via closure variable set in setupWebSocket
-  // Actually, the subscribe handler doesn't have direct access to revocationService.
-  // Let's store it in a module-level variable set during setupWebSocket.
-  if (_revocationService) {
-    _revocationService
-      .checkRevoked(tokenInfo)
-      .then((result) => {
-        if (result.revoked) {
-          ws.close(4401, 'Session revoked');
-          return;
-        }
-        grantSubscription(ws, topic);
-      })
-      .catch(() => {
-        ws.close(1013, 'Service unavailable');
-      });
-  } else {
-    // Should not happen — setupWebSocket always sets _revocationService
-    ws.close(1013, 'Service unavailable');
-  }
+  revocationService
+    .checkRevoked(tokenInfo)
+    .then((result) => {
+      if (result.revoked) {
+        ws.close(4401, 'Session revoked');
+        return;
+      }
+      grantSubscription(ws, topic);
+    })
+    .catch(() => {
+      ws.close(1013, 'Service unavailable');
+    });
 }
 
 function grantSubscription(ws: AuthenticatedWebSocket, topic: string): void {
@@ -388,12 +421,6 @@ function grantSubscription(ws: AuthenticatedWebSocket, topic: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Module-level revocation service reference (set at setupWebSocket)
-// ---------------------------------------------------------------------------
-
-let _revocationService: TokenRevocationService | null = null;
-
-// ---------------------------------------------------------------------------
 // Cross-instance revocation handler
 // ---------------------------------------------------------------------------
 
@@ -405,23 +432,26 @@ export function closeConnectionsByEvent(event: {
 }): void {
   switch (event.type) {
     case 'jti': {
-      const ws = jtiIndex.get(event.id);
+      const ws = jtiIndex.get(scopedIndexKey(event.tenantId, event.id));
       if (ws && ws.tenantId === event.tenantId) {
+        websocketRevocationClosesTotal.inc({ scope: 'jti' });
         ws.close(4401, 'Session terminated');
         cleanupSocket(ws);
       }
       break;
     }
     case 'sid': {
-      const set = sidIndex.get(event.id);
+      const key = scopedIndexKey(event.tenantId, event.id);
+      const set = sidIndex.get(key);
       if (set) {
         for (const ws of set) {
           if (ws.tenantId === event.tenantId) {
+            websocketRevocationClosesTotal.inc({ scope: 'sid' });
             ws.close(4401, 'Session terminated');
             cleanupSocket(ws);
           }
         }
-        sidIndex.delete(event.id);
+        sidIndex.delete(key);
       }
       break;
     }
@@ -436,6 +466,7 @@ export function closeConnectionsByEvent(event: {
       for (const [userId, wsSet] of tenantConnections) {
         if (userId === event.userId) {
           for (const ws of wsSet) {
+            websocketRevocationClosesTotal.inc({ scope: 'user' });
             ws.close(4401, 'Session terminated');
             cleanupSocket(ws);
           }

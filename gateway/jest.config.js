@@ -2,9 +2,12 @@ module.exports = {
   preset: 'ts-jest',
   testEnvironment: 'node',
   setupFiles: ['<rootDir>/src/jest.setup.ts'],
-  testMatch: ['**/src/tests/**/*.test.ts', '**/tests/**/*.ts'],
+  testMatch: [
+    '<rootDir>/src/tests/**/*.test.ts',
+    '**/tests/test_rls_enforcement.ts',
+  ],
+  testPathIgnorePatterns: ['<rootDir>/dist/', '<rootDir>/src/tests/helpers/'],
   maxWorkers: 1,
-  forceExit: true,
   collectCoverage: true,
   coverageDirectory: 'coverage',
   coverageThreshold: {
@@ -16,4 +19,3 @@ module.exports = {
     },
   },
 };
-

@@ -1,6 +1,11 @@
 import { Redis } from 'ioredis';
 import { randomUUID } from 'crypto';
 import { logger } from '../utils/logger';
+import {
+  authRefreshConsumeTotal,
+  authRevocationChecksTotal,
+  authRevocationEventsTotal,
+} from './metrics';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -72,16 +77,16 @@ export function computeTtl(exp: number): number {
 /** All key builders require validated identifiers — caller must validate first. */
 export const authKeys = {
   revokedJti: (tenantId: string, jti: string) =>
-    `auth:${tenantId}:revoked:jti:${jti}`,
+    `auth:{${tenantId}}:revoked:jti:${jti}`,
 
   revokedSid: (tenantId: string, sid: string) =>
-    `auth:${tenantId}:revoked:sid:${sid}`,
+    `auth:{${tenantId}}:revoked:sid:${sid}`,
 
   consumedRefresh: (tenantId: string, jti: string) =>
-    `auth:${tenantId}:refresh:consumed:${jti}`,
+    `auth:{${tenantId}}:refresh:consumed:${jti}`,
 
   userVersion: (tenantId: string, userId: string) =>
-    `auth:${tenantId}:user:${userId}:version`,
+    `auth:{${tenantId}}:user:${userId}:version`,
 };
 
 // ---------------------------------------------------------------------------
@@ -93,20 +98,26 @@ export interface TokenValidationResult {
   error?: string;
 }
 
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export function validateDecodedToken(
   decoded: Record<string, unknown>,
 ): TokenValidationResult {
   // Type check each claim
-  if (typeof decoded.jti !== 'string' || !decoded.jti) {
+  if (typeof decoded.jti !== 'string' || !UUID_PATTERN.test(decoded.jti)) {
     return { valid: false, error: 'Missing or invalid jti' };
   }
-  if (typeof decoded.sid !== 'string' || !decoded.sid) {
+  if (typeof decoded.sid !== 'string' || !UUID_PATTERN.test(decoded.sid)) {
     return { valid: false, error: 'Missing or invalid sid' };
   }
-  if (typeof decoded.sub !== 'string' || !decoded.sub) {
+  if (typeof decoded.sub !== 'string' || !UUID_PATTERN.test(decoded.sub)) {
     return { valid: false, error: 'Missing or invalid sub' };
   }
-  if (typeof decoded.tenantId !== 'string' || !decoded.tenantId) {
+  if (
+    typeof decoded.tenantId !== 'string' ||
+    !UUID_PATTERN.test(decoded.tenantId)
+  ) {
     return { valid: false, error: 'Missing or invalid tenantId' };
   }
   if (decoded.type !== 'access' && decoded.type !== 'refresh') {
@@ -115,14 +126,32 @@ export function validateDecodedToken(
   if (typeof decoded.uv !== 'number' || !Number.isInteger(decoded.uv) || decoded.uv < 0) {
     return { valid: false, error: 'Missing or invalid uv (non-negative integer)' };
   }
-  if (typeof decoded.sexp !== 'number' || decoded.sexp < 0) {
+  if (
+    typeof decoded.sexp !== 'number' ||
+    !Number.isInteger(decoded.sexp) ||
+    decoded.sexp <= 0
+  ) {
     return { valid: false, error: 'Missing or invalid sexp (Unix seconds)' };
   }
-  if (typeof decoded.iat !== 'number' || decoded.iat <= 0) {
+  if (
+    typeof decoded.iat !== 'number' ||
+    !Number.isInteger(decoded.iat) ||
+    decoded.iat <= 0
+  ) {
     return { valid: false, error: 'Missing or invalid iat' };
   }
-  if (typeof decoded.exp !== 'number' || decoded.exp <= 0) {
+  if (
+    typeof decoded.exp !== 'number' ||
+    !Number.isInteger(decoded.exp) ||
+    decoded.exp <= 0
+  ) {
     return { valid: false, error: 'Missing or invalid exp' };
+  }
+  if (decoded.iat > decoded.exp) {
+    return { valid: false, error: 'iat must not be after exp' };
+  }
+  if (decoded.exp > decoded.sexp) {
+    return { valid: false, error: 'Token expiry exceeds session expiry' };
   }
   return { valid: true };
 }
@@ -187,6 +216,9 @@ end
 // ---------------------------------------------------------------------------
 
 export class TokenRevocationService {
+  private subscriberReady = false;
+  private localEventHandler?: (event: RevocationEvent) => void;
+
   constructor(
     private readonly client: Redis,
     private readonly subscriber?: Redis,
@@ -202,6 +234,25 @@ export class TokenRevocationService {
    * FAIL-CLOSED: throws on any Redis error.
    */
   async checkRevoked(token: DecodedToken): Promise<RevocationResult> {
+    try {
+      const result = await this.checkRevokedInternal(token);
+      authRevocationChecksTotal.inc({
+        result: result.revoked ? 'revoked' : 'allowed',
+        reason: result.reason ?? 'none',
+      });
+      return result;
+    } catch (err) {
+      authRevocationChecksTotal.inc({
+        result: 'dependency_error',
+        reason: 'redis',
+      });
+      throw err;
+    }
+  }
+
+  private async checkRevokedInternal(
+    token: DecodedToken,
+  ): Promise<RevocationResult> {
     const pipe = this.client.pipeline();
     pipe.get(authKeys.revokedJti(token.tenantId, token.jti));
     pipe.get(authKeys.revokedSid(token.tenantId, token.sid));
@@ -248,8 +299,13 @@ export class TokenRevocationService {
     const currentUvRaw = uvResult[1];
     if (currentUvRaw != null) {
       if (typeof currentUvRaw === 'string') {
-        const parsed = parseInt(currentUvRaw, 10);
-        if (Number.isNaN(parsed) || parsed < 0) {
+        if (!/^\d+$/.test(currentUvRaw)) {
+          throw new Error(
+            `Malformed user version for ${token.tenantId}:${token.sub}: ${currentUvRaw}`,
+          );
+        }
+        const parsed = Number(currentUvRaw);
+        if (!Number.isSafeInteger(parsed)) {
           throw new Error(
             `Malformed user version for ${token.tenantId}:${token.sub}: ${currentUvRaw}`,
           );
@@ -337,8 +393,13 @@ export class TokenRevocationService {
       authKeys.userVersion(tenantId, userId),
     );
     if (val == null) return 0;
-    const parsed = parseInt(val, 10);
-    if (Number.isNaN(parsed) || parsed < 0) {
+    if (!/^\d+$/.test(val)) {
+      throw new Error(
+        `Malformed user version for ${tenantId}:${userId}: ${val}`,
+      );
+    }
+    const parsed = Number(val);
+    if (!Number.isSafeInteger(parsed)) {
       throw new Error(
         `Malformed user version for ${tenantId}:${userId}: ${val}`,
       );
@@ -359,6 +420,14 @@ export class TokenRevocationService {
    * Returns DEPENDENCY_ERROR → Redis error.
    */
   async consumeRefresh(
+    token: DecodedToken,
+  ): Promise<RefreshConsumeResult> {
+    const result = await this.consumeRefreshInternal(token);
+    authRefreshConsumeTotal.inc({ outcome: result.status.toLowerCase() });
+    return result;
+  }
+
+  private async consumeRefreshInternal(
     token: DecodedToken,
   ): Promise<RefreshConsumeResult> {
     const consumedTtl = computeTtl(token.exp);
@@ -440,14 +509,28 @@ export class TokenRevocationService {
     handler: (event: RevocationEvent) => void,
   ): Promise<void> {
     if (!this.subscriber) {
-      logger.warn('No subscriber connection provided — cross-instance revocation disabled');
-      return;
+      throw new Error('Revocation subscriber connection is required');
     }
+    this.localEventHandler = handler;
+    this.subscriber.on('ready', () => {
+      this.subscriberReady = true;
+      authRevocationEventsTotal.inc({ result: 'subscriber_ready' });
+    });
+    this.subscriber.on('close', () => {
+      this.subscriberReady = false;
+      authRevocationEventsTotal.inc({ result: 'subscriber_closed' });
+    });
+    this.subscriber.on('error', (err: Error) => {
+      this.subscriberReady = false;
+      authRevocationEventsTotal.inc({ result: 'subscriber_error' });
+      logger.error('Revocation subscriber error', { error: err.message });
+    });
     this.subscriber.on('message', (channel: string, message: string) => {
       if (channel !== 'auth:revocation:events') return;
 
       // Size limit
       if (Buffer.byteLength(message, 'utf-8') > MAX_EVENT_PAYLOAD_BYTES) {
+        authRevocationEventsTotal.inc({ result: 'rejected_oversize' });
         logger.error('Oversized revocation event', {
           bytes: Buffer.byteLength(message, 'utf-8'),
         });
@@ -455,20 +538,16 @@ export class TokenRevocationService {
       }
 
       try {
-        const event: RevocationEvent = JSON.parse(message);
-
-        // Schema validation
-        if (!event || event.version !== 1 || !event.type || !event.tenantId || !event.id) {
-          logger.error('Malformed revocation event', { event: JSON.stringify(event).slice(0, 200) });
+        const event: unknown = JSON.parse(message);
+        if (!isRevocationEvent(event)) {
+          authRevocationEventsTotal.inc({ result: 'rejected_schema' });
+          logger.error('Malformed revocation event');
           return;
         }
-        if (!['jti', 'sid', 'user'].includes(event.type)) {
-          logger.error('Unknown revocation event type', { type: event.type });
-          return;
-        }
-
+        authRevocationEventsTotal.inc({ result: 'received' });
         handler(event);
       } catch (err) {
+        authRevocationEventsTotal.inc({ result: 'rejected_json' });
         logger.error('Failed to parse revocation event', {
           error: err instanceof Error ? err.message : String(err),
         });
@@ -476,15 +555,30 @@ export class TokenRevocationService {
     });
 
     await this.subscriber.subscribe('auth:revocation:events');
+    this.subscriberReady = true;
     logger.info('Revocation subscriber initialized');
+  }
+
+  isSubscriberReady(): boolean {
+    return this.subscriberReady;
   }
 
   /** Publish a revocation event to other Gateway instances. */
   private publishEvent(event: RevocationEvent): void {
     const payload = JSON.stringify(event);
 
+    try {
+      this.localEventHandler?.(event);
+    } catch (err) {
+      logger.error('Local revocation event handler failed', {
+        error: err instanceof Error ? err.message : String(err),
+        type: event.type,
+      });
+    }
+
     // Check size before publish to guard against oversized messages
     if (Buffer.byteLength(payload, 'utf-8') > MAX_EVENT_PAYLOAD_BYTES) {
+      authRevocationEventsTotal.inc({ result: 'publish_rejected_oversize' });
       logger.error('Revocation event exceeds max size, not published', {
         type: event.type,
         bytes: Buffer.byteLength(payload, 'utf-8'),
@@ -494,7 +588,11 @@ export class TokenRevocationService {
 
     this.client
       .publish('auth:revocation:events', payload)
+      .then(() => {
+        authRevocationEventsTotal.inc({ result: 'published' });
+      })
       .catch((err: Error) => {
+        authRevocationEventsTotal.inc({ result: 'publish_error' });
         // Log and meter but never throw — Pub/Sub is best-effort notification.
         // The revocation key is already written durably in Redis.
         logger.error('Failed to publish revocation event', {
@@ -509,6 +607,7 @@ export class TokenRevocationService {
   // -----------------------------------------------------------------------
 
   async shutdown(): Promise<void> {
+    this.subscriberReady = false;
     if (this.subscriber) {
       try {
         await this.subscriber.unsubscribe('auth:revocation:events');
@@ -518,4 +617,30 @@ export class TokenRevocationService {
       this.subscriber.disconnect();
     }
   }
+}
+
+function isRevocationEvent(value: unknown): value is RevocationEvent {
+  if (!value || typeof value !== 'object') return false;
+  const event = value as Record<string, unknown>;
+  if (
+    event.version !== 1 ||
+    !['jti', 'sid', 'user'].includes(String(event.type)) ||
+    typeof event.tenantId !== 'string' ||
+    !UUID_PATTERN.test(event.tenantId) ||
+    typeof event.id !== 'string' ||
+    !UUID_PATTERN.test(event.id) ||
+    typeof event.occurredAt !== 'number' ||
+    !Number.isFinite(event.occurredAt)
+  ) {
+    return false;
+  }
+  if (
+    event.type === 'user' &&
+    (typeof event.userId !== 'string' ||
+      !UUID_PATTERN.test(event.userId) ||
+      event.userId !== event.id)
+  ) {
+    return false;
+  }
+  return true;
 }

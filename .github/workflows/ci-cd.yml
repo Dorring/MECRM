@@ -157,6 +157,7 @@ jobs:
           REDIS_URL: redis://localhost:6379
           JWT_SECRET: test-secret
           CRM_TEST_REQUIRE_DB: 1
+          CRM_REDIS_AVAILABLE: 1
 
       - name: Upload coverage
         uses: codecov/codecov-action@v5

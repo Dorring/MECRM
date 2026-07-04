@@ -222,6 +222,48 @@ export const authRecheckLatencyMs = new Histogram({
   registers: [register],
 });
 
+export const authRevocationChecksTotal = new Counter({
+  name: 'auth_revocation_checks_total',
+  help: 'Token revocation checks by bounded result and reason',
+  labelNames: ['result', 'reason'],
+  registers: [register],
+});
+
+export const authRefreshConsumeTotal = new Counter({
+  name: 'auth_refresh_consume_total',
+  help: 'Atomic refresh-token consume outcomes',
+  labelNames: ['outcome'],
+  registers: [register],
+});
+
+export const authRevocationEventsTotal = new Counter({
+  name: 'auth_revocation_events_total',
+  help: 'Revocation Pub/Sub lifecycle and validation events',
+  labelNames: ['result'],
+  registers: [register],
+});
+
+export const websocketRevocationClosesTotal = new Counter({
+  name: 'websocket_revocation_closes_total',
+  help: 'WebSockets closed after a revocation event',
+  labelNames: ['scope'],
+  registers: [register],
+});
+
+export const websocketAuthHeartbeatDuration = new Histogram({
+  name: 'websocket_auth_heartbeat_duration_seconds',
+  help: 'Duration of WebSocket authentication heartbeat cycles',
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30],
+  registers: [register],
+});
+
+export const websocketAuthHeartbeatTotal = new Counter({
+  name: 'websocket_auth_heartbeat_total',
+  help: 'WebSocket authentication heartbeat outcomes',
+  labelNames: ['result'],
+  registers: [register],
+});
+
 // Setup metrics endpoint
 export const setupMetrics = (app: Application): void => {
   app.get('/metrics', async (req, res) => {
