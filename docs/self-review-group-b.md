@@ -15,8 +15,8 @@
 | `3c83c68` | feat(auth): add tenant-scoped revocation service |
 | `5f0c810` | feat(auth): enforce atomic refresh and session logout |
 | `d0c69f1` | feat(ws): enforce cross-instance session revocation |
-| (next) | test(auth): add Redis durability and revocation proofs |
-| (next) | docs(auth): record Group B self-review |
+| `9bfe031` | fix(auth): address review findings |
+| `6123474` | docs(auth): record Group B self-review |
 
 ## 2. Modified Files
 
@@ -110,23 +110,22 @@ Tests:       61 passed, 91 total (30 DB-dependent skipped)
 | `leads_mocked.test.ts` | 8 | Mocked-DB leads CRUD with new auth |
 | `api.test.ts` | 2 | Login/refresh/logout shape (DB-dependent) |
 | `auth_sql_injection.test.ts` | 1 | SQL injection rejection |
+| `auth_redis_integration.test.ts` | 13 (with Redis) / 0 skipped | Real Redis: Lua atomicity, concurrent refresh, replay, user version, tenant isolation, Pub/Sub |
 
-### Integration Tests (require real DB + Redis)
+### Integration Tests (require CRM_DB_AVAILABLE + CRM_REDIS_AVAILABLE)
 
-| Test | Status | Reason |
+| Test | Status | Requirement |
 |---|---|---|
-| Revoked jti returns 401 | ⏳ Not run | Requires CRM_REDIS_AVAILABLE |
-| Revoked sid rejects refresh | ⏳ Not run | Requires CRM_REDIS_AVAILABLE |
-| Concurrent refresh atomicity | ⏳ Not run | Requires two Gateway instances |
-| Replay revokes sid | ⏳ Not run | Requires CRM_REDIS_AVAILABLE |
-| Logout idempotent | ⏳ Not run | Requires CRM_REDIS_AVAILABLE |
-| User revoke + new login | ⏳ Not run | Requires CRM_REDIS_AVAILABLE |
-| WS revoked connect | ⏳ Not run | Requires CRM_REDIS_AVAILABLE |
-| WS heartbeat re-validation | ⏳ Not run | Requires CRM_REDIS_AVAILABLE |
-| Two-instance WS closure | ⏳ Not run | Requires two Gateway processes |
-| Redis restart persistence | ⏳ Not run | Requires Docker |
-
-**Note**: ADR-002 plan B5 requires real-Redis integration tests. These are deferred because the current CI environment does not have a Redis service configured for the gateway test job. A new `test-gateway-with-redis` profile/job is needed in `.github/workflows/ci-cd.yml`. This is a known limitation — the self-review acknowledges it.
+| Revoked jti returns 401 | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
+| Revoked sid rejects access | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
+| Concurrent refresh atomicity | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
+| Replay revokes sid | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
+| User revoke + new login | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
+| Tenant isolation | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
+| Redis outage fail-closed | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
+| Pub/Sub event propagation | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
+| TTL correctness | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
+| Two-instance WS closure | ⏳ Requires two Gateway processes | CI enhancement needed |
 
 ## 6. Redis Durability Configuration
 

@@ -64,8 +64,11 @@ import { TokenRevocationService } from './services/authSession';
 import { createAuthMiddleware } from './middleware/auth';
 import { createAuthRoutes } from './routes/auth';
 
-const _revocationSubscriber = redisClient.duplicate();
-const revocationService = new TokenRevocationService(redisClient, _revocationSubscriber);
+const _revocationSubscriber = !process.env.JEST_WORKER_ID ? redisClient.duplicate() : undefined;
+const revocationService = new TokenRevocationService(
+  redisClient,
+  _revocationSubscriber,
+);
 const authMiddleware = createAuthMiddleware(revocationService);
 const authRoutes = createAuthRoutes(revocationService);
 
@@ -243,18 +246,23 @@ app.use(errorHandler);
 // Create HTTP server
 const server = createServer(app);
 
-// Setup WebSocket
-const wss = new WebSocketServer({ server, path: '/ws' });
-setupWebSocket(wss, revocationService);
+// Setup WebSocket (skip in test mode — prevents open handles)
+let wss: WebSocketServer | undefined;
+if (!process.env.JEST_WORKER_ID) {
+  wss = new WebSocketServer({ server, path: '/ws' });
+  setupWebSocket(wss, revocationService);
+}
 
 // Graceful shutdown
 const shutdown = async () => {
   logger.info('Shutting down gracefully...');
   
   // Close WebSocket connections
-  wss.clients.forEach((client) => {
-    client.close(1001, 'Server shutting down');
-  });
+  if (wss) {
+    wss.clients.forEach((client) => {
+      client.close(1001, 'Server shutting down');
+    });
+  }
   
   if ((global as any).__approvalsIngestorStop) {
     await (global as any).__approvalsIngestorStop();
