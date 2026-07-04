@@ -8,7 +8,7 @@ import WebSocket from 'ws';
 import app from '../src/index';
 import { prisma, withTenantDb } from '../src/services/prisma';
 import { setupWebSocket } from '../src/services/websocket';
-import { cache, tenantKey } from '../src/services/redis';
+import { cache, redisClient, tenantKey } from '../src/services/redis';
 import { TokenRevocationService } from '../src/services/authSession';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'development-secret-change-in-production';
@@ -94,12 +94,14 @@ describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
       await db.customer.deleteMany({ where: { tenantId: tenantB } });
     });
     await prisma.tenant.deleteMany({ where: { id: { in: [tenantA, tenantB] } } });
+    await prisma.$disconnect();
+    redisClient.disconnect();
   });
 
   it('blocks cross-tenant resource access (tenant A cannot read tenant B)', async () => {
     const tokenA = signToken({
       sub: userA,
-      tenant_id: tenantA,
+      tenantId: tenantA,
       email: 'a@example.com',
       roles: ['admin'],
     });
@@ -113,7 +115,7 @@ describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
   it('blocks tenant override for non-super-admin (JWT tampering attempt)', async () => {
     const tokenA = signToken({
       sub: userA,
-      tenant_id: tenantA,
+      tenantId: tenantA,
       email: 'a@example.com',
       roles: ['admin'],
     });
@@ -128,7 +130,7 @@ describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
   it('allows super_admin cross-tenant READ only (OPA enforced)', async () => {
     const superToken = signToken({
       sub: superAdmin,
-      tenant_id: tenantA,
+      tenantId: tenantA,
       email: 'sa@example.com',
       roles: ['super_admin'],
     });
@@ -146,7 +148,7 @@ describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
   it('denies super_admin cross-tenant WRITE (OPA enforced)', async () => {
     const superToken = signToken({
       sub: superAdmin,
-      tenant_id: tenantA,
+      tenantId: tenantA,
       email: 'sa@example.com',
       roles: ['super_admin'],
     });
@@ -179,7 +181,7 @@ describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
   it('blocks websocket cross-tenant channel subscription', async () => {
     const tokenA = signToken({
       sub: userA,
-      tenant_id: tenantA,
+      tenantId: tenantA,
       email: 'a@example.com',
       roles: ['admin'],
     });
@@ -200,30 +202,35 @@ describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
 
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(tokenA)}`);
 
-    const first = await new Promise<any>((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('timeout')), 5000);
-      ws.once('message', (data) => {
-        clearTimeout(t);
-        resolve(JSON.parse(data.toString()));
+    try {
+      const first = await new Promise<any>((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('timeout')), 5000);
+        ws.once('message', (data) => {
+          clearTimeout(t);
+          resolve(JSON.parse(data.toString()));
+        });
+        ws.once('error', reject);
       });
-      ws.once('error', reject);
-    });
-    expect(first.type).toBe('connected');
+      expect(first.type).toBe('connected');
 
-    ws.send(JSON.stringify({ type: 'subscribe', payload: { topic: `tenant:${tenantB}:updates` } }));
-
-    const denial = await new Promise<any>((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('timeout')), 5000);
-      ws.once('message', (data) => {
-        clearTimeout(t);
-        resolve(JSON.parse(data.toString()));
+      const denied = new Promise<number>((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('timeout')), 5000);
+        ws.once('close', (code) => {
+          clearTimeout(t);
+          resolve(code);
+        });
+        ws.once('error', reject);
       });
-      ws.once('error', reject);
-    });
-    expect(denial.type).toBe('error');
-    expect(denial.payload.code).toBe('CROSS_TENANT_SUBSCRIBE_DENY');
-
-    ws.close();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+      ws.send(JSON.stringify({
+        type: 'subscribe',
+        payload: { topic: `tenant:${tenantB}:updates` },
+      }));
+      await expect(denied).resolves.toBe(4403);
+    } finally {
+      ws.terminate();
+      for (const client of wss.clients) client.terminate();
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });
