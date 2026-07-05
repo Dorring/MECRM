@@ -124,8 +124,8 @@
 ### Unit Tests (no external deps) — 🟢 Automated
 
 ```
-Test Suites: 5 passed, 5 of 10 total (5 DB-dependent skipped)
-Tests:       61 passed, 91 total (30 DB-dependent skipped)
+Test Suites: 7 passed, 8 skipped (DB-dependent), 15 total
+Tests:       71 passed, 51 skipped, 122 total
 ```
 
 | Test File | Passed | Notes |
