@@ -173,6 +173,7 @@ jobs:
           JWT_SECRET: test-secret
           CRM_TEST_REQUIRE_DB: 1
           CRM_REDIS_AVAILABLE: 1
+          CRM_CAN_RESTART_REDIS: 1
 
       - name: Upload coverage
         uses: codecov/codecov-action@v5

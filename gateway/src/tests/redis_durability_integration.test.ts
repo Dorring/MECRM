@@ -43,7 +43,6 @@ function restartRedis(): void {
     // Fall through to direct docker restart
   }
   try {
-    // Find the Redis container by image
     const containerId = execSync(
       'docker ps -q --filter ancestor=redis:7-alpine --filter ancestor=redis:7',
       { timeout: 5000, stdio: 'pipe' },
@@ -66,6 +65,7 @@ function restartRedis(): void {
 
 /**
  * Wait for Redis to become reachable after a restart.
+ * Returns a NEW client with retryStrategy disabled (no auto-reconnect).
  */
 async function waitForRedis(url: string, maxWaitMs = 10000): Promise<Redis> {
   const start = Date.now();
@@ -75,6 +75,7 @@ async function waitForRedis(url: string, maxWaitMs = 10000): Promise<Redis> {
       lazyConnect: true,
       maxRetriesPerRequest: 1,
       connectTimeout: 2000,
+      retryStrategy: () => null, // no auto-reconnect
     });
     try {
       await client.connect();
@@ -90,13 +91,24 @@ async function waitForRedis(url: string, maxWaitMs = 10000): Promise<Redis> {
   }
 }
 
+/**
+ * Disconnect a Redis client, suppressing errors.
+ */
+function safeDisconnect(client: Redis | undefined): void {
+  try { client?.disconnect(); } catch { /* */ }
+}
+
 describeRestart('Redis restart persistence', () => {
   let redis: Redis;
   let subscriber: Redis;
   let service: TokenRevocationService;
 
   beforeAll(async () => {
-    redis = new Redis(REDIS_URL, { lazyConnect: true, maxRetriesPerRequest: 1 });
+    redis = new Redis(REDIS_URL, {
+      lazyConnect: true,
+      maxRetriesPerRequest: 1,
+      retryStrategy: () => null,
+    });
     subscriber = redis.duplicate();
     await redis.connect();
     await subscriber.connect();
@@ -105,7 +117,8 @@ describeRestart('Redis restart persistence', () => {
 
   afterAll(async () => {
     await service.shutdown();
-    redis.disconnect();
+    safeDisconnect(redis);
+    safeDisconnect(subscriber);
   });
 
   // -----------------------------------------------------------------------
@@ -118,23 +131,25 @@ describeRestart('Redis restart persistence', () => {
 
     await service.revokeJti(tenant, jti, exp);
 
-    // Verify revocation before restart
     const pre = await service.checkRevoked({
       jti, sid: randomUUID(), sub: randomUUID(), tenantId: tenant,
       type: 'access', uv: 0, sexp: exp + 86400, iat: 0, exp,
     });
     expect(pre.revoked).toBe(true);
 
-    // Restart Redis
+    // Disconnect old clients BEFORE restart to prevent auto-reconnect handles
+    await service.shutdown();
+    safeDisconnect(subscriber);
+    safeDisconnect(redis);
+
     restartRedis();
 
-    // Wait for Redis to recover and reconnect
+    // Create fresh clients after restart
     redis = await waitForRedis(REDIS_URL);
     subscriber = redis.duplicate();
     await subscriber.connect();
     service = new TokenRevocationService(redis, subscriber);
 
-    // Revocation must persist (AOF durability)
     const post = await service.checkRevoked({
       jti, sid: randomUUID(), sub: randomUUID(), tenantId: tenant,
       type: 'access', uv: 0, sexp: exp + 86400, iat: 0, exp,
@@ -142,7 +157,6 @@ describeRestart('Redis restart persistence', () => {
     expect(post.revoked).toBe(true);
     expect(post.reason).toBe('jti');
 
-    // Cleanup
     const keys = await redis.keys('auth:*');
     if (keys.length > 0) await redis.del(...keys);
   }, 30000);
@@ -154,18 +168,20 @@ describeRestart('Redis restart persistence', () => {
     const tenant = randomUUID();
     const userId = randomUUID();
 
-    // Revoke user (increment version to 1)
     const v = await service.revokeUser(tenant, userId);
     expect(v).toBe(1);
 
-    // Verify old uv=0 is rejected before restart
     const preReject = await service.checkRevoked({
       jti: randomUUID(), sid: randomUUID(), sub: userId, tenantId: tenant,
       type: 'access', uv: 0, sexp: Math.floor(Date.now() / 1000) + 86400, iat: 0, exp: 3600,
     });
     expect(preReject.revoked).toBe(true);
 
-    // Restart Redis
+    // Disconnect old clients BEFORE restart
+    await service.shutdown();
+    safeDisconnect(subscriber);
+    safeDisconnect(redis);
+
     restartRedis();
 
     redis = await waitForRedis(REDIS_URL);
@@ -188,41 +204,33 @@ describeRestart('Redis restart persistence', () => {
     });
     expect(postAccept.revoked).toBe(false);
 
-    // Cleanup
     const keys = await redis.keys('auth:*');
     if (keys.length > 0) await redis.del(...keys);
   }, 30000);
 });
 
 describeRedis('Redis stop/start fault injection', () => {
-  // -----------------------------------------------------------------------
-  // B5-3: Redis down → checkRevoked throws (fail-closed for HTTP 503 / WS 1013)
-  // -----------------------------------------------------------------------
-  it('checkRevoked throws when Redis is unreachable (maps to HTTP 503 / WS 1013)', async () => {
-    // Connect to a port with no Redis
+  it('checkRevoked throws when Redis is unreachable', async () => {
     const broken = new Redis('redis://127.0.0.1:6399', {
       lazyConnect: true,
       connectTimeout: 200,
       maxRetriesPerRequest: 1,
       retryStrategy: () => null,
     });
-
-    const brokenService = new TokenRevocationService(broken);
-
-    await expect(
-      brokenService.checkRevoked({
-        jti: randomUUID(), sid: randomUUID(), sub: randomUUID(),
-        tenantId: randomUUID(), type: 'access', uv: 0,
-        sexp: Math.floor(Date.now() / 1000) + 86400, iat: 0, exp: 3600,
-      }),
-    ).rejects.toThrow();
-
-    broken.disconnect();
+    try {
+      const brokenService = new TokenRevocationService(broken);
+      await expect(
+        brokenService.checkRevoked({
+          jti: randomUUID(), sid: randomUUID(), sub: randomUUID(),
+          tenantId: randomUUID(), type: 'access', uv: 0,
+          sexp: Math.floor(Date.now() / 1000) + 86400, iat: 0, exp: 3600,
+        }),
+      ).rejects.toThrow();
+    } finally {
+      broken.disconnect();
+    }
   });
 
-  // -----------------------------------------------------------------------
-  // B5-4: consumeRefresh fails when Redis is down
-  // -----------------------------------------------------------------------
   it('consumeRefresh returns DEPENDENCY_ERROR when Redis is unreachable', async () => {
     const broken = new Redis('redis://127.0.0.1:6399', {
       lazyConnect: true,
@@ -230,17 +238,17 @@ describeRedis('Redis stop/start fault injection', () => {
       maxRetriesPerRequest: 1,
       retryStrategy: () => null,
     });
-
-    const brokenService = new TokenRevocationService(broken);
-    const now = Math.floor(Date.now() / 1000);
-
-    const result = await brokenService.consumeRefresh({
-      jti: randomUUID(), sid: randomUUID(), sub: randomUUID(),
-      tenantId: randomUUID(), type: 'refresh', uv: 0,
-      sexp: now + 86400, iat: now, exp: now + 3600,
-    });
-    expect(result.status).toBe('DEPENDENCY_ERROR');
-
-    broken.disconnect();
+    try {
+      const brokenService = new TokenRevocationService(broken);
+      const now = Math.floor(Date.now() / 1000);
+      const result = await brokenService.consumeRefresh({
+        jti: randomUUID(), sid: randomUUID(), sub: randomUUID(),
+        tenantId: randomUUID(), type: 'refresh', uv: 0,
+        sexp: now + 86400, iat: now, exp: now + 3600,
+      });
+      expect(result.status).toBe('DEPENDENCY_ERROR');
+    } finally {
+      broken.disconnect();
+    }
   });
 });

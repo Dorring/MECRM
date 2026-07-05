@@ -19,11 +19,16 @@ const JWT_VERIFY_OPTIONS: VerifyOptions = {
   algorithms: ['HS256'],
 };
 
-const HEARTBEAT_INTERVAL_MS = 30000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 30000;
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+
+export interface WebSocketSetupOptions {
+  /** Override the heartbeat interval (default 30000ms). For testing only. */
+  heartbeatIntervalMs?: number;
+}
 
 interface AuthenticatedWebSocket extends WebSocket {
   userId: string;
@@ -50,6 +55,7 @@ const jtiIndex = new Map<string, AuthenticatedWebSocket>();
 const sidIndex = new Map<string, Set<AuthenticatedWebSocket>>();
 const subscriptions = new WeakMap<AuthenticatedWebSocket, Set<string>>();
 const HEARTBEAT_CONCURRENCY = 25;
+export { HEARTBEAT_CONCURRENCY };
 
 function scopedIndexKey(tenantId: string, id: string): string {
   return `${tenantId}:${id}`;
@@ -62,7 +68,10 @@ function scopedIndexKey(tenantId: string, id: string): string {
 export function setupWebSocket(
   wss: WebSocketServer,
   revocationService: TokenRevocationService,
+  options?: WebSocketSetupOptions,
 ): void {
+  const heartbeatIntervalMs = options?.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
+
   // Heartbeat — re-checks revocation and token/session expiry
   let heartbeatRunning = false;
   const heartbeatInterval = setInterval(async () => {
@@ -134,7 +143,7 @@ export function setupWebSocket(
       heartbeatEnd();
       heartbeatRunning = false;
     }
-  }, HEARTBEAT_INTERVAL_MS);
+  }, heartbeatIntervalMs);
 
   wss.on('close', () => {
     clearInterval(heartbeatInterval);

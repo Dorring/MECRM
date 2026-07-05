@@ -124,8 +124,9 @@
 ### Unit Tests (no external deps) — 🟢 Automated
 
 ```
-Test Suites: 7 passed, 8 skipped (DB-dependent), 15 total
-Tests:       71 passed, 51 skipped, 122 total
+Test Suites: 7 passed, 8 skipped (DB/Redis-dependent), 15 total
+Tests:       73 passed, 55 skipped, 128 total
+No --forceExit required. --detectOpenHandles exits cleanly.
 ```
 
 | Test File | Passed | Notes |
@@ -137,18 +138,26 @@ Tests:       71 passed, 51 skipped, 122 total
 | `auth_sql_injection.test.ts` | 1 | SQL injection rejection |
 | `auth_token_lifetime.test.ts` | 4 | exp <= sexp validation |
 
-### B4 WebSocket Tests (mock Redis) — 🟢 Automated
+### B4 WebSocket Tests — 🟢 Automated (mock Redis)
 
-| Test | Status | Evidence |
+| Test | File | Status |
 |---|---|---|
-| Unrelated tenant socket stays open on revocation | 🟢 Automated | `ws_revocation_integration.test.ts` |
-| Heartbeat catches revoked token (Pub/Sub miss) | 🟢 Automated | `ws_revocation_integration.test.ts` |
-| Heartbeat overlap_prevented metric | 🟢 Automated | `ws_revocation_integration.test.ts` |
-| Bounded concurrency ≤ 25 | 🟢 Automated | `ws_revocation_integration.test.ts` |
-| 1013 on Redis fault during heartbeat | 🟢 Automated | `ws_revocation_integration.test.ts` |
-| Malformed Pub/Sub event rejected + metric | 🟢 Automated | `ws_revocation_integration.test.ts` |
-| Oversized Pub/Sub event rejected + metric | 🟢 Automated | `ws_revocation_integration.test.ts` |
-| Subscriber readiness transitions | 🟢 Automated | `ws_revocation_integration.test.ts` |
+| closeConnectionsByEvent closes jti socket with 4401 | `ws_revocation_integration.test.ts` | 🟢 Automated |
+| Heartbeat catches revoked token (100ms interval) | `ws_revocation_integration.test.ts` | 🟢 Automated |
+| Heartbeat overlap_prevented metric | `ws_revocation_integration.test.ts` | 🟢 Automated |
+| Bounded concurrency ≤ HEARTBEAT_CONCURRENCY (25) | `ws_revocation_integration.test.ts` | 🟢 Automated |
+| 1013 on Redis fault during heartbeat | `ws_revocation_integration.test.ts` | 🟢 Automated |
+| HTTP auth middleware → 503 on Redis fault | `ws_revocation_integration.test.ts` | 🟢 Automated |
+| Two-process: revocation closes remote socket | `ws_cross_instance_integration.test.ts` | 🟢 Automated |
+| Two-process: unrelated tenant socket stays open | `ws_cross_instance_integration.test.ts` | 🟢 Automated |
+
+### B4 Pub/Sub Tests (require CRM_REDIS_AVAILABLE) — 🟢 Automated with real Redis
+
+| Test | File | Status |
+|---|---|---|
+| Malformed Pub/Sub event rejected + metric | `ws_revocation_integration.test.ts` | 🟢 Automated |
+| Oversized Pub/Sub event rejected + metric | `ws_revocation_integration.test.ts` | 🟢 Automated |
+| Subscriber readiness transitions | `ws_revocation_integration.test.ts` | 🟢 Automated |
 
 ### Integration Tests (require CRM_REDIS_AVAILABLE) — 🟢 Automated with real Redis
 
@@ -167,20 +176,21 @@ Tests:       71 passed, 51 skipped, 122 total
 | Client reconnect: revoked jti persists | 🟡 Client reconnect | `auth_redis_integration.test.ts` |
 | Client reconnect: user version persists | 🟡 Client reconnect | `auth_redis_integration.test.ts` |
 
-### Redis Restart Persistence — 🔴 Requires CRM_CAN_RESTART_REDIS=1
+### Redis Restart Persistence — 🟢 CI (CRM_CAN_RESTART_REDIS=1)
 
-| Test | Status | Evidence |
+| Test | File | Status |
 |---|---|---|
-| Revoked jti survives real Redis restart | 🔴 Env required | `redis_durability_integration.test.ts` |
-| User version survives real Redis restart | 🔴 Env required | `redis_durability_integration.test.ts` |
-| checkRevoked fails on unreachable Redis | 🟢 Automated | `redis_durability_integration.test.ts` |
-| consumeRefresh DEPENDENCY_ERROR on unreachable | 🟢 Automated | `redis_durability_integration.test.ts` |
+| Revoked jti survives real Redis restart | `redis_durability_integration.test.ts` | 🟢 CI |
+| User version survives real Redis restart | `redis_durability_integration.test.ts` | 🟢 CI |
+| checkRevoked fails on unreachable Redis | `redis_durability_integration.test.ts` | 🟢 Automated |
+| consumeRefresh DEPENDENCY_ERROR on unreachable | `redis_durability_integration.test.ts` | 🟢 Automated |
 
 ### Two-Instance WebSocket — 🟢 Automated (requires Redis)
 
-| Test | Status | Evidence |
+| Test | File | Status |
 |---|---|---|
-| Instance A revoke → Instance B socket closed | 🟢 Automated | `ws_cross_instance_integration.test.ts` |
+| Instance A revoke → Instance B socket closed | `ws_cross_instance_integration.test.ts` | 🟢 Automated |
+| Unrelated tenant socket stays open | `ws_cross_instance_integration.test.ts` | 🟢 Automated |
 
 ## 6. Redis Durability Configuration
 

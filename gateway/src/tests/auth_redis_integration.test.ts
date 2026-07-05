@@ -358,8 +358,8 @@ describeRedis('TokenRevocationService (real Redis)', () => {
     try {
       await redis.config('SET', 'maxmemory-policy', 'noeviction');
     } catch {
-      // CONFIG SET is restricted (e.g. ACL); skip instead of silently passing
-      return;
+      // CONFIG SET is restricted (e.g. ACL) — test cannot run
+      throw new Error('CONFIG SET unavailable — OOM test requires Redis CONFIG access');
     }
 
     try {

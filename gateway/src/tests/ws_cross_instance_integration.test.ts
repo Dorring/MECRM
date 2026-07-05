@@ -162,4 +162,70 @@ describeRedis('WebSocket revocation across Gateway processes', () => {
       redis.disconnect();
     }
   }, 30000);
+
+  it('unrelated tenant socket stays open when another tenant is revoked', async () => {
+    const redis = new Redis(redisUrl);
+    const gatewayA = startGatewayProcess();
+    const gatewayB = startGatewayProcess();
+    let socketA: WebSocket | undefined;
+    let socketB: WebSocket | undefined;
+
+    try {
+      const [readyA, readyB] = await Promise.all([
+        waitForMessage(gatewayA, 'READY'),
+        waitForMessage(gatewayB, 'READY'),
+      ]);
+
+      const now = Math.floor(Date.now() / 1000);
+      const tenantA = randomUUID();
+      const tenantB = randomUUID();
+      const sidA = randomUUID();
+      const sexp = now + 3600;
+
+      const tokenA = jwt.sign(
+        { jti: randomUUID(), sid: sidA, sub: randomUUID(), tenantId: tenantA,
+          type: 'access', uv: 0, sexp, roles: ['admin'], email: 'a@test.com' },
+        jwtSecret, { algorithm: 'HS256', expiresIn: 600 },
+      );
+      const tokenB = jwt.sign(
+        { jti: randomUUID(), sid: randomUUID(), sub: randomUUID(), tenantId: tenantB,
+          type: 'access', uv: 0, sexp, roles: ['admin'], email: 'b@test.com' },
+        jwtSecret, { algorithm: 'HS256', expiresIn: 600 },
+      );
+
+      // Connect both sockets to gateway B
+      socketA = new WebSocket(`ws://127.0.0.1:${readyB.port}/ws?token=${encodeURIComponent(tokenA)}`);
+      socketB = new WebSocket(`ws://127.0.0.1:${readyB.port}/ws?token=${encodeURIComponent(tokenB)}`);
+
+      await Promise.all([socketA, socketB].map((s) =>
+        new Promise<void>((resolve, reject) => {
+          const t = setTimeout(() => reject(new Error('WS connect timeout')), 5000);
+          s.once('message', (d) => {
+            if (JSON.parse(d.toString()).type === 'connected') { clearTimeout(t); resolve(); }
+          });
+          s.once('error', reject);
+        }),
+      ));
+
+      // Revoke tenant A's session via gateway A
+      const closedA = new Promise<number>((resolve) => {
+        const t = setTimeout(() => resolve(0), 5000);
+        socketA?.once('close', (code) => { clearTimeout(t); resolve(code); });
+      });
+
+      gatewayA.send({ type: 'REVOKE_SID', tenantId: tenantA, sid: sidA, sexp });
+      await waitForMessage(gatewayA, 'REVOKED');
+
+      const closeCode = await closedA;
+      expect(closeCode).toBe(4401);
+
+      // Tenant B socket must still be open
+      expect(socketB.readyState).toBe(WebSocket.OPEN);
+    } finally {
+      socketA?.terminate();
+      socketB?.terminate();
+      await Promise.all([stopChild(gatewayA), stopChild(gatewayB)]);
+      redis.disconnect();
+    }
+  }, 30000);
 });
