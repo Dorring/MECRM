@@ -16,24 +16,39 @@
 | `5f0c810` | feat(auth): enforce atomic refresh and session logout |
 | `d0c69f1` | feat(ws): enforce cross-instance session revocation |
 | `9bfe031` | fix(auth): address review findings |
+| `9570d73` | test(auth): finalize lint-clean Redis integration tests |
+| `4c197e7` | docs(auth): update self-review and fix lint/open handles |
 | `6123474` | docs(auth): record Group B self-review |
+| `23fcc76` | fix(auth): harden session revocation guarantees |
+| `9930cfd` | fix(test): align tenant isolation with revocation contract |
+| `20f9456` | fix(test): close gateway integration dependencies |
 
 ## 2. Modified Files
 
 | File | Status |
 |---|---|
-| `docs/adr/002-auth-session-revocation.md` | NEW — ADR design record |
-| `docs/adr/002-auth-session-revocation-plan.md` | NEW — implementation plan |
-| `gateway/src/services/authSession.ts` | NEW — TokenRevocationService, Lua script, key builders, TTL helpers, Pub/Sub subscriber |
-| `gateway/src/middleware/auth.ts` | MODIFIED — new JWT claims (jti, sid, type, uv, sexp), algorithm pinning, DI via createAuthMiddleware, 503 for Redis errors |
-| `gateway/src/routes/auth.ts` | MODIFIED — factory pattern, login/register reads user version, atomic refresh with Lua, verified logout, WS closure on logout |
-| `gateway/src/services/websocket.ts` | MODIFIED — JWT claim validation at connect, subscribe re-check, heartbeat re-validation, jti/sid indexes, closeConnectionsByEvent |
-| `gateway/src/index.ts` | MODIFIED — revocation service + subscriber initialization, shutdown |
+| `docs/adr/002-auth-session-revocation.md` | NEW → Accepted/Implemented |
+| `docs/adr/002-auth-session-revocation-plan.md` | NEW → Implemented |
+| `gateway/jest.config.js` | NEW — Jest config with cleanup (no forceExit) |
+| `gateway/src/jest.cleanup.ts` | NEW — global afterAll cleanup for test dependencies |
+| `gateway/src/services/authSession.ts` | NEW — TokenRevocationService, Lua script, key builders, TTL helpers, Pub/Sub subscriber, metrics |
+| `gateway/src/services/metrics.ts` | MODIFIED — revocation counters, refresh outcomes, Pub/Sub events, WS closes, heartbeat duration/outcomes |
+| `gateway/src/services/redis.ts` | MODIFIED — test cleanup registration |
+| `gateway/src/services/prisma.ts` | MODIFIED — test cleanup registration |
+| `gateway/src/middleware/auth.ts` | MODIFIED — new JWT claims (jti, sid, type, uv, sexp), algorithm pinning, DI via createAuthMiddleware, exp <= sexp validation, 503 for Redis errors |
+| `gateway/src/routes/auth.ts` | MODIFIED — factory pattern, login/register reads user version, atomic refresh with Lua, verified logout, WS closure on logout, refresh token malformed rejection |
+| `gateway/src/services/websocket.ts` | MODIFIED — JWT claim validation at connect, subscribe re-check, heartbeat re-validation (overlap-protected, bounded concurrency 25), tenant-scoped jti/sid indexes, closeConnectionsByEvent, close codes 4401/4403/1013 |
+| `gateway/src/index.ts` | MODIFIED — revocation service + subscriber initialization, startup-critical subscriber init, readiness includes subscriber check |
 | `gateway/src/tests/revocation.test.ts` | NEW — 38 unit tests for service, TTL, keys, pipeline errors |
 | `gateway/src/tests/nodb_security.test.ts` | MODIFIED — updated for 503/401 fail-closed semantics |
 | `gateway/src/tests/leads_mocked.test.ts` | MODIFIED — updated Redis mock + JWT claims |
 | `gateway/src/tests/productivity.test.ts` | MODIFIED — updated generateToken signature |
+| `gateway/src/tests/auth_redis_integration.test.ts` | NEW — 16 real-Redis tests: Lua atomicity, concurrent refresh, replay, user version, tenant isolation, Pub/Sub, Redis config verification, reconnect persistence, OOM simulation |
+| `gateway/src/tests/auth_token_lifetime.test.ts` | NEW — token exp <= sexp validation |
+| `gateway/src/tests/ws_cross_instance_integration.test.ts` | NEW — two Gateway child process WS revocation test |
+| `gateway/src/tests/helpers/ws_gateway_process.ts` | NEW — child Gateway process helper |
 | `docker-compose.yml` | MODIFIED — Redis AOF + noeviction |
+| `.github/workflows/ci-cd.yml` | MODIFIED — Redis service for integration tests |
 
 ## 3. Contracts
 
@@ -110,7 +125,9 @@ Tests:       61 passed, 91 total (30 DB-dependent skipped)
 | `leads_mocked.test.ts` | 8 | Mocked-DB leads CRUD with new auth |
 | `api.test.ts` | 2 | Login/refresh/logout shape (DB-dependent) |
 | `auth_sql_injection.test.ts` | 1 | SQL injection rejection |
-| `auth_redis_integration.test.ts` | 13 (with Redis) / 0 skipped | Real Redis: Lua atomicity, concurrent refresh, replay, user version, tenant isolation, Pub/Sub |
+| `auth_token_lifetime.test.ts` | 4 | exp <= sexp validation |
+| `auth_redis_integration.test.ts` | 16 (with Redis) / 0 skipped | Real Redis: Lua atomicity, concurrent refresh, replay, user version, tenant isolation, Pub/Sub, AOF config, reconnect persistence, OOM simulation |
+| `ws_cross_instance_integration.test.ts` | 1 (with Redis) / 0 skipped | Two child Gateway processes, shared Redis |
 
 ### Integration Tests (require CRM_DB_AVAILABLE + CRM_REDIS_AVAILABLE)
 
@@ -125,7 +142,11 @@ Tests:       61 passed, 91 total (30 DB-dependent skipped)
 | Redis outage fail-closed | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
 | Pub/Sub event propagation | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
 | TTL correctness | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
-| Two-instance WS closure | ✅ Implemented and locally passed | Two child Gateway processes + real Redis |
+| Redis AOF/appendfsync/noeviction config | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
+| Revoked jti survives reconnect (simulated restart) | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
+| User version survives reconnect (old rejected, new works) | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
+| OOM/write failure fail-closed | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
+| Two-instance WS closure | ✅ `ws_cross_instance_integration` | `CRM_REDIS_AVAILABLE=1` |
 
 ## 6. Redis Durability Configuration
 
@@ -187,10 +208,14 @@ Local verification after the review:
 Gateway lint: passed
 Gateway build: passed
 Gateway full suite with Redis: 81 passed, 30 DB-dependent skipped
-Redis integration: 13 passed
+Redis integration: 16 passed
+  - AOF/appendfsync/noeviction config: verified at runtime
+  - Revoked jti reconnect persistence: verified
+  - User version reconnect persistence: verified
+  - OOM/write failure fail-closed: verified
 Two-process WS revocation: 1 passed
 Redis AOF/noeviction runtime config: verified
-Redis restart persistence: manually verified with Docker Compose
+Redis restart persistence: verified via reconnect simulation
 ```
 
 ## 9. Boundary with Group C

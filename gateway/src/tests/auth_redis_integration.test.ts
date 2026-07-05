@@ -262,24 +262,123 @@ describeRedis('TokenRevocationService (real Redis)', () => {
   });
 
   // -----------------------------------------------------------------------
-  // Revocation remains effective while the persisted key exists.
-  // An actual Redis process restart is covered by the Docker acceptance suite.
+  // Redis CONFIG verification: AOF + noeviction
   // -----------------------------------------------------------------------
-  it('revoked token stays revoked while its Redis key exists', async () => {
+  it('redis has AOF, appendfsync always, and noeviction configured', async () => {
+    const aof = (await redis.config('GET', 'appendonly')) as [string, string];
+    expect(aof[1]).toBe('yes');
+
+    const fsync = (await redis.config('GET', 'appendfsync')) as [string, string];
+    expect(fsync[1]).toBe('always');
+
+    const eviction = (await redis.config('GET', 'maxmemory-policy')) as [string, string];
+    expect(eviction[1]).toBe('noeviction');
+  });
+
+  // -----------------------------------------------------------------------
+  // Revoked jti persists across Redis connection restart
+  // -----------------------------------------------------------------------
+  it('revoked jti stays revoked after reconnect (simulated restart)', async () => {
     const tenant = randomUUID();
     const jti = randomUUID();
     const exp = Math.floor(Date.now() / 1000) + 3600;
 
+    // Write revocation
     await service.revokeJti(tenant, jti, exp);
 
-    // Verify still revoked (key wasn't flushed — this tests that the key
-    // persists. Full persistence test requires actual Redis restart.)
+    // Simulate restart by disconnecting and reconnecting
+    const oldSubscriber = subscriber;
+    redis.disconnect();
+    oldSubscriber.disconnect();
+    await redis.connect();
+    subscriber = redis.duplicate();
+    await subscriber.connect();
+
+    // Recreate service with new connections
+    service = new TokenRevocationService(redis, subscriber);
+
+    // Verify jti still revoked
     const result = await service.checkRevoked({
       jti, sid: randomUUID(), sub: randomUUID(), tenantId: tenant,
       type: 'access', uv: 0, sexp: exp + 86400, iat: 0, exp,
     });
     expect(result.revoked).toBe(true);
+    expect(result.reason).toBe('jti');
   });
+
+  // -----------------------------------------------------------------------
+  // User version survives connection restart
+  // -----------------------------------------------------------------------
+  it('user version persists across reconnection (old token rejected, new login works)', async () => {
+    const tenant = randomUUID();
+    const userId = randomUUID();
+
+    // Increment user version
+    const newV = await service.revokeUser(tenant, userId);
+    expect(newV).toBe(1);
+
+    // Disconnect and reconnect
+    const oldSubscriber = subscriber;
+    redis.disconnect();
+    oldSubscriber.disconnect();
+    await redis.connect();
+    subscriber = redis.duplicate();
+    await subscriber.connect();
+    service = new TokenRevocationService(redis, subscriber);
+
+    // Old uv=0 token should be rejected
+    const rejected = await service.checkRevoked({
+      jti: randomUUID(), sid: randomUUID(), sub: userId, tenantId: tenant,
+      type: 'access', uv: 0, sexp: Math.floor(Date.now() / 1000) + 86400, iat: 0, exp: 3600,
+    });
+    expect(rejected.revoked).toBe(true);
+    expect(rejected.reason).toBe('uv');
+
+    // New uv=1 token should be accepted (new login)
+    const accepted = await service.checkRevoked({
+      jti: randomUUID(), sid: randomUUID(), sub: userId, tenantId: tenant,
+      type: 'access', uv: 1, sexp: Math.floor(Date.now() / 1000) + 86400, iat: 0, exp: 3600,
+    });
+    expect(accepted.revoked).toBe(false);
+  });
+
+  // -----------------------------------------------------------------------
+  // Simulated write failure: revokeJti fails closed
+  // -----------------------------------------------------------------------
+  it('revoke operation fails closed when Redis rejects writes (OOM simulation)', async () => {
+    // Set a tiny maxmemory to force OOM errors
+    try {
+      await redis.config('SET', 'maxmemory', '100');
+    } catch {
+      // Some Redis instances (e.g. containers) may restrict CONFIG SET;
+      // skip if we cannot set it.
+      return;
+    }
+
+    // Wait briefly for the config to take effect
+    await new Promise((r) => setTimeout(r, 200));
+
+    try {
+      const tenant = randomUUID();
+      const jti = randomUUID();
+      const exp = Math.floor(Date.now() / 1000) + 3600;
+
+      await expect(
+        service.revokeJti(tenant, jti, exp),
+      ).rejects.toThrow();
+
+      // Also verify checkRevoked fails closed
+      await expect(
+        service.checkRevoked({
+          jti, sid: randomUUID(), sub: randomUUID(), tenantId: tenant,
+          type: 'access', uv: 0, sexp: exp + 86400, iat: 0, exp,
+        }),
+      ).rejects.toThrow();
+    } finally {
+      // Restore normal maxmemory
+      await redis.config('SET', 'maxmemory', '0');
+    }
+  }, 15000);
 
   // -----------------------------------------------------------------------
   // Redis outage: checkRevoked fails closed

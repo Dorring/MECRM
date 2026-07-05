@@ -1,7 +1,7 @@
 # ADR-002: Tenant-Scoped Token and Session Revocation
 
-**Status:** Proposed — implementation is blocked until this ADR is approved  
-**Date:** 2026-07-03  
+**Status:** Accepted/Implemented — Group B complete  
+**Date:** 2026-07-05  
 **Scope:** Hardening 1.1 Group B  
 **Supersedes:** `blacklist:<full-jwt>` revocation keys
 

@@ -1,8 +1,9 @@
 # ADR-002 Implementation Plan: Group B
 
-**Status:** Ready for implementation after ADR approval  
+**Status:** Implemented — all phases complete  
 **Target branch:** `hardening/auth-session-revocation`  
-**Baseline:** latest `main` after Group A merge and green CI
+**Baseline:** `main@HEAD` after Group A merge and green CI  
+**Tags:** `hardening/group-b` (pending independent review and merge)
 
 ## 1. Scope
 
