@@ -119,6 +119,14 @@ jobs:
           --health-retries 5
       redis:
         image: redis:7
+        args:
+          - redis-server
+          - --appendonly
+          - "yes"
+          - --appendfsync
+          - always
+          - --maxmemory-policy
+          - noeviction
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 10s
@@ -154,15 +162,16 @@ jobs:
           POSTGRES_DB: test_db
           GATEWAY_DIR: ./gateway
 
-      - name: Configure Redis for AOF/noeviction
+      - name: Verify Redis AOF/noeviction (set at container startup)
         run: |
-          sudo apt-get update && sudo apt-get install -y redis-tools
+          # Ensure AOF/noeviction — redundant with service args, but defensive
           redis-cli -h localhost -p 6379 CONFIG SET appendonly yes
           redis-cli -h localhost -p 6379 CONFIG SET appendfsync always
           redis-cli -h localhost -p 6379 CONFIG SET maxmemory-policy noeviction
-          redis-cli -h localhost -p 6379 CONFIG GET appendonly
-          redis-cli -h localhost -p 6379 CONFIG GET appendfsync
-          redis-cli -h localhost -p 6379 CONFIG GET maxmemory-policy
+          # Verify all three settings are correct
+          [ "$(redis-cli -h localhost -p 6379 CONFIG GET appendonly | tail -1)" = "yes" ]
+          [ "$(redis-cli -h localhost -p 6379 CONFIG GET appendfsync | tail -1)" = "always" ]
+          [ "$(redis-cli -h localhost -p 6379 CONFIG GET maxmemory-policy | tail -1)" = "noeviction" ]
 
       - name: Run tests
         run: npm test -- --coverage --detectOpenHandles
@@ -172,6 +181,20 @@ jobs:
           REDIS_URL: redis://localhost:6379
           JWT_SECRET: test-secret
           CRM_TEST_REQUIRE_DB: 1
+          CRM_REDIS_AVAILABLE: 1
+          CRM_CAN_RESTART_REDIS: 1
+
+      - name: Run Redis durability tests (restart test, runInBand)
+        run: >
+          npx jest src/tests/durability/redis_durability_integration.test.ts
+          --runInBand --detectOpenHandles
+          --testPathIgnorePatterns="<rootDir>/dist/"
+          --testPathIgnorePatterns="<rootDir>/src/tests/helpers/"
+        working-directory: gateway
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/test_db
+          REDIS_URL: redis://localhost:6379
+          JWT_SECRET: test-secret
           CRM_REDIS_AVAILABLE: 1
           CRM_CAN_RESTART_REDIS: 1
 

@@ -7,7 +7,12 @@ module.exports = {
     '<rootDir>/src/tests/**/*.test.ts',
     '**/tests/test_rls_enforcement.ts',
   ],
-  testPathIgnorePatterns: ['<rootDir>/dist/', '<rootDir>/src/tests/helpers/'],
+  testPathIgnorePatterns: [
+    '<rootDir>/dist/',
+    '<rootDir>/src/tests/helpers/',
+    // Durability tests restart Redis; run separately with --runInBand
+    '<rootDir>/src/tests/durability/',
+  ],
   maxWorkers: 1,
   collectCoverage: true,
   coverageDirectory: 'coverage',

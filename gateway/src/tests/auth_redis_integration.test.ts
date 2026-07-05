@@ -433,29 +433,31 @@ describeRedis('TokenRevocationService (real Redis)', () => {
     const sub2 = redis.duplicate();
     await sub2.connect();
 
-    const received: any[] = [];
-    await sub2.subscribe('auth:revocation:events');
-    sub2.on('message', (channel, message) => {
-      if (channel === 'auth:revocation:events') {
-        received.push(JSON.parse(message));
-      }
-    });
+    try {
+      const received: any[] = [];
+      await sub2.subscribe('auth:revocation:events');
+      sub2.on('message', (channel, message) => {
+        if (channel === 'auth:revocation:events') {
+          received.push(JSON.parse(message));
+        }
+      });
 
-    const tenant = randomUUID();
-    const jti = randomUUID();
-    const exp = Math.floor(Date.now() / 1000) + 3600;
+      const tenant = randomUUID();
+      const jti = randomUUID();
+      const exp = Math.floor(Date.now() / 1000) + 3600;
 
-    await service.revokeJti(tenant, jti, exp);
+      await service.revokeJti(tenant, jti, exp);
 
-    // Wait for Pub/Sub propagation
-    await new Promise((r) => setTimeout(r, 500));
+      // Wait for Pub/Sub propagation
+      await new Promise((r) => setTimeout(r, 500));
 
-    expect(received.length).toBeGreaterThanOrEqual(1);
-    expect(received[0].type).toBe('jti');
-    expect(received[0].tenantId).toBe(tenant);
-    expect(received[0].id).toBe(jti);
-
-    await sub2.unsubscribe('auth:revocation:events');
-    sub2.disconnect();
+      expect(received.length).toBeGreaterThanOrEqual(1);
+      expect(received[0].type).toBe('jti');
+      expect(received[0].tenantId).toBe(tenant);
+      expect(received[0].id).toBe(jti);
+    } finally {
+      await sub2.unsubscribe('auth:revocation:events').catch(() => {});
+      sub2.disconnect();
+    }
   });
 });

@@ -14,7 +14,7 @@ import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 import { randomUUID } from 'crypto';
 import { execSync } from 'child_process';
 import Redis from 'ioredis';
-import { TokenRevocationService } from '../services/authSession';
+import { TokenRevocationService } from '../../services/authSession';
 
 const describeRedis =
   process.env.CRM_REDIS_AVAILABLE === '1' ? describe : describe.skip;
@@ -29,8 +29,8 @@ const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 
 /**
  * Attempt to restart the Redis server.
- * Tries docker compose first, then direct docker restart.
- * Throws if neither succeeds.
+ * Tries docker compose first, then direct docker restart by container ID.
+ * Docker restart properly sends SIGTERM, preserving AOF state.
  */
 function restartRedis(): void {
   try {
@@ -44,7 +44,7 @@ function restartRedis(): void {
   }
   try {
     const containerId = execSync(
-      'docker ps -q --filter ancestor=redis:7-alpine --filter ancestor=redis:7',
+      'docker ps -q --filter publish=6379',
       { timeout: 5000, stdio: 'pipe' },
     )
       .toString()
@@ -60,7 +60,9 @@ function restartRedis(): void {
   } catch {
     // Fall through
   }
-  throw new Error('Could not restart Redis — set CRM_CAN_RESTART_REDIS=1');
+  throw new Error(
+    'Could not restart Redis — docker restart required for AOF persistence tests',
+  );
 }
 
 /**
@@ -148,6 +150,15 @@ describeRestart('Redis restart persistence', () => {
     redis = await waitForRedis(REDIS_URL);
     subscriber = redis.duplicate();
     await subscriber.connect();
+
+    // --- Verify AOF/noeviction survived the restart (set at container startup) ---
+    const aof1 = (await redis.config('GET', 'appendonly')) as [string, string];
+    expect(aof1[1]).toBe('yes');
+    const fsync1 = (await redis.config('GET', 'appendfsync')) as [string, string];
+    expect(fsync1[1]).toBe('always');
+    const evict1 = (await redis.config('GET', 'maxmemory-policy')) as [string, string];
+    expect(evict1[1]).toBe('noeviction');
+
     service = new TokenRevocationService(redis, subscriber);
 
     const post = await service.checkRevoked({
@@ -187,6 +198,15 @@ describeRestart('Redis restart persistence', () => {
     redis = await waitForRedis(REDIS_URL);
     subscriber = redis.duplicate();
     await subscriber.connect();
+
+    // --- Verify AOF/noeviction survived the restart (set at container startup) ---
+    const aof2 = (await redis.config('GET', 'appendonly')) as [string, string];
+    expect(aof2[1]).toBe('yes');
+    const fsync2 = (await redis.config('GET', 'appendfsync')) as [string, string];
+    expect(fsync2[1]).toBe('always');
+    const evict2 = (await redis.config('GET', 'maxmemory-policy')) as [string, string];
+    expect(evict2[1]).toBe('noeviction');
+
     service = new TokenRevocationService(redis, subscriber);
 
     // Old token (uv=0) must still be rejected

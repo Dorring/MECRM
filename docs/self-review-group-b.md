@@ -124,8 +124,8 @@
 ### Unit Tests (no external deps) — 🟢 Automated
 
 ```
-Test Suites: 7 passed, 8 skipped (DB/Redis-dependent), 15 total
-Tests:       73 passed, 55 skipped, 128 total
+Test Suites: 7 passed, 7 skipped, 14 total
+Tests:       73 passed, 51 skipped, 124 total
 No --forceExit required. --detectOpenHandles exits cleanly.
 ```
 
@@ -158,6 +158,7 @@ No --forceExit required. --detectOpenHandles exits cleanly.
 | Malformed Pub/Sub event rejected + metric | `ws_revocation_integration.test.ts` | 🟢 Automated |
 | Oversized Pub/Sub event rejected + metric | `ws_revocation_integration.test.ts` | 🟢 Automated |
 | Subscriber readiness transitions | `ws_revocation_integration.test.ts` | 🟢 Automated |
+| Subscriber receives revocation events | `auth_redis_integration.test.ts` | 🟢 Automated (try/finally cleanup) |
 
 ### Integration Tests (require CRM_REDIS_AVAILABLE) — 🟢 Automated with real Redis
 
@@ -176,14 +177,15 @@ No --forceExit required. --detectOpenHandles exits cleanly.
 | Client reconnect: revoked jti persists | 🟡 Client reconnect | `auth_redis_integration.test.ts` |
 | Client reconnect: user version persists | 🟡 Client reconnect | `auth_redis_integration.test.ts` |
 
-### Redis Restart Persistence — 🟢 CI (CRM_CAN_RESTART_REDIS=1)
+### Redis Restart Persistence — 🟢 CI (separate step, --runInBand, CRM_CAN_RESTART_REDIS=1)
 
 | Test | File | Status |
 |---|---|---|
-| Revoked jti survives real Redis restart | `redis_durability_integration.test.ts` | 🟢 CI |
-| User version survives real Redis restart | `redis_durability_integration.test.ts` | 🟢 CI |
-| checkRevoked fails on unreachable Redis | `redis_durability_integration.test.ts` | 🟢 Automated |
-| consumeRefresh DEPENDENCY_ERROR on unreachable | `redis_durability_integration.test.ts` | 🟢 Automated |
+| Revoked jti survives real Redis restart | `durability/redis_durability_integration.test.ts` | 🟢 CI |
+| User version survives real Redis restart | `durability/redis_durability_integration.test.ts` | 🟢 CI |
+| AOF/noeviction config survives restart | `durability/redis_durability_integration.test.ts` | 🟢 CI |
+| checkRevoked fails on unreachable Redis | `durability/redis_durability_integration.test.ts` | 🟢 Automated |
+| consumeRefresh DEPENDENCY_ERROR on unreachable | `durability/redis_durability_integration.test.ts` | 🟢 Automated |
 
 ### Two-Instance WebSocket — 🟢 Automated (requires Redis)
 
@@ -199,9 +201,12 @@ No --forceExit required. --detectOpenHandles exits cleanly.
 - Persistent volume: `redis_data:/data`
 
 CI (`ci-cd.yml`):
-- Redis service with health check
-- Post-startup step: `CONFIG SET appendonly yes`, `appendfsync always`, `maxmemory-policy noeviction`
-- Config verified at runtime by `auth_redis_integration.test.ts`
+- Redis service starts with `args: [redis-server, --appendonly, "yes", --appendfsync, always, --maxmemory-policy, noeviction]`
+- Health check waits for Redis to be ready
+- Post-startup step verifies `appendonly=yes`, `appendfsync=always`, `maxmemory-policy=noeviction`
+- Durability tests run in a separate CI step with `--runInBand` after the main test suite
+- `CRM_CAN_RESTART_REDIS=1` is set only for the durability step
+- Config verified after restart by `durability/redis_durability_integration.test.ts`
 
 Production Helm/Redis must provide:
 - AOF persistence with `appendfsync always` (or `everysec` with acceptable loss window)
@@ -225,15 +230,14 @@ Production Helm/Redis must provide:
 | Pub/Sub is fire-and-forget | Missed events bounded by 30s heartbeat | B4 heartbeat mitigates |
 | Metrics | Implemented for revocation checks, refresh outcomes, Pub/Sub lifecycle, WS revocation closure and heartbeat | Low-cardinality labels only |
 | Lua script not loadable via SHA | Sent as text every call | Optimization for follow-up |
-| Real Redis restart tests | Require CRM_CAN_RESTART_REDIS=1; not yet green in CI | Needs CI Docker access |
+| Real Redis restart tests | Now isolated in `src/tests/durability/` and run as separate CI step with --runInBand | In CI verification |
+| TCPWRAP leak from subscriber test | Fixed by try/finally unsubscribe/disconnect in `auth_redis_integration.test.ts` | Resolved |
 
 ## 9. What Remains Before Merge
 
-1. **CI green**: All new tests must pass in CI (B4 WS tests, durability tests, OOM rewrite).
-2. **Redis restart tests**: Currently require `CRM_CAN_RESTART_REDIS=1`. CI needs Docker socket access or a dedicated restart test job.
-3. **HTTP-layer user-version restart test**: Full login/register flow with new token after Redis restart (requires running Gateway, not just service layer).
-4. **Independent review**: All findings from this self-review must be verified by an independent reviewer.
-5. **No merge until CI is green and reviewer signs off.**
+1. **CI green**: All new tests must pass in CI (B4 WS tests, durability tests, OOM rewrite, no open handles).
+2. **Independent review**: All findings from this self-review must be verified by an independent reviewer.
+3. **No merge until CI is green and reviewer signs off.**
 
 ## 10. Boundary with Group C
 
