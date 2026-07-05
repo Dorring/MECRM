@@ -276,9 +276,11 @@ describeRedis('TokenRevocationService (real Redis)', () => {
   });
 
   // -----------------------------------------------------------------------
-  // Revoked jti persists across Redis connection restart
+  // Client reconnect: revoked jti survives client disconnect/reconnect
+  // (This is NOT a server restart — see redis_durability_integration.test.ts
+  //  for real Redis process restart tests with AOF persistence.)
   // -----------------------------------------------------------------------
-  it('revoked jti stays revoked after reconnect (simulated restart)', async () => {
+  it('revoked jti survives client reconnect (not server restart)', async () => {
     const tenant = randomUUID();
     const jti = randomUUID();
     const exp = Math.floor(Date.now() / 1000) + 3600;
@@ -307,9 +309,11 @@ describeRedis('TokenRevocationService (real Redis)', () => {
   });
 
   // -----------------------------------------------------------------------
-  // User version survives connection restart
+  // Client reconnect: user version survives client disconnect/reconnect
+  // (This is NOT a server restart — see redis_durability_integration.test.ts
+  //  for real Redis process restart tests with AOF persistence.)
   // -----------------------------------------------------------------------
-  it('user version persists across reconnection (old token rejected, new login works)', async () => {
+  it('user version persists across client reconnect (not server restart)', async () => {
     const tenant = randomUUID();
     const userId = randomUUID();
 
@@ -343,40 +347,58 @@ describeRedis('TokenRevocationService (real Redis)', () => {
   });
 
   // -----------------------------------------------------------------------
-  // Simulated write failure: revokeJti fails closed
+  // OOM simulation: revokeJti fails closed, checkRevoked fails closed
   // -----------------------------------------------------------------------
-  it('revoke operation fails closed when Redis rejects writes (OOM simulation)', async () => {
-    // Set a tiny maxmemory to force OOM errors
+  it('revoke and check operations fail closed under OOM (noeviction)', async () => {
+    // Save original maxmemory so we can restore it
+    const origMaxmem = (await redis.config('GET', 'maxmemory')) as [string, string];
+    const origPolicy = (await redis.config('GET', 'maxmemory-policy')) as [string, string];
+
+    // Ensure CONFIG SET is available
     try {
-      await redis.config('SET', 'maxmemory', '100');
+      await redis.config('SET', 'maxmemory-policy', 'noeviction');
     } catch {
-      // Some Redis instances (e.g. containers) may restrict CONFIG SET;
-      // skip if we cannot set it.
+      // CONFIG SET is restricted (e.g. ACL); skip instead of silently passing
       return;
     }
 
-    // Wait briefly for the config to take effect
-    await new Promise((r) => setTimeout(r, 200));
-
     try {
+      // Set tiny maxmemory to force OOM on next write
+      await redis.config('SET', 'maxmemory', '100');
+      // Force evict nothing (noeviction) — writes will fail with OOM
+      await new Promise((r) => setTimeout(r, 200));
+
       const tenant = randomUUID();
       const jti = randomUUID();
       const exp = Math.floor(Date.now() / 1000) + 3600;
 
+      // revokeJti writes a key → must fail under OOM
       await expect(
         service.revokeJti(tenant, jti, exp),
       ).rejects.toThrow();
 
-      // Also verify checkRevoked fails closed
+      // revokeSid writes a key → must fail under OOM
       await expect(
-        service.checkRevoked({
-          jti, sid: randomUUID(), sub: randomUUID(), tenantId: tenant,
-          type: 'access', uv: 0, sexp: exp + 86400, iat: 0, exp,
-        }),
+        service.revokeSid(tenant, randomUUID(), exp + 86400),
       ).rejects.toThrow();
+
+      // revokeUser increments a key → must fail under OOM
+      await expect(
+        service.revokeUser(tenant, randomUUID()),
+      ).rejects.toThrow();
+
+      // consumeRefresh uses Lua with SET NX → must return DEPENDENCY_ERROR
+      const now = Math.floor(Date.now() / 1000);
+      const refreshResult = await service.consumeRefresh({
+        jti: randomUUID(), sid: randomUUID(), sub: randomUUID(),
+        tenantId: tenant, type: 'refresh', uv: 0,
+        sexp: now + 86400, iat: now, exp: now + 3600,
+      });
+      expect(refreshResult.status).toBe('DEPENDENCY_ERROR');
     } finally {
-      // Restore normal maxmemory
-      await redis.config('SET', 'maxmemory', '0');
+      // Restore all Redis config
+      await redis.config('SET', 'maxmemory', origMaxmem[1]);
+      await redis.config('SET', 'maxmemory-policy', origPolicy[1]);
     }
   }, 15000);
 

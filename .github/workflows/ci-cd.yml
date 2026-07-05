@@ -119,6 +119,11 @@ jobs:
           --health-retries 5
       redis:
         image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
         ports:
           - 6379:6379
     steps:
@@ -148,6 +153,16 @@ jobs:
           POSTGRES_PORT: "5432"
           POSTGRES_DB: test_db
           GATEWAY_DIR: ./gateway
+
+      - name: Configure Redis for AOF/noeviction
+        run: |
+          sudo apt-get update && sudo apt-get install -y redis-tools
+          redis-cli -h localhost -p 6379 CONFIG SET appendonly yes
+          redis-cli -h localhost -p 6379 CONFIG SET appendfsync always
+          redis-cli -h localhost -p 6379 CONFIG SET maxmemory-policy noeviction
+          redis-cli -h localhost -p 6379 CONFIG GET appendonly
+          redis-cli -h localhost -p 6379 CONFIG GET appendfsync
+          redis-cli -h localhost -p 6379 CONFIG GET maxmemory-policy
 
       - name: Run tests
         run: npm test -- --coverage --detectOpenHandles

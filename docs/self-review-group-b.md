@@ -4,6 +4,7 @@
 **Base:** `main@HEAD` (post-Group-A)
 **ADR:** `docs/adr/002-auth-session-revocation.md`
 **Plan:** `docs/adr/002-auth-session-revocation-plan.md`
+**Status:** Implementing — Group B hardening in progress (NOT complete)
 
 ---
 
@@ -22,13 +23,14 @@
 | `23fcc76` | fix(auth): harden session revocation guarantees |
 | `9930cfd` | fix(test): align tenant isolation with revocation contract |
 | `20f9456` | fix(test): close gateway integration dependencies |
+| `edfeafa` | test(auth): add Redis fault and config verification tests |
 
 ## 2. Modified Files
 
 | File | Status |
 |---|---|
-| `docs/adr/002-auth-session-revocation.md` | NEW → Accepted/Implemented |
-| `docs/adr/002-auth-session-revocation-plan.md` | NEW → Implemented |
+| `docs/adr/002-auth-session-revocation.md` | NEW → Implementing |
+| `docs/adr/002-auth-session-revocation-plan.md` | NEW → Implementing |
 | `gateway/jest.config.js` | NEW — Jest config with cleanup (no forceExit) |
 | `gateway/src/jest.cleanup.ts` | NEW — global afterAll cleanup for test dependencies |
 | `gateway/src/services/authSession.ts` | NEW — TokenRevocationService, Lua script, key builders, TTL helpers, Pub/Sub subscriber, metrics |
@@ -43,12 +45,14 @@
 | `gateway/src/tests/nodb_security.test.ts` | MODIFIED — updated for 503/401 fail-closed semantics |
 | `gateway/src/tests/leads_mocked.test.ts` | MODIFIED — updated Redis mock + JWT claims |
 | `gateway/src/tests/productivity.test.ts` | MODIFIED — updated generateToken signature |
-| `gateway/src/tests/auth_redis_integration.test.ts` | NEW — 16 real-Redis tests: Lua atomicity, concurrent refresh, replay, user version, tenant isolation, Pub/Sub, Redis config verification, reconnect persistence, OOM simulation |
+| `gateway/src/tests/auth_redis_integration.test.ts` | NEW — real-Redis tests: Lua atomicity, concurrent refresh, replay, user version, tenant isolation, Pub/Sub, Redis config verification, client reconnect, OOM simulation |
 | `gateway/src/tests/auth_token_lifetime.test.ts` | NEW — token exp <= sexp validation |
 | `gateway/src/tests/ws_cross_instance_integration.test.ts` | NEW — two Gateway child process WS revocation test |
+| `gateway/src/tests/ws_revocation_integration.test.ts` | NEW — B4 WS tests: tenant isolation, heartbeat revocation catch, subscriber readiness, bounded concurrency, 1013 on Redis fault, malformed/oversized Pub/Sub |
+| `gateway/src/tests/redis_durability_integration.test.ts` | NEW — real Redis restart persistence tests (requires CRM_CAN_RESTART_REDIS=1) |
 | `gateway/src/tests/helpers/ws_gateway_process.ts` | NEW — child Gateway process helper |
 | `docker-compose.yml` | MODIFIED — Redis AOF + noeviction |
-| `.github/workflows/ci-cd.yml` | MODIFIED — Redis service for integration tests |
+| `.github/workflows/ci-cd.yml` | MODIFIED — Redis service health check + AOF/noeviction config step |
 
 ## 3. Contracts
 
@@ -109,9 +113,15 @@
 | Cross-instance revocation | ✅ Pub/Sub subscriber + closeConnectionsByEvent |
 | No mutable singleton | ✅ Constructor injection via createAuthMiddleware/createAuthRoutes |
 
-## 5. Test Results
+## 5. Test Results and Evidence Classification
 
-### Unit Tests (no external deps)
+**Evidence categories:**
+- 🟢 **Automated** — runs in CI, produces pass/fail
+- 🟡 **Client reconnect** — disconnect/reconnect ioredis client (not Redis server restart)
+- 🔴 **Requires manual/env setup** — needs `CRM_CAN_RESTART_REDIS=1` or Docker access
+- ⚪ **Not yet executed** — test written but not verified in target environment
+
+### Unit Tests (no external deps) — 🟢 Automated
 
 ```
 Test Suites: 5 passed, 5 of 10 total (5 DB-dependent skipped)
@@ -126,33 +136,62 @@ Tests:       61 passed, 91 total (30 DB-dependent skipped)
 | `api.test.ts` | 2 | Login/refresh/logout shape (DB-dependent) |
 | `auth_sql_injection.test.ts` | 1 | SQL injection rejection |
 | `auth_token_lifetime.test.ts` | 4 | exp <= sexp validation |
-| `auth_redis_integration.test.ts` | 16 (with Redis) / 0 skipped | Real Redis: Lua atomicity, concurrent refresh, replay, user version, tenant isolation, Pub/Sub, AOF config, reconnect persistence, OOM simulation |
-| `ws_cross_instance_integration.test.ts` | 1 (with Redis) / 0 skipped | Two child Gateway processes, shared Redis |
 
-### Integration Tests (require CRM_DB_AVAILABLE + CRM_REDIS_AVAILABLE)
+### B4 WebSocket Tests (mock Redis) — 🟢 Automated
 
-| Test | Status | Requirement |
+| Test | Status | Evidence |
 |---|---|---|
-| Revoked jti returns 401 | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
-| Revoked sid rejects access | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
-| Concurrent refresh atomicity | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
-| Replay revokes sid | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
-| User revoke + new login | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
-| Tenant isolation | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
-| Redis outage fail-closed | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
-| Pub/Sub event propagation | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
-| TTL correctness | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
-| Redis AOF/appendfsync/noeviction config | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
-| Revoked jti survives reconnect (simulated restart) | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
-| User version survives reconnect (old rejected, new works) | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
-| OOM/write failure fail-closed | ✅ `auth_redis_integration` | `CRM_REDIS_AVAILABLE=1` |
-| Two-instance WS closure | ✅ `ws_cross_instance_integration` | `CRM_REDIS_AVAILABLE=1` |
+| Unrelated tenant socket stays open on revocation | 🟢 Automated | `ws_revocation_integration.test.ts` |
+| Heartbeat catches revoked token (Pub/Sub miss) | 🟢 Automated | `ws_revocation_integration.test.ts` |
+| Heartbeat overlap_prevented metric | 🟢 Automated | `ws_revocation_integration.test.ts` |
+| Bounded concurrency ≤ 25 | 🟢 Automated | `ws_revocation_integration.test.ts` |
+| 1013 on Redis fault during heartbeat | 🟢 Automated | `ws_revocation_integration.test.ts` |
+| Malformed Pub/Sub event rejected + metric | 🟢 Automated | `ws_revocation_integration.test.ts` |
+| Oversized Pub/Sub event rejected + metric | 🟢 Automated | `ws_revocation_integration.test.ts` |
+| Subscriber readiness transitions | 🟢 Automated | `ws_revocation_integration.test.ts` |
+
+### Integration Tests (require CRM_REDIS_AVAILABLE) — 🟢 Automated with real Redis
+
+| Test | Status | Evidence |
+|---|---|---|
+| Revoked jti returns revoked | 🟢 Automated | `auth_redis_integration.test.ts` |
+| Revoked sid rejects access | 🟢 Automated | `auth_redis_integration.test.ts` |
+| Concurrent refresh atomicity | 🟢 Automated | `auth_redis_integration.test.ts` |
+| Replay revokes sid | 🟢 Automated | `auth_redis_integration.test.ts` |
+| User revoke + old token rejected | 🟢 Automated | `auth_redis_integration.test.ts` |
+| Tenant isolation | 🟢 Automated | `auth_redis_integration.test.ts` |
+| Pub/Sub event propagation | 🟢 Automated | `auth_redis_integration.test.ts` |
+| TTL correctness | 🟢 Automated | `auth_redis_integration.test.ts` |
+| Redis AOF/appendfsync/noeviction config | 🟢 Automated | `auth_redis_integration.test.ts` |
+| OOM/write failure fail-closed | 🟢 Automated | `auth_redis_integration.test.ts` (rewritten) |
+| Client reconnect: revoked jti persists | 🟡 Client reconnect | `auth_redis_integration.test.ts` |
+| Client reconnect: user version persists | 🟡 Client reconnect | `auth_redis_integration.test.ts` |
+
+### Redis Restart Persistence — 🔴 Requires CRM_CAN_RESTART_REDIS=1
+
+| Test | Status | Evidence |
+|---|---|---|
+| Revoked jti survives real Redis restart | 🔴 Env required | `redis_durability_integration.test.ts` |
+| User version survives real Redis restart | 🔴 Env required | `redis_durability_integration.test.ts` |
+| checkRevoked fails on unreachable Redis | 🟢 Automated | `redis_durability_integration.test.ts` |
+| consumeRefresh DEPENDENCY_ERROR on unreachable | 🟢 Automated | `redis_durability_integration.test.ts` |
+
+### Two-Instance WebSocket — 🟢 Automated (requires Redis)
+
+| Test | Status | Evidence |
+|---|---|---|
+| Instance A revoke → Instance B socket closed | 🟢 Automated | `ws_cross_instance_integration.test.ts` |
 
 ## 6. Redis Durability Configuration
 
 `docker-compose.yml`:
 - `command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always", "--maxmemory-policy", "noeviction"]`
 - Persistent volume: `redis_data:/data`
+
+CI (`ci-cd.yml`):
+- Redis service with health check
+- Post-startup step: `CONFIG SET appendonly yes`, `appendfsync always`, `maxmemory-policy noeviction`
+- Config verified at runtime by `auth_redis_integration.test.ts`
 
 Production Helm/Redis must provide:
 - AOF persistence with `appendfsync always` (or `everysec` with acceptable loss window)
@@ -171,54 +210,22 @@ Production Helm/Redis must provide:
 | Limitation | Impact | ETA |
 |---|---|---|
 | WebSocket token in query string | Token visible in server logs, referrer headers | Group C |
-| Redis integration coverage | Enabled in Gateway CI with `CRM_REDIS_AVAILABLE=1` | 13 real-Redis tests |
 | No HttpOnly cookie for refresh | Token accessible to JS | Group C |
 | No CSRF protection | POST endpoints could be targeted by CSRF | Group C |
 | Pub/Sub is fire-and-forget | Missed events bounded by 30s heartbeat | B4 heartbeat mitigates |
 | Metrics | Implemented for revocation checks, refresh outcomes, Pub/Sub lifecycle, WS revocation closure and heartbeat | Low-cardinality labels only |
 | Lua script not loadable via SHA | Sent as text every call | Optimization for follow-up |
+| Real Redis restart tests | Require CRM_CAN_RESTART_REDIS=1; not yet green in CI | Needs CI Docker access |
 
-### 8.1 Independent Review Addendum
+## 9. What Remains Before Merge
 
-The post-implementation review corrected the following issues before merge:
+1. **CI green**: All new tests must pass in CI (B4 WS tests, durability tests, OOM rewrite).
+2. **Redis restart tests**: Currently require `CRM_CAN_RESTART_REDIS=1`. CI needs Docker socket access or a dedicated restart test job.
+3. **HTTP-layer user-version restart test**: Full login/register flow with new token after Redis restart (requires running Gateway, not just service layer).
+4. **Independent review**: All findings from this self-review must be verified by an independent reviewer.
+5. **No merge until CI is green and reviewer signs off.**
 
-- Token lifetimes are capped in seconds and cannot exceed absolute session
-  expiry (`sexp`), including short sessions.
-- Malformed user-version values and inconsistent `iat`/`exp`/`sexp` claims
-  fail closed.
-- Redis Cluster keys use a tenant hash tag so the four-key refresh Lua script
-  executes in one slot.
-- Subscriber initialization is startup-critical and `/ready` includes
-  subscriber readiness.
-- Logout rejects a supplied malformed refresh token instead of silently
-  ignoring it.
-- WebSocket heartbeat work uses bounded concurrency and prevents overlapping
-  runs.
-- Jest no longer uses `--forceExit`; open handles are detected instead of
-  hidden.
-- CI executes the real Redis integration suite.
-- A real two-process Gateway WebSocket test proves that a revocation issued by
-  instance A closes the matching socket on instance B.
-- Prometheus metrics cover the ADR-002 observability contract without exposing
-  token, jti or sid values.
-
-Local verification after the review:
-
-```text
-Gateway lint: passed
-Gateway build: passed
-Gateway full suite with Redis: 81 passed, 30 DB-dependent skipped
-Redis integration: 16 passed
-  - AOF/appendfsync/noeviction config: verified at runtime
-  - Revoked jti reconnect persistence: verified
-  - User version reconnect persistence: verified
-  - OOM/write failure fail-closed: verified
-Two-process WS revocation: 1 passed
-Redis AOF/noeviction runtime config: verified
-Redis restart persistence: verified via reconnect simulation
-```
-
-## 9. Boundary with Group C
+## 10. Boundary with Group C
 
 The following are explicitly NOT implemented in Group B and remain for Group C:
 - HttpOnly cookies for refresh token storage
@@ -227,7 +234,7 @@ The following are explicitly NOT implemented in Group B and remain for Group C:
 - Frontend localStorage token removal
 - WebSocket token transport via cookie/header instead of query string
 
-## 10. P0/P1/P2 Review
+## 11. P0/P1/P2 Review
 
 | ID | Finding | Status |
 |---|---|---|
