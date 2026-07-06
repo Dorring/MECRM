@@ -288,24 +288,33 @@ describeRedis('TokenRevocationService (real Redis)', () => {
     // Write revocation
     await service.revokeJti(tenant, jti, exp);
 
-    // Simulate restart by disconnecting and reconnecting
-    const oldSubscriber = subscriber;
-    redis.disconnect();
-    oldSubscriber.disconnect();
-    await redis.connect();
-    subscriber = redis.duplicate();
-    await subscriber.connect();
-
-    // Recreate service with new connections
-    service = new TokenRevocationService(redis, subscriber);
-
-    // Verify jti still revoked
-    const result = await service.checkRevoked({
-      jti, sid: randomUUID(), sub: randomUUID(), tenantId: tenant,
-      type: 'access', uv: 0, sexp: exp + 86400, iat: 0, exp,
+    // Verify the state from entirely new connections. Do not disconnect the
+    // suite-level clients: a failed reconnect must not poison later tests.
+    const reconnectedRedis = new Redis(REDIS_URL, {
+      lazyConnect: true,
+      maxRetriesPerRequest: 1,
     });
-    expect(result.revoked).toBe(true);
-    expect(result.reason).toBe('jti');
+    const reconnectedSubscriber = reconnectedRedis.duplicate();
+    let reconnectedService: TokenRevocationService | undefined;
+    try {
+      await reconnectedRedis.connect();
+      await reconnectedSubscriber.connect();
+      reconnectedService = new TokenRevocationService(
+        reconnectedRedis,
+        reconnectedSubscriber,
+      );
+
+      const result = await reconnectedService.checkRevoked({
+        jti, sid: randomUUID(), sub: randomUUID(), tenantId: tenant,
+        type: 'access', uv: 0, sexp: exp + 86400, iat: 0, exp,
+      });
+      expect(result.revoked).toBe(true);
+      expect(result.reason).toBe('jti');
+    } finally {
+      await reconnectedService?.shutdown();
+      reconnectedSubscriber.disconnect();
+      reconnectedRedis.disconnect();
+    }
   });
 
   // -----------------------------------------------------------------------
@@ -321,29 +330,39 @@ describeRedis('TokenRevocationService (real Redis)', () => {
     const newV = await service.revokeUser(tenant, userId);
     expect(newV).toBe(1);
 
-    // Disconnect and reconnect
-    const oldSubscriber = subscriber;
-    redis.disconnect();
-    oldSubscriber.disconnect();
-    await redis.connect();
-    subscriber = redis.duplicate();
-    await subscriber.connect();
-    service = new TokenRevocationService(redis, subscriber);
-
-    // Old uv=0 token should be rejected
-    const rejected = await service.checkRevoked({
-      jti: randomUUID(), sid: randomUUID(), sub: userId, tenantId: tenant,
-      type: 'access', uv: 0, sexp: Math.floor(Date.now() / 1000) + 86400, iat: 0, exp: 3600,
+    const reconnectedRedis = new Redis(REDIS_URL, {
+      lazyConnect: true,
+      maxRetriesPerRequest: 1,
     });
-    expect(rejected.revoked).toBe(true);
-    expect(rejected.reason).toBe('uv');
+    const reconnectedSubscriber = reconnectedRedis.duplicate();
+    let reconnectedService: TokenRevocationService | undefined;
+    try {
+      await reconnectedRedis.connect();
+      await reconnectedSubscriber.connect();
+      reconnectedService = new TokenRevocationService(
+        reconnectedRedis,
+        reconnectedSubscriber,
+      );
 
-    // New uv=1 token should be accepted (new login)
-    const accepted = await service.checkRevoked({
-      jti: randomUUID(), sid: randomUUID(), sub: userId, tenantId: tenant,
-      type: 'access', uv: 1, sexp: Math.floor(Date.now() / 1000) + 86400, iat: 0, exp: 3600,
-    });
-    expect(accepted.revoked).toBe(false);
+      // Old uv=0 token should be rejected
+      const rejected = await reconnectedService.checkRevoked({
+        jti: randomUUID(), sid: randomUUID(), sub: userId, tenantId: tenant,
+        type: 'access', uv: 0, sexp: Math.floor(Date.now() / 1000) + 86400, iat: 0, exp: 3600,
+      });
+      expect(rejected.revoked).toBe(true);
+      expect(rejected.reason).toBe('uv');
+
+      // New uv=1 token should be accepted (new login)
+      const accepted = await reconnectedService.checkRevoked({
+        jti: randomUUID(), sid: randomUUID(), sub: userId, tenantId: tenant,
+        type: 'access', uv: 1, sexp: Math.floor(Date.now() / 1000) + 86400, iat: 0, exp: 3600,
+      });
+      expect(accepted.revoked).toBe(false);
+    } finally {
+      await reconnectedService?.shutdown();
+      reconnectedSubscriber.disconnect();
+      reconnectedRedis.disconnect();
+    }
   });
 
   // -----------------------------------------------------------------------
@@ -431,9 +450,8 @@ describeRedis('TokenRevocationService (real Redis)', () => {
   // -----------------------------------------------------------------------
   it('subscriber receives revocation events', async () => {
     const sub2 = redis.duplicate();
-    await sub2.connect();
-
     try {
+      await sub2.connect();
       const received: any[] = [];
       await sub2.subscribe('auth:revocation:events');
       sub2.on('message', (channel, message) => {

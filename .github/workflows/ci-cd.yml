@@ -117,23 +117,6 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-      redis:
-        image: redis:7
-        args:
-          - redis-server
-          - --appendonly
-          - "yes"
-          - --appendfsync
-          - always
-          - --maxmemory-policy
-          - noeviction
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 6379:6379
     steps:
       - uses: actions/checkout@v4
 
@@ -141,6 +124,40 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+
+      # GitHub Actions service containers do not support a command/args field.
+      # Start Redis explicitly so its durable configuration is part of the
+      # container command and therefore survives `docker restart`.
+      - name: Start Redis with AOF/noeviction
+        run: |
+          docker run --detach \
+            --name mecrm-ci-redis \
+            --publish 6379:6379 \
+            --health-cmd "redis-cli ping" \
+            --health-interval 1s \
+            --health-timeout 3s \
+            --health-retries 30 \
+            redis:7 \
+            redis-server \
+            --appendonly yes \
+            --appendfsync always \
+            --maxmemory-policy noeviction
+
+          for i in $(seq 1 60); do
+            STATUS="$(docker inspect --format '{{.State.Health.Status}}' mecrm-ci-redis)"
+            if [ "$STATUS" = "healthy" ]; then
+              exit 0
+            fi
+            if [ "$STATUS" = "unhealthy" ]; then
+              docker logs mecrm-ci-redis
+              exit 1
+            fi
+            sleep 1
+          done
+
+          docker logs mecrm-ci-redis
+          echo "Redis did not become healthy in time" >&2
+          exit 1
 
       - name: Install dependencies
         run: |
@@ -164,14 +181,9 @@ jobs:
 
       - name: Verify Redis AOF/noeviction (set at container startup)
         run: |
-          # Ensure AOF/noeviction — redundant with service args, but defensive
-          redis-cli -h localhost -p 6379 CONFIG SET appendonly yes
-          redis-cli -h localhost -p 6379 CONFIG SET appendfsync always
-          redis-cli -h localhost -p 6379 CONFIG SET maxmemory-policy noeviction
-          # Verify all three settings are correct
-          [ "$(redis-cli -h localhost -p 6379 CONFIG GET appendonly | tail -1)" = "yes" ]
-          [ "$(redis-cli -h localhost -p 6379 CONFIG GET appendfsync | tail -1)" = "always" ]
-          [ "$(redis-cli -h localhost -p 6379 CONFIG GET maxmemory-policy | tail -1)" = "noeviction" ]
+          [ "$(docker exec mecrm-ci-redis redis-cli CONFIG GET appendonly | tail -1)" = "yes" ]
+          [ "$(docker exec mecrm-ci-redis redis-cli CONFIG GET appendfsync | tail -1)" = "always" ]
+          [ "$(docker exec mecrm-ci-redis redis-cli CONFIG GET maxmemory-policy | tail -1)" = "noeviction" ]
 
       - name: Run tests
         run: npm test -- --coverage --detectOpenHandles
@@ -182,14 +194,9 @@ jobs:
           JWT_SECRET: test-secret
           CRM_TEST_REQUIRE_DB: 1
           CRM_REDIS_AVAILABLE: 1
-          CRM_CAN_RESTART_REDIS: 1
 
       - name: Run Redis durability tests (restart test, runInBand)
-        run: >
-          npx jest src/tests/durability/redis_durability_integration.test.ts
-          --runInBand --detectOpenHandles
-          --testPathIgnorePatterns="<rootDir>/dist/"
-          --testPathIgnorePatterns="<rootDir>/src/tests/helpers/"
+        run: npx jest --config jest.durability.config.js --runInBand --detectOpenHandles
         working-directory: gateway
         env:
           DATABASE_URL: postgresql://test:test@localhost:5432/test_db
@@ -197,8 +204,14 @@ jobs:
           JWT_SECRET: test-secret
           CRM_REDIS_AVAILABLE: 1
           CRM_CAN_RESTART_REDIS: 1
+          CRM_REDIS_CONTAINER: mecrm-ci-redis
+
+      - name: Stop Redis test container
+        if: always()
+        run: docker rm --force mecrm-ci-redis || true
 
       - name: Upload coverage
+        if: always()
         uses: codecov/codecov-action@v5
         with:
           files: gateway/coverage/lcov.info

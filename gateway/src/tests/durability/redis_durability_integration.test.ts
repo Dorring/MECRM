@@ -12,7 +12,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 import { randomUUID } from 'crypto';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import Redis from 'ioredis';
 import { TokenRevocationService } from '../../services/authSession';
 
@@ -29,40 +29,31 @@ const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 
 /**
  * Attempt to restart the Redis server.
- * Tries docker compose first, then direct docker restart by container ID.
+ * Uses the explicit CI container name when provided, otherwise falls back to
+ * the repository's Docker Compose Redis service for local execution.
  * Docker restart properly sends SIGTERM, preserving AOF state.
  */
 function restartRedis(): void {
+  const containerName = process.env.CRM_REDIS_CONTAINER?.trim();
+  if (containerName) {
+    execFileSync('docker', ['restart', containerName], {
+      timeout: 30000,
+      stdio: 'pipe',
+    });
+    return;
+  }
+
   try {
-    execSync('docker compose restart redis', {
+    execFileSync('docker', ['compose', 'restart', 'redis'], {
       timeout: 30000,
       stdio: 'pipe',
     });
     return;
   } catch {
-    // Fall through to direct docker restart
+    throw new Error(
+      'Could not restart Redis; set CRM_REDIS_CONTAINER to the exact container name',
+    );
   }
-  try {
-    const containerId = execSync(
-      'docker ps -q --filter publish=6379',
-      { timeout: 5000, stdio: 'pipe' },
-    )
-      .toString()
-      .trim()
-      .split('\n')[0];
-    if (containerId) {
-      execSync(`docker restart ${containerId}`, {
-        timeout: 30000,
-        stdio: 'pipe',
-      });
-      return;
-    }
-  } catch {
-    // Fall through
-  }
-  throw new Error(
-    'Could not restart Redis — docker restart required for AOF persistence tests',
-  );
 }
 
 /**

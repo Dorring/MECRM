@@ -49,10 +49,10 @@
 | `gateway/src/tests/auth_token_lifetime.test.ts` | NEW — token exp <= sexp validation |
 | `gateway/src/tests/ws_cross_instance_integration.test.ts` | NEW — two Gateway child process WS revocation test |
 | `gateway/src/tests/ws_revocation_integration.test.ts` | NEW — B4 WS tests: tenant isolation, heartbeat revocation catch, subscriber readiness, bounded concurrency, 1013 on Redis fault, malformed/oversized Pub/Sub |
-| `gateway/src/tests/redis_durability_integration.test.ts` | NEW — real Redis restart persistence tests (requires CRM_CAN_RESTART_REDIS=1) |
+| `gateway/src/tests/durability/redis_durability_integration.test.ts` | NEW — real Redis restart persistence tests (requires CRM_CAN_RESTART_REDIS=1) |
 | `gateway/src/tests/helpers/ws_gateway_process.ts` | NEW — child Gateway process helper |
 | `docker-compose.yml` | MODIFIED — Redis AOF + noeviction |
-| `.github/workflows/ci-cd.yml` | MODIFIED — Redis service health check + AOF/noeviction config step |
+| `.github/workflows/ci-cd.yml` | MODIFIED — explicit Redis test container with health check, AOF/noeviction, and isolated restart step |
 
 ## 3. Contracts
 
@@ -201,11 +201,12 @@ No --forceExit required. --detectOpenHandles exits cleanly.
 - Persistent volume: `redis_data:/data`
 
 CI (`ci-cd.yml`):
-- Redis service starts with `args: [redis-server, --appendonly, "yes", --appendfsync, always, --maxmemory-policy, noeviction]`
+- Redis is started explicitly with `docker run ... redis-server --appendonly yes --appendfsync always --maxmemory-policy noeviction` because GitHub Actions service containers do not support a command/args field
 - Health check waits for Redis to be ready
 - Post-startup step verifies `appendonly=yes`, `appendfsync=always`, `maxmemory-policy=noeviction`
 - Durability tests run in a separate CI step with `--runInBand` after the main test suite
 - `CRM_CAN_RESTART_REDIS=1` is set only for the durability step
+- `CRM_REDIS_CONTAINER=mecrm-ci-redis` selects the exact container to restart
 - Config verified after restart by `durability/redis_durability_integration.test.ts`
 
 Production Helm/Redis must provide:
