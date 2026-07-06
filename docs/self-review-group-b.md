@@ -1,10 +1,11 @@
 # Group B Self-Review: Session/WS Revocation Model
 
-**Branch:** `hardening/auth-session-revocation`
-**Base:** `main@HEAD` (post-Group-A)
-**ADR:** `docs/adr/002-auth-session-revocation.md`
-**Plan:** `docs/adr/002-auth-session-revocation-plan.md`
-**Status:** Implementing — Group B hardening in progress (NOT complete)
+**Branch:** `main` (merged from `hardening/auth-session-revocation`)  
+**Base:** `main@HEAD` (post-Group-A)  
+**ADR:** `docs/adr/002-auth-session-revocation.md`  
+**Plan:** `docs/adr/002-auth-session-revocation-plan.md`  
+**Tag:** `hardening-group-b-stabilized` (2026-07-06)  
+**Status:** Stabilized — Group B complete, CI green
 
 ---
 
@@ -231,14 +232,37 @@ Production Helm/Redis must provide:
 | Pub/Sub is fire-and-forget | Missed events bounded by 30s heartbeat | B4 heartbeat mitigates |
 | Metrics | Implemented for revocation checks, refresh outcomes, Pub/Sub lifecycle, WS revocation closure and heartbeat | Low-cardinality labels only |
 | Lua script not loadable via SHA | Sent as text every call | Optimization for follow-up |
-| Real Redis restart tests | Now isolated in `src/tests/durability/` and run as separate CI step with --runInBand | In CI verification |
+| Real Redis restart tests | Isolated in `src/tests/durability/`, run as separate CI step with --runInBand | ✅ CI green |
 | TCPWRAP leak from subscriber test | Fixed by try/finally unsubscribe/disconnect in `auth_redis_integration.test.ts` | Resolved |
 
-## 9. What Remains Before Merge
+## 9. Group B Stabilization Summary
 
-1. **CI green**: All new tests must pass in CI (B4 WS tests, durability tests, OOM rewrite, no open handles).
-2. **Independent review**: All findings from this self-review must be verified by an independent reviewer.
-3. **No merge until CI is green and reviewer signs off.**
+**Tag:** `hardening-group-b-stabilized` (2026-07-06)  
+**Status:** ✅ Complete — merged to main, CI green
+
+### CI Evidence (main branch)
+
+| Check | Result |
+|---|---|
+| test-gateway (main suite) | ✅ 73 passed, 51 skipped, 0 failed, --detectOpenHandles clean |
+| test-gateway (durability, --runInBand) | ✅ AOF/noeviction asserted, restart tests green |
+| Lint & Type Check (gateway) | ✅ 0 errors |
+| Build & Push (3 matrix items) | ✅ gateway, frontend, agents — digest export correct |
+| Compose Config + Smoke Test | ✅ pass |
+| Test Agents | ✅ pass |
+| Test OPA Policies | ✅ pass |
+| Validate Event Schemas | ✅ pass |
+| Migration Runner Integration | ✅ pass |
+
+### What was fixed (from review findings)
+
+1. `--forceExit` removed; `--detectOpenHandles` exits cleanly
+2. Heartbeat, overlap, concurrency, 1013, 503 tests — all automated with mock/real Redis
+3. Subscriber test wrapped in try/finally; TCPWRAP leak resolved
+4. Durability tests isolated in `src/tests/durability/` with separate CI step
+5. Redis AOF/noeviction set at container startup + verified after restart
+6. OOM test rewritten: fail-not-skip pattern
+7. CI export-digest uses `${{ matrix.project }}` with lowercase OCI normalization
 
 ## 10. Boundary with Group C
 

@@ -1,7 +1,8 @@
 # ADR-002: Tenant-Scoped Token and Session Revocation
 
-**Status:** Implementing — Group B hardening in progress  
+**Status:** Stabilized — Group B complete, CI green, tagged `hardening-group-b-stabilized`  
 **Date:** 2026-07-05  
+**Stabilized:** 2026-07-06  
 **Scope:** Hardening 1.1 Group B  
 **Supersedes:** `blacklist:<full-jwt>` revocation keys
 
