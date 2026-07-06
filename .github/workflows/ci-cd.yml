@@ -571,11 +571,14 @@ jobs:
       # Phase 4 CI/CD requirement: deploys must reference a digest, not a tag.
       - name: Export image digest
         id: export-digest
+        env:
+          IMAGE_NAME: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.project }}
         run: |
           DIGEST="${{ steps.build-push.outputs.digest }}"
-          echo "Pushed digest: ${DIGEST}"
+          IMAGE_NAME="$(printf '%s' "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
+          test -n "${DIGEST}"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "image=${REGISTRY}/${IMAGE_PREFIX}/${matrix.project}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE_NAME}@${DIGEST}" >> "$GITHUB_OUTPUT"
 
   # Deploy to staging.
   # NOTE: job-level `if:` cannot reference the `secrets` context reliably
