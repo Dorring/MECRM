@@ -12,6 +12,16 @@ export const redisClient = new Redis(REDIS_URL, {
   },
 });
 
+if (process.env.JEST_WORKER_ID) {
+  const cleanupGlobal = globalThis as typeof globalThis & {
+    __gatewayTestCleanups?: Array<() => void | Promise<void>>;
+  };
+  cleanupGlobal.__gatewayTestCleanups ??= [];
+  cleanupGlobal.__gatewayTestCleanups.push(() => {
+    redisClient.disconnect();
+  });
+}
+
 redisClient.on('connect', () => {
   logger.info('Redis connected');
 });

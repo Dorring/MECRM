@@ -9,13 +9,11 @@ import { v4 as uuidv4 } from 'uuid';
 
 import { logger } from './utils/logger';
 import { errorHandler } from './middleware/errorHandler';
-import { authMiddleware } from './middleware/auth';
 import { tenantMiddleware } from './middleware/tenant';
 import { opaMiddleware } from './middleware/opa';
 import { auditMiddleware } from './middleware/audit';
 import { requestLogger } from './middleware/requestLogger';
 
-import authRoutes from './routes/auth';
 import leadsRoutes from './routes/leads';
 import dealsRoutes from './routes/deals';
 import ticketsRoutes from './routes/tickets';
@@ -36,7 +34,7 @@ import voiceRoutes from './routes/voice';
 import twinsRoutes from './routes/twins';
 import devxRoutes from './routes/devx';
 
-import { setupWebSocket } from './services/websocket';
+import { setupWebSocket, closeConnectionsByEvent } from './services/websocket';
 import { kafkaProducer, kafkaClient } from './services/kafka';
 import { setupMetrics } from './services/metrics';
 import { startApprovalsRequiredIngestor } from './consumers/approvalsRequired';
@@ -56,6 +54,23 @@ import { redisClient } from './services/redis';
 // a missing/insecure secret throws here and is caught by startServer -> exit(1).
 // Side-effect import: the validation runs at module load; no binding needed.
 import './config/jwt';
+
+// ---------------------------------------------------------------------------
+// Auth dependencies — constructed at module load so that middleware and routes
+// are available when app is created. The underlying Redis client uses
+// lazyConnect: true so no TCP connection is opened until the first command.
+// ---------------------------------------------------------------------------
+import { TokenRevocationService } from './services/authSession';
+import { createAuthMiddleware } from './middleware/auth';
+import { createAuthRoutes } from './routes/auth';
+
+const _revocationSubscriber = !process.env.JEST_WORKER_ID ? redisClient.duplicate() : undefined;
+const revocationService = new TokenRevocationService(
+  redisClient,
+  _revocationSubscriber,
+);
+const authMiddleware = createAuthMiddleware(revocationService);
+const authRoutes = createAuthRoutes(revocationService);
 
 const app: Application = express();
 const PORT = process.env.GATEWAY_PORT || 4000;
@@ -129,6 +144,9 @@ app.get('/ready', async (req: Request, res: Response) => {
     await prisma.$queryRaw`SELECT 1`;
     // Check Redis
     await redisClient.ping();
+    if (!process.env.JEST_WORKER_ID && !revocationService.isSubscriberReady()) {
+      throw new Error('Revocation subscriber is not ready');
+    }
     // Check Kafka
     const kafkaAdmin = kafkaClient.admin();
     await kafkaAdmin.connect();
@@ -231,18 +249,23 @@ app.use(errorHandler);
 // Create HTTP server
 const server = createServer(app);
 
-// Setup WebSocket
-const wss = new WebSocketServer({ server, path: '/ws' });
-setupWebSocket(wss);
+// Setup WebSocket (skip in test mode — prevents open handles)
+let wss: WebSocketServer | undefined;
+if (!process.env.JEST_WORKER_ID) {
+  wss = new WebSocketServer({ server, path: '/ws' });
+  setupWebSocket(wss, revocationService);
+}
 
 // Graceful shutdown
 const shutdown = async () => {
   logger.info('Shutting down gracefully...');
   
   // Close WebSocket connections
-  wss.clients.forEach((client) => {
-    client.close(1001, 'Server shutting down');
-  });
+  if (wss) {
+    wss.clients.forEach((client) => {
+      client.close(1001, 'Server shutting down');
+    });
+  }
   
   if ((global as any).__approvalsIngestorStop) {
     await (global as any).__approvalsIngestorStop();
@@ -280,7 +303,10 @@ const shutdown = async () => {
 
   // Disconnect Kafka
   await kafkaProducer.disconnect();
-  
+
+  // Shutdown revocation service (unsubscribe + disconnect subscriber)
+  await revocationService.shutdown();
+
   // Close HTTP server
   server.close(() => {
     logger.info('HTTP server closed');
@@ -309,6 +335,12 @@ const startServer = async () => {
     } else if (!process.env.JWT_SECRET) {
       logger.warn('Running with insecure development JWT_SECRET — production will refuse to start without JWT_SECRET');
     }
+
+    // Revocation notification is a security dependency. Startup fails if the
+    // dedicated subscriber cannot be established.
+    await revocationService.initSubscriber((event) => {
+      closeConnectionsByEvent(event);
+    });
 
     // Connect to Kafka
     await kafkaProducer.connect();

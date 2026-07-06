@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, jest } from '@jest/globals';
 import jwt from 'jsonwebtoken';
 import request from 'supertest';
+import { randomUUID } from 'crypto';
 
 /**
  * Mocked-DB tests for the leads route (P1-13).
@@ -74,6 +75,12 @@ jest.mock('../services/kafka', () => ({
 // the real authMiddleware + JWT verification in play without a live Redis.
 jest.mock('../services/redis', () => {
   const store = new Map<string, string>();
+  const makeSubscriber = () => ({
+    on: jest.fn(),
+    subscribe: jest.fn(async () => undefined),
+    unsubscribe: jest.fn(async () => undefined),
+    disconnect: jest.fn(),
+  });
   const client = {
     get: jest.fn(async (k: string) => (store.has(k) ? store.get(k) : null)),
     set: jest.fn(async (k: string, v: string) => { store.set(k, v); return 'OK'; }),
@@ -85,6 +92,13 @@ jest.mock('../services/redis', () => {
     expire: jest.fn(async () => 1),
     keys: jest.fn(async () => []),
     on: jest.fn(),
+    publish: jest.fn(async () => 0),
+    duplicate: jest.fn(() => makeSubscriber()),
+    pipeline: jest.fn(() => ({
+      get: jest.fn(() => {}),
+      exec: jest.fn(async () => [[null, null], [null, null], [null, null]]),
+    })),
+    eval: jest.fn(async (_script: string, _numKeys: number, ..._args: string[]) => [1, 'OK' as any]),
   };
   return {
     __esModule: true,
@@ -97,16 +111,24 @@ jest.mock('../services/redis', () => {
 import app from '../index';
 
 function signToken(overrides: Record<string, any> = {}): string {
+  const now = Math.floor(Date.now() / 1000);
   return jwt.sign(
     {
-      sub: 'user-1',
+      jti: randomUUID(),
+      sid: randomUUID(),
+      sub: '00000000-0000-4000-8000-000000000001',
       tenantId: '00000000-0000-0000-0000-000000000000',
       email: 'u@example.com',
       roles: ['sales_rep'],
+      type: 'access',
+      uv: 0,
+      sexp: now + 86400 * 7,
+      iat: now,
+      exp: now + 3600,
       ...overrides,
     },
     JWT_SECRET,
-    { expiresIn: '1h' }
+    { algorithm: 'HS256' },
   );
 }
 

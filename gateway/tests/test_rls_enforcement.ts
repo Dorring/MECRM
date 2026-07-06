@@ -8,7 +8,8 @@ import WebSocket from 'ws';
 import app from '../src/index';
 import { prisma, withTenantDb } from '../src/services/prisma';
 import { setupWebSocket } from '../src/services/websocket';
-import { cache, tenantKey } from '../src/services/redis';
+import { cache, redisClient, tenantKey } from '../src/services/redis';
+import { TokenRevocationService } from '../src/services/authSession';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'development-secret-change-in-production';
 
@@ -18,11 +19,27 @@ const tenantA = '11111111-1111-4111-8111-111111111111';
 const tenantB = '22222222-2222-4222-8222-222222222222';
 const customerA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const customerB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const userA = 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa';
+const superAdmin = 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb';
 const tenantASlug = `tenant-a-${tenantA.slice(0, 8)}`;
 const tenantBSlug = `tenant-b-${tenantB.slice(0, 8)}`;
 
 function signToken(payload: Record<string, any>): string {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: '1h' });
+  const now = Math.floor(Date.now() / 1000);
+  return jwt.sign(
+    {
+      jti: payload.jti || require('crypto').randomUUID(),
+      sid: payload.sid || require('crypto').randomUUID(),
+      type: payload.type || 'access',
+      uv: payload.uv ?? 0,
+      sexp: payload.sexp || now + 86400 * 7,
+      iat: now,
+      exp: now + 3600,
+      ...payload,
+    },
+    JWT_SECRET,
+    { algorithm: 'HS256' },
+  );
 }
 
 describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
@@ -77,12 +94,14 @@ describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
       await db.customer.deleteMany({ where: { tenantId: tenantB } });
     });
     await prisma.tenant.deleteMany({ where: { id: { in: [tenantA, tenantB] } } });
+    await prisma.$disconnect();
+    redisClient.disconnect();
   });
 
   it('blocks cross-tenant resource access (tenant A cannot read tenant B)', async () => {
     const tokenA = signToken({
-      sub: 'user-a',
-      tenant_id: tenantA,
+      sub: userA,
+      tenantId: tenantA,
       email: 'a@example.com',
       roles: ['admin'],
     });
@@ -95,8 +114,8 @@ describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
 
   it('blocks tenant override for non-super-admin (JWT tampering attempt)', async () => {
     const tokenA = signToken({
-      sub: 'user-a',
-      tenant_id: tenantA,
+      sub: userA,
+      tenantId: tenantA,
       email: 'a@example.com',
       roles: ['admin'],
     });
@@ -110,8 +129,8 @@ describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
 
   it('allows super_admin cross-tenant READ only (OPA enforced)', async () => {
     const superToken = signToken({
-      sub: 'super-admin',
-      tenant_id: tenantA,
+      sub: superAdmin,
+      tenantId: tenantA,
       email: 'sa@example.com',
       roles: ['super_admin'],
     });
@@ -128,8 +147,8 @@ describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
 
   it('denies super_admin cross-tenant WRITE (OPA enforced)', async () => {
     const superToken = signToken({
-      sub: 'super-admin',
-      tenant_id: tenantA,
+      sub: superAdmin,
+      tenantId: tenantA,
       email: 'sa@example.com',
       roles: ['super_admin'],
     });
@@ -161,15 +180,19 @@ describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
 
   it('blocks websocket cross-tenant channel subscription', async () => {
     const tokenA = signToken({
-      sub: 'user-a',
-      tenant_id: tenantA,
+      sub: userA,
+      tenantId: tenantA,
       email: 'a@example.com',
       roles: ['admin'],
     });
 
     const server = createServer(app);
     const wss = new WebSocketServer({ server, path: '/ws' });
-    setupWebSocket(wss);
+    const mockRevocation = new TokenRevocationService(
+      { get: async () => null, pipeline: () => ({ get: () => {}, exec: async () => [[null, null], [null, null], [null, null]] }), duplicate: () => ({ on: () => {}, subscribe: async () => {}, unsubscribe: async () => {}, disconnect: () => {} }), publish: async () => 0 } as any,
+      undefined,
+    );
+    setupWebSocket(wss, mockRevocation);
 
     const port = await new Promise<number>((resolve) => {
       server.listen(0, () => {
@@ -179,31 +202,35 @@ describeDb('Tenant isolation proof (gateway) [requires DB]', () => {
 
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(tokenA)}`);
 
-    const first = await new Promise<any>((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('timeout')), 5000);
-      ws.once('message', (data) => {
-        clearTimeout(t);
-        resolve(JSON.parse(data.toString()));
+    try {
+      const first = await new Promise<any>((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('timeout')), 5000);
+        ws.once('message', (data) => {
+          clearTimeout(t);
+          resolve(JSON.parse(data.toString()));
+        });
+        ws.once('error', reject);
       });
-      ws.once('error', reject);
-    });
-    expect(first.type).toBe('connected');
+      expect(first.type).toBe('connected');
 
-    ws.send(JSON.stringify({ type: 'subscribe', payload: { topic: `tenant:${tenantB}:updates` } }));
-
-    const denial = await new Promise<any>((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('timeout')), 5000);
-      ws.once('message', (data) => {
-        clearTimeout(t);
-        resolve(JSON.parse(data.toString()));
+      const denied = new Promise<number>((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('timeout')), 5000);
+        ws.once('close', (code) => {
+          clearTimeout(t);
+          resolve(code);
+        });
+        ws.once('error', reject);
       });
-      ws.once('error', reject);
-    });
-    expect(denial.type).toBe('error');
-    expect(denial.payload.code).toBe('CROSS_TENANT_SUBSCRIBE_DENY');
-
-    ws.close();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+      ws.send(JSON.stringify({
+        type: 'subscribe',
+        payload: { topic: `tenant:${tenantB}:updates` },
+      }));
+      await expect(denied).resolves.toBe(4403);
+    } finally {
+      ws.terminate();
+      for (const client of wss.clients) client.terminate();
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });
-
