@@ -12,13 +12,23 @@
  * All tests use supertest against a real Express app with mocked backends.
  */
 
-import { describe, it, expect, beforeAll, jest } from '@jest/globals';
+import { describe, it, expect, beforeAll, beforeEach, jest } from '@jest/globals';
 
 // ---------------------------------------------------------------------------
 // Mocks — must come before any real module import
 // ---------------------------------------------------------------------------
 
 const mockRedisStore = new Map<string, any>();
+const mockRevocationState = {
+  checkRevokedResult: { revoked: false } as { revoked: boolean; reason?: string },
+  checkRevokedError: null as Error | null,
+  consumeRefreshResult: { status: 'OK' } as { status: 'OK' | 'DEPENDENCY_ERROR' | 'REVOKED' | 'REPLAY' },
+  revokeSidError: null as Error | null,
+  rateLimitExceeded: false,
+  issueWsTicketError: null as Error | null,
+  lastWsTicketPayload: null as any,
+  revokeSidCalls: [] as any[][],
+};
 const mockRedis = {
   get: jest.fn(async (k: string) => mockRedisStore.get(k) ?? null),
   getdel: jest.fn(async (k: string) => { const v = mockRedisStore.get(k); mockRedisStore.delete(k); return v ?? null; }),
@@ -53,13 +63,25 @@ jest.mock('../services/authSession', () => {
     TokenRevocationService: class {
       private client: any;
       constructor(client: any) { this.client = client || mockRedis; }
-      async checkRevoked(_token: any) { return { revoked: false }; }
-      async consumeRefresh(_token: any) { return { status: 'OK' }; }
+      async checkRevoked(_token: any) {
+        if (mockRevocationState.checkRevokedError) throw mockRevocationState.checkRevokedError;
+        return mockRevocationState.checkRevokedResult;
+      }
+      async consumeRefresh(_token: any) { return mockRevocationState.consumeRefreshResult; }
       async getUserVersion(_t: string, _u: string) { return 0; }
-      async revokeSid(_t: string, _s: string, _e: number) { return; }
-      async issueWsTicket(_p: any) { const id = '00000000-0000-0000-0000-000000000099'; mockRedis.set(`ws:ticket:${id}`, '{}', 'EX', 10, 'NX'); return id; }
+      async revokeSid(...args: any[]) {
+        mockRevocationState.revokeSidCalls.push(args);
+        if (mockRevocationState.revokeSidError) throw mockRevocationState.revokeSidError;
+      }
+      async issueWsTicket(p: any) {
+        if (mockRevocationState.issueWsTicketError) throw mockRevocationState.issueWsTicketError;
+        mockRevocationState.lastWsTicketPayload = p;
+        const id = '00000000-0000-0000-0000-000000000099';
+        mockRedis.set(`ws:ticket:${id}`, JSON.stringify(p), 'EX', 10, 'NX');
+        return id;
+      }
       async consumeWsTicket(ticket: string) { return mockRedis.getdel(`ws:ticket:${ticket}`) || null; }
-      async consumeWsTicketRateLimit(_uid: string) { return false; }
+      async consumeWsTicketRateLimit(_uid: string) { return mockRevocationState.rateLimitExceeded; }
       async shutdown() { }
       async initSubscriber() { }
       isSubscriberReady() { return true; }
@@ -132,6 +154,7 @@ import { REFRESH_COOKIE, CSRF_COOKIE, CSRF_HEADER } from '../config/cookies';
 import { generateCsrfToken } from '../config/csrf';
 import { TokenRevocationService } from '../services/authSession';
 import { redisClient as mockRedisClient } from '../services/redis';
+import { generateRefreshToken, generateToken } from '../middleware/auth';
 
 // ---------------------------------------------------------------------------
 // Test app factory
@@ -151,6 +174,59 @@ function buildApp() {
   app.use('/api/v1/auth', createAuthRoutes(svc, createOriginValidation()));
   return app;
 }
+
+const TEST_TENANT_ID = '00000000-0000-0000-0000-000000000001';
+const TEST_USER_ID = '00000000-0000-0000-0000-000000000002';
+const TEST_SID = '00000000-0000-0000-0000-000000000003';
+
+function futureSessionExpiry(): number {
+  return Math.floor(Date.now() / 1000) + 7 * 86400;
+}
+
+function makeAccessToken(roles = ['admin', 'agent']): string {
+  return generateToken({
+    sub: TEST_USER_ID,
+    tenantId: TEST_TENANT_ID,
+    sid: TEST_SID,
+    uv: 0,
+    sexp: futureSessionExpiry(),
+    email: 'a@b.com',
+    roles,
+  });
+}
+
+function makeRefreshToken(): string {
+  return generateRefreshToken({
+    sub: TEST_USER_ID,
+    tenantId: TEST_TENANT_ID,
+    sid: TEST_SID,
+    uv: 0,
+    sexp: futureSessionExpiry(),
+  });
+}
+
+function cookieHeader(values: Record<string, string>): string {
+  return Object.entries(values).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+function setCookies(res: request.Response): string[] {
+  const raw = res.headers['set-cookie'];
+  if (!raw) return [];
+  return Array.isArray(raw) ? raw : [raw];
+}
+
+beforeEach(() => {
+  mockRedisStore.clear();
+  jest.clearAllMocks();
+  mockRevocationState.checkRevokedResult = { revoked: false };
+  mockRevocationState.checkRevokedError = null;
+  mockRevocationState.consumeRefreshResult = { status: 'OK' };
+  mockRevocationState.revokeSidError = null;
+  mockRevocationState.rateLimitExceeded = false;
+  mockRevocationState.issueWsTicketError = null;
+  mockRevocationState.lastWsTicketPayload = null;
+  mockRevocationState.revokeSidCalls = [];
+});
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -268,6 +344,25 @@ describe('POST /refresh (mocked)', () => {
       .send({ refreshToken: 'some.ignored.token' })
       .expect(401);
   });
+
+  it('200: valid refresh cookie + CSRF rotates cookies and omits refreshToken from body', async () => {
+    const csrf = generateCsrfToken();
+    const res = await request(app)
+      .post('/api/v1/auth/refresh')
+      .set(CSRF_HEADER, csrf)
+      .set('Cookie', cookieHeader({
+        [CSRF_COOKIE]: csrf,
+        [REFRESH_COOKIE]: makeRefreshToken(),
+      }))
+      .send({})
+      .expect(200);
+
+    const sc = setCookies(res);
+    expect(sc.find((h: string) => h.startsWith(`${REFRESH_COOKIE}=`))).toBeDefined();
+    expect(sc.find((h: string) => h.startsWith(`${CSRF_COOKIE}=`))).toBeDefined();
+    expect(res.body.accessToken).toBeDefined();
+    expect(res.body.refreshToken).toBeUndefined();
+  });
 });
 
 describe('POST /logout (mocked)', () => {
@@ -279,6 +374,37 @@ describe('POST /logout (mocked)', () => {
       .post('/api/v1/auth/logout')
       .send({})
       .expect(401);
+  });
+
+  it('200: valid access token clears refresh and CSRF cookies after revocation', async () => {
+    const csrf = generateCsrfToken();
+    const res = await request(app)
+      .post('/api/v1/auth/logout')
+      .set('Authorization', `Bearer ${makeAccessToken()}`)
+      .set('Cookie', cookieHeader({
+        [CSRF_COOKIE]: csrf,
+        [REFRESH_COOKIE]: makeRefreshToken(),
+      }))
+      .send({})
+      .expect(200);
+
+    const sc = setCookies(res);
+    expect(sc.find((h: string) => h.startsWith(`${REFRESH_COOKIE}=`))).toMatch(/Expires=Thu, 01 Jan 1970|Max-Age=0/i);
+    expect(sc.find((h: string) => h.startsWith(`${CSRF_COOKIE}=`))).toMatch(/Expires=Thu, 01 Jan 1970|Max-Age=0/i);
+    expect(mockRevocationState.revokeSidCalls).toHaveLength(1);
+  });
+
+  it('503: Redis revoke failure does not clear cookies', async () => {
+    mockRevocationState.revokeSidError = new Error('redis down');
+
+    const res = await request(app)
+      .post('/api/v1/auth/logout')
+      .set('Authorization', `Bearer ${makeAccessToken()}`)
+      .send({})
+      .expect(503);
+
+    expect(res.body.error.code).toBe('AUTH_DEPENDENCY_UNAVAILABLE');
+    expect(setCookies(res)).toEqual([]);
   });
 });
 
@@ -313,6 +439,19 @@ describe('POST /migrate-cookie (mocked)', () => {
         }
       });
   });
+
+  it('200: valid legacy refresh token sets cookies and omits refreshToken from body', async () => {
+    const res = await request(app)
+      .post('/api/v1/auth/migrate-cookie')
+      .send({ refreshToken: makeRefreshToken() })
+      .expect(200);
+
+    const sc = setCookies(res);
+    expect(sc.find((h: string) => h.startsWith(`${REFRESH_COOKIE}=`))).toBeDefined();
+    expect(sc.find((h: string) => h.startsWith(`${CSRF_COOKIE}=`))).toBeDefined();
+    expect(res.body.accessToken).toBeDefined();
+    expect(res.body.refreshToken).toBeUndefined();
+  });
 });
 
 describe('POST /ws-ticket (mocked)', () => {
@@ -323,5 +462,62 @@ describe('POST /ws-ticket (mocked)', () => {
     await request(app)
       .post('/api/v1/auth/ws-ticket')
       .expect(401);
+  });
+
+  it('403 with disallowed Origin', async () => {
+    const res = await request(app)
+      .post('/api/v1/auth/ws-ticket')
+      .set('Origin', 'http://evil.com')
+      .set('Authorization', `Bearer ${makeAccessToken()}`)
+      .expect(403);
+
+    expect(res.body.error.code).toBe('ORIGIN_NOT_ALLOWED');
+  });
+
+  it('200: valid access token issues ticket and preserves JWT roles', async () => {
+    const res = await request(app)
+      .post('/api/v1/auth/ws-ticket')
+      .set('Authorization', `Bearer ${makeAccessToken(['admin', 'sales'])}`)
+      .expect(200);
+
+    expect(res.body.ticket).toBe('00000000-0000-0000-0000-000000000099');
+    expect(mockRevocationState.lastWsTicketPayload).toMatchObject({
+      tenantId: TEST_TENANT_ID,
+      userId: TEST_USER_ID,
+      sid: TEST_SID,
+      uv: 0,
+      roles: ['admin', 'sales'],
+    });
+  });
+
+  it('401 when access token is revoked', async () => {
+    mockRevocationState.checkRevokedResult = { revoked: true, reason: 'jti' };
+
+    await request(app)
+      .post('/api/v1/auth/ws-ticket')
+      .set('Authorization', `Bearer ${makeAccessToken()}`)
+      .expect(401);
+  });
+
+  it('503 when revocation dependency fails', async () => {
+    mockRevocationState.checkRevokedError = new Error('redis down');
+
+    const res = await request(app)
+      .post('/api/v1/auth/ws-ticket')
+      .set('Authorization', `Bearer ${makeAccessToken()}`)
+      .expect(503);
+
+    expect(res.body.error.code).toBe('AUTH_DEPENDENCY_UNAVAILABLE');
+  });
+
+  it('429 when per-user WS ticket rate limit is exceeded', async () => {
+    mockRevocationState.rateLimitExceeded = true;
+
+    const res = await request(app)
+      .post('/api/v1/auth/ws-ticket')
+      .set('Authorization', `Bearer ${makeAccessToken()}`)
+      .expect(429);
+
+    expect(res.body.error.code).toBe('RATE_LIMITED');
   });
 });
