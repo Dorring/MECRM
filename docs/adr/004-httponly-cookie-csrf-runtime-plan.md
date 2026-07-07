@@ -84,20 +84,27 @@ Planned commits (do not mix with formatting or Group D work):
      refresh: CookieOptions;
      csrf: CookieOptions;
    } {
-     const isProd = process.env.NODE_ENV === 'production';
+     // Explicit env var takes precedence; otherwise derive from NODE_ENV.
+     // Compose runs over HTTP, so COOKIE_SECURE must be false.
+     const secure =
+       process.env.COOKIE_SECURE !== undefined
+         ? process.env.COOKIE_SECURE === 'true'
+         : process.env.NODE_ENV === 'production';
+     const sameSite: 'strict' | 'lax' =
+       process.env.COOKIE_SAME_SITE === 'lax' ? 'lax' : 'strict';
      return {
        refresh: {
          httpOnly: true,
-         secure: isProd,
-         sameSite: isProd ? 'strict' : 'lax',
+         secure,
+         sameSite,
          path: '/api/v1/auth',
          maxAge: 604_800_000, // 7 days in ms (Express cookie maxAge is ms)
        },
        csrf: {
          httpOnly: false,
-         secure: isProd,
-         sameSite: isProd ? 'strict' : 'lax',
-         path: '/api/v1/auth',
+         secure,
+         sameSite,
+         path: '/',            // site-wide: JS must read from any page
          maxAge: 604_800_000,
        },
      };
@@ -114,6 +121,12 @@ Planned commits (do not mix with formatting or Group D work):
    # Comma-separated trusted origins for auth POST endpoints.
    # Missing Origin header (same-origin/non-browser) is allowed.
    ALLOWED_ORIGINS=http://localhost:3000
+
+   # Cookie security flags. COOKIE_SECURE must be false for Compose/local
+   # (HTTP); true for Helm/production (HTTPS terminated at Ingress).
+   # If unset, derived from NODE_ENV: production → true, else false.
+   COOKIE_SECURE=false
+   # COOKIE_SAME_SITE=strict
    ```
 
 6. Update `docker-compose.yml` frontend service:
@@ -123,6 +136,11 @@ Planned commits (do not mix with formatting or Group D work):
        - API_URL=http://gateway:4000
        - WS_URL=ws://gateway:4000
        # NEXT_PUBLIC_API_URL and NEXT_PUBLIC_WS_URL intentionally omitted
+   ```
+   Update `docker-compose.yml` gateway service environment to add:
+   ```yaml
+   - COOKIE_SECURE=false   # Compose uses HTTP; no TLS termination inside Compose
+   - ALLOWED_ORIGINS=http://localhost:3000,http://localhost:3001
    ```
 
 **Required C1 tests:**
@@ -135,10 +153,18 @@ Planned commits (do not mix with formatting or Group D work):
 - Origin middleware allows missing Origin header.
 - Origin middleware allows listed origin.
 - Origin middleware rejects unlisted origin with 403.
-- `getCookieOptions()` returns `httpOnly: true` for refresh cookie.
-- `getCookieOptions()` returns `secure: true` when `NODE_ENV=production`.
-- `getCookieOptions()` returns `sameSite: 'strict'` when `NODE_ENV=production`.
-- `getCookieOptions()` returns `sameSite: 'lax'` when `NODE_ENV=development`.
+- `getCookieOptions().refresh` returns `httpOnly: true`.
+- `getCookieOptions().refresh` returns `path: '/api/v1/auth'`.
+- `getCookieOptions().csrf` returns `httpOnly: false`.
+- `getCookieOptions().csrf` returns `path: '/'` (site-wide).
+- `getCookieOptions()` returns `secure: true` when `COOKIE_SECURE=true`.
+- `getCookieOptions()` returns `secure: false` when `COOKIE_SECURE=false`.
+- `getCookieOptions()` defaults `secure: true` when `NODE_ENV=production`
+  and `COOKIE_SECURE` is unset.
+- `getCookieOptions()` defaults `secure: false` when `NODE_ENV=development`
+  and `COOKIE_SECURE` is unset.
+- `getCookieOptions()` returns `sameSite: 'strict'` by default.
+- `getCookieOptions()` returns `sameSite: 'lax'` when `COOKIE_SAME_SITE=lax`.
 
 **Exit gate:** lint, TypeScript build, C1 tests pass.
 
@@ -159,10 +185,10 @@ Planned commits (do not mix with formatting or Group D work):
    - After signing token pair (Group B unchanged), set two cookies:
      ```
      Set-Cookie: refresh_token=<jwt>; HttpOnly; Secure; SameSite=Strict; Path=/api/v1/auth; Max-Age=604800
-     Set-Cookie: csrf_token=<random>; SameSite=Strict; Path=/api/v1/auth; Max-Age=604800
+     Set-Cookie: csrf_token=<random>; SameSite=Strict; Path=/; Max-Age=604800
      ```
    - JSON body returns `{ accessToken, user }` (no `refreshToken` field).
-   - Register follows the same pattern.
+   - Register follows the same pattern but returns **201** (not 200).
 
 2. **Refresh** (`POST /api/v1/auth/refresh`):
    - Read `refresh_token` from cookie (`req.cookies.refresh_token`).
@@ -204,9 +230,10 @@ Planned commits (do not mix with formatting or Group D work):
 
 **Required C2 tests (real Redis):**
 
-- Login response sets `refresh_token` HttpOnly cookie.
-- Login response sets `csrf_token` cookie (not HttpOnly).
+- Login response sets `refresh_token` HttpOnly cookie with `Path=/api/v1/auth`.
+- Login response sets `csrf_token` cookie (not HttpOnly) with `Path=/`.
 - Login response body has `accessToken` but no `refreshToken`.
+- Register response returns **201** (not 200) with `accessToken` and `user`.
 - Refresh with valid cookie + CSRF header → 200 + new accessToken + rotated cookies.
 - Refresh with missing CSRF header → 403.
 - Refresh with mismatched CSRF → 403.
@@ -270,21 +297,44 @@ Planned commits (do not mix with formatting or Group D work):
      ```typescript
      useEffect(() => {
        const boot = async () => {
-         // Legacy localStorage cleanup
-         for (const key of ['accessToken', 'refreshToken', 'authUser']) {
-           localStorage.removeItem(key);
-         }
-         // Try to restore session via cookie refresh
-         const ok = await api.tryRefresh();
-         if (ok) {
-           // Decode accessToken to get user claims for UI
-           const token = getAccessToken();
-           if (token) {
-             const claims = decodeToken(token);
-             if (claims) setUser(extractAuthUser(claims));
+         // 1. Read legacy tokens BEFORE any cleanup
+         const legacyRefresh = localStorage.getItem('refreshToken');
+         try {
+           // 2. Try cookie-based refresh first (existing cookie sessions)
+           const ok = await api.tryRefresh();
+           if (ok) {
+             const token = getAccessToken();
+             if (token) {
+               const claims = decodeToken(token);
+               if (claims) setUser(extractAuthUser(claims));
+             }
+             return; // cookie session valid, skip migration
            }
+           // 3. No cookie session; attempt legacy migration if token exists
+           if (legacyRefresh) {
+             const res = await fetch('/api/v1/auth/migrate-cookie', {
+               method: 'POST',
+               headers: { 'Content-Type': 'application/json' },
+               credentials: 'include',
+               body: JSON.stringify({ refreshToken: legacyRefresh }),
+             });
+             if (res.ok) {
+               const body = await res.json();
+               if (body.accessToken) {
+                 setAccessToken(body.accessToken);
+                 const claims = decodeToken(body.accessToken);
+                 if (claims) setUser(extractAuthUser(claims));
+               }
+             }
+             // Migration failure → fall through to login page
+           }
+         } finally {
+           // 4. ALWAYS clear localStorage after migration attempt
+           for (const key of ['accessToken', 'refreshToken', 'authUser']) {
+             localStorage.removeItem(key);
+           }
+           setBooted(true);
          }
-         setBooted(true);
        };
        boot();
      }, []);
@@ -303,13 +353,19 @@ Planned commits (do not mix with formatting or Group D work):
          source: '/api/:path*',
          destination: `${process.env.API_URL || 'http://localhost:4000'}/api/:path*`,
        },
-       {
-         source: '/ws',
-         destination: `${process.env.WS_URL || 'ws://localhost:4000'}/ws`,
-       },
+       // NOTE: /ws WebSocket proxy is handled at the infrastructure layer
+       // (nginx/Ingress/compose sidecar), NOT via Next.js rewrite.
+       // See ADR §8.2 and §8.4 for rationale.
      ];
    },
    ```
+
+4. **WebSocket proxy validation (C3 exit gate):**
+   - Run `next build && next start` in a CI step.
+   - Test: `GET /ws?ticket=<valid-ticket>` must return 101 Switching Protocols.
+   - If this test fails, add an nginx sidecar to `docker-compose.yml` that
+     proxies `/ws` to `http://gateway:4000/ws` with WebSocket upgrade headers.
+   - Group C **cannot merge** until WS upgrade works end-to-end in CI.
 
 4. **WebSocket changes:**
    - On connect, first request WS ticket via `POST /api/v1/auth/ws-ticket`
@@ -331,6 +387,11 @@ Planned commits (do not mix with formatting or Group D work):
 - Auto-refresh uses `credentials: 'include'`.
 - CSRF token sent in `X-CSRF-Token` header on refresh.
 - All API requests use relative paths (no absolute localhost URL).
+- Legacy migration: legacy `refreshToken` is read **before** localStorage
+  cleanup runs (test that `migrate-cookie` is called when legacy token
+  exists and no cookie session is present).
+- WS upgrade: `next build && next start` → `GET /ws?ticket=<valid>` returns
+  101. If fails, nginx sidecar is added and retested.
 
 **Exit gate:** Frontend lint, TypeScript build, Next.js production build pass.
 
@@ -499,7 +560,8 @@ Planned commits (do not mix with formatting or Group D work):
 
 | Condition | Status |
 |---|---|
-| Successful login/register | 200 `{ accessToken, user }` |
+| Successful login | 200 `{ accessToken, user }` |
+| Successful register | 201 `{ accessToken, user }` |
 | Successful refresh | 200 `{ accessToken }` |
 | CSRF validation failed | 403 `{ error: { code: "CSRF_VALIDATION_FAILED" } }` |
 | Origin not allowed | 403 `{ error: { code: "ORIGIN_NOT_ALLOWED" } }` |
@@ -552,11 +614,15 @@ is modified.
 | Frontend build | `cd frontend && npm run build` | 0 errors |
 | TypeScript check | `cd frontend && npx tsc --noEmit` | 0 errors |
 | Compose config | `docker compose config --quiet` | Exit 0 |
-| Cookie HttpOnly | Response header inspection | `refresh_token` has `HttpOnly` |
-| Cookie Secure | `NODE_ENV=production` test | `refresh_token` has `Secure` |
+| refresh_token cookie | Response header | `HttpOnly`; `Path=/api/v1/auth` |
+| csrf_token cookie | Response header | NOT `HttpOnly`; `Path=/` |
+| Cookie Secure (prod) | `COOKIE_SECURE=true` test | `cookie.secure === true` |
+| Cookie Secure (compose) | `COOKIE_SECURE=false` test | `cookie.secure === false` |
 | CSRF 403 | Gateway test | Missing/mismatched → 403 |
-| localStorage clean | Frontend test | No tokens after login |
+| Register 201 | Gateway test | `POST /register` → 201 |
+| localStorage clean | Frontend test | No tokens after login or boot |
 | WS ticket single-use | Redis integration | Second GETDEL → null |
+| WS upgrade | CI (next build + next start) | 101 Switching Protocols; nginx sidecar if fails |
 
 ---
 
@@ -566,7 +632,9 @@ Before requesting merge, review the diff for:
 
 - Refresh token in JSON body on login/refresh response (must NOT be present).
 - `HttpOnly` missing from `refresh_token` cookie.
-- `Secure` missing when `NODE_ENV=production`.
+- `Secure` set to `true` in Compose (must be `false` for HTTP).
+- `Secure` set to `false` in production/Helm.
+- `csrf_token` cookie `Path` set to `/api/v1/auth` (must be `/`).
 - CSRF double-submit not validated on refresh endpoint.
 - Origin validation missing on auth POST endpoints.
 - Access token stored in localStorage or sessionStorage.
@@ -576,10 +644,14 @@ Before requesting merge, review the diff for:
 - WS ticket missing GETDEL (allows replay).
 - Group B revocation logic modified (should be untouched).
 - Migration endpoint without defined removal date.
+- Migration boot: localStorage cleared **before** migration attempt (must be after).
 - `NEXT_PUBLIC_API_URL` still present in docker-compose.yml frontend service.
 - `credentials: 'include'` missing on frontend refresh request.
 - Auto-refresh on boot not implemented (page refresh loses session).
+- WS proxy assumed to work via Next.js rewrite without CI validation.
 - `forceExit` or other Jest handle-leak suppression.
+- Register returns 200 (must be 201).
+- Cross-origin mode documented as supported (must be explicitly deferred).
 
 ---
 

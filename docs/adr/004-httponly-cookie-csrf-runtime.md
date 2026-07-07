@@ -50,17 +50,21 @@ Group C addresses all four issues without changing Group B revocation semantics.
 │                  Path=/api/v1/auth  Max-Age=604800              │
 │                                                                 │
 │  csrf_token:     SameSite=Strict                                │
-│                  Path=/api/v1/auth  Max-Age=604800              │
-│                  (JS-readable; not HttpOnly)                    │
+│                  Path=/  Max-Age=604800                         │
+│                  (JS-readable; not HttpOnly; visible site-wide) │
 └─────────────────────────────────────────────────────────────────┘
            │ HTTPS  (same-origin: browser → Next.js)
            ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │ Next.js Server                                                  │
 │                                                                 │
-│  Rewrites:                                                      │
+│  Rewrites (HTTP only):                                         │
 │    /api/v1/*  → http://gateway:4000/api/v1/*   (no path change) │
-│    /ws        → http://gateway:4000/ws          (upgrade proxy)  │
+│                                                                 │
+│  WebSocket (/ws):                                               │
+│    Proxied at infrastructure layer (nginx/Ingress/compose)      │
+│    → http://gateway:4000/ws                                     │
+│    NOT via Next.js rewrite (see §8.4)                           │
 │                                                                 │
 │  Serves:                                                        │
 │    /api/config → runtime { apiUrl, wsUrl }                      │
@@ -137,7 +141,7 @@ Browser                    Next.js Proxy              Gateway
    │                            │  Set-Cookie:           │
    │                            │    csrf_token=<rand>;  │
    │                            │    SameSite=Strict;    │
-   │                            │    Path=/api/v1/auth;  │
+   │                            │    Path=/;             │
    │                            │    Max-Age=604800      │
    │                            │                        │
    │                            │  JSON body:            │
@@ -190,7 +194,7 @@ Browser                    Next.js Proxy              Gateway
    │                            │    (rotated)           │
    │                            │  Set-Cookie:           │
    │                            │    csrf_token=NEW      │
-   │                            │    (rotated)           │
+   │                            │    (rotated; Path=/)   │
    │                            │                        │
    │                            │  JSON body:            │
    │                            │    {accessToken}       │
@@ -282,24 +286,50 @@ Browser                    Next.js Proxy              Gateway
    │<═══════════════════════════│<═══════════════════════│
 ```
 
-### 3.5 Legacy localStorage Migration (one-time)
+### 3.5 Legacy localStorage Migration (one-time, on boot)
 
 ```
-Browser (page load)
+Browser (page load, before rendering protected routes)
    │
-   │  const rt = localStorage.getItem('refreshToken')
-   │  const at = localStorage.getItem('accessToken')
-   │  if (rt && at) {
-   │    // POST /api/v1/auth/migrate-cookie
-   │    //   body: { refreshToken: rt }
-   │    //   credentials: 'include'
-   │    // → Gateway reads body token, validates, issues cookies
-   │    // → return { accessToken }
-   │    // localStorage.removeItem('accessToken')
-   │    // localStorage.removeItem('refreshToken')
-   │    // localStorage.removeItem('authUser')
+   │  // 1. Read legacy tokens into memory (BEFORE any cleanup)
+   │  const legacyRefresh = localStorage.getItem('refreshToken')
+   │  const legacyAccess  = localStorage.getItem('accessToken')
+   │  const legacyUser    = localStorage.getItem('authUser')
+   │
+   │  try {
+   │    // 2. First, try cookie-based refresh (for users who already migrated)
+   │    const ok = await POST /api/v1/auth/refresh
+   │                credentials: 'include'
+   │                headers: { X-CSRF-Token: <from cookie> }
+   │    if (ok) {
+   │      // Cookie session valid — store access token in memory
+   │      return  // skip migration, user already has cookie session
+   │    }
+   │
+   │    // 3. No cookie session; check for legacy localStorage token
+   │    if (legacyRefresh) {
+   │      // 4. Migrate: send body token to migration endpoint
+   │      const res = await POST /api/v1/auth/migrate-cookie
+   │                   body: { refreshToken: legacyRefresh }
+   │                   credentials: 'include'
+   │      if (res.ok) {
+   │        // Cookie issued — store new access token in memory
+   │      }
+   │      // If migration fails (token expired/revoked) → fall through to login
+   │    }
+   │  } finally {
+   │    // 5. ALWAYS clear localStorage, regardless of migration outcome
+   │    //    This prevents stale tokens from lingering.
+   │    localStorage.removeItem('accessToken')
+   │    localStorage.removeItem('refreshToken')
+   │    localStorage.removeItem('authUser')
    │  }
 ```
+
+**Critical ordering:** Legacy tokens are read **before** any cleanup. Cleanup
+runs in `finally` only **after** migration is attempted or skipped. Never
+clear localStorage before migration — that would destroy the refresh token
+needed for migration.
 
 ---
 
@@ -327,9 +357,17 @@ Browser (page load)
 | HttpOnly | `false` | JS must read this to set `X-CSRF-Token` header |
 | Secure | `true` in production/compose; `false` in local dev | Same policy as refresh_token |
 | SameSite | `Strict` in production; `Lax` in dev | Same policy as refresh_token |
-| Path | `/api/v1/auth` | Scoped to auth endpoints |
+| Path | `/` | JS must read cookie from any page to set `X-CSRF-Token` header; not restricted to auth endpoints |
 | Max-Age | `604800` (7 days) | Matches refresh token lifetime |
 | Domain | Omit | Same scoping as refresh_token |
+
+**Why `Path=/` and not `Path=/api/v1/auth`:** The frontend reads `csrf_token` via
+`document.cookie` from pages like `/dashboard` or `/settings`. If `Path` were
+scoped to `/api/v1/auth`, the browser would not send the cookie on those pages,
+and `document.cookie` would not see it. `Path=/` makes the cookie site-wide.
+The `refresh_token` cookie can safely use `Path=/api/v1/auth` because it is
+HttpOnly and never read by JavaScript — it is only sent on auth endpoint
+requests, which is exactly where it is needed.
 
 ### 4.3 CSRF double-submit validation
 
@@ -383,20 +421,24 @@ For non-auth endpoints, CORS middleware already handles origin filtering (Group 
 
 ### 5.3 Relationship to CORS
 
-Same-origin mode (Next.js proxy, no cross-origin requests):
+Same-origin mode (Next.js proxy, no cross-origin requests) — **Group C default**:
 
 - CORS middleware is a no-op.
 - CSRF + SameSite=Strict provide the security boundary.
+- All auth endpoints, refresh, logout and WS ticket work via same-origin proxy.
 
-Cross-origin mode (direct browser → Gateway):
+**Cross-origin mode (direct browser → Gateway) — DEFERRED, not in Group C scope:**
 
-- CORS middleware must return `Access-Control-Allow-Origin` matching the Origin.
-- CORS must include `Access-Control-Allow-Credentials: true`.
-- CSRF double-submit protects the refresh endpoint.
-- SameSite=Lax/None required so browser sends cookies.
-
-The ADR recommends same-origin proxy as the default. Cross-origin mode is
-documented for deployments where the proxy is not feasible.
+- Requires `SameSite=None; Secure` on both cookies (browser sends cross-site).
+- Requires full CORS credentials: `Access-Control-Allow-Origin` matching the
+  specific Origin (not `*`), `Access-Control-Allow-Credentials: true`, and
+  explicit `Access-Control-Allow-Headers` including `X-CSRF-Token` and
+  `Authorization`.
+- Requires additional tests: cross-origin preflight, cookie attachment with
+  `credentials: 'include'`, CSRF validation with `SameSite=None`.
+- Group C does **not** implement or test this mode. Deployments requiring
+  cross-origin must implement it in a follow-up with dedicated ADR amendments
+  and test coverage.
 
 ---
 
@@ -506,10 +548,26 @@ endpoint requires a rebuild and redeployment.
 
 **Same-origin proxy** (default):
 
-- Next.js `rewrites` forward `/api/v1/*` to the Gateway.
+- Next.js `rewrites` forward `/api/v1/*` to the Gateway (HTTP requests only).
 - No absolute URL needed in frontend code; all requests are relative paths.
 - `NEXT_PUBLIC_API_URL` becomes empty string or unset; frontend uses `/api/v1`
   as the base.
+
+**WebSocket proxy** (`/ws`):
+
+- Next.js `rewrites` do **not** reliably support WebSocket upgrade across all
+  deployment modes. The `/ws` path is proxied at the infrastructure layer:
+  - **Compose:** a lightweight nginx sidecar or the built-in Next.js custom
+    server forwards `/ws` to `http://gateway:4000/ws`. If Next.js rewrite is
+    used, verify with a production build (`next build && next start`) that
+    `/ws` upgrade actually works; if it fails, add a dedicated reverse proxy.
+  - **Helm/production:** Ingress controller (nginx-ingress, Traefik) routes
+    `/ws` to the Gateway service with WebSocket upgrade annotations.
+  - **Local dev (no Docker):** connect directly to `ws://localhost:4000/ws`
+    via `NEXT_PUBLIC_WS_URL` or runtime config.
+- The implementation plan includes a validation test (C3) that must pass
+  `/ws` upgrade under `next build && next start`. If it fails, the proxy
+  layer must be added before Group C can merge.
 
 **Runtime config endpoint** (fallback for direct cross-origin):
 
@@ -520,9 +578,10 @@ endpoint requires a rebuild and redeployment.
 
 ### 8.3 WebSocket URL
 
-In same-origin mode: `ws(s)://${window.location.host}/ws`.
+In same-origin mode: `ws(s)://${window.location.host}/ws` — relies on
+infrastructure proxy forwarding `/ws` to the Gateway (see §8.2).
 
-In direct mode: value from runtime config.
+In direct mode: value from runtime config (e.g. `ws://localhost:4000/ws`).
 
 ---
 
@@ -534,13 +593,35 @@ In direct mode: value from runtime config.
 |---|---|---|---|
 | `NODE_ENV` | `development` | `production` | `production` |
 | `ALLOWED_ORIGINS` | `http://localhost:3000` | `http://localhost:3000,http://localhost:3001` | `https://crm.example.com` |
-| `COOKIE_SECURE` | `false` (auto from NODE_ENV) | `true` (auto) | `true` (auto) |
-| `COOKIE_SAME_SITE` | `Lax` (auto) | `Strict` (auto) | `Strict` (auto) |
+| `COOKIE_SECURE` | `false` | `false` (Compose uses HTTP; see §9.3) | `true` |
+| `COOKIE_SAME_SITE` | `Lax` | `Strict` | `Strict` |
 | `CSRF_ENABLED` | `true` | `true` | `true` |
 | `WS_TICKET_TTL` | `10` | `10` | `10` |
 
-`COOKIE_SECURE` and `COOKIE_SAME_SITE` are derived from `NODE_ENV` by default
-but can be overridden for testing.
+`COOKIE_SECURE` and `COOKIE_SAME_SITE` are derived from explicit environment
+configuration, not solely from `NODE_ENV`. See §9.3 for the derivation rules.
+
+### 9.3 COOKIE_SECURE derivation rules
+
+`COOKIE_SECURE` is **not** derived from `NODE_ENV` alone. The derivation:
+
+1. If `COOKIE_SECURE` env var is explicitly set (`true`/`false`), use that value.
+2. Otherwise, `NODE_ENV === 'production'` → `true`, else `false`.
+
+**Compose uses HTTP** between the browser and the Next.js frontend (no TLS
+terminates inside Compose). If `COOKIE_SECURE=true` were set, the browser
+would silently refuse to store or send the cookie, breaking login/refresh
+entirely. Compose therefore sets `COOKIE_SECURE=false` explicitly (or relies
+on the default when `NODE_ENV` is not `production`).
+
+**Production/Helm** terminates TLS at the Ingress/load balancer. The browser
+sees HTTPS, so `COOKIE_SECURE=true` is required.
+
+**Test matrix implication:** The C1 test suite must include:
+- `COOKIE_SECURE=true` → `cookie.secure === true` (production simulation).
+- `COOKIE_SECURE=false` → `cookie.secure === false` (Compose simulation).
+- Default with `NODE_ENV=production` and no explicit override → `true`.
+- Default with `NODE_ENV=development` and no explicit override → `false`.
 
 ### 9.2 Frontend environment
 
@@ -607,14 +688,23 @@ consumption across instances.
 Users who logged in under Group B have `accessToken` and `refreshToken` in
 localStorage. On first page load after Group C deployment:
 
-1. Frontend checks for `localStorage.getItem('refreshToken')`.
-2. If present, calls `POST /api/v1/auth/migrate-cookie` with the refresh token
-   in the request body.
-3. Gateway validates the token (same as current refresh logic), issues new
+1. Read legacy `accessToken`, `refreshToken`, `authUser` from localStorage
+   into memory variables **before any cleanup**.
+2. Try cookie-based `POST /api/v1/auth/refresh` (for users who already
+   migrated on a previous visit). If 200, store new access token in memory;
+   skip migration.
+3. If no cookie session and legacy `refreshToken` exists, call
+   `POST /api/v1/auth/migrate-cookie` with the legacy token in the request
+   body.
+4. Gateway validates the token (same as current refresh logic), issues new
    token pair with HttpOnly cookie.
-4. Frontend clears all localStorage auth keys.
-5. If migration fails (token expired/revoked), clear localStorage and redirect
-   to login.
+5. Frontend stores the new access token in memory.
+6. **In `finally`**: clear all localStorage auth keys regardless of outcome.
+   This ensures stale tokens never linger even if migration fails.
+
+If migration fails (token expired/revoked), localStorage is still cleared
+and the user is redirected to login. This is safe: the token was already
+invalid.
 
 ### 12.2 Migration endpoint
 
@@ -629,16 +719,22 @@ localStorage. On first page load after Group C deployment:
 
 ### 12.3 localStorage cleanup
 
-On every page load, frontend runs:
+On every page load, frontend runs the migration boot sequence (see §3.5).
+The final `finally` block clears localStorage:
 
 ```javascript
-for (const key of ['accessToken', 'refreshToken', 'authUser']) {
-  localStorage.removeItem(key);
+try {
+  // ... migration logic ...
+} finally {
+  for (const key of ['accessToken', 'refreshToken', 'authUser']) {
+    localStorage.removeItem(key);
+  }
 }
 ```
 
-This is safe to run unconditionally. If the key does not exist, `removeItem`
-is a no-op.
+This runs **after** migration is attempted, never before. If the key does not
+exist, `removeItem` is a no-op. The `finally` ensures cleanup even if
+migration throws.
 
 ### 12.4 Rollback
 
@@ -661,6 +757,7 @@ All Group B invariants (ADR-002 §2) remain in force. Group C adds:
 3. Refresh cookie is never attached to cross-origin requests in production
    (`SameSite=Strict`).
 4. Refresh endpoint requires valid CSRF double-submit on every request.
+   CSRF cookie uses `Path=/` so it is readable from any page.
 5. Origin header is validated for all auth POST endpoints.
 6. Access token lives only in JavaScript memory, never in persistent storage.
 7. No complete JWT appears in WebSocket URLs, logs, or error responses.
@@ -686,7 +783,7 @@ All Group B invariants (ADR-002 §2) remain in force. Group C adds:
 | 8 | Logout closes HTTP+WS | Gateway test | Logout revokes sid; WS heartbeat detects and closes |
 | 9 | Redis down → refresh 503 | Redis integration test | Broken Redis → `POST /refresh` → 503 |
 | 10 | Redis down → logout 503 | Redis integration test | Broken Redis → `POST /logout` → 503 |
-| 11 | Cookie Secure in production | Gateway config test | `NODE_ENV=production` → `cookie.secure === true` |
+| 11 | Cookie Secure in production | Gateway config test | `COOKIE_SECURE=true` → `cookie.secure === true`; `COOKIE_SECURE=false` → `false` |
 | 12 | API URL no build-time inline | Frontend build | `grep -r "localhost:4000" frontend/.next/` → no matches (except source maps) |
 | 13 | WS ticket single-use | Redis integration | `GETDEL` on consumed ticket → null |
 | 14 | WS ticket short TTL | Redis integration | Ticket key TTL ≤ 10 |
@@ -695,8 +792,12 @@ All Group B invariants (ADR-002 §2) remain in force. Group C adds:
 | 17 | Gateway lint/tsc/Jest green | CI | 0 errors, 0 failures |
 | 18 | Frontend lint/tsc/build green | CI | 0 errors, 0 failures |
 | 19 | Compose smoke | CI | `docker compose config --quiet` passes |
-| 20 | Legacy localStorage migration | Gateway test | Body refresh token → cookie issued → localStorage cleared |
+| 20 | Legacy localStorage migration | Gateway test | Body refresh token → cookie issued → localStorage cleared; read-before-clear ordering verified |
 | 21 | Self-review | `docs/self-review-group-c.md` | All sections complete |
+| 22 | csrf_token Path is `/` | Gateway Jest | `Set-Cookie: csrf_token=...; Path=/` in login/refresh response |
+| 23 | refresh_token Path is `/api/v1/auth` | Gateway Jest | `Set-Cookie: refresh_token=...; Path=/api/v1/auth` in login response |
+| 24 | WS upgrade via infra proxy | CI (next build + next start) | `GET /ws?ticket=<valid>` returns 101 Switching Protocols; if fails, add nginx sidecar before merge |
+| 25 | Register returns 201 | Gateway Jest | `POST /register` with valid payload → 201; body contains `accessToken` and `user` |
 
 ---
 
@@ -704,11 +805,20 @@ All Group B invariants (ADR-002 §2) remain in force. Group C adds:
 
 Implementation may begin only after reviewers accept:
 
-- HttpOnly refresh cookie with SameSite/Secure derivation from NODE_ENV;
+- HttpOnly refresh cookie with SameSite/Secure derivation from explicit env
+  config (not solely `NODE_ENV`); Compose uses `COOKIE_SECURE=false` since
+  it runs over HTTP;
+- CSRF `Path=/` (site-wide) so frontend can read from any page;
 - CSRF double-submit on refresh endpoint (stateless, no server-side store);
 - Origin validation on auth POST endpoints;
 - WS ticket single-use, short TTL, cross-instance via Redis;
+- WS upgrade proxied at infrastructure layer, not assumed to work via
+  Next.js rewrite; requires passing `next build && next start` test;
 - migration endpoint with defined removal timeline;
+- migration boot sequence: read legacy → try cookie refresh → migrate →
+  clear in `finally` (never clear before migration);
+- register returns 201 (distinct from login 200);
+- cross-origin mode explicitly deferred (not in Group C scope);
 - 10-second ticket TTL and 10/minute rate limit;
-- same-origin proxy as default (cross-origin as documented alternative);
+- same-origin proxy as Group C default;
 - Group B revocation semantics unchanged.
