@@ -569,19 +569,28 @@ endpoint requires a rebuild and redeployment.
   `/ws` upgrade under `next build && next start`. If it fails, the proxy
   layer must be added before Group C can merge.
 
-**Runtime config endpoint** (fallback for direct cross-origin):
+**Runtime config endpoint** (`/api/config`):
 
 - `GET /api/config` (served by Next.js, not proxied to Gateway).
 - Returns `{ apiUrl: "<from env API_URL>", wsUrl: "<from env WS_URL>" }`.
-- Frontend fetches this once at boot and uses it for subsequent requests.
+- Used for runtime URL resolution in local/dev environments where the frontend
+  connects directly to the Gateway (no same-origin proxy).
 - `API_URL` and `WS_URL` are server-side env vars (not `NEXT_PUBLIC_`).
+- **Not a cross-origin cookie auth mechanism.** Group C does not support
+  browser cross-origin cookie auth. Any production deployment requiring
+  the frontend to authenticate against a different origin than the one
+  serving the SPA must implement SameSite=None; Secure + full CORS
+  credentials in a separate ADR amendment with dedicated test coverage.
 
 ### 8.3 WebSocket URL
 
 In same-origin mode: `ws(s)://${window.location.host}/ws` — relies on
 infrastructure proxy forwarding `/ws` to the Gateway (see §8.2).
 
-In direct mode: value from runtime config (e.g. `ws://localhost:4000/ws`).
+In local/dev direct mode (no same-origin proxy): value from runtime config
+or environment variable (e.g. `ws://localhost:4000/ws`). This mode does **not**
+use cross-origin cookie auth; it is a direct Gateway connection for development
+only.
 
 ---
 
@@ -601,9 +610,9 @@ In direct mode: value from runtime config (e.g. `ws://localhost:4000/ws`).
 `COOKIE_SECURE` and `COOKIE_SAME_SITE` are derived from explicit environment
 configuration, not solely from `NODE_ENV`. See §9.3 for the derivation rules.
 
-### 9.3 COOKIE_SECURE derivation rules
+### 9.3 Cookie attribute derivation rules
 
-`COOKIE_SECURE` is **not** derived from `NODE_ENV` alone. The derivation:
+**COOKIE_SECURE** is **not** derived from `NODE_ENV` alone. The derivation:
 
 1. If `COOKIE_SECURE` env var is explicitly set (`true`/`false`), use that value.
 2. Otherwise, `NODE_ENV === 'production'` → `true`, else `false`.
@@ -617,11 +626,25 @@ on the default when `NODE_ENV` is not `production`).
 **Production/Helm** terminates TLS at the Ingress/load balancer. The browser
 sees HTTPS, so `COOKIE_SECURE=true` is required.
 
+**COOKIE_SAME_SITE** derivation:
+
+1. If `COOKIE_SAME_SITE=lax` → `lax`.
+2. If `COOKIE_SAME_SITE=strict` → `strict`.
+3. If unset and `NODE_ENV=production` → `strict`.
+4. If unset and non-production → `lax`.
+
+This matches the table in §9.1: Local dev → `lax` (NODE_ENV=development),
+Compose → `strict` (NODE_ENV=production), Helm/Prod → `strict`.
+
 **Test matrix implication:** The C1 test suite must include:
-- `COOKIE_SECURE=true` → `cookie.secure === true` (production simulation).
-- `COOKIE_SECURE=false` → `cookie.secure === false` (Compose simulation).
-- Default with `NODE_ENV=production` and no explicit override → `true`.
-- Default with `NODE_ENV=development` and no explicit override → `false`.
+- `COOKIE_SECURE=true` → `cookie.secure === true`.
+- `COOKIE_SECURE=false` → `cookie.secure === false`.
+- Default with `NODE_ENV=production` and no explicit override → `secure: true`.
+- Default with `NODE_ENV=development` and no explicit override → `secure: false`.
+- `COOKIE_SAME_SITE=lax` → `sameSite: 'lax'`.
+- `COOKIE_SAME_SITE=strict` → `sameSite: 'strict'`.
+- Default with `NODE_ENV=production` and no explicit override → `sameSite: 'strict'`.
+- Default with `NODE_ENV=development` and no explicit override → `sameSite: 'lax'`.
 
 ### 9.2 Frontend environment
 

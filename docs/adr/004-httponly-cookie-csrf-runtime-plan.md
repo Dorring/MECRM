@@ -17,7 +17,8 @@ Group C implements ADR-004 only:
 - Origin validation on auth POST endpoints;
 - WebSocket ticket (single-use, short TTL, tenant-bound) replacing JWT-in-URL;
 - same-origin proxy (Next.js rewrites) as default;
-- runtime `/api/config` endpoint for cross-origin fallback;
+- runtime `/api/config` endpoint for local/dev direct URL resolution;
+- Group C does **not** support browser cross-origin cookie auth;
 - legacy localStorage migration and cleanup;
 - documentation and self-review.
 
@@ -90,8 +91,18 @@ Planned commits (do not mix with formatting or Group D work):
        process.env.COOKIE_SECURE !== undefined
          ? process.env.COOKIE_SECURE === 'true'
          : process.env.NODE_ENV === 'production';
+     // SameSite derivation:
+     //   1. Explicit COOKIE_SAME_SITE=lax|strict → use that.
+     //   2. Unset + NODE_ENV=production → strict.
+     //   3. Unset + non-production → lax.
      const sameSite: 'strict' | 'lax' =
-       process.env.COOKIE_SAME_SITE === 'lax' ? 'lax' : 'strict';
+       process.env.COOKIE_SAME_SITE === 'lax'
+         ? 'lax'
+         : process.env.COOKIE_SAME_SITE === 'strict'
+           ? 'strict'
+           : process.env.NODE_ENV === 'production'
+             ? 'strict'
+             : 'lax';
      return {
        refresh: {
          httpOnly: true,
@@ -126,6 +137,8 @@ Planned commits (do not mix with formatting or Group D work):
    # (HTTP); true for Helm/production (HTTPS terminated at Ingress).
    # If unset, derived from NODE_ENV: production → true, else false.
    COOKIE_SECURE=false
+   # COOKIE_SAME_SITE: explicit lax/strict overrides NODE_ENV default.
+   # If unset: NODE_ENV=production → strict, else → lax.
    # COOKIE_SAME_SITE=strict
    ```
 
@@ -163,8 +176,12 @@ Planned commits (do not mix with formatting or Group D work):
   and `COOKIE_SECURE` is unset.
 - `getCookieOptions()` defaults `secure: false` when `NODE_ENV=development`
   and `COOKIE_SECURE` is unset.
-- `getCookieOptions()` returns `sameSite: 'strict'` by default.
 - `getCookieOptions()` returns `sameSite: 'lax'` when `COOKIE_SAME_SITE=lax`.
+- `getCookieOptions()` returns `sameSite: 'strict'` when `COOKIE_SAME_SITE=strict`.
+- `getCookieOptions()` defaults `sameSite: 'strict'` when `NODE_ENV=production`
+  and `COOKIE_SAME_SITE` is unset.
+- `getCookieOptions()` defaults `sameSite: 'lax'` when `NODE_ENV=development`
+  and `COOKIE_SAME_SITE` is unset.
 
 **Exit gate:** lint, TypeScript build, C1 tests pass.
 
@@ -367,14 +384,14 @@ Planned commits (do not mix with formatting or Group D work):
      proxies `/ws` to `http://gateway:4000/ws` with WebSocket upgrade headers.
    - Group C **cannot merge** until WS upgrade works end-to-end in CI.
 
-4. **WebSocket changes:**
+5. **WebSocket changes:**
    - On connect, first request WS ticket via `POST /api/v1/auth/ws-ticket`
      (uses access token from memory).
    - Connect with `ws://host/ws?ticket=<ticket>` (same-origin relative).
    - Remove any JWT from WebSocket URL.
    - On 4401 close, request new ticket and reconnect (token may have rotated).
 
-5. **Login page (`page.tsx`):**
+6. **Login page (`page.tsx`):**
    - `persistSession()` no longer writes to localStorage; unchanged call site.
    - After login redirect, `AuthContext.user` is set from response body.
 
@@ -495,8 +512,11 @@ Planned commits (do not mix with formatting or Group D work):
      });
    }
    ```
+   Used for runtime URL resolution in local/dev environments where the frontend
+   connects directly to the Gateway (no same-origin proxy). **Not a cross-origin
+   cookie auth mechanism.**
 
-2. **Runtime config client (optional — for direct cross-origin mode):**
+2. **Runtime config client (for local/dev direct mode only):**
    ```typescript
    // frontend/src/lib/runtime-config.ts
    let cached: { apiUrl: string; wsUrl: string } | null = null;
@@ -512,6 +532,11 @@ Planned commits (do not mix with formatting or Group D work):
      return { apiUrl: '', wsUrl: '' };
    }
    ```
+   In same-origin proxy mode the frontend uses relative paths and this client
+   is unused. In local/dev direct mode it provides the Gateway URL.
+   **Group C does not implement cross-origin cookie auth.** Any production
+   cross-origin deployment requires a separate ADR amendment with SameSite=None,
+   CORS credentials, and dedicated tests.
 
 3. **Legacy localStorage cleanup:**
    Runs on every page load in AuthContext boot (already specified in C3).
