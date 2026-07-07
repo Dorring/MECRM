@@ -236,11 +236,6 @@ export class TokenRevocationService {
     private readonly subscriber?: Redis,
   ) {}
 
-  /** Expose the underlying Redis client for internal use by auth routes. */
-  get redis(): Redis {
-    return this.client;
-  }
-
   /**
    * Per-user rate limit for WS ticket generation.
    * Returns true if the rate limit has been exceeded (10 tickets / 60s window).
@@ -650,13 +645,17 @@ export class TokenRevocationService {
       uv: auth.uv,
       roles: auth.roles,
     });
-    await this.client.set(
+    const result = await this.client.set(
       authKeys.wsTicket(ticket),
       payload,
       'EX',
       WS_TICKET_TTL,
       'NX',
     );
+    // NX returns null if the key already existed (UUID collision — defender code).
+    if (result !== 'OK') {
+      throw new Error('Failed to issue WS ticket — key collision');
+    }
     return ticket;
   }
 
