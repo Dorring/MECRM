@@ -24,7 +24,18 @@ export function createOriginValidation() {
       return;
     }
 
-    if (allowed.length === 0 || allowed.includes(origin)) {
+    // Origin present but allowlist is empty → fail-closed.
+    if (allowed.length === 0) {
+      res.status(403).json({
+        error: {
+          code: 'ORIGIN_NOT_ALLOWED',
+          message: 'Request origin is not allowed',
+        },
+      });
+      return;
+    }
+
+    if (allowed.includes(origin)) {
       next();
       return;
     }

@@ -218,10 +218,22 @@ describe('createOriginValidation', () => {
     expect((res as any).body.error.code).toBe('ORIGIN_NOT_ALLOWED');
   });
 
-  it('allows any origin when ALLOWED_ORIGINS is empty', () => {
+  it('rejects present Origin when ALLOWED_ORIGINS is empty (fail-closed)', () => {
     process.env.ALLOWED_ORIGINS = '';
     const middleware = createOriginValidation();
     const req = mockReq({ origin: 'http://anything.com' });
+    const res = mockRes();
+    let called = false;
+    middleware(req, res, () => { called = true; });
+    expect(called).toBe(false);
+    expect(res.statusCode).toBe(403);
+    expect((res as any).body.error.code).toBe('ORIGIN_NOT_ALLOWED');
+  });
+
+  it('allows missing Origin even when ALLOWED_ORIGINS is empty', () => {
+    process.env.ALLOWED_ORIGINS = '';
+    const middleware = createOriginValidation();
+    const req = mockReq({});  // no Origin header
     const res = mockRes();
     let called = false;
     middleware(req, res, () => { called = true; });
