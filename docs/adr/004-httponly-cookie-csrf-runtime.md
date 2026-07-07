@@ -564,7 +564,7 @@ endpoint requires a rebuild and redeployment.
   - **Helm/production:** Ingress controller (nginx-ingress, Traefik) routes
     `/ws` to the Gateway service with WebSocket upgrade annotations.
   - **Local dev (no Docker):** connect directly to `ws://localhost:4000/ws`
-    via `NEXT_PUBLIC_WS_URL` or runtime config.
+    via runtime config (`/api/config`); `NEXT_PUBLIC_WS_URL` remains unset.
 - The implementation plan includes a validation test (C3) that must pass
   `/ws` upgrade under `next build && next start`. If it fails, the proxy
   layer must be added before Group C can merge.
