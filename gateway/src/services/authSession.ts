@@ -236,9 +236,22 @@ export class TokenRevocationService {
     private readonly subscriber?: Redis,
   ) {}
 
-  /** Expose the underlying Redis client for rate-limiting and other direct ops. */
+  /** Expose the underlying Redis client for internal use by auth routes. */
   get redis(): Redis {
     return this.client;
+  }
+
+  /**
+   * Per-user rate limit for WS ticket generation.
+   * Returns true if the rate limit has been exceeded (10 tickets / 60s window).
+   */
+  async consumeWsTicketRateLimit(userId: string): Promise<boolean> {
+    const rateKey = `ratelimit:ws-ticket:{${userId}}`;
+    const current = await this.client.incr(rateKey);
+    if (current === 1) {
+      await this.client.expire(rateKey, 60);
+    }
+    return current > 10;
   }
 
   // -----------------------------------------------------------------------

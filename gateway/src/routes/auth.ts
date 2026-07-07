@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { body, validationResult } from 'express-validator';
 import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import { prisma } from '../services/prisma';
 import {
@@ -15,6 +16,7 @@ import { Prisma } from '@prisma/client';
 import {
   TokenRevocationService,
   DecodedToken,
+  validateDecodedToken,
 } from '../services/authSession';
 import { closeConnectionsByEvent } from '../services/websocket';
 import {
@@ -23,13 +25,10 @@ import {
   CSRF_COOKIE,
 } from '../config/cookies';
 import { generateCsrfToken, validateCsrf } from '../config/csrf';
+import { JWT_SECRET } from '../config/jwt';
 import { RequestHandler } from 'express';
 
 const SYSTEM_TENANT_ID = '00000000-0000-0000-0000-000000000000';
-
-// Per-user rate limit for WS ticket: 10 per minute
-const WS_TICKET_RATE_LIMIT = 10;
-const WS_TICKET_RATE_WINDOW = 60;
 
 // ---------------------------------------------------------------------------
 // Factory: create auth routes with injected revocation service and origin middleware
@@ -709,6 +708,7 @@ export function createAuthRoutes(
   // -----------------------------------------------------------------------
   router.post(
     '/ws-ticket',
+    originValidation ?? ((_req, _res, next) => next()),
     async (req: Request, res: Response, next) => {
       try {
         // Manually verify access token (authMiddleware is not applied to this router)
@@ -718,21 +718,64 @@ export function createAuthRoutes(
         }
 
         const token = authHeader.substring(7);
-        let accessDecoded: DecodedToken;
+
+        // Verify JWT and extract full payload including roles
+        let fullPayload: Record<string, unknown>;
         try {
-          accessDecoded = verifyAccessToken(token);
-        } catch {
+          fullPayload = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] }) as Record<string, unknown>;
+        } catch (err) {
+          if (err instanceof jwt.TokenExpiredError) throw unauthorized('Token has expired');
           throw unauthorized('Invalid token');
         }
 
-        // Per-user rate limit
-        const rateKey = `ratelimit:ws-ticket:{${accessDecoded.sub}}`;
+        // Validate required claims
+        const validation = validateDecodedToken(fullPayload);
+        if (!validation.valid) {
+          throw unauthorized('Invalid token claims');
+        }
+        if (fullPayload.type !== 'access') {
+          throw unauthorized('Invalid token type');
+        }
+
+        const accessDecoded: DecodedToken = {
+          jti: fullPayload.jti as string,
+          sid: fullPayload.sid as string,
+          sub: fullPayload.sub as string,
+          tenantId: fullPayload.tenantId as string,
+          type: 'access',
+          uv: fullPayload.uv as number,
+          sexp: fullPayload.sexp as number,
+          iat: fullPayload.iat as number,
+          exp: fullPayload.exp as number,
+        };
+        const roles: string[] = Array.isArray(fullPayload.roles) ? (fullPayload.roles as string[]) : [];
+
+        // Check revocation state (fail-closed)
         try {
-          const current = await revocationService.redis.incr(rateKey);
-          if (current === 1) {
-            await revocationService.redis.expire(rateKey, WS_TICKET_RATE_WINDOW);
+          const revResult = await revocationService.checkRevoked(accessDecoded);
+          if (revResult.revoked) {
+            throw unauthorized('Token has been revoked');
           }
-          if (current > WS_TICKET_RATE_LIMIT) {
+        } catch (redisError) {
+          if (redisError && typeof redisError === 'object' && (redisError as any).statusCode === 401) {
+            throw redisError;
+          }
+          logger.error('WS ticket — revocation check failed', {
+            error: redisError instanceof Error ? redisError.message : String(redisError),
+          });
+          res.status(503).json({
+            error: {
+              code: 'AUTH_DEPENDENCY_UNAVAILABLE',
+              message: 'Unable to verify authentication state',
+            },
+          });
+          return;
+        }
+
+        // Per-user rate limit via encapsulated service method
+        try {
+          const exceeded = await revocationService.consumeWsTicketRateLimit(accessDecoded.sub);
+          if (exceeded) {
             res.status(429).json({
               error: {
                 code: 'RATE_LIMITED',
@@ -742,7 +785,6 @@ export function createAuthRoutes(
             return;
           }
         } catch (redisError) {
-          // Redis down for rate limit → fail-closed (503)
           logger.error('WS ticket rate limit check failed', {
             error: redisError instanceof Error ? redisError.message : String(redisError),
           });
@@ -755,7 +797,7 @@ export function createAuthRoutes(
           return;
         }
 
-        // Issue ticket (tenant-bound, session-bound)
+        // Issue ticket (tenant-bound, session-bound, with real roles)
         try {
           const ticket = await revocationService.issueWsTicket({
             tenantId: accessDecoded.tenantId,
@@ -763,7 +805,7 @@ export function createAuthRoutes(
             sid: accessDecoded.sid,
             sexp: accessDecoded.sexp,
             uv: accessDecoded.uv,
-            roles: [], // roles not needed for WS ticket; validated at subscribe
+            roles,
           });
 
           res.json({ ticket });

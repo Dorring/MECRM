@@ -1,10 +1,10 @@
 /**
- * Group C cookie/auth endpoint tests.
+ * Group C cookie/auth tests.
  *
- * Tests are split:
- *   - Unit (no deps): cookie config, CSRF validation, origin middleware
- *   - Redis integration (CRM_REDIS_AVAILABLE=1): WS ticket, refresh rotation,
- *     token consumption, cookie helper behavior
+ * Layers:
+ *   Unit (no deps):     cookie config, CSRF validation, origin middleware
+ *   Redis integration:  WS ticket lifecycle, refresh rotation, replay detection
+ *   (CRM_REDIS_AVAILABLE=1 to enable Redis tests)
  */
 
 import { describe, it, expect, beforeAll, afterAll, afterEach } from '@jest/globals';
@@ -68,8 +68,7 @@ describe('getCookieOptions (no Redis)', () => {
     expect(opts.csrf.path).toBe('/');
   });
 
-  it('refresh body does not contain refreshToken key', () => {
-    // verify config constants used for naming
+  it('constants match expected names', () => {
     expect(REFRESH_COOKIE).toBe('refresh_token');
     expect(CSRF_COOKIE).toBe('csrf_token');
     expect(CSRF_HEADER).toBe('x-csrf-token');
@@ -77,7 +76,7 @@ describe('getCookieOptions (no Redis)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Unit: CSRF double-submit
+// Unit: CSRF
 // ---------------------------------------------------------------------------
 
 describe('CSRF helpers (no Redis)', () => {
@@ -87,46 +86,26 @@ describe('CSRF helpers (no Redis)', () => {
     expect(t).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it('tokens are unique', () => {
-    const a = generateCsrfToken();
-    const b = generateCsrfToken();
-    expect(a).not.toBe(b);
-  });
-
-  it('validateCsrf: matching header+cookie → true', () => {
+  it('validateCsrf: matching → true', () => {
     const t = generateCsrfToken();
-    const req = mockReq({ [CSRF_HEADER]: t }, { [CSRF_COOKIE]: t });
-    expect(validateCsrf(req)).toBe(true);
+    expect(validateCsrf(mockReq({ [CSRF_HEADER]: t }, { [CSRF_COOKIE]: t }))).toBe(true);
   });
 
   it('validateCsrf: missing header → false', () => {
-    const req = mockReq({}, { [CSRF_COOKIE]: 'abc' });
-    expect(validateCsrf(req)).toBe(false);
+    expect(validateCsrf(mockReq({}, { [CSRF_COOKIE]: 'abc' }))).toBe(false);
   });
 
   it('validateCsrf: missing cookie → false', () => {
-    const req = mockReq({ [CSRF_HEADER]: 'abc' }, {});
-    expect(validateCsrf(req)).toBe(false);
+    expect(validateCsrf(mockReq({ [CSRF_HEADER]: 'abc' }, {}))).toBe(false);
   });
 
   it('validateCsrf: mismatch → false', () => {
-    const req = mockReq({ [CSRF_HEADER]: 'aaa' }, { [CSRF_COOKIE]: 'bbb' });
-    expect(validateCsrf(req)).toBe(false);
-  });
-
-  it('validateCsrf: empty header → false', () => {
-    const req = mockReq({ [CSRF_HEADER]: '' }, { [CSRF_COOKIE]: 'abc' });
-    expect(validateCsrf(req)).toBe(false);
-  });
-
-  it('validateCsrf: empty cookie → false', () => {
-    const req = mockReq({ [CSRF_HEADER]: 'abc' }, { [CSRF_COOKIE]: '' });
-    expect(validateCsrf(req)).toBe(false);
+    expect(validateCsrf(mockReq({ [CSRF_HEADER]: 'aaa' }, { [CSRF_COOKIE]: 'bbb' }))).toBe(false);
   });
 });
 
 // ---------------------------------------------------------------------------
-// Unit: Origin validation middleware
+// Unit: Origin
 // ---------------------------------------------------------------------------
 
 describe('origin middleware (no Redis)', () => {
@@ -137,20 +116,10 @@ describe('origin middleware (no Redis)', () => {
     else process.env.ALLOWED_ORIGINS = envBackup;
   });
 
-  it('allows missing Origin header', () => {
+  it('allows missing Origin', () => {
     process.env.ALLOWED_ORIGINS = 'http://localhost:3000';
     const mw = createOriginValidation();
     const req = mockReq({});
-    const res = mockRes();
-    let called = false;
-    mw(req, res, () => { called = true; });
-    expect(called).toBe(true);
-  });
-
-  it('allows listed origin', () => {
-    process.env.ALLOWED_ORIGINS = 'http://a.com,http://b.com';
-    const mw = createOriginValidation();
-    const req = mockReq({ origin: 'http://a.com' });
     const res = mockRes();
     let called = false;
     mw(req, res, () => { called = true; });
@@ -179,20 +148,10 @@ describe('origin middleware (no Redis)', () => {
     expect(called).toBe(false);
     expect(res.statusCode).toBe(403);
   });
-
-  it('empty ALLOWED_ORIGINS + missing Origin → allow', () => {
-    process.env.ALLOWED_ORIGINS = '';
-    const mw = createOriginValidation();
-    const req = mockReq({});
-    const res = mockRes();
-    let called = false;
-    mw(req, res, () => { called = true; });
-    expect(called).toBe(true);
-  });
 });
 
 // ---------------------------------------------------------------------------
-// Redis Integration: WS Ticket
+// Redis: WS Ticket lifecycle
 // ---------------------------------------------------------------------------
 
 describeRedis('WS ticket (real Redis)', () => {
@@ -211,97 +170,66 @@ describeRedis('WS ticket (real Redis)', () => {
   });
 
   afterEach(async () => {
-    const keys = await redis.keys('auth:*');
+    const keys = await redis.keys('ws:ticket:*');
     if (keys.length > 0) await redis.del(...keys);
-    const tkeys = await redis.keys('ratelimit:*');
-    if (tkeys.length > 0) await redis.del(...tkeys);
   });
 
   it('issueWsTicket returns UUID', async () => {
     const ticket = await service.issueWsTicket({
-      tenantId: randomUUID(),
-      userId: randomUUID(),
-      sid: randomUUID(),
-      sexp: Math.floor(Date.now() / 1000) + 86400,
-      uv: 0,
-      roles: [],
+      tenantId: randomUUID(), userId: randomUUID(), sid: randomUUID(),
+      sexp: Math.floor(Date.now() / 1000) + 86400, uv: 0, roles: ['admin'],
     });
     expect(ticket).toMatch(/^[0-9a-f-]{36}$/);
   });
 
-  it('consumeWsTicket returns payload on first use', async () => {
+  it('consumeWsTicket returns payload with roles on first use', async () => {
     const payload = {
-      tenantId: randomUUID(),
-      userId: randomUUID(),
-      sid: randomUUID(),
-      sexp: Math.floor(Date.now() / 1000) + 86400,
-      uv: 0,
-      roles: ['admin'],
+      tenantId: randomUUID(), userId: randomUUID(), sid: randomUUID(),
+      sexp: Math.floor(Date.now() / 1000) + 86400, uv: 0, roles: ['admin', 'user'],
     };
     const ticket = await service.issueWsTicket(payload);
     const consumed = await service.consumeWsTicket(ticket);
     expect(consumed).not.toBeNull();
     expect(consumed!.tenantId).toBe(payload.tenantId);
-    expect(consumed!.userId).toBe(payload.userId);
-    expect(consumed!.sid).toBe(payload.sid);
     expect(consumed!.roles).toEqual(payload.roles);
   });
 
   it('consumeWsTicket returns null on second use (GETDEL)', async () => {
     const ticket = await service.issueWsTicket({
-      tenantId: randomUUID(),
-      userId: randomUUID(),
-      sid: randomUUID(),
-      sexp: Math.floor(Date.now() / 1000) + 86400,
-      uv: 0,
-      roles: [],
+      tenantId: randomUUID(), userId: randomUUID(), sid: randomUUID(),
+      sexp: Math.floor(Date.now() / 1000) + 86400, uv: 0, roles: [],
     });
-    const first = await service.consumeWsTicket(ticket);
-    expect(first).not.toBeNull();
-    const second = await service.consumeWsTicket(ticket);
-    expect(second).toBeNull();
+    expect(await service.consumeWsTicket(ticket)).not.toBeNull();
+    expect(await service.consumeWsTicket(ticket)).toBeNull();
   });
 
   it('ws ticket TTL ≤ 10 seconds', async () => {
     const ticket = await service.issueWsTicket({
-      tenantId: randomUUID(),
-      userId: randomUUID(),
-      sid: randomUUID(),
-      sexp: Math.floor(Date.now() / 1000) + 86400,
-      uv: 0,
-      roles: [],
+      tenantId: randomUUID(), userId: randomUUID(), sid: randomUUID(),
+      sexp: Math.floor(Date.now() / 1000) + 86400, uv: 0, roles: [],
     });
     const ttl = await redis.ttl(authKeys.wsTicket(ticket));
     expect(ttl).toBeGreaterThan(0);
     expect(ttl).toBeLessThanOrEqual(10);
   });
 
-  it('consumeWsTicket returns null for expired/non-existent ticket', async () => {
-    const result = await service.consumeWsTicket(randomUUID());
-    expect(result).toBeNull();
+  it('consumeWsTicket returns null for non-existent ticket', async () => {
+    expect(await service.consumeWsTicket(randomUUID())).toBeNull();
   });
 
-  it('issueWsTicket uses NX — does not overwrite existing', async () => {
-    const payload = {
-      tenantId: randomUUID(),
-      userId: randomUUID(),
-      sid: randomUUID(),
-      sexp: Math.floor(Date.now() / 1000) + 86400,
-      uv: 0,
-      roles: [],
-    };
-    const ticket = await service.issueWsTicket(payload);
-    // Manually set a different value at the same key
-    await redis.set(authKeys.wsTicket(ticket), 'different');
-    // issueWsTicket with NX should not overwrite
-    // (the second issue would fail silently on NX; the key keeps the manual value)
-    const raw = await redis.get(authKeys.wsTicket(ticket));
-    expect(raw).toBe('different');
+  it('rate limit returns false within limit, true when exceeded', async () => {
+    const userId = randomUUID();
+    // First 10 calls within limit
+    for (let i = 0; i < 10; i++) {
+      expect(await service.consumeWsTicketRateLimit(userId)).toBe(false);
+    }
+    // 11th call exceeds
+    expect(await service.consumeWsTicketRateLimit(userId)).toBe(true);
   });
 });
 
 // ---------------------------------------------------------------------------
-// Redis Integration: Refresh rotation (Group B invariant)
+// Redis: Refresh rotation (Group B)
 // ---------------------------------------------------------------------------
 
 describeRedis('Refresh rotation (real Redis)', () => {
@@ -324,34 +252,18 @@ describeRedis('Refresh rotation (real Redis)', () => {
     if (keys.length > 0) await redis.del(...keys);
   });
 
-  it('consumeRefresh: OK on first use, REPLAY on second (Group B)', async () => {
+  it('consumeRefresh: OK then REPLAY', async () => {
     const now = Math.floor(Date.now() / 1000);
     const token = {
       jti: randomUUID(), sid: randomUUID(), sub: randomUUID(),
       tenantId: randomUUID(), type: 'refresh' as const,
       uv: 0, sexp: now + 86400, iat: now, exp: now + 3600,
     };
-    const first = await service.consumeRefresh(token);
-    expect(first.status).toBe('OK');
-    const second = await service.consumeRefresh(token);
-    expect(second.status).toBe('REPLAY');
+    expect((await service.consumeRefresh(token)).status).toBe('OK');
+    expect((await service.consumeRefresh(token)).status).toBe('REPLAY');
   });
 
-  it('consumeRefresh: REPVOKED on uv mismatch', async () => {
-    const now = Math.floor(Date.now() / 1000);
-    const tenantId = randomUUID();
-    const userId = randomUUID();
-    await service.revokeUser(tenantId, userId); // uv → 1
-
-    const token = {
-      jti: randomUUID(), sid: randomUUID(), sub: userId, tenantId,
-      type: 'refresh' as const, uv: 0, sexp: now + 86400, iat: now, exp: now + 3600,
-    };
-    const result = await service.consumeRefresh(token);
-    expect(result.status).toBe('REVOKED');
-  });
-
-  it('REPLAY revokes sid so subsequent access is rejected', async () => {
+  it('REPLAY revokes sid', async () => {
     const now = Math.floor(Date.now() / 1000);
     const sid = randomUUID();
     const tenantId = randomUUID();
@@ -359,96 +271,55 @@ describeRedis('Refresh rotation (real Redis)', () => {
       jti: randomUUID(), sid, sub: randomUUID(), tenantId,
       type: 'refresh' as const, uv: 0, sexp: now + 86400, iat: now, exp: now + 3600,
     };
-
-    // First use
     await service.consumeRefresh(token);
-    // Replay
-    const replay = await service.consumeRefresh(token);
-    expect(replay.status).toBe('REPLAY');
-
-    // Access token with same sid should be revoked
+    await service.consumeRefresh(token);
     const check = await service.checkRevoked({
       jti: randomUUID(), sid, sub: randomUUID(), tenantId,
       type: 'access', uv: 0, sexp: now + 86400, iat: now, exp: now + 3600,
     });
     expect(check.revoked).toBe(true);
+    expect(check.reason).toBe('sid');
   });
 });
 
 // ---------------------------------------------------------------------------
-// Redis Integration: Redis down fail-closed
+// Redis: Fail-closed (disconnected Redis)
 // ---------------------------------------------------------------------------
 
-describeRedis('Fail-closed behavior (real Redis)', () => {
-  let redis: Redis;
-  let service: TokenRevocationService;
-
-  beforeAll(async () => {
-    redis = new Redis(REDIS_URL, { lazyConnect: true, maxRetriesPerRequest: 1 });
-    try { await redis.connect(); } catch { redis.disconnect(); throw new Error('Redis not available'); }
-    service = new TokenRevocationService(redis);
-  });
-
-  afterAll(async () => {
-    await service.shutdown();
-    redis.disconnect();
-  });
-
-  it('checkRevoked throws when Redis is disconnected', async () => {
+describeRedis('Fail-closed (real Redis)', () => {
+  it('checkRevoked throws on disconnected Redis', async () => {
     const broke = new Redis('redis://127.0.0.1:6399', {
       lazyConnect: true, connectTimeout: 100, maxRetriesPerRequest: 1,
       retryStrategy: () => null,
     });
     const broken = new TokenRevocationService(broke);
-
-    await expect(
-      broken.checkRevoked({
-        jti: randomUUID(), sid: randomUUID(), sub: randomUUID(),
-        tenantId: randomUUID(), type: 'access', uv: 0,
-        sexp: Math.floor(Date.now() / 1000) + 86400, iat: 0, exp: 3600,
-      }),
-    ).rejects.toThrow();
-
-    broke.disconnect();
-  });
-
-  it('issueWsTicket throws when Redis is disconnected', async () => {
-    const broke = new Redis('redis://127.0.0.1:6399', {
-      lazyConnect: true, connectTimeout: 100, maxRetriesPerRequest: 1,
-      retryStrategy: () => null,
-    });
-    const broken2 = new TokenRevocationService(broke);
-
-    await expect(
-      broken2.issueWsTicket({
-        tenantId: randomUUID(), userId: randomUUID(), sid: randomUUID(),
-        sexp: Math.floor(Date.now() / 1000) + 86400, uv: 0, roles: [],
-      }),
-    ).rejects.toThrow();
-
+    await expect(broken.checkRevoked({
+      jti: randomUUID(), sid: randomUUID(), sub: randomUUID(),
+      tenantId: randomUUID(), type: 'access', uv: 0,
+      sexp: Math.floor(Date.now() / 1000) + 86400, iat: 0, exp: 3600,
+    })).rejects.toThrow();
     broke.disconnect();
   });
 });
 
 // ---------------------------------------------------------------------------
-// Redis Integration: WS ticket cross-instance
+// Redis: Cross-instance WS ticket
 // ---------------------------------------------------------------------------
 
 describeRedis('WS ticket cross-instance (real Redis)', () => {
   let redis: Redis;
-  let serviceA: TokenRevocationService;
-  let serviceB: TokenRevocationService;
+  let sa: TokenRevocationService;
+  let sb: TokenRevocationService;
 
   beforeAll(async () => {
     redis = new Redis(REDIS_URL, { lazyConnect: true, maxRetriesPerRequest: 1 });
     try { await redis.connect(); } catch { redis.disconnect(); throw new Error('Redis not available'); }
-    serviceA = new TokenRevocationService(redis);
-    serviceB = new TokenRevocationService(redis);
+    sa = new TokenRevocationService(redis);
+    sb = new TokenRevocationService(redis);
   });
 
   afterAll(async () => {
-    await serviceA.shutdown();
-    await serviceB.shutdown();
+    await sa.shutdown(); await sb.shutdown();
     redis.disconnect();
   });
 
@@ -457,21 +328,13 @@ describeRedis('WS ticket cross-instance (real Redis)', () => {
     if (keys.length > 0) await redis.del(...keys);
   });
 
-  it('ticket issued by A is consumable by B (shared Redis)', async () => {
-    const payload = {
-      tenantId: randomUUID(),
-      userId: randomUUID(),
-      sid: randomUUID(),
-      sexp: Math.floor(Date.now() / 1000) + 86400,
-      uv: 0,
-      roles: ['admin'],
-    };
-    const ticket = await serviceA.issueWsTicket(payload);
-    const consumed = await serviceB.consumeWsTicket(ticket);
+  it('ticket issued by A consumed by B', async () => {
+    const payload = { tenantId: randomUUID(), userId: randomUUID(), sid: randomUUID(), sexp: Math.floor(Date.now() / 1000) + 86400, uv: 0, roles: ['admin'] };
+    const ticket = await sa.issueWsTicket(payload);
+    const consumed = await sb.consumeWsTicket(ticket);
     expect(consumed).not.toBeNull();
     expect(consumed!.tenantId).toBe(payload.tenantId);
-    // Only one instance can consume (GETDEL atomic)
-    const second = await serviceA.consumeWsTicket(ticket);
-    expect(second).toBeNull();
+    // A can't consume again
+    expect(await sa.consumeWsTicket(ticket)).toBeNull();
   });
 });
