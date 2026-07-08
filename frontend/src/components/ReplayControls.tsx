@@ -2,11 +2,11 @@
 
 import { useMemo, useState } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
-import { replayApi } from '@/lib/api';
+import { replayApi, getAccessToken } from '@/lib/api';
 
 function getTenantIdFromToken(): string | null {
   if (typeof window === 'undefined') return null;
-  const token = localStorage.getItem('accessToken');
+  const token = getAccessToken();
   if (!token) return null;
   const parts = token.split('.');
   if (parts.length < 2) return null;
