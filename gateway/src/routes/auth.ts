@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { body, validationResult } from 'express-validator';
 import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import { prisma } from '../services/prisma';
 import {
@@ -8,7 +9,6 @@ import {
   generateRefreshToken,
   verifyRefreshToken,
   verifyAccessToken,
-  AuthenticatedRequest,
 } from '../middleware/auth';
 import { badRequest, unauthorized } from '../middleware/errorHandler';
 import { logger } from '../utils/logger';
@@ -16,23 +16,54 @@ import { Prisma } from '@prisma/client';
 import {
   TokenRevocationService,
   DecodedToken,
+  validateDecodedToken,
 } from '../services/authSession';
 import { closeConnectionsByEvent } from '../services/websocket';
+import {
+  getCookieOptions,
+  REFRESH_COOKIE,
+  CSRF_COOKIE,
+} from '../config/cookies';
+import { generateCsrfToken, validateCsrf } from '../config/csrf';
+import { JWT_SECRET } from '../config/jwt';
+import { RequestHandler } from 'express';
 
 const SYSTEM_TENANT_ID = '00000000-0000-0000-0000-000000000000';
 
 // ---------------------------------------------------------------------------
-// Factory: create auth routes with injected revocation service
+// Factory: create auth routes with injected revocation service and origin middleware
 // ---------------------------------------------------------------------------
 
-export function createAuthRoutes(revocationService: TokenRevocationService): Router {
+export function createAuthRoutes(
+  revocationService: TokenRevocationService,
+  originValidation?: RequestHandler,
+): Router {
   const router = Router();
+
+  /** Compute and apply Set-Cookie headers for refresh + CSRF cookies. */
+  function setAuthCookies(
+    res: Response,
+    refreshToken: string,
+    csrfToken: string,
+  ): void {
+    const opts = getCookieOptions();
+    res.cookie(REFRESH_COOKIE, refreshToken, opts.refresh);
+    res.cookie(CSRF_COOKIE, csrfToken, opts.csrf);
+  }
+
+  /** Clear both auth cookies. */
+  function clearAuthCookies(res: Response): void {
+    const opts = getCookieOptions();
+    res.clearCookie(REFRESH_COOKIE, { ...opts.refresh, maxAge: 0 });
+    res.clearCookie(CSRF_COOKIE, { ...opts.csrf, maxAge: 0 });
+  }
 
   // -----------------------------------------------------------------------
   // POST /login
   // -----------------------------------------------------------------------
   router.post(
     '/login',
+    originValidation ?? ((_req, _res, next) => next()),
     body('email').isEmail().normalizeEmail(),
     body('password').isLength({ min: 8 }),
     body('tenantSlug').isLength({ min: 2, max: 50 }).matches(/^[a-z0-9-]+$/),
@@ -142,6 +173,10 @@ export function createAuthRoutes(revocationService: TokenRevocationService): Rou
           sexp,
         });
 
+        // Set HttpOnly refresh cookie + CSRF cookie
+        const csrfToken = generateCsrfToken();
+        setAuthCookies(res, refreshToken, csrfToken);
+
         logger.info('User logged in', {
           userId: user.id,
           tenantId: user.tenantId,
@@ -149,7 +184,6 @@ export function createAuthRoutes(revocationService: TokenRevocationService): Rou
 
         res.json({
           accessToken,
-          refreshToken,
           user: {
             id: user.id,
             email: user.email,
@@ -172,10 +206,25 @@ export function createAuthRoutes(revocationService: TokenRevocationService): Rou
   // -----------------------------------------------------------------------
   router.post(
     '/refresh',
-    body('refreshToken').notEmpty(),
+    originValidation ?? ((_req, _res, next) => next()),
     async (req: Request, res: Response, next) => {
       try {
-        const { refreshToken } = req.body;
+        // CSRF double-submit validation
+        if (!validateCsrf(req)) {
+          res.status(403).json({
+            error: {
+              code: 'CSRF_VALIDATION_FAILED',
+              message: 'CSRF token missing or invalid',
+            },
+          });
+          return;
+        }
+
+        // Read refresh token from cookie (NOT from request body)
+        const refreshToken = req.cookies?.[REFRESH_COOKIE];
+        if (!refreshToken || typeof refreshToken !== 'string') {
+          throw unauthorized('Missing refresh token');
+        }
 
         // Verify signature, algorithm and claims
         let decoded: DecodedToken;
@@ -273,9 +322,13 @@ export function createAuthRoutes(revocationService: TokenRevocationService): Rou
               sexp: decoded.sexp,
             });
 
+            // Rotate both cookies
+            const newCsrfToken = generateCsrfToken();
+            setAuthCookies(res, newRefreshToken, newCsrfToken);
+
+            // Body returns only access token — no refreshToken
             res.json({
               accessToken: newAccessToken,
-              refreshToken: newRefreshToken,
             });
             return;
           }
@@ -291,7 +344,8 @@ export function createAuthRoutes(revocationService: TokenRevocationService): Rou
   // -----------------------------------------------------------------------
   router.post(
     '/logout',
-    async (req: AuthenticatedRequest, res: Response, next) => {
+    originValidation ?? ((_req, _res, next) => next()),
+    async (req: Request, res: Response, next) => {
       try {
         const authHeader = req.headers.authorization;
         if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -308,22 +362,26 @@ export function createAuthRoutes(revocationService: TokenRevocationService): Rou
           throw unauthorized('Invalid token');
         }
 
-        // Validate the optional refreshToken from body if provided
-        const { refreshToken } = req.body;
-        if (refreshToken) {
+        // Validate optional refresh token from cookie
+        const cookieRefresh = req.cookies?.[REFRESH_COOKIE];
+        if (cookieRefresh && typeof cookieRefresh === 'string') {
           try {
-            const refreshDecoded = verifyRefreshToken(refreshToken);
+            const refreshDecoded = verifyRefreshToken(cookieRefresh);
             // Verify refresh token matches the access token
             if (
               refreshDecoded.tenantId !== accessDecoded.tenantId ||
               refreshDecoded.sub !== accessDecoded.sub ||
               refreshDecoded.sid !== accessDecoded.sid
             ) {
-              throw unauthorized('Refresh token does not match session');
+              // Mismatch — log but don't fail logout (cookie cleanup is best-effort)
+              logger.warn('Refresh cookie does not match access token session', {
+                userId: accessDecoded.sub,
+                tenantId: accessDecoded.tenantId,
+              });
             }
-          } catch (err) {
-            if ((err as any).statusCode === 401) throw err;
-            throw unauthorized('Invalid refresh token');
+          } catch {
+            // Malformed cookie — log warning, still clear cookies
+            logger.warn('Malformed refresh token in cookie during logout');
           }
         }
 
@@ -346,6 +404,7 @@ export function createAuthRoutes(revocationService: TokenRevocationService): Rou
           logger.error('Logout failed — unable to persist revocation', {
             error: redisError instanceof Error ? redisError.message : String(redisError),
           });
+          // FAIL-CLOSED: do NOT clear cookies if revocation was not persisted
           res.status(503).json({
             error: {
               code: 'AUTH_DEPENDENCY_UNAVAILABLE',
@@ -354,6 +413,9 @@ export function createAuthRoutes(revocationService: TokenRevocationService): Rou
           });
           return;
         }
+
+        // Clear cookies after successful revocation
+        clearAuthCookies(res);
 
         logger.info('User logged out', {
           userId: accessDecoded.sub,
@@ -372,6 +434,7 @@ export function createAuthRoutes(revocationService: TokenRevocationService): Rou
   // -----------------------------------------------------------------------
   router.post(
     '/register',
+    originValidation ?? ((_req, _res, next) => next()),
     body('tenantName').isLength({ min: 2, max: 100 }),
     body('tenantSlug').isLength({ min: 2, max: 50 }).matches(/^[a-z0-9-]+$/),
     body('email').isEmail().normalizeEmail(),
@@ -493,9 +556,12 @@ export function createAuthRoutes(revocationService: TokenRevocationService): Rou
           sexp,
         });
 
+        // Set HttpOnly refresh cookie + CSRF cookie
+        const csrfToken = generateCsrfToken();
+        setAuthCookies(res, refreshToken, csrfToken);
+
         res.status(201).json({
           accessToken,
-          refreshToken,
           user: {
             id: result.user.id,
             email: result.user.email,
@@ -507,6 +573,253 @@ export function createAuthRoutes(revocationService: TokenRevocationService): Rou
             },
           },
         });
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  // -----------------------------------------------------------------------
+  // POST /migrate-cookie (temporary — remove 7 days post-deploy)
+  // -----------------------------------------------------------------------
+  router.post(
+    '/migrate-cookie',
+    originValidation ?? ((_req, _res, next) => next()),
+    body('refreshToken').notEmpty(),
+    async (req: Request, res: Response, next) => {
+      try {
+        const { refreshToken } = req.body;
+
+        // Verify signature, algorithm and claims
+        let decoded: DecodedToken;
+        try {
+          decoded = verifyRefreshToken(refreshToken);
+        } catch {
+          throw unauthorized('Invalid refresh token');
+        }
+
+        // No CSRF required — this is a one-time migration, no cookie exists yet.
+        // Origin validation still applies (applied above).
+
+        // Verify user exists and is active
+        let user: {
+          id: string;
+          tenantId: string;
+          status: string;
+          email?: string;
+          userRoles?: Array<{ role: { name: string } }>;
+        } | null;
+        try {
+          const result = await prisma.$transaction(
+            async (db: Prisma.TransactionClient) => {
+              await db.$executeRaw`SELECT set_config('app.tenant_id', ${decoded.tenantId}, true)`;
+              return db.user.findFirst({
+                where: { id: decoded.sub, tenantId: decoded.tenantId },
+                include: {
+                  userRoles: {
+                    include: { role: true },
+                  },
+                },
+              });
+            },
+          );
+          user = result;
+        } catch {
+          throw unauthorized('User not found or inactive');
+        }
+
+        if (!user || user.status !== 'active') {
+          throw unauthorized('User not found or inactive');
+        }
+
+        // Atomically consume the refresh token (Lua script)
+        const consumeResult = await revocationService.consumeRefresh(decoded);
+
+        switch (consumeResult.status) {
+          case 'DEPENDENCY_ERROR': {
+            logger.error('Migration failed — Redis dependency unavailable');
+            res.status(503).json({
+              error: {
+                code: 'AUTH_DEPENDENCY_UNAVAILABLE',
+                message: 'Unable to verify token status',
+              },
+            });
+            return;
+          }
+
+          case 'REVOKED': {
+            throw unauthorized('Token has been revoked');
+          }
+
+          case 'REPLAY': {
+            try {
+              await revocationService.revokeSid(
+                decoded.tenantId,
+                decoded.sid,
+                decoded.sexp,
+              );
+            } catch {
+              // Best-effort
+            }
+            throw unauthorized('Token has been revoked');
+          }
+
+          case 'OK': {
+            const roles =
+              (user as any).userRoles
+                ?.map((ur: { role: { name: string } }) => ur.role.name) || [];
+
+            const newAccessToken = generateToken({
+              sub: decoded.sub,
+              tenantId: decoded.tenantId,
+              sid: decoded.sid,
+              uv: decoded.uv,
+              sexp: decoded.sexp,
+              email: (user as any).email || '',
+              roles,
+            });
+
+            const newRefreshToken = generateRefreshToken({
+              sub: decoded.sub,
+              tenantId: decoded.tenantId,
+              sid: decoded.sid,
+              uv: decoded.uv,
+              sexp: decoded.sexp,
+            });
+
+            // Issue cookies for the first time
+            const csrfToken = generateCsrfToken();
+            setAuthCookies(res, newRefreshToken, csrfToken);
+
+            res.json({
+              accessToken: newAccessToken,
+            });
+            return;
+          }
+        }
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  // -----------------------------------------------------------------------
+  // POST /ws-ticket — issue a single-use, tenant-bound WS connection ticket
+  // -----------------------------------------------------------------------
+  router.post(
+    '/ws-ticket',
+    originValidation ?? ((_req, _res, next) => next()),
+    async (req: Request, res: Response, next) => {
+      try {
+        // Manually verify access token (authMiddleware is not applied to this router)
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+          throw unauthorized('Missing or invalid authorization header');
+        }
+
+        const token = authHeader.substring(7);
+
+        // Verify JWT and extract full payload including roles
+        let fullPayload: Record<string, unknown>;
+        try {
+          fullPayload = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] }) as Record<string, unknown>;
+        } catch (err) {
+          if (err instanceof jwt.TokenExpiredError) throw unauthorized('Token has expired');
+          throw unauthorized('Invalid token');
+        }
+
+        // Validate required claims
+        const validation = validateDecodedToken(fullPayload);
+        if (!validation.valid) {
+          throw unauthorized('Invalid token claims');
+        }
+        if (fullPayload.type !== 'access') {
+          throw unauthorized('Invalid token type');
+        }
+
+        const accessDecoded: DecodedToken = {
+          jti: fullPayload.jti as string,
+          sid: fullPayload.sid as string,
+          sub: fullPayload.sub as string,
+          tenantId: fullPayload.tenantId as string,
+          type: 'access',
+          uv: fullPayload.uv as number,
+          sexp: fullPayload.sexp as number,
+          iat: fullPayload.iat as number,
+          exp: fullPayload.exp as number,
+        };
+        const roles: string[] = Array.isArray(fullPayload.roles) ? (fullPayload.roles as string[]) : [];
+
+        // Check revocation state (fail-closed)
+        try {
+          const revResult = await revocationService.checkRevoked(accessDecoded);
+          if (revResult.revoked) {
+            throw unauthorized('Token has been revoked');
+          }
+        } catch (redisError) {
+          if (redisError && typeof redisError === 'object' && (redisError as any).statusCode === 401) {
+            throw redisError;
+          }
+          logger.error('WS ticket — revocation check failed', {
+            error: redisError instanceof Error ? redisError.message : String(redisError),
+          });
+          res.status(503).json({
+            error: {
+              code: 'AUTH_DEPENDENCY_UNAVAILABLE',
+              message: 'Unable to verify authentication state',
+            },
+          });
+          return;
+        }
+
+        // Per-user rate limit via encapsulated service method
+        try {
+          const exceeded = await revocationService.consumeWsTicketRateLimit(accessDecoded.sub);
+          if (exceeded) {
+            res.status(429).json({
+              error: {
+                code: 'RATE_LIMITED',
+                message: 'Too many WS ticket requests',
+              },
+            });
+            return;
+          }
+        } catch (redisError) {
+          logger.error('WS ticket rate limit check failed', {
+            error: redisError instanceof Error ? redisError.message : String(redisError),
+          });
+          res.status(503).json({
+            error: {
+              code: 'AUTH_DEPENDENCY_UNAVAILABLE',
+              message: 'Unable to issue WS ticket',
+            },
+          });
+          return;
+        }
+
+        // Issue ticket (tenant-bound, session-bound, with real roles)
+        try {
+          const ticket = await revocationService.issueWsTicket({
+            tenantId: accessDecoded.tenantId,
+            userId: accessDecoded.sub,
+            sid: accessDecoded.sid,
+            sexp: accessDecoded.sexp,
+            uv: accessDecoded.uv,
+            roles,
+          });
+
+          res.json({ ticket });
+        } catch (redisError) {
+          logger.error('WS ticket issue failed — Redis unavailable', {
+            error: redisError instanceof Error ? redisError.message : String(redisError),
+          });
+          res.status(503).json({
+            error: {
+              code: 'AUTH_DEPENDENCY_UNAVAILABLE',
+              message: 'Unable to issue WS ticket',
+            },
+          });
+        }
       } catch (error) {
         next(error);
       }

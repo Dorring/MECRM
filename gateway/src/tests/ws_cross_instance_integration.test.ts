@@ -171,7 +171,7 @@ describeRedis('WebSocket revocation across Gateway processes', () => {
     let socketB: WebSocket | undefined;
 
     try {
-      const [readyA, readyB] = await Promise.all([
+      const [, readyB] = await Promise.all([
         waitForMessage(gatewayA, 'READY'),
         waitForMessage(gatewayB, 'READY'),
       ]);

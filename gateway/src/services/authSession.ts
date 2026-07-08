@@ -47,6 +47,15 @@ export interface RevocationEvent {
   occurredAt: number;
 }
 
+export interface WsTicketPayload {
+  tenantId: string;
+  userId: string;
+  sid: string;
+  sexp: number;
+  uv: number;
+  roles: string[];
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -54,6 +63,7 @@ export interface RevocationEvent {
 const TTL_CEILING = 604800; // 7 days
 const CLOCK_SKEW = 60;      // 60-second clock skew buffer
 const MAX_EVENT_PAYLOAD_BYTES = 4096;
+const WS_TICKET_TTL = 10;   // 10-second ticket lifetime
 
 // ---------------------------------------------------------------------------
 // TTL helpers
@@ -87,6 +97,8 @@ export const authKeys = {
 
   userVersion: (tenantId: string, userId: string) =>
     `auth:{${tenantId}}:user:${userId}:version`,
+
+  wsTicket: (id: string) => `ws:ticket:${id}`,
 };
 
 // ---------------------------------------------------------------------------
@@ -223,6 +235,19 @@ export class TokenRevocationService {
     private readonly client: Redis,
     private readonly subscriber?: Redis,
   ) {}
+
+  /**
+   * Per-user rate limit for WS ticket generation.
+   * Returns true if the rate limit has been exceeded (10 tickets / 60s window).
+   */
+  async consumeWsTicketRateLimit(userId: string): Promise<boolean> {
+    const rateKey = `ratelimit:ws-ticket:{${userId}}`;
+    const current = await this.client.incr(rateKey);
+    if (current === 1) {
+      await this.client.expire(rateKey, 60);
+    }
+    return current > 10;
+  }
 
   // -----------------------------------------------------------------------
   // Revocation checks
@@ -600,6 +625,52 @@ export class TokenRevocationService {
           type: event.type,
         });
       });
+  }
+
+  // -----------------------------------------------------------------------
+  // WS Ticket
+  // -----------------------------------------------------------------------
+
+  /**
+   * Issue a single-use WebSocket ticket with 10-second TTL.
+   * Ticket payload contains auth metadata validated by the WS upgrade handler.
+   */
+  async issueWsTicket(auth: WsTicketPayload): Promise<string> {
+    const ticket = randomUUID();
+    const payload = JSON.stringify({
+      tenantId: auth.tenantId,
+      userId: auth.userId,
+      sid: auth.sid,
+      sexp: auth.sexp,
+      uv: auth.uv,
+      roles: auth.roles,
+    });
+    const result = await this.client.set(
+      authKeys.wsTicket(ticket),
+      payload,
+      'EX',
+      WS_TICKET_TTL,
+      'NX',
+    );
+    // NX returns null if the key already existed (UUID collision — defender code).
+    if (result !== 'OK') {
+      throw new Error('Failed to issue WS ticket — key collision');
+    }
+    return ticket;
+  }
+
+  /**
+   * Consume a WebSocket ticket atomically (GETDEL).
+   * Returns the auth payload or null if expired/already consumed.
+   */
+  async consumeWsTicket(ticket: string): Promise<WsTicketPayload | null> {
+    const raw = await this.client.getdel(authKeys.wsTicket(ticket));
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as WsTicketPayload;
+    } catch {
+      return null;
+    }
   }
 
   // -----------------------------------------------------------------------

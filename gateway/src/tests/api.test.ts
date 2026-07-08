@@ -2,12 +2,32 @@ import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 import request from 'supertest';
 import app from '../index';
 import { prisma, withTenantDb } from '../services/prisma';
+import { REFRESH_COOKIE, CSRF_COOKIE, CSRF_HEADER } from '../config/cookies';
 
 const describeDb = process.env.CRM_DB_AVAILABLE === '1' ? describe : describe.skip;
+
+function setCookies(response: request.Response): string[] {
+  const raw = response.headers['set-cookie'];
+  if (!raw) return [];
+  return Array.isArray(raw) ? raw : [raw];
+}
+
+function cookieValue(response: request.Response, name: string): string {
+  const header = setCookies(response).find((h) => h.startsWith(`${name}=`));
+  if (!header) {
+    throw new Error(`Missing Set-Cookie header for ${name}`);
+  }
+  return header.split(';')[0].slice(name.length + 1);
+}
+
+function authCookieHeader(refreshToken: string, csrfToken: string): string {
+  return `${REFRESH_COOKIE}=${refreshToken}; ${CSRF_COOKIE}=${csrfToken}`;
+}
 
 describeDb('Authentication API [requires DB]', () => {
   let accessToken: string;
   let refreshToken: string;
+  let csrfToken: string;
   let tenantId: string | undefined;
   
   const testUser = {
@@ -40,13 +60,17 @@ describeDb('Authentication API [requires DB]', () => {
         .expect(201);
 
       expect(response.body).toHaveProperty('accessToken');
-      expect(response.body).toHaveProperty('refreshToken');
+      expect(response.body).not.toHaveProperty('refreshToken');
       expect(response.body.user).toHaveProperty('id');
       expect(response.body.user.email).toBe(testUser.email);
       expect(response.body.user.roles).toContain('admin');
 
+      expect(setCookies(response).find((h) => h.startsWith(`${REFRESH_COOKIE}=`))).toContain('HttpOnly');
+      expect(setCookies(response).find((h) => h.startsWith(`${CSRF_COOKIE}=`))).toBeDefined();
+
       accessToken = response.body.accessToken;
-      refreshToken = response.body.refreshToken;
+      refreshToken = cookieValue(response, REFRESH_COOKIE);
+      csrfToken = cookieValue(response, CSRF_COOKIE);
       tenantId = response.body.user.tenant.id;
     });
 
@@ -79,7 +103,9 @@ describeDb('Authentication API [requires DB]', () => {
         .expect(200);
 
       expect(response.body).toHaveProperty('accessToken');
-      expect(response.body).toHaveProperty('refreshToken');
+      expect(response.body).not.toHaveProperty('refreshToken');
+      expect(setCookies(response).find((h) => h.startsWith(`${REFRESH_COOKIE}=`))).toBeDefined();
+      expect(setCookies(response).find((h) => h.startsWith(`${CSRF_COOKIE}=`))).toBeDefined();
     });
 
     it('should reject invalid password', async () => {
@@ -109,17 +135,27 @@ describeDb('Authentication API [requires DB]', () => {
     it('should refresh access token', async () => {
       const response = await request(app)
         .post('/api/v1/auth/refresh')
-        .send({ refreshToken })
+        .set(CSRF_HEADER, csrfToken)
+        .set('Cookie', authCookieHeader(refreshToken, csrfToken))
+        .send({})
         .expect(200);
 
       expect(response.body).toHaveProperty('accessToken');
-      expect(response.body).toHaveProperty('refreshToken');
+      expect(response.body).not.toHaveProperty('refreshToken');
+      expect(setCookies(response).find((h) => h.startsWith(`${REFRESH_COOKIE}=`))).toBeDefined();
+      expect(setCookies(response).find((h) => h.startsWith(`${CSRF_COOKIE}=`))).toBeDefined();
+
+      accessToken = response.body.accessToken;
+      refreshToken = cookieValue(response, REFRESH_COOKIE);
+      csrfToken = cookieValue(response, CSRF_COOKIE);
     });
 
     it('should reject invalid refresh token', async () => {
       await request(app)
         .post('/api/v1/auth/refresh')
-        .send({ refreshToken: 'invalid-token' })
+        .set(CSRF_HEADER, csrfToken)
+        .set('Cookie', authCookieHeader('invalid-token', csrfToken))
+        .send({})
         .expect(401);
     });
   });
@@ -129,7 +165,8 @@ describeDb('Authentication API [requires DB]', () => {
       await request(app)
         .post('/api/v1/auth/logout')
         .set('Authorization', `Bearer ${accessToken}`)
-        .send({ refreshToken })
+        .set('Cookie', authCookieHeader(refreshToken, csrfToken))
+        .send({})
         .expect(200);
     });
   });

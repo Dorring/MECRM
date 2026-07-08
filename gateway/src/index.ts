@@ -2,6 +2,7 @@ import express, { Application, Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import compression from 'compression';
+import cookieParser from 'cookie-parser';
 import rateLimit from 'express-rate-limit';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
@@ -63,6 +64,7 @@ import './config/jwt';
 import { TokenRevocationService } from './services/authSession';
 import { createAuthMiddleware } from './middleware/auth';
 import { createAuthRoutes } from './routes/auth';
+import { createOriginValidation } from './middleware/origin';
 
 const _revocationSubscriber = !process.env.JEST_WORKER_ID ? redisClient.duplicate() : undefined;
 const revocationService = new TokenRevocationService(
@@ -70,7 +72,7 @@ const revocationService = new TokenRevocationService(
   _revocationSubscriber,
 );
 const authMiddleware = createAuthMiddleware(revocationService);
-const authRoutes = createAuthRoutes(revocationService);
+const authRoutes = createAuthRoutes(revocationService, createOriginValidation());
 
 const app: Application = express();
 const PORT = process.env.GATEWAY_PORT || 4000;
@@ -111,6 +113,7 @@ const authLimiter = rateLimit({
 // Body parsing
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
 
 // Add correlation ID to all requests
 app.use((req: Request, res: Response, next: NextFunction) => {
