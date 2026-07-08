@@ -341,7 +341,39 @@ Planned commits (do not mix with formatting or Group D work):
 | TD-C3-3 | WebSocket same-origin `/ws` upgrade proxy may need nginx/Traefik if Next.js doesn't support it | C4 or infra PR |
 | TD-C3-4 | Frontend has no test framework (no jest/vitest config) | Set up jest + jsdom + RTL |
 
-### 5.4 Build verification
+### 5.4 Code review fixes (post-C3, commit 8e925c7)
+
+1. **requestWsTicket structured result**: Returns `{ ok, ticket, status, reason }` instead of `string|null`.
+   401/403/4xx (except 429) → permanent failure, no retry. 429/503/0 → bounded retry.
+
+2. **Boot concurrency guard**: `bootStartedRef` + `mountedRef` prevent double `/refresh` or
+   `migrate-cookie` in React StrictMode.
+
+3. **WS auth gate**: `WsBridge` component reads `useAuth()` and passes `enabled` prop to
+   `WebSocketProvider`. WS only connects when `!isLoading && isAuthenticated`.
+
+4. **Token expiry check**: `ensureAccessToken` uses `decodeToken` + `exp` check (5s skew),
+   not just presence check.
+
+5. **WS URL runtime resolution**: `wsUrlRef` updated from runtime-config via dynamic import,
+   falling back to `deriveWsUrl()`.
+
+6. **Runtime config init order**: `boot()` awaits `getRuntimeConfig()` before any API call,
+   guaranteeing API base URL is set for direct mode.
+
+7. **ReplayControls token read**: `getTenantIdFromToken()` called at action time (inside
+   `mutationFn` / `onSuccess`), not once at mount via `useMemo([])`.
+
+8. **4401 bounded retry**: 4401 on WebSocket now stops after 1 retry (ticket race tolerance).
+   Does NOT reset attempt counter — permanent auth failure after second 4401.
+
+9. **429 transient**: 429 Too Many Requests is excluded from `isPermanentFailure`
+   and enters bounded exponential backoff.
+
+10. **Logout error UX**: Header shows dismissible red banner; Settings shows error card
+    with retry info. Local session always preserved on failure.
+
+### 5.5 Build verification
 
 - `npx tsc --noEmit`: 0 errors
 - `npm run lint`: 0 errors, 0 warnings
@@ -350,7 +382,7 @@ Planned commits (do not mix with formatting or Group D work):
 - Client bundle: 0 hardcoded API/WS URLs
 - Server chunks: only expected fallback URLs (rewrites destination default, /api/config default, deriveWsUrl SSR fallback)
 
-### 5.5 Exit gate
+### 5.6 Exit gate
 
 ✅ C3 complete. Frontend now uses memory-only accessToken, cookie-based refresh,
 CSRF double-submit, WS ticket exchange, and same-origin relative API paths.
@@ -611,7 +643,7 @@ is modified.
 | C2: endpoint-level auth cookie tests (HTTP contract) | ✅ 23 passed (`auth_cookie_endpoint.test.ts`) |
 | C2: no-Redis integration + Redis gated tests | ✅ 11 passed + 10 skipped (`auth_cookie_integration.test.ts`) |
 | C2: lint, TypeScript build, all C1+C2 tests pass | ✅ |
-| C3/C4/C5 | C3 ✅ complete | C4 (WS proxy validation), C5 (runtime + cleanup) pending |
+| C3/C4/C5 | C3 ✅ complete (incl. code-review fixes) | C4 (WS proxy validation), C5 (runtime + cleanup) pending |
 | Group B `consumeRefresh` Lua unchanged | ✅ All Group B tests still pass |
 
 ---

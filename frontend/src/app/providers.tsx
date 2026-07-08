@@ -14,7 +14,7 @@ import {
   tryCookieRefresh,
   migrateFromLocalStorage,
 } from '@/lib/api';
-import { initRuntimeConfig } from '@/lib/runtime-config';
+import { initRuntimeConfig, getRuntimeConfig } from '@/lib/runtime-config';
 
 // ---------------------------------------------------------------------------
 // Auth context (defined here to keep the change within scope; exported for
@@ -79,6 +79,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     async function boot(): Promise<void> {
       try {
+        // Ensure runtime config (API_URL/WS_URL from /api/config) is resolved
+        // before any API call. In same-origin mode this returns the cached
+        // default immediately; in direct mode it fetches /api/config first.
+        await getRuntimeConfig();
+
         // Step 1: attempt cookie-based refresh
         const newToken = await tryCookieRefresh();
         if (!mountedRef.current) return;

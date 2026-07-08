@@ -89,7 +89,11 @@ const RECONNECT_BASE_MS = 3000;
 
 /** Returns true if the status is a permanent failure — do NOT retry. */
 function isPermanentFailure(status: number): boolean {
-  return status >= 400 && status < 500;
+  // 401 Unauthorized — token expired/revoked
+  // 403 Forbidden — origin not allowed
+  // Other 4xx (400, 404, 405, etc.) — client error, won't fix itself
+  // EXCEPT 429 Too Many Requests — rate limit is transient, should retry with backoff
+  return status >= 400 && status < 500 && status !== 429;
 }
 
 export interface WebSocketMessage {
@@ -226,7 +230,16 @@ export function useWebSocket({ enabled }: { enabled: boolean } = { enabled: true
       wsRef.current = null;
 
       if (event.code === 4401) {
-        reconnectAttemptsRef.current = 0;
+        // 4401 Unauthorized — ticket expired/revoked/session invalid.
+        // Allow at most ONE bounded retry for a ticket race (old ticket
+        // consumed between /ws-ticket call and WebSocket upgrade).
+        // Do NOT reset the attempt counter — if the retry also fails,
+        // stop permanently (auth failure requires re-login).
+        if (reconnectAttemptsRef.current >= 1) {
+          console.error('WebSocket: 4401 after retry — auth failure, stopping');
+          stoppedRef.current = true;
+          return;
+        }
         scheduleReconnect();
         return;
       }
