@@ -71,7 +71,7 @@ export default function SettingsPage() {
           your tokens. You will need to sign in again.
         </p>
         <button
-          onClick={() => { void logout(); }}
+          onClick={() => { void logout().then((r) => { if (r.success) window.location.href = '/login'; }); }}
           className="btn btn-secondary"
         >
           <LogOut size={16} className="mr-2" />

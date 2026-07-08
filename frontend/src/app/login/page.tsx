@@ -77,6 +77,11 @@ export default function LoginPage() {
     setSubmitting(true);
     try {
       await login(values);
+      // Clean up any legacy localStorage token keys from pre-C3 sessions.
+      if (typeof window !== 'undefined') {
+        try { window.localStorage.removeItem('refreshToken'); } catch { /* ignore */ }
+        try { window.localStorage.removeItem('accessToken'); } catch { /* ignore */ }
+      }
       // Redirect to the origin page the user was trying to reach, else home.
       // Use replace so the login page doesn't linger in history.
       router.replace(getPostLoginRedirect());

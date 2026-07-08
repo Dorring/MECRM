@@ -47,8 +47,12 @@ export function Header() {
 
   const handleLogout = async () => {
     setMenuOpen(false);
-    await logout();
-    router.replace('/login');
+    const result = await logout();
+    if (result.success) {
+      router.replace('/login');
+    }
+    // On failure (503/network error), local session is preserved.
+    // User stays on current page; error is logged by the auth provider.
   };
 
   const displayName = user?.name || user?.email || 'User';

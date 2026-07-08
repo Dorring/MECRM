@@ -11,7 +11,9 @@ import {
   clearSession,
   persistSession,
   authApi,
-  getRefreshToken,
+  tryCookieRefresh,
+  migrateFromLocalStorage,
+  setAccessToken,
 } from '@/lib/api';
 
 // ---------------------------------------------------------------------------
@@ -29,7 +31,10 @@ interface AuthContextValue {
   isAuthenticated: boolean;
   isLoading: boolean;
   login: (credentials: { email: string; password: string; tenantSlug: string }) => Promise<AuthUser>;
-  logout: () => Promise<void>;
+  /** Returns { success: true } on successful server logout.
+   *  Returns { success: false, error } on 503, network error, or any failure
+   *  — local session is PRESERVED in this case. Caller must show error to user. */
+  logout: () => Promise<{ success: boolean; error?: string }>;
   refreshUser: () => void;
 }
 
@@ -44,25 +49,85 @@ function emitAuthChange(): void {
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   // Start null on the server and on first client render to avoid hydration
-  // mismatch; resolve from localStorage in an effect.
+  // mismatch; resolved in the boot effect below.
   const [user, setUser] = useState<AuthUser | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  // Track whether boot recovery has run to avoid double execution in StrictMode.
+  const [booted, setBooted] = useState(false);
 
   const refreshUser = useCallback(() => {
     if (!hasValidAccessToken()) {
       setUser(null);
       return;
     }
-    setUser(getCachedUser());
+    const cached = getCachedUser();
+    if (cached) setUser(cached);
+    // If no cached user exists (e.g. after cookie refresh without /auth/me),
+    // user stays at its previous value. TD-C3-1: add GET /auth/me to fill this gap.
   }, []);
 
+  // -----------------------------------------------------------------------
+  // Boot recovery (§3 in ADR-004 implementation plan)
+  // -----------------------------------------------------------------------
+  // 1. Try cookie-based refresh (for users who already have an HttpOnly
+  //    refresh_token cookie from a previous login).
+  // 2. If no cookie session, try legacy localStorage → cookie migration.
+  // 3. If both fail, user is unauthenticated — login page will show.
+  // 4. Finally, clean up any leftover legacy localStorage keys.
   useEffect(() => {
-    refreshUser();
-    setIsLoading(false);
+    if (booted) return;
 
+    async function boot(): Promise<void> {
+      try {
+        // Step 1: attempt cookie-based refresh
+        const newToken = await tryCookieRefresh();
+        if (newToken) {
+          // /refresh only returns { accessToken } — no user profile.
+          // Restore user from the cached authUser (display-only cache).
+          // If cache is missing, user stays null (TD-C3-1: /auth/me gap).
+          const cachedUser = getCachedUser();
+          if (cachedUser) {
+            setUser(cachedUser);
+          }
+          setBooted(true);
+          setIsLoading(false);
+          return;
+        }
+
+        // Step 2: no cookie session — try legacy localStorage migration
+        const migrated = await migrateFromLocalStorage();
+        if (migrated) {
+          // Migration succeeded: accessToken is now in memory.
+          // Restore user from legacy authUser cache if present.
+          const cachedUser = getCachedUser();
+          if (cachedUser) {
+            setUser(cachedUser);
+          }
+          setBooted(true);
+          setIsLoading(false);
+          return;
+        }
+
+        // Step 3: both failed — unauthenticated
+        setUser(null);
+        setBooted(true);
+        setIsLoading(false);
+      } catch {
+        // Unexpected error during boot — treat as unauthenticated
+        setUser(null);
+        setBooted(true);
+        setIsLoading(false);
+      }
+    }
+
+    boot();
+  }, [booted]);
+
+  // Listen for auth-change events and cross-tab storage changes.
+  useEffect(() => {
     const onChange = () => refreshUser();
     const onStorage = (e: StorageEvent) => {
-      if (e.key === 'accessToken' || e.key === 'authUser' || e.key === null) {
+      if (e.key === 'authUser' || e.key === null) {
         refreshUser();
       }
     };
@@ -85,18 +150,37 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     []
   );
 
-  const logout = useCallback(async () => {
-    const refreshToken = getRefreshToken();
-    // Best-effort server-side blacklist. Never block UI on a failed logout:
-    // access tokens are short-lived and the refresh token is also blacklisted.
+  // -----------------------------------------------------------------------
+  // Safe logout (§4 in ADR-004 implementation plan)
+  // -----------------------------------------------------------------------
+  // POST /api/v1/auth/logout with credentials + CSRF header.
+  // On 2xx: clear local session (memory token + authUser cache).
+  // On 503 or network error: PRESERVE local session — the server did NOT
+  //   persist the revocation (C2 fail-closed contract), so clearing locally
+  //   would leave the user in an inconsistent state (valid cookie, no
+  //   access token). Show an error to the user instead.
+  const logout = useCallback(async (): Promise<{ success: boolean; error?: string }> => {
     try {
-      if (refreshToken) await authApi.logout(refreshToken);
-    } catch {
-      // swallow: we clear local state regardless
+      await authApi.logout();
+      // Server confirmed logout (2xx) — safe to clear local state.
+      clearSession();
+      setUser(null);
+      emitAuthChange();
+      return { success: true };
+    } catch (err: any) {
+      // Do NOT clear local session. Server did not persist revocation.
+      const status = err?.status;
+      let error: string;
+      if (status === 503) {
+        error = 'Logout failed — service temporarily unavailable. Please try again.';
+      } else if (err?.name === 'TimeoutError' || err?.message?.includes('timed out')) {
+        error = 'Logout timed out. Please check your connection and try again.';
+      } else {
+        error = 'Logout failed. Please try again.';
+      }
+      console.error('Logout error (local session preserved)', status || err?.message);
+      return { success: false, error };
     }
-    clearSession();
-    setUser(null);
-    emitAuthChange();
   }, []);
 
   const value = useMemo<AuthContextValue>(
