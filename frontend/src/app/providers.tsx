@@ -1,7 +1,7 @@
 'use client';
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { useEffect, useState, useCallback, createContext, useContext, useMemo, ReactNode } from 'react';
+import { useEffect, useState, useCallback, createContext, useContext, useMemo, useRef, ReactNode } from 'react';
 import { TelemetryProvider } from '@/components/TelemetryProvider';
 import { WebSocketProvider } from '@/hooks/useWebSocket';
 import {
@@ -13,8 +13,8 @@ import {
   authApi,
   tryCookieRefresh,
   migrateFromLocalStorage,
-  setAccessToken,
 } from '@/lib/api';
+import { initRuntimeConfig } from '@/lib/runtime-config';
 
 // ---------------------------------------------------------------------------
 // Auth context (defined here to keep the change within scope; exported for
@@ -52,8 +52,77 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // mismatch; resolved in the boot effect below.
   const [user, setUser] = useState<AuthUser | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  // Track whether boot recovery has run to avoid double execution in StrictMode.
-  const [booted, setBooted] = useState(false);
+
+  // -------------------------------------------------------------------
+  // Boot recovery — concurrency guards (§3 in ADR-004 plan)
+  // -------------------------------------------------------------------
+  // React StrictMode double-invokes effects in development. We use refs
+  // (not state) to guard the boot flow so a second concurrent invocation
+  // cannot overwrite the first successful result.
+  //
+  // - bootStartedRef: prevents two boots from starting simultaneously.
+  // - mountedRef: lets us bail out if the component unmounts mid-boot.
+  //   (setState on an unmounted component is a no-op in React 18+, but
+  //   we avoid the wasted work.)
+  const bootStartedRef = useRef(false);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  useEffect(() => {
+    // If boot already started (StrictMode double-fire), skip.
+    if (bootStartedRef.current) return;
+    bootStartedRef.current = true;
+
+    async function boot(): Promise<void> {
+      try {
+        // Step 1: attempt cookie-based refresh
+        const newToken = await tryCookieRefresh();
+        if (!mountedRef.current) return;
+
+        if (newToken) {
+          // /refresh only returns { accessToken } — no user profile.
+          // Restore user from the cached authUser (display-only cache).
+          // If cache is missing, user stays null (TD-C3-1: /auth/me gap).
+          const cachedUser = getCachedUser();
+          if (mountedRef.current) {
+            if (cachedUser) setUser(cachedUser);
+            setIsLoading(false);
+          }
+          return;
+        }
+
+        // Step 2: no cookie session — try legacy localStorage migration
+        const migrated = await migrateFromLocalStorage();
+        if (!mountedRef.current) return;
+
+        if (migrated) {
+          const cachedUser = getCachedUser();
+          if (mountedRef.current) {
+            if (cachedUser) setUser(cachedUser);
+            setIsLoading(false);
+          }
+          return;
+        }
+
+        // Step 3: both failed — unauthenticated
+        if (mountedRef.current) {
+          setUser(null);
+          setIsLoading(false);
+        }
+      } catch {
+        if (mountedRef.current) {
+          setUser(null);
+          setIsLoading(false);
+        }
+      }
+    }
+
+    boot();
+  }, []);
 
   const refreshUser = useCallback(() => {
     if (!hasValidAccessToken()) {
@@ -65,63 +134,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // If no cached user exists (e.g. after cookie refresh without /auth/me),
     // user stays at its previous value. TD-C3-1: add GET /auth/me to fill this gap.
   }, []);
-
-  // -----------------------------------------------------------------------
-  // Boot recovery (§3 in ADR-004 implementation plan)
-  // -----------------------------------------------------------------------
-  // 1. Try cookie-based refresh (for users who already have an HttpOnly
-  //    refresh_token cookie from a previous login).
-  // 2. If no cookie session, try legacy localStorage → cookie migration.
-  // 3. If both fail, user is unauthenticated — login page will show.
-  // 4. Finally, clean up any leftover legacy localStorage keys.
-  useEffect(() => {
-    if (booted) return;
-
-    async function boot(): Promise<void> {
-      try {
-        // Step 1: attempt cookie-based refresh
-        const newToken = await tryCookieRefresh();
-        if (newToken) {
-          // /refresh only returns { accessToken } — no user profile.
-          // Restore user from the cached authUser (display-only cache).
-          // If cache is missing, user stays null (TD-C3-1: /auth/me gap).
-          const cachedUser = getCachedUser();
-          if (cachedUser) {
-            setUser(cachedUser);
-          }
-          setBooted(true);
-          setIsLoading(false);
-          return;
-        }
-
-        // Step 2: no cookie session — try legacy localStorage migration
-        const migrated = await migrateFromLocalStorage();
-        if (migrated) {
-          // Migration succeeded: accessToken is now in memory.
-          // Restore user from legacy authUser cache if present.
-          const cachedUser = getCachedUser();
-          if (cachedUser) {
-            setUser(cachedUser);
-          }
-          setBooted(true);
-          setIsLoading(false);
-          return;
-        }
-
-        // Step 3: both failed — unauthenticated
-        setUser(null);
-        setBooted(true);
-        setIsLoading(false);
-      } catch {
-        // Unexpected error during boot — treat as unauthenticated
-        setUser(null);
-        setBooted(true);
-        setIsLoading(false);
-      }
-    }
-
-    boot();
-  }, [booted]);
 
   // Listen for auth-change events and cross-tab storage changes.
   useEffect(() => {
@@ -153,12 +165,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // -----------------------------------------------------------------------
   // Safe logout (§4 in ADR-004 implementation plan)
   // -----------------------------------------------------------------------
-  // POST /api/v1/auth/logout with credentials + CSRF header.
-  // On 2xx: clear local session (memory token + authUser cache).
-  // On 503 or network error: PRESERVE local session — the server did NOT
-  //   persist the revocation (C2 fail-closed contract), so clearing locally
-  //   would leave the user in an inconsistent state (valid cookie, no
-  //   access token). Show an error to the user instead.
   const logout = useCallback(async (): Promise<{ success: boolean; error?: string }> => {
     try {
       await authApi.logout();
@@ -214,6 +220,21 @@ export function getPostLoginRedirect(): string {
 // Root providers
 // ---------------------------------------------------------------------------
 
+/**
+ * Bridge component: reads auth state and controls WebSocket connection.
+ * WebSocket MUST NOT connect before auth boot completes — otherwise it races
+ * AuthProvider's tryCookieRefresh for the single-use refresh token.
+ * When loading or not authenticated, WebSocket is disconnected.
+ */
+function WsBridge({ children }: { children: ReactNode }) {
+  const { isAuthenticated, isLoading } = useAuth();
+  return (
+    <WebSocketProvider enabled={!isLoading && isAuthenticated}>
+      {children}
+    </WebSocketProvider>
+  );
+}
+
 export function Providers({ children }: { children: React.ReactNode }) {
   const [queryClient] = useState(
     () =>
@@ -227,9 +248,14 @@ export function Providers({ children }: { children: React.ReactNode }) {
       })
   );
 
+  // Initialize runtime config early — before AuthProvider boot.
+  // Fire-and-forget: same-origin defaults are always correct for production;
+  // /api/config is only needed for local/dev direct mode.
+  useEffect(() => {
+    initRuntimeConfig();
+  }, []);
+
   // Capture unhandled errors and promise rejections to keep UI stable.
-  // Deliberately log only a compact summary, never raw objects that could
-  // contain tokens or PII.
   useEffect(() => {
     const onError = (event: ErrorEvent) => {
       const summary =
@@ -258,7 +284,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
     <AuthProvider>
       <TelemetryProvider>
         <QueryClientProvider client={queryClient}>
-          <WebSocketProvider>{children}</WebSocketProvider>
+          <WsBridge>{children}</WsBridge>
         </QueryClientProvider>
       </TelemetryProvider>
     </AuthProvider>

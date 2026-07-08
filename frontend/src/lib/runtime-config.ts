@@ -19,7 +19,7 @@
 
 import { setApiBaseUrl } from './api';
 
-interface RuntimeConfig {
+export interface RuntimeConfig {
   apiUrl: string;
   wsUrl: string;
 }

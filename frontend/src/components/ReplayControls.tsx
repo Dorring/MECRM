@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useState } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { replayApi, getAccessToken } from '@/lib/api';
 
@@ -34,10 +34,11 @@ export function ReplayControls({ onJobStarted }: ReplayControlsProps) {
   const [targetTime, setTargetTime] = useState('');
   const [jobId, setJobId] = useState<string | null>(null);
 
-  const tenantId = useMemo(() => getTenantIdFromToken(), []);
-
+  // Read tenantId from the access token at action time — the token lives in
+  // memory and may change between mount and user interaction (refresh, re-login).
   const startMutation = useMutation({
     mutationFn: async () => {
+      const tenantId = getTenantIdFromToken();
       if (!tenantId) throw new Error('Missing tenant_id in access token');
       if (!aggregateId) throw new Error('aggregate_id is required');
       if (mode === 'offset') {
@@ -59,6 +60,7 @@ export function ReplayControls({ onJobStarted }: ReplayControlsProps) {
       });
     },
     onSuccess: (res) => {
+      const tenantId = getTenantIdFromToken();
       const id = res.data.job_id as string;
       setJobId(id);
       if (tenantId) {
