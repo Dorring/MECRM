@@ -633,8 +633,8 @@ is modified.
 |---|---|---|
 | Gateway lint | ✅ | 0 errors, 0 warnings |
 | Gateway build | ✅ | `tsc --noEmit` clean |
-| Gateway Jest | ✅ | 126 passed, 61 skipped, 0 failed |
-| Redis integration | ✅ | 11 passed (with Redis), 10 skipped |
+| Gateway Jest | ✅ | 135 passed, 61 skipped, 0 failed (196 total) |
+| Redis integration | ✅ | 11 passed, 10 skipped (Redis-dependent gated) |
 | Frontend lint | ⏳ | C3 pending |
 | Frontend build | ⏳ | C3 pending |
 | TypeScript check | ✅ | `npx tsc --noEmit` clean |
@@ -653,10 +653,12 @@ is modified.
 
 | Exit gate | Status |
 |---|---|
-| C1: `getCookieOptions()` , CSRF helpers, origin middleware tests | ✅ 28 passed |
+| C1: `getCookieOptions()` , CSRF helpers, origin middleware tests | ✅ 28 passed (`csrf_origin.test.ts`) |
 | C1: lint, TypeScript build | ✅ |
-| C2: login/register Set-Cookie + cookie-only refresh + CSRF + logout + migrate + ws-ticket | ✅ 14 endpoint + 11 integration tests |
+| C2: endpoint-level auth cookie tests (HTTP contract) | ✅ 23 passed (`auth_cookie_endpoint.test.ts`) |
+| C2: no-Redis integration + Redis gated tests | ✅ 11 passed + 10 skipped (`auth_cookie_integration.test.ts`) |
 | C2: lint, TypeScript build, all C1+C2 tests pass | ✅ |
+| C3/C4/C5 | ⏳ Pending |
 | Group B `consumeRefresh` Lua unchanged | ✅ All Group B tests still pass |
 
 ---

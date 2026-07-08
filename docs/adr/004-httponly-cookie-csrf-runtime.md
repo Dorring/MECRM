@@ -888,13 +888,13 @@ Implementation may begin only after reviewers accept:
 | Test file | Passed | Mode |
 |---|---|---|
 | `csrf_origin.test.ts` | 28 | Unit (no deps) |
-| `auth_cookie_endpoint.test.ts` | 14 | HTTP endpoint (mocked Prisma/Redis/bcrypt) |
-| `auth_cookie_integration.test.ts` | 11 | Service-level (10 Redis-dependent skipped) |
+| `auth_cookie_endpoint.test.ts` | 23 | HTTP endpoint (mocked Prisma/Redis/bcrypt) |
+| `auth_cookie_integration.test.ts` | 11 + 10 skipped | No-Redis integration; Redis-dependent gated behind `CRM_REDIS_AVAILABLE=1` |
 
-**CI evidence (main@6779be8):**
+**CI evidence (local, per main merge):**
 - Gateway lint: 0 errors, 0 warnings
 - Gateway TypeScript: clean
-- Gateway full test suite: 126 passed, 61 skipped, 0 failed
+- Gateway full test suite: 135 passed, 61 skipped, 0 failed (196 total)
 - 7 DB-dependent suites skipped, 10 passed
 
 ### 16.3 Remaining — C3, C4, C5
