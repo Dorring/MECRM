@@ -113,8 +113,6 @@ export function useWebSocket() {
     // 1. Ensure we have a valid access token
     const token = await ensureAccessToken();
     if (!token) {
-      // No token and refresh failed — user is unauthenticated.
-      // Don't reconnect; the auth provider will handle the login redirect.
       stoppedRef.current = true;
       return;
     }
@@ -122,11 +120,7 @@ export function useWebSocket() {
     // 2. Request a single-use WS ticket
     const ticket = await requestWsTicket();
     if (!ticket) {
-      // Ticket request failed. Check if it was an auth failure (401)
-      // or a transient error (503/network). We can't distinguish here
-      // because fetch doesn't give us the status through the helper.
-      // Fall through to bounded retry.
-      handleReconnect();
+      scheduleReconnect();
       return;
     }
 
@@ -175,7 +169,7 @@ export function useWebSocket() {
       // Try to reconnect with a fresh ticket (not counted against limit).
       if (event.code === 4401) {
         reconnectAttemptsRef.current = 0;
-        handleReconnect();
+        scheduleReconnect();
         return;
       }
 
@@ -183,13 +177,13 @@ export function useWebSocket() {
       if (event.code === 1000) {
         if (getAccessToken()) {
           reconnectAttemptsRef.current = 0;
-          handleReconnect();
+          scheduleReconnect();
         }
         return;
       }
 
       // Other close codes — bounded retry
-      handleReconnect();
+      scheduleReconnect();
     };
 
     ws.onerror = (error) => {
@@ -197,11 +191,17 @@ export function useWebSocket() {
     };
 
     wsRef.current = ws;
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- scheduleReconnect is accessed via connectRef to break circular dependency
   }, [ensureAccessToken]);
 
   // Schedule reconnect with exponential backoff.
-  // Respects MAX_RECONNECT_ATTEMPTS and stoppedRef.
-  const handleReconnect = useCallback(() => {
+  // Uses a ref to the latest connect function to avoid circular dependency.
+  const connectRef = useRef(connect);
+  useEffect(() => {
+    connectRef.current = connect;
+  }, [connect]);
+
+  const scheduleReconnect = useCallback(() => {
     if (stoppedRef.current) return;
 
     const attempt = reconnectAttemptsRef.current;
@@ -220,9 +220,9 @@ export function useWebSocket() {
     reconnectAttemptsRef.current = attempt + 1;
 
     reconnectTimeoutRef.current = setTimeout(() => {
-      connect();
+      connectRef.current();
     }, delay);
-  }, [connect]);
+  }, []);
 
   const disconnect = useCallback(() => {
     stoppedRef.current = true;
