@@ -5,10 +5,6 @@ const nextConfig = {
   reactStrictMode: true,
   output: 'standalone',
   turbopack: {},
-  env: {
-    NEXT_PUBLIC_API_URL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000',
-    NEXT_PUBLIC_WS_URL: process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:4000',
-  },
   webpack: (config) => {
     config.resolve.alias = {
       ...(config.resolve.alias || {}),
@@ -20,7 +16,10 @@ const nextConfig = {
     return [
       {
         source: '/api/:path*',
-        destination: `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'}/api/:path*`,
+        // GATEWAY_INTERNAL_URL is a server-side build/start-time variable,
+        // NOT a browser NEXT_PUBLIC_* variable. It is inlined into the
+        // Next.js server bundle, never exposed to the browser.
+        destination: `${process.env.GATEWAY_INTERNAL_URL || 'http://localhost:4000'}/api/:path*`,
       },
     ];
   },

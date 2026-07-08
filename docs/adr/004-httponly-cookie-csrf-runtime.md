@@ -1,9 +1,9 @@
 # ADR-004: HttpOnly Refresh Cookie, CSRF, WS Ticket and Runtime URL
 
-**Status:** Partially Implemented — C1/C2 complete (merged to main)  
-**Date:** 2026-07-05 (approved), 2026-07-07 (C1/C2 implemented)  
+**Status:** Partially Implemented — C1/C2/C3 complete (C3 on hardening/http-cookie-csrf-runtime)  
+**Date:** 2026-07-05 (approved), 2026-07-07 (C1/C2 implemented), 2026-07-08 (C3 implemented)  
 **Scope:** Hardening 1.1 Group C  
-**Supersedes:** localStorage-based refresh token storage, JWT-in-URL WebSocket authentication, build-time `NEXT_PUBLIC_API_URL`  
+**Supersedes:** localStorage-based refresh token storage, JWT-in-URL WebSocket authentication, build-time `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_WS_URL`  
 **Depends on:** ADR-002 (session revocation, Group B — unmodified)
 
 ---
@@ -897,7 +897,25 @@ Implementation may begin only after reviewers accept:
 - Gateway full test suite: 135 passed, 61 skipped, 0 failed (196 total)
 - 7 DB-dependent suites skipped, 10 passed
 
-### 16.3 Remaining — C3, C4, C5
+### 16.3 Remaining — C4, C5
 
-C3 (frontend memory-only token + same-origin proxy), C4 (WS ticket upgrade
-handler integration), and C5 (runtime config + self-review) are pending.
+**C3 complete** (commits 009be32..e958e02, hardening/http-cookie-csrf-runtime):
+- Frontend memory-only accessToken (never in localStorage)
+- CSRF double-submit: `X-CSRF-Token` header from `csrf_token` cookie (POST/PUT/PATCH/DELETE only)
+- Cookie-based refresh via `POST /api/v1/auth/refresh` (credentials: 'include' + CSRF header)
+- Legacy localStorage → cookie migration (`POST /api/v1/auth/migrate-cookie`, one-shot at boot)
+- Safe logout: local session preserved on 503/network error
+- WS ticket exchange: `POST /api/v1/auth/ws-ticket` → single-use UUID → `ws://host/ws?ticket=<uuid>`
+- Bounded WS reconnect: 401/403 stop, 429/503/0 max 5 retries; 4401 allows one ticket-race retry then stops
+- Runtime `/api/config` endpoint (server-side env, NOT NEXT_PUBLIC_*)
+- Same-origin relative API paths (no absolute URL in browser bundle)
+- `GATEWAY_INTERNAL_URL` for Next.js rewrites (server-side build-time var)
+- Build verified: 0 `NEXT_PUBLIC_*` in client bundle
+
+**Tech debt:**
+- TD-C3-1: `/refresh` returns no user profile — need `GET /api/v1/auth/me`
+- TD-C3-2: Runtime Gateway switching needs custom Next.js server proxy
+- TD-C3-3: Same-origin `/ws` upgrade proxy validation (C4 or infra PR)
+- TD-C3-4: Frontend test framework gap (no jest/vitest config)
+
+C4 (WS ticket upgrade handler integration) and C5 (runtime config + self-review) are pending.

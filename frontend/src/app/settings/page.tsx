@@ -1,10 +1,30 @@
 'use client';
 
-import { User, Building, Shield, LogOut, Mail, CheckCircle2 } from 'lucide-react';
+import { useState } from 'react';
+import { User, Building, Shield, LogOut, Mail, CheckCircle2, X, AlertTriangle } from 'lucide-react';
 import { useAuth } from '../providers';
 
 export default function SettingsPage() {
   const { user, logout } = useAuth();
+  const [logoutError, setLogoutError] = useState<string | null>(null);
+  const [loggingOut, setLoggingOut] = useState(false);
+
+  const handleLogout = async () => {
+    setLogoutError(null);
+    setLoggingOut(true);
+    try {
+      const result = await logout();
+      if (result.success) {
+        window.location.href = '/login';
+      } else {
+        setLogoutError(result.error || 'Logout failed');
+      }
+    } catch {
+      setLogoutError('Logout failed — unexpected error');
+    } finally {
+      setLoggingOut(false);
+    }
+  };
 
   return (
     <div className="space-y-6 max-w-3xl">
@@ -67,15 +87,33 @@ export default function SettingsPage() {
           <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Session</h2>
         </div>
         <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">
-          Signing out clears your local session and asks the gateway to revoke
-          your tokens. You will need to sign in again.
+          Signing out asks the gateway to revoke your session tokens.
+          You will need to sign in again.
         </p>
+        {logoutError && (
+          <div
+            className="flex items-center gap-2 mb-3 px-3 py-2 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-md text-sm text-red-700 dark:text-red-300"
+            role="alert"
+            aria-live="assertive"
+          >
+            <AlertTriangle size={14} className="shrink-0" />
+            <span className="flex-1">{logoutError}</span>
+            <button
+              onClick={() => setLogoutError(null)}
+              className="text-red-400 hover:text-red-600 dark:hover:text-red-200 shrink-0"
+              aria-label="Dismiss"
+            >
+              <X size={14} />
+            </button>
+          </div>
+        )}
         <button
-          onClick={() => { void logout(); }}
+          onClick={handleLogout}
+          disabled={loggingOut}
           className="btn btn-secondary"
         >
           <LogOut size={16} className="mr-2" />
-          Sign out
+          {loggingOut ? 'Signing out…' : 'Sign out'}
         </button>
       </div>
     </div>

@@ -1,7 +1,7 @@
 'use client';
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { useEffect, useState, useCallback, createContext, useContext, useMemo, ReactNode } from 'react';
+import { useEffect, useState, useCallback, createContext, useContext, useMemo, useRef, ReactNode } from 'react';
 import { TelemetryProvider } from '@/components/TelemetryProvider';
 import { WebSocketProvider } from '@/hooks/useWebSocket';
 import {
@@ -11,8 +11,10 @@ import {
   clearSession,
   persistSession,
   authApi,
-  getRefreshToken,
+  tryCookieRefresh,
+  migrateFromLocalStorage,
 } from '@/lib/api';
+import { initRuntimeConfig, getRuntimeConfig } from '@/lib/runtime-config';
 
 // ---------------------------------------------------------------------------
 // Auth context (defined here to keep the change within scope; exported for
@@ -29,7 +31,10 @@ interface AuthContextValue {
   isAuthenticated: boolean;
   isLoading: boolean;
   login: (credentials: { email: string; password: string; tenantSlug: string }) => Promise<AuthUser>;
-  logout: () => Promise<void>;
+  /** Returns { success: true } on successful server logout.
+   *  Returns { success: false, error } on 503, network error, or any failure
+   *  — local session is PRESERVED in this case. Caller must show error to user. */
+  logout: () => Promise<{ success: boolean; error?: string }>;
   refreshUser: () => void;
 }
 
@@ -44,25 +49,102 @@ function emitAuthChange(): void {
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   // Start null on the server and on first client render to avoid hydration
-  // mismatch; resolve from localStorage in an effect.
+  // mismatch; resolved in the boot effect below.
   const [user, setUser] = useState<AuthUser | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+
+  // -------------------------------------------------------------------
+  // Boot recovery — concurrency guards (§3 in ADR-004 plan)
+  // -------------------------------------------------------------------
+  // React StrictMode double-invokes effects in development. We use refs
+  // (not state) to guard the boot flow so a second concurrent invocation
+  // cannot overwrite the first successful result.
+  //
+  // - bootStartedRef: prevents two boots from starting simultaneously.
+  // - mountedRef: lets us bail out if the component unmounts mid-boot.
+  //   (setState on an unmounted component is a no-op in React 18+, but
+  //   we avoid the wasted work.)
+  const bootStartedRef = useRef(false);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  useEffect(() => {
+    // If boot already started (StrictMode double-fire), skip.
+    if (bootStartedRef.current) return;
+    bootStartedRef.current = true;
+
+    async function boot(): Promise<void> {
+      try {
+        // Ensure runtime config (API_URL/WS_URL from /api/config) is resolved
+        // before any API call. In same-origin mode this returns the cached
+        // default immediately; in direct mode it fetches /api/config first.
+        await getRuntimeConfig();
+
+        // Step 1: attempt cookie-based refresh
+        const newToken = await tryCookieRefresh();
+        if (!mountedRef.current) return;
+
+        if (newToken) {
+          // /refresh only returns { accessToken } — no user profile.
+          // Restore user from the cached authUser (display-only cache).
+          // If cache is missing, user stays null (TD-C3-1: /auth/me gap).
+          const cachedUser = getCachedUser();
+          if (mountedRef.current) {
+            if (cachedUser) setUser(cachedUser);
+            setIsLoading(false);
+          }
+          return;
+        }
+
+        // Step 2: no cookie session — try legacy localStorage migration
+        const migrated = await migrateFromLocalStorage();
+        if (!mountedRef.current) return;
+
+        if (migrated) {
+          const cachedUser = getCachedUser();
+          if (mountedRef.current) {
+            if (cachedUser) setUser(cachedUser);
+            setIsLoading(false);
+          }
+          return;
+        }
+
+        // Step 3: both failed — unauthenticated
+        if (mountedRef.current) {
+          setUser(null);
+          setIsLoading(false);
+        }
+      } catch {
+        if (mountedRef.current) {
+          setUser(null);
+          setIsLoading(false);
+        }
+      }
+    }
+
+    boot();
+  }, []);
 
   const refreshUser = useCallback(() => {
     if (!hasValidAccessToken()) {
       setUser(null);
       return;
     }
-    setUser(getCachedUser());
+    const cached = getCachedUser();
+    if (cached) setUser(cached);
+    // If no cached user exists (e.g. after cookie refresh without /auth/me),
+    // user stays at its previous value. TD-C3-1: add GET /auth/me to fill this gap.
   }, []);
 
+  // Listen for auth-change events and cross-tab storage changes.
   useEffect(() => {
-    refreshUser();
-    setIsLoading(false);
-
     const onChange = () => refreshUser();
     const onStorage = (e: StorageEvent) => {
-      if (e.key === 'accessToken' || e.key === 'authUser' || e.key === null) {
+      if (e.key === 'authUser' || e.key === null) {
         refreshUser();
       }
     };
@@ -85,18 +167,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     []
   );
 
-  const logout = useCallback(async () => {
-    const refreshToken = getRefreshToken();
-    // Best-effort server-side blacklist. Never block UI on a failed logout:
-    // access tokens are short-lived and the refresh token is also blacklisted.
+  // -----------------------------------------------------------------------
+  // Safe logout (§4 in ADR-004 implementation plan)
+  // -----------------------------------------------------------------------
+  const logout = useCallback(async (): Promise<{ success: boolean; error?: string }> => {
     try {
-      if (refreshToken) await authApi.logout(refreshToken);
-    } catch {
-      // swallow: we clear local state regardless
+      await authApi.logout();
+      // Server confirmed logout (2xx) — safe to clear local state.
+      clearSession();
+      setUser(null);
+      emitAuthChange();
+      return { success: true };
+    } catch (err: any) {
+      // Do NOT clear local session. Server did not persist revocation.
+      const status = err?.status;
+      let error: string;
+      if (status === 503) {
+        error = 'Logout failed — service temporarily unavailable. Please try again.';
+      } else if (err?.name === 'TimeoutError' || err?.message?.includes('timed out')) {
+        error = 'Logout timed out. Please check your connection and try again.';
+      } else {
+        error = 'Logout failed. Please try again.';
+      }
+      console.error('Logout error (local session preserved)', status || err?.message);
+      return { success: false, error };
     }
-    clearSession();
-    setUser(null);
-    emitAuthChange();
   }, []);
 
   const value = useMemo<AuthContextValue>(
@@ -130,6 +225,21 @@ export function getPostLoginRedirect(): string {
 // Root providers
 // ---------------------------------------------------------------------------
 
+/**
+ * Bridge component: reads auth state and controls WebSocket connection.
+ * WebSocket MUST NOT connect before auth boot completes — otherwise it races
+ * AuthProvider's tryCookieRefresh for the single-use refresh token.
+ * When loading or not authenticated, WebSocket is disconnected.
+ */
+function WsBridge({ children }: { children: ReactNode }) {
+  const { isAuthenticated, isLoading } = useAuth();
+  return (
+    <WebSocketProvider enabled={!isLoading && isAuthenticated}>
+      {children}
+    </WebSocketProvider>
+  );
+}
+
 export function Providers({ children }: { children: React.ReactNode }) {
   const [queryClient] = useState(
     () =>
@@ -143,9 +253,14 @@ export function Providers({ children }: { children: React.ReactNode }) {
       })
   );
 
+  // Initialize runtime config early — before AuthProvider boot.
+  // Fire-and-forget: same-origin defaults are always correct for production;
+  // /api/config is only needed for local/dev direct mode.
+  useEffect(() => {
+    initRuntimeConfig();
+  }, []);
+
   // Capture unhandled errors and promise rejections to keep UI stable.
-  // Deliberately log only a compact summary, never raw objects that could
-  // contain tokens or PII.
   useEffect(() => {
     const onError = (event: ErrorEvent) => {
       const summary =
@@ -174,7 +289,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
     <AuthProvider>
       <TelemetryProvider>
         <QueryClientProvider client={queryClient}>
-          <WebSocketProvider>{children}</WebSocketProvider>
+          <WsBridge>{children}</WsBridge>
         </QueryClientProvider>
       </TelemetryProvider>
     </AuthProvider>

@@ -1,22 +1,19 @@
 'use client';
 
-import { Bell, User, Moon, Sun, LogOut, ChevronDown } from 'lucide-react';
-import { useState, useEffect, useRef } from 'react';
+import { Bell, User, Moon, Sun, LogOut, ChevronDown, X } from 'lucide-react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { CommandBar } from '@/components/CommandBar';
 import { useAuth } from '@/app/providers';
 
 export function Header() {
   const [darkMode, setDarkMode] = useState(false);
-  // TODO(Phase 5): wire notifications to a real endpoint (e.g. a pending
-  // approvals/notifications API). Until that contract exists, we intentionally
-  // do NOT show a fake count — the previous hardcoded "3" was misleading.
-  // Set to null so the badge renders nothing.
   const notifications: number | null = null;
   const { user, logout } = useAuth();
   const router = useRouter();
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const [logoutError, setLogoutError] = useState<string | null>(null);
 
   useEffect(() => {
     if (darkMode) {
@@ -47,9 +44,18 @@ export function Header() {
 
   const handleLogout = async () => {
     setMenuOpen(false);
-    await logout();
-    router.replace('/login');
+    setLogoutError(null);
+    const result = await logout();
+    if (result.success) {
+      router.replace('/login');
+    } else {
+      // Local session preserved (server did NOT persist revocation).
+      // Show visible error to user — do NOT clear session or redirect.
+      setLogoutError(result.error || 'Logout failed');
+    }
   };
+
+  const dismissError = useCallback(() => setLogoutError(null), []);
 
   const displayName = user?.name || user?.email || 'User';
   // Display-only role summary. Never use this for access decisions.
@@ -62,7 +68,25 @@ export function Header() {
     .join('') || '?';
 
   return (
-    <header className="h-16 bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800 flex items-center justify-between px-6">
+    <>
+      {/* Logout error banner — visible, user-dismissible, preserves local session */}
+      {logoutError && (
+        <div
+          className="bg-red-50 dark:bg-red-900/20 border-b border-red-200 dark:border-red-800 px-6 py-2 flex items-center justify-between"
+          role="alert"
+          aria-live="assertive"
+        >
+          <span className="text-sm text-red-700 dark:text-red-300">{logoutError}</span>
+          <button
+            onClick={dismissError}
+            className="text-red-400 hover:text-red-600 dark:hover:text-red-200"
+            aria-label="Dismiss"
+          >
+            <X size={16} />
+          </button>
+        </div>
+      )}
+      <header className="h-16 bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800 flex items-center justify-between px-6">
       {/* Search */}
       <div className="flex-1 max-w-lg">
         <CommandBar />
@@ -155,5 +179,6 @@ export function Header() {
         </div>
       </div>
     </header>
+    </>
   );
 }

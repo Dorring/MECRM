@@ -41,10 +41,8 @@ export function ChatPanel() {
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   const clientModule = useMemo(() => pathname || '/', [pathname]);
-  const intelligencePrefix = useMemo(() => {
-    const base = process.env.NEXT_PUBLIC_API_URL || '';
-    return base.includes('/api') ? '' : '/api';
-  }, []);
+  // Same-origin proxy: all API calls go through /api/*. No NEXT_PUBLIC_API_URL.
+  const intelligencePrefix = '/api';
 
   useEffect(() => {
     const stored = typeof window !== 'undefined' ? window.localStorage.getItem('crm.chat.conversation_id') : null;
