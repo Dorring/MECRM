@@ -1,6 +1,6 @@
 # ADR-004 Implementation Plan: Group C
 
-**Status:** Partially Implemented — C1/C2 complete (merged to main@6779be8)  
+**Status:** Partially Implemented — C1/C2/C3 complete; C4/C5 pending  
 **Target branch:** `hardening/http-cookie-csrf-runtime`  
 **Baseline:** `main@9e44a64` (hardening-group-b-stabilized.1)  
 **ADR:** `docs/adr/004-httponly-cookie-csrf-runtime.md`
@@ -274,7 +274,7 @@ Planned commits (do not mix with formatting or Group D work):
 
 ## 5. C3 — Frontend: Memory-Only Access Token and Same-Origin Proxy ✅
 
-**Status:** Implemented (commits 009be32..625d3cd on hardening/http-cookie-csrf-runtime)
+**Status:** Implemented (commits 009be32..e958e02 on hardening/http-cookie-csrf-runtime)
 **Date:** 2026-07-08
 
 ### 5.1 Files changed
@@ -365,7 +365,7 @@ Planned commits (do not mix with formatting or Group D work):
    `mutationFn` / `onSuccess`), not once at mount via `useMemo([])`.
 
 8. **4401 bounded retry**: 4401 on WebSocket now stops after 1 retry (ticket race tolerance).
-   Does NOT reset attempt counter — permanent auth failure after second 4401.
+   Uses a dedicated `wsAuthRetryUsedRef` that is not reset in `onopen`; permanent auth failure after second 4401.
 
 9. **429 transient**: 429 Too Many Requests is excluded from `isPermanentFailure`
    and enters bounded exponential backoff.

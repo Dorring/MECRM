@@ -899,14 +899,14 @@ Implementation may begin only after reviewers accept:
 
 ### 16.3 Remaining — C4, C5
 
-**C3 complete** (commits 009be32..625d3cd, hardening/http-cookie-csrf-runtime):
+**C3 complete** (commits 009be32..e958e02, hardening/http-cookie-csrf-runtime):
 - Frontend memory-only accessToken (never in localStorage)
 - CSRF double-submit: `X-CSRF-Token` header from `csrf_token` cookie (POST/PUT/PATCH/DELETE only)
 - Cookie-based refresh via `POST /api/v1/auth/refresh` (credentials: 'include' + CSRF header)
 - Legacy localStorage → cookie migration (`POST /api/v1/auth/migrate-cookie`, one-shot at boot)
 - Safe logout: local session preserved on 503/network error
 - WS ticket exchange: `POST /api/v1/auth/ws-ticket` → single-use UUID → `ws://host/ws?ticket=<uuid>`
-- Bounded WS reconnect: 401/403 stop, 503 max 5 retries
+- Bounded WS reconnect: 401/403 stop, 429/503/0 max 5 retries; 4401 allows one ticket-race retry then stops
 - Runtime `/api/config` endpoint (server-side env, NOT NEXT_PUBLIC_*)
 - Same-origin relative API paths (no absolute URL in browser bundle)
 - `GATEWAY_INTERNAL_URL` for Next.js rewrites (server-side build-time var)
