@@ -1,37 +1,67 @@
-const BASE_URL = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000').replace(/\/$/, '');
+// BASE_URL is empty in same-origin mode (browser uses relative /api/v1/...).
+// In local/dev direct mode, runtime-config sets it from /api/config (API_URL).
+// Never use NEXT_PUBLIC_* — all API URLs are resolved at runtime, not build time.
+let BASE_URL = '';
+
+/** Set the API base URL at runtime. Called by runtime-config boot. */
+export function setApiBaseUrl(url: string): void {
+  BASE_URL = url.replace(/\/$/, '');
+}
+
 const API_PREFIX = '/api/v1';
 
-// Token storage keys. NOTE: storing access/refresh tokens in localStorage is a
-// known XSS-risk surface (see project-optimization-plan.md Phase 5 task 2).
-// The gateway currently issues JWTs; HttpOnly Secure cookies would be safer
-// but require a gateway-side change. This is the interim strategy and does
-// not change the authorization model: the backend (Gateway + OPA) remains the
-// final authorization authority; the UI must never treat local role claims as
-// a security control.
-const ACCESS_TOKEN_KEY = 'accessToken';
-const REFRESH_TOKEN_KEY = 'refreshToken';
+// ---------------------------------------------------------------------------
+// Memory-only access token
+// ---------------------------------------------------------------------------
+// accessToken lives ONLY in this module-level variable. It is never written
+// to localStorage, sessionStorage, or any other persistent store. On page
+// reload it is lost and must be recovered via cookie-based refresh (§3 boot
+// recovery in ADR-004 plan) or re-login.
+
+let accessToken: string | null = null;
 
 export function getAccessToken(): string | null {
+  return accessToken;
+}
+
+export function setAccessToken(token: string | null): void {
+  accessToken = token;
+}
+
+// Clear memory-only access token and legacy localStorage keys.
+// Called on logout success and during boot cleanup.
+// Does NOT clear authUser cache — that is handled by clearSession().
+function clearAccessToken(): void {
+  accessToken = null;
+  // Remove legacy localStorage keys (pre-C3 migration cleanup)
+  if (typeof window !== 'undefined') {
+    try { window.localStorage.removeItem('accessToken'); } catch { /* ignore */ }
+    try { window.localStorage.removeItem('refreshToken'); } catch { /* ignore */ }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CSRF double-submit helpers
+// ---------------------------------------------------------------------------
+// The gateway sets a csrf_token cookie (Path=/, NOT HttpOnly) on login,
+// register, refresh, and migrate-cookie. The frontend reads it via
+// document.cookie and echoes it back in the X-CSRF-Token header on mutating
+// requests. GET/HEAD/OPTIONS do NOT send the header (no side effects).
+// This is stateless double-submit: the server compares header === cookie.
+
+export const CSRF_HEADER = 'x-csrf-token';
+const CSRF_COOKIE_NAME = 'csrf_token';
+
+export function getCsrfToken(): string | null {
   if (typeof window === 'undefined') return null;
-  return window.localStorage.getItem(ACCESS_TOKEN_KEY);
+  const match = document.cookie.match(
+    new RegExp(`(?:^|;\\s*)${CSRF_COOKIE_NAME}=([^;]*)`)
+  );
+  return match ? decodeURIComponent(match[1]) : null;
 }
 
-export function getRefreshToken(): string | null {
-  if (typeof window === 'undefined') return null;
-  return window.localStorage.getItem(REFRESH_TOKEN_KEY);
-}
-
-function setTokens(accessToken: string, refreshToken: string): void {
-  if (typeof window === 'undefined') return;
-  window.localStorage.setItem(ACCESS_TOKEN_KEY, accessToken);
-  window.localStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
-}
-
-function clearTokens(): void {
-  if (typeof window === 'undefined') return;
-  window.localStorage.removeItem(ACCESS_TOKEN_KEY);
-  window.localStorage.removeItem(REFRESH_TOKEN_KEY);
-}
+/** Methods that require CSRF header injection. */
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
 // Decode a JWT payload WITHOUT verifying the signature. Verification happens
 // server-side. We only use the decoded claims for UI display (name, roles,
@@ -65,11 +95,11 @@ export function decodeToken(token: string): DecodedTokenClaims | null {
   }
 }
 
-// Returns true if a token is present and not past its `exp`. Used only to
-// decide whether to show the login page / attempt a request; the server still
-// rejects expired/revoked tokens.
+// Returns true if a token is present in memory and not past its `exp`. Used
+// only to decide whether to show the login page / attempt a request; the
+// server still rejects expired/revoked tokens.
 export function hasValidAccessToken(): boolean {
-  const token = getAccessToken();
+  const token = accessToken;
   if (!token) return false;
   const claims = decodeToken(token);
   if (!claims) return false;
@@ -126,27 +156,35 @@ const normalizeEndpoint = (endpoint: string) => {
 class ApiClient {
   private refreshing: Promise<boolean> | null = null;
 
-  // Attempt to refresh the access token using the stored refresh token.
-  // Returns true on success. Returns false if there is no refresh token, the
-  // gateway rejects it, or the request errors. Errors are intentionally
-  // swallowed: callers re-throw the original 401 so the UI can redirect to
-  // login. The gateway blacklists the old refresh token on successful refresh.
+  // Attempt to refresh the access token using the HttpOnly refresh_token
+  // cookie (set by gateway on login/register/refresh/migrate). No refresh
+  // token is sent in the request body — the cookie is attached automatically
+  // via credentials: 'include'.
+  // CSRF double-submit: reads csrf_token from document.cookie and sends it
+  // as X-CSRF-Token header.
+  // Returns true on success (new accessToken stored in memory).
+  // Returns false if there is no csrf_token cookie, the gateway rejects the
+  // refresh, or the request errors.
   private async tryRefresh(): Promise<boolean> {
-    const refreshToken = getRefreshToken();
-    if (!refreshToken) return false;
+    const csrfToken = getCsrfToken();
+    if (!csrfToken) return false;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
     try {
       const resp = await fetch(`${BASE_URL}/api/v1/auth/refresh`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refreshToken }),
+        headers: {
+          'Content-Type': 'application/json',
+          [CSRF_HEADER]: csrfToken,
+        },
+        credentials: 'include',
         signal: controller.signal,
       });
       if (!resp.ok) return false;
       const body = await resp.json();
-      if (!body?.accessToken || !body?.refreshToken) return false;
-      setTokens(body.accessToken, body.refreshToken);
+      // C2 contract: /refresh returns { accessToken } only — no refreshToken in body
+      if (!body?.accessToken) return false;
+      setAccessToken(body.accessToken);
       return true;
     } catch {
       return false;
@@ -161,17 +199,30 @@ class ApiClient {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), options?.timeoutMs ?? 10000);
     const token = getAccessToken();
-    const headers = {
+    const method = (options?.method || 'GET').toUpperCase();
+
+    // Build headers: Authorization if token present, CSRF for mutating methods
+    const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       ...(token ? { Authorization: token.startsWith('Bearer ') ? token : `Bearer ${token}` } : {}),
-      ...options?.headers,
+      ...options?.headers as Record<string, string> | undefined,
     };
+
+    // Inject CSRF token on POST/PUT/PATCH/DELETE only — never on GET/HEAD/OPTIONS
+    if (MUTATING_METHODS.has(method)) {
+      const csrfToken = getCsrfToken();
+      if (csrfToken) {
+        headers[CSRF_HEADER] = csrfToken;
+      }
+    }
 
     try {
       const response = await fetch(url, {
         ...options,
+        method,
         signal: controller.signal,
         headers,
+        credentials: 'include', // send HttpOnly cookies on all requests
       });
 
       if (!response.ok) {
@@ -542,7 +593,8 @@ export const replayApi = {
 
 export interface LoginResponse {
   accessToken: string;
-  refreshToken: string;
+  // refreshToken is NOT in the body — it is set as an HttpOnly cookie by the
+  // gateway (C2 contract). The frontend never sees or stores the refresh token.
   user: {
     id: string;
     email: string;
@@ -554,6 +606,7 @@ export interface LoginResponse {
 
 export const authApi = {
   // Gateway contract: { email, password, tenantSlug } -> LoginResponse
+  // Refresh token is set as HttpOnly cookie (not in response body).
   login: (payload: { email: string; password: string; tenantSlug: string }) =>
     api.post<LoginResponse>('/api/v1/auth/login', payload),
   register: (payload: {
@@ -563,15 +616,17 @@ export const authApi = {
     password: string;
     name: string;
   }) => api.post<LoginResponse>('/api/v1/auth/register', payload),
-  logout: (refreshToken: string) =>
-    api.post<{ message: string }>('/api/v1/auth/logout', { refreshToken }),
+  // C2 contract: no request body — refresh token is in HttpOnly cookie.
+  // Access token from Authorization header identifies the session.
+  logout: () =>
+    api.post<{ message: string }>('/api/v1/auth/logout', undefined),
 };
 
-// Persist the full login response: tokens + cached user profile, so the UI can
-// render the header/identity without an extra /auth/me round-trip (none exists
-// today). Roles read from here are for display only.
+// Persist the login/migrate response: access token in memory only, user profile
+// cached in localStorage for UI display (NOT for authorization decisions).
 export function persistSession(login: LoginResponse): AuthUser {
-  setTokens(login.accessToken, login.refreshToken);
+  setAccessToken(login.accessToken);
+  // Refresh token is in HttpOnly cookie (set by gateway) — we never see it.
   const user: AuthUser = {
     id: login.user.id,
     email: login.user.email,
@@ -583,11 +638,57 @@ export function persistSession(login: LoginResponse): AuthUser {
   return user;
 }
 
-// Clear all client-side session artifacts. Always called on logout. We do not
-// log token values anywhere.
+// Clear client-side session artifacts. Called ONLY after a successful server
+// logout (2xx). Does NOT clear on 503/network error — the caller must show
+// an error to the user and keep the local session intact.
+// Also cleans up any leftover legacy localStorage token keys.
 export function clearSession(): void {
-  clearTokens();
+  clearAccessToken();
   if (typeof window !== 'undefined') {
     window.localStorage.removeItem('authUser');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy localStorage migration (one-shot, called at app boot)
+// ---------------------------------------------------------------------------
+// Before C3, refresh tokens were stored in localStorage. This function reads
+// any legacy token, sends it to the /migrate-cookie endpoint, and clears
+// localStorage regardless of outcome.
+//
+// Returns true if migration succeeded (cookie issued, accessToken stored).
+// Returns false if there was no legacy token or migration failed.
+// Caller should fall back to cookie refresh, then to login.
+export async function migrateFromLocalStorage(): Promise<boolean> {
+  if (typeof window === 'undefined') return false;
+
+  const legacyRefresh = window.localStorage.getItem('refreshToken');
+  if (!legacyRefresh) return false;
+
+  try {
+    const resp = await fetch(`${BASE_URL}/api/v1/auth/migrate-cookie`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken: legacyRefresh }),
+      credentials: 'include', // accept Set-Cookie from gateway
+    });
+
+    if (!resp.ok) return false;
+
+    const body = await resp.json();
+    if (body?.accessToken) {
+      setAccessToken(body.accessToken);
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    // Always clear legacy localStorage regardless of migration outcome.
+    // This prevents stale tokens from lingering after a failed migration.
+    window.localStorage.removeItem('refreshToken');
+    window.localStorage.removeItem('accessToken');
+    // NOTE: authUser cache is NOT cleared here — it may be needed to restore
+    // the user profile after a successful migration.
   }
 }
