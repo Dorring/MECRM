@@ -1,7 +1,7 @@
 # ADR-004 Implementation Plan: Group C
 
-**Status:** Partially Implemented — C1/C2/C3 complete; C4/C5 pending  
-**Target branch:** `hardening/http-cookie-csrf-runtime`  
+**Status:** Partially Implemented — C1/C2/C3 complete (merged to main@6b0cf3c); C4/C5 pending  
+**Target branch:** `hardening/http-cookie-csrf-runtime` (merged)  
 **Baseline:** `main@9e44a64` (hardening-group-b-stabilized.1)  
 **ADR:** `docs/adr/004-httponly-cookie-csrf-runtime.md`
 
@@ -643,7 +643,7 @@ is modified.
 | C2: endpoint-level auth cookie tests (HTTP contract) | ✅ 23 passed (`auth_cookie_endpoint.test.ts`) |
 | C2: no-Redis integration + Redis gated tests | ✅ 11 passed + 10 skipped (`auth_cookie_integration.test.ts`) |
 | C2: lint, TypeScript build, all C1+C2 tests pass | ✅ |
-| C3/C4/C5 | C3 ✅ complete (incl. code-review fixes) | C4 (WS proxy validation), C5 (runtime + cleanup) pending |
+| C3/C4/C5 | C3 ✅ complete (merged to main@6b0cf3c) | C4 (WS proxy validation), C5 (runtime + cleanup) pending |
 | Group B `consumeRefresh` Lua unchanged | ✅ All Group B tests still pass |
 
 ---

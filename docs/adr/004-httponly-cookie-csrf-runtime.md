@@ -1,7 +1,7 @@
 # ADR-004: HttpOnly Refresh Cookie, CSRF, WS Ticket and Runtime URL
 
-**Status:** Partially Implemented — C1/C2/C3 complete (C3 on hardening/http-cookie-csrf-runtime)  
-**Date:** 2026-07-05 (approved), 2026-07-07 (C1/C2 implemented), 2026-07-08 (C3 implemented)  
+**Status:** Partially Implemented — C1/C2/C3 complete (merged to main@6b0cf3c)  
+**Date:** 2026-07-05 (approved), 2026-07-07 (C1/C2 implemented), 2026-07-08 (C3 implemented), 2026-07-09 (C3 merged)  
 **Scope:** Hardening 1.1 Group C  
 **Supersedes:** localStorage-based refresh token storage, JWT-in-URL WebSocket authentication, build-time `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_WS_URL`  
 **Depends on:** ADR-002 (session revocation, Group B — unmodified)
