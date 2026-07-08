@@ -111,6 +111,11 @@ export function useWebSocket({ enabled }: { enabled: boolean } = { enabled: true
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const stoppedRef = useRef(false);
+  // Tracks whether the ONE 4401 auth retry has already been used for this
+  // connection cycle. Reset only on explicit reconnect (login, enable).
+  // NEVER reset in onopen — that would create an infinite open→close(4401)
+  // → retry → open → close(4401) loop.
+  const wsAuthRetryUsedRef = useRef(false);
 
   // Resolve wsUrl from runtime-config, falling back to deriveWsUrl().
   // Updated asynchronously — same-origin default is always correct for prod.
@@ -135,11 +140,14 @@ export function useWebSocket({ enabled }: { enabled: boolean } = { enabled: true
       // Check expiry before using — don't just check presence.
       const claims = decodeToken(token);
       if (claims && typeof claims.exp === 'number') {
-        if (claims.exp * 1000 > Date.now() - 5000) {
-          return token; // valid and not expired
+        // Token must have at least 5s of remaining validity.
+        // Using Date.now() + 5000 (not -5000) ensures we don't
+        // accept tokens that expire within the next 5 seconds.
+        if (claims.exp * 1000 > Date.now() + 5000) {
+          return token;
         }
+        // Token exists but is expired or malformed — try refresh
       }
-      // Token exists but is expired or malformed — try refresh
     }
     // No valid token — try cookie-based refresh
     return await tryCookieRefresh();
@@ -231,15 +239,17 @@ export function useWebSocket({ enabled }: { enabled: boolean } = { enabled: true
 
       if (event.code === 4401) {
         // 4401 Unauthorized — ticket expired/revoked/session invalid.
-        // Allow at most ONE bounded retry for a ticket race (old ticket
-        // consumed between /ws-ticket call and WebSocket upgrade).
-        // Do NOT reset the attempt counter — if the retry also fails,
-        // stop permanently (auth failure requires re-login).
-        if (reconnectAttemptsRef.current >= 1) {
-          console.error('WebSocket: 4401 after retry — auth failure, stopping');
+        // Allow at most ONE retry (ticket race: old ticket consumed
+        // between /ws-ticket call and WebSocket upgrade).
+        // Uses a dedicated ref — NOT reconnectAttemptsRef — because onopen
+        // resets reconnectAttemptsRef to 0, which would create an infinite
+        // open→close(4401)→retry→open→close(4401) loop.
+        if (wsAuthRetryUsedRef.current) {
+          console.error('WebSocket: second 4401 — auth failure, stopping');
           stoppedRef.current = true;
           return;
         }
+        wsAuthRetryUsedRef.current = true;
         scheduleReconnect();
         return;
       }
@@ -285,6 +295,7 @@ export function useWebSocket({ enabled }: { enabled: boolean } = { enabled: true
   const reconnect = useCallback(() => {
     stoppedRef.current = false;
     reconnectAttemptsRef.current = 0;
+    wsAuthRetryUsedRef.current = false;
     connectRef.current();
   }, []);
 
@@ -314,6 +325,7 @@ export function useWebSocket({ enabled }: { enabled: boolean } = { enabled: true
     }
     stoppedRef.current = false;
     reconnectAttemptsRef.current = 0;
+    wsAuthRetryUsedRef.current = false;
     connect();
     return () => disconnect();
   }, [enabled, connect, disconnect]);

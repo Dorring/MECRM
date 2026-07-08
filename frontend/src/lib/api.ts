@@ -95,17 +95,17 @@ export function decodeToken(token: string): DecodedTokenClaims | null {
   }
 }
 
-// Returns true if a token is present in memory and not past its `exp`. Used
-// only to decide whether to show the login page / attempt a request; the
-// server still rejects expired/revoked tokens.
+// Returns true if a token is present in memory and has at least 5 seconds of
+// remaining validity. We require a 5s buffer to avoid using a token that will
+// expire mid-request. The server still rejects expired/revoked tokens.
 export function hasValidAccessToken(): boolean {
   const token = accessToken;
   if (!token) return false;
   const claims = decodeToken(token);
   if (!claims) return false;
   if (typeof claims.exp === 'number') {
-    // 5s skew window
-    return claims.exp * 1000 > Date.now() - 5000;
+    // Require at least 5s remaining — don't accept nearly-expired tokens
+    return claims.exp * 1000 > Date.now() + 5000;
   }
   return true;
 }
