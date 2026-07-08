@@ -3,7 +3,7 @@ import { IncomingMessage } from 'http';
 import jwt, { VerifyOptions } from 'jsonwebtoken';
 import { logger } from '../utils/logger';
 import { JWT_SECRET } from '../config/jwt';
-import type { TokenRevocationService, DecodedToken } from './authSession';
+import type { TokenRevocationService, DecodedToken, WsTicketPayload } from './authSession';
 import { validateDecodedToken } from './authSession';
 import {
   websocketAuthHeartbeatDuration,
@@ -51,7 +51,7 @@ interface WebSocketMessage {
 // ---------------------------------------------------------------------------
 
 const connections = new Map<string, Map<string, Set<AuthenticatedWebSocket>>>();
-const jtiIndex = new Map<string, AuthenticatedWebSocket>();
+const jtiIndex = new Map<string, Set<AuthenticatedWebSocket>>();
 const sidIndex = new Map<string, Set<AuthenticatedWebSocket>>();
 const subscriptions = new WeakMap<AuthenticatedWebSocket, Set<string>>();
 const HEARTBEAT_CONCURRENCY = 25;
@@ -150,14 +150,18 @@ export function setupWebSocket(
   });
 
   wss.on('connection', (rawWs: WebSocket, request: IncomingMessage) => {
-    const token = extractToken(request);
-    if (!token) {
-      rawWs.close(4001, 'Authentication required');
+    const credential = extractWebSocketCredential(request);
+    if (!credential) {
+      rawWs.close(4401, 'Authentication required');
       return;
     }
 
-    // Verify JWT and check revocation synchronously in the handler
-    authenticateAndRegister(rawWs, token, revocationService);
+    if (credential.kind === 'ticket') {
+      authenticateTicketAndRegister(rawWs, credential.value, revocationService);
+    } else {
+      // Legacy token path retained for internal tests/backward compatibility.
+      authenticateTokenAndRegister(rawWs, credential.value, revocationService);
+    }
   });
 }
 
@@ -165,7 +169,7 @@ export function setupWebSocket(
 // Authentication and registration
 // ---------------------------------------------------------------------------
 
-function authenticateAndRegister(
+function authenticateTokenAndRegister(
   rawWs: WebSocket,
   token: string,
   revocationService: TokenRevocationService,
@@ -191,26 +195,70 @@ function authenticateAndRegister(
     return;
   }
 
-  const tenantId = decoded.tenantId as string;
-  const sub = decoded.sub as string;
-  const jti = decoded.jti as string;
-  const sid = decoded.sid as string;
-  const uv = decoded.uv as number;
-  const sexp = decoded.sexp as number;
-  const exp = decoded.exp as number;
+  const tokenInfo: DecodedToken = {
+    jti: decoded.jti as string,
+    sid: decoded.sid as string,
+    sub: decoded.sub as string,
+    tenantId: decoded.tenantId as string,
+    type: 'access',
+    uv: decoded.uv as number,
+    sexp: decoded.sexp as number,
+    iat: decoded.iat as number,
+    exp: decoded.exp as number,
+  };
 
-  // Check session has not already expired
+  authenticateDecodedAndRegister(rawWs, tokenInfo, revocationService);
+}
+
+function authenticateTicketAndRegister(
+  rawWs: WebSocket,
+  ticket: string,
+  revocationService: TokenRevocationService,
+): void {
+  revocationService
+    .consumeWsTicket(ticket)
+    .then((payload) => {
+      if (!payload) {
+        rawWs.close(4401, 'Invalid or expired ticket');
+        return;
+      }
+      authenticateDecodedAndRegister(rawWs, tokenInfoFromTicket(payload), revocationService);
+    })
+    .catch((err) => {
+      logger.error('WebSocket ticket consumption failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      rawWs.close(1013, 'Service unavailable');
+    });
+}
+
+function tokenInfoFromTicket(payload: WsTicketPayload): DecodedToken {
+  return {
+    jti: payload.jti,
+    sid: payload.sid,
+    sub: payload.userId,
+    tenantId: payload.tenantId,
+    type: 'access',
+    uv: payload.uv,
+    sexp: payload.sexp,
+    iat: 0,
+    exp: payload.exp,
+  };
+}
+
+function authenticateDecodedAndRegister(
+  rawWs: WebSocket,
+  tokenInfo: DecodedToken,
+  revocationService: TokenRevocationService,
+): void {
+  // Check token/session has not already expired.
   const nowSec = Math.floor(Date.now() / 1000);
-  if (sexp <= nowSec) {
+  if (tokenInfo.exp <= nowSec || tokenInfo.sexp <= nowSec) {
     rawWs.close(4401, 'Session expired');
     return;
   }
 
-  // Check revocation — if Redis is down, fail closed
-  const tokenInfo: DecodedToken = {
-    jti, sid, sub, tenantId, type: 'access' as const, uv, sexp, iat: decoded.iat as number, exp,
-  };
-
+  // Check revocation — if Redis is down, fail closed.
   revocationService
     .checkRevoked(tokenInfo)
     .then((result) => {
@@ -222,20 +270,23 @@ function authenticateAndRegister(
 
       // Auth succeeded — cast to AuthenticatedWebSocket and store metadata
       const ws = rawWs as unknown as AuthenticatedWebSocket;
-      ws.userId = sub;
-      ws.tenantId = tenantId;
-      ws.jti = jti;
-      ws.sid = sid;
-      ws.uv = uv;
-      ws.sexp = sexp;
-      ws.exp = exp;
+      ws.userId = tokenInfo.sub;
+      ws.tenantId = tokenInfo.tenantId;
+      ws.jti = tokenInfo.jti;
+      ws.sid = tokenInfo.sid;
+      ws.uv = tokenInfo.uv;
+      ws.sexp = tokenInfo.sexp;
+      ws.exp = tokenInfo.exp;
       ws.isAlive = true;
 
-      addConnection(tenantId, sub, ws);
-      jtiIndex.set(scopedIndexKey(tenantId, jti), ws);
-      addToSidIndex(tenantId, sid, ws);
+      addConnection(tokenInfo.tenantId, tokenInfo.sub, ws);
+      addToJtiIndex(tokenInfo.tenantId, tokenInfo.jti, ws);
+      addToSidIndex(tokenInfo.tenantId, tokenInfo.sid, ws);
 
-      logger.info('WebSocket connected', { userId: sub, tenantId });
+      logger.info('WebSocket connected', {
+        userId: tokenInfo.sub,
+        tenantId: tokenInfo.tenantId,
+      });
 
       ws.send(
         JSON.stringify({ type: 'connected', payload: { message: 'Connected to CRM WebSocket' } }),
@@ -286,13 +337,39 @@ function setupEventHandlers(
 
 function cleanupSocket(ws: AuthenticatedWebSocket): void {
   removeConnection(ws.tenantId, ws.userId, ws);
-  jtiIndex.delete(scopedIndexKey(ws.tenantId, ws.jti));
+  removeFromJtiIndex(ws.tenantId, ws.jti, ws);
   removeFromSidIndex(ws.tenantId, ws.sid, ws);
 }
 
 // ---------------------------------------------------------------------------
 // Index helpers
 // ---------------------------------------------------------------------------
+
+function addToJtiIndex(
+  tenantId: string,
+  jti: string,
+  ws: AuthenticatedWebSocket,
+): void {
+  const key = scopedIndexKey(tenantId, jti);
+  let set = jtiIndex.get(key);
+  if (!set) {
+    set = new Set<AuthenticatedWebSocket>();
+    jtiIndex.set(key, set);
+  }
+  set.add(ws);
+}
+
+function removeFromJtiIndex(
+  tenantId: string,
+  jti: string,
+  ws: AuthenticatedWebSocket,
+): void {
+  const key = scopedIndexKey(tenantId, jti);
+  const set = jtiIndex.get(key);
+  if (!set) return;
+  set.delete(ws);
+  if (set.size === 0) jtiIndex.delete(key);
+}
 
 function addToSidIndex(
   tenantId: string,
@@ -320,9 +397,15 @@ function removeFromSidIndex(
   if (set.size === 0) sidIndex.delete(key);
 }
 
-function extractToken(request: IncomingMessage): string | null {
+function extractWebSocketCredential(
+  request: IncomingMessage,
+): { kind: 'ticket' | 'token'; value: string } | null {
   const url = new URL(request.url || '', `http://${request.headers.host}`);
-  return url.searchParams.get('token');
+  const ticket = url.searchParams.get('ticket');
+  if (ticket) return { kind: 'ticket', value: ticket };
+  const token = url.searchParams.get('token');
+  if (token) return { kind: 'token', value: token };
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -441,11 +524,16 @@ export function closeConnectionsByEvent(event: {
 }): void {
   switch (event.type) {
     case 'jti': {
-      const ws = jtiIndex.get(scopedIndexKey(event.tenantId, event.id));
-      if (ws && ws.tenantId === event.tenantId) {
-        websocketRevocationClosesTotal.inc({ scope: 'jti' });
-        ws.close(4401, 'Session terminated');
-        cleanupSocket(ws);
+      const key = scopedIndexKey(event.tenantId, event.id);
+      const set = jtiIndex.get(key);
+      if (set) {
+        for (const ws of Array.from(set)) {
+          if (ws.tenantId === event.tenantId) {
+            websocketRevocationClosesTotal.inc({ scope: 'jti' });
+            ws.close(4401, 'Session terminated');
+            cleanupSocket(ws);
+          }
+        }
       }
       break;
     }

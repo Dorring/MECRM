@@ -26,7 +26,12 @@ import {
   closeConnectionsByEvent,
   HEARTBEAT_CONCURRENCY,
 } from '../services/websocket';
-import type { TokenRevocationService, DecodedToken, RevocationResult } from '../services/authSession';
+import type {
+  TokenRevocationService,
+  DecodedToken,
+  RevocationResult,
+  WsTicketPayload,
+} from '../services/authSession';
 import { register } from '../services/metrics';
 import { JWT_SECRET } from '../config/jwt';
 
@@ -52,6 +57,21 @@ function makeToken(overrides: Partial<DecodedToken> = {}): string {
     JWT_SECRET,
     { algorithm: 'HS256' },
   );
+}
+
+function makeTicketPayload(overrides: Partial<WsTicketPayload> = {}): WsTicketPayload {
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    tenantId: randomUUID(),
+    userId: randomUUID(),
+    jti: randomUUID(),
+    sid: randomUUID(),
+    exp: now + 3600,
+    sexp: now + 3600,
+    uv: 0,
+    roles: ['user'],
+    ...overrides,
+  };
 }
 
 function onClose(ws: WebSocket): Promise<{ code: number; reason: string }> {
@@ -135,6 +155,45 @@ describe('B4 WebSocket revocation', () => {
 
       const closed = await closePromise;
       expect(closed.code).toBe(4401);
+    } finally {
+      await close();
+    }
+  }, 15000);
+
+  it('closeConnectionsByEvent closes all sockets sharing the same jti', async () => {
+    const { wss, port, close } = await createWss();
+    try {
+      const mockService = {
+        checkRevoked: jest.fn(async (): Promise<RevocationResult> => ({ revoked: false })),
+        isSubscriberReady: jest.fn(() => true),
+        shutdown: jest.fn(),
+      } as unknown as TokenRevocationService;
+
+      setupWebSocket(wss, mockService);
+
+      const token = makeToken();
+      const decoded = jwt.decode(token) as Record<string, unknown>;
+      const wsA = new WebSocket(`ws://localhost:${port}/?token=${token}`);
+      const wsB = new WebSocket(`ws://localhost:${port}/?token=${token}`);
+
+      await Promise.all([wsA, wsB].map((ws) => new Promise<void>((resolve, reject) => {
+        ws.once('open', () => resolve());
+        ws.once('error', reject);
+      })));
+      sockets.push(wsA, wsB);
+
+      await new Promise((r) => setTimeout(r, 300));
+      const closeA = onClose(wsA);
+      const closeB = onClose(wsB);
+
+      closeConnectionsByEvent({
+        type: 'jti',
+        tenantId: decoded.tenantId as string,
+        id: decoded.jti as string,
+      });
+
+      const closed = await Promise.all([closeA, closeB]);
+      expect(closed.map((event) => event.code)).toEqual([4401, 4401]);
     } finally {
       await close();
     }
@@ -303,6 +362,95 @@ describe('B4 WebSocket revocation', () => {
       await new Promise((r) => setTimeout(r, 300));
 
       const closed = await closePromise;
+      expect(closed.code).toBe(1013);
+    } finally {
+      await close();
+    }
+  }, 10000);
+});
+
+// ---------------------------------------------------------------------------
+// C4: WebSocket ticket authentication
+// ---------------------------------------------------------------------------
+
+describe('C4 WebSocket ticket authentication', () => {
+  const sockets: WebSocket[] = [];
+
+  afterEach(() => {
+    sockets.forEach((s) => { try { s.terminate(); } catch { /* */ } });
+    sockets.length = 0;
+  });
+
+  it('valid ticket connects and indexes jti for revocation close', async () => {
+    const { wss, port, close } = await createWss();
+    try {
+      const payload = makeTicketPayload();
+      const mockService = {
+        consumeWsTicket: jest.fn(async (ticket: string) => (ticket === 'ticket-1' ? payload : null)),
+        checkRevoked: jest.fn(async (): Promise<RevocationResult> => ({ revoked: false })),
+        isSubscriberReady: jest.fn(() => true),
+        shutdown: jest.fn(),
+      } as unknown as TokenRevocationService;
+
+      setupWebSocket(wss, mockService);
+
+      const ws = new WebSocket(`ws://localhost:${port}/?ticket=ticket-1`);
+      await new Promise<void>((resolve, reject) => {
+        ws.once('open', () => resolve());
+        ws.once('error', reject);
+      });
+      sockets.push(ws);
+
+      expect((mockService.consumeWsTicket as jest.Mock).mock.calls[0][0]).toBe('ticket-1');
+
+      const closePromise = onClose(ws);
+      closeConnectionsByEvent({
+        type: 'jti',
+        tenantId: payload.tenantId,
+        id: payload.jti,
+      });
+
+      const closed = await closePromise;
+      expect(closed.code).toBe(4401);
+    } finally {
+      await close();
+    }
+  }, 10000);
+
+  it('expired or already consumed ticket closes with 4401', async () => {
+    const { wss, port, close } = await createWss();
+    try {
+      const mockService = {
+        consumeWsTicket: jest.fn(async () => null),
+        checkRevoked: jest.fn(async (): Promise<RevocationResult> => ({ revoked: false })),
+        isSubscriberReady: jest.fn(() => true),
+        shutdown: jest.fn(),
+      } as unknown as TokenRevocationService;
+
+      setupWebSocket(wss, mockService);
+
+      const ws = new WebSocket(`ws://localhost:${port}/?ticket=missing`);
+      const closed = await onClose(ws);
+      expect(closed.code).toBe(4401);
+    } finally {
+      await close();
+    }
+  }, 10000);
+
+  it('Redis failure while consuming ticket closes with 1013', async () => {
+    const { wss, port, close } = await createWss();
+    try {
+      const mockService = {
+        consumeWsTicket: jest.fn(async () => { throw new Error('Redis unavailable'); }),
+        checkRevoked: jest.fn(async (): Promise<RevocationResult> => ({ revoked: false })),
+        isSubscriberReady: jest.fn(() => true),
+        shutdown: jest.fn(),
+      } as unknown as TokenRevocationService;
+
+      setupWebSocket(wss, mockService);
+
+      const ws = new WebSocket(`ws://localhost:${port}/?ticket=ticket-1`);
+      const closed = await onClose(ws);
       expect(closed.code).toBe(1013);
     } finally {
       await close();

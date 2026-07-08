@@ -802,7 +802,9 @@ export function createAuthRoutes(
           const ticket = await revocationService.issueWsTicket({
             tenantId: accessDecoded.tenantId,
             userId: accessDecoded.sub,
+            jti: accessDecoded.jti,
             sid: accessDecoded.sid,
+            exp: accessDecoded.exp,
             sexp: accessDecoded.sexp,
             uv: accessDecoded.uv,
             roles,

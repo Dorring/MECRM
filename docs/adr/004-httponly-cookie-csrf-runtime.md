@@ -1,6 +1,6 @@
 # ADR-004: HttpOnly Refresh Cookie, CSRF, WS Ticket and Runtime URL
 
-**Status:** Partially Implemented — C1/C2/C3 complete (merged to main@6b0cf3c)  
+**Status:** Partially Implemented — C1/C2/C3 complete; C4 gateway ticket handler implemented; `/ws` proxy validation and C5 pending
 **Date:** 2026-07-05 (approved), 2026-07-07 (C1/C2 implemented), 2026-07-08 (C3 implemented), 2026-07-09 (C3 merged)  
 **Scope:** Hardening 1.1 Group C  
 **Supersedes:** localStorage-based refresh token storage, JWT-in-URL WebSocket authentication, build-time `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_WS_URL`  
@@ -894,10 +894,10 @@ Implementation may begin only after reviewers accept:
 **CI evidence (local, per main merge):**
 - Gateway lint: 0 errors, 0 warnings
 - Gateway TypeScript: clean
-- Gateway full test suite: 135 passed, 61 skipped, 0 failed (196 total)
+- Gateway full test suite: 139 passed, 61 skipped, 0 failed (200 total)
 - 7 DB-dependent suites skipped, 10 passed
 
-### 16.3 Remaining — C4, C5
+### 16.3 C3 — Frontend Runtime Auth Migration ✅
 
 **C3 complete** (commits 009be32..e958e02, hardening/http-cookie-csrf-runtime):
 - Frontend memory-only accessToken (never in localStorage)
@@ -912,10 +912,34 @@ Implementation may begin only after reviewers accept:
 - `GATEWAY_INTERNAL_URL` for Next.js rewrites (server-side build-time var)
 - Build verified: 0 `NEXT_PUBLIC_*` in client bundle
 
+### 16.4 C4 — Gateway WebSocket Ticket Handler Partial ✅/⏳
+
+**Implemented in Gateway:**
+- WebSocket upgrade accepts `?ticket=<uuid>` and consumes `ws:ticket:{uuid}` via `GETDEL`.
+- Ticket payload now carries `jti` and `exp` in addition to tenant, user, session, user-version and roles.
+- Ticket payload is schema-validated before use; malformed payloads are rejected as invalid tickets.
+- Consumed/expired/missing tickets close the socket with `4401`.
+- Redis/ticket-store failure during upgrade closes the socket with `1013` (fail-closed dependency unavailable).
+- Accepted tickets are converted into the same `DecodedToken` metadata used by Group B revocation checks.
+- JTI/SID indexes are populated from ticket metadata, so revocation events still close matching sockets.
+- Legacy `?token=<jwt>` upgrade is retained only for internal tests/backward compatibility during migration.
+
+**Test evidence:**
+
+| Test file | Passed | Scope |
+|---|---:|---|
+| `ws_revocation_integration.test.ts` | 10 + 3 skipped | Ticket upgrade, multi-socket JTI close, 4401 invalid ticket, 1013 Redis failure, Group B heartbeat revocation |
+| `auth_cookie_endpoint.test.ts` | 23 | `/ws-ticket` endpoint contract, origin, revocation and rate-limit behavior |
+| `auth_cookie_integration.test.ts` | 11 + 10 skipped | Ticket issue/consume contract; Redis-dependent tests gated behind `CRM_REDIS_AVAILABLE=1` |
+
+**Still pending for full C4 exit:**
+- Same-origin browser `/ws` upgrade proxy validation (`next build && next start` or Compose browser path).
+- If Next.js cannot reliably proxy WebSocket upgrades, add an nginx/Traefik sidecar or ingress-level `/ws` route and verify `GET /ws?ticket=<valid>` returns `101 Switching Protocols`.
+
 **Tech debt:**
 - TD-C3-1: `/refresh` returns no user profile — need `GET /api/v1/auth/me`
 - TD-C3-2: Runtime Gateway switching needs custom Next.js server proxy
-- TD-C3-3: Same-origin `/ws` upgrade proxy validation (C4 or infra PR)
+- TD-C3-3: Same-origin `/ws` upgrade proxy validation (remaining C4 infra PR)
 - TD-C3-4: Frontend test framework gap (no jest/vitest config)
 
-C4 (WS ticket upgrade handler integration) and C5 (runtime config + self-review) are pending.
+C5 (runtime config finalization + self-review) is pending.
