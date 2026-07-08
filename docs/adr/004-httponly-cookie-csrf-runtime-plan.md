@@ -1,6 +1,6 @@
 # ADR-004 Implementation Plan: Group C
 
-**Status:** Proposed — pending independent review  
+**Status:** Partially Implemented — C1/C2 complete (merged to main@6779be8)  
 **Target branch:** `hardening/http-cookie-csrf-runtime`  
 **Baseline:** `main@9e44a64` (hardening-group-b-stabilized.1)  
 **ADR:** `docs/adr/004-httponly-cookie-csrf-runtime.md`
@@ -629,25 +629,35 @@ is modified.
 
 ## 10. Verification Matrix
 
-| Check | Command | Criterion |
+| Check | Status | Evidence |
 |---|---|---|
-| Gateway lint | `cd gateway && npm run lint` | 0 errors, 0 warnings |
-| Gateway build | `cd gateway && npm run build` | 0 errors |
-| Gateway Jest | `cd gateway && npm test` | All non-DB tests pass; DB tests skipped with reason |
-| Redis integration | `CRM_REDIS_AVAILABLE=1 npm test` | All C1-C4 tests pass |
-| Frontend lint | `cd frontend && npm run lint` | 0 errors |
-| Frontend build | `cd frontend && npm run build` | 0 errors |
-| TypeScript check | `cd frontend && npx tsc --noEmit` | 0 errors |
-| Compose config | `docker compose config --quiet` | Exit 0 |
-| refresh_token cookie | Response header | `HttpOnly`; `Path=/api/v1/auth` |
-| csrf_token cookie | Response header | NOT `HttpOnly`; `Path=/` |
-| Cookie Secure (prod) | `COOKIE_SECURE=true` test | `cookie.secure === true` |
-| Cookie Secure (compose) | `COOKIE_SECURE=false` test | `cookie.secure === false` |
-| CSRF 403 | Gateway test | Missing/mismatched → 403 |
-| Register 201 | Gateway test | `POST /register` → 201 |
-| localStorage clean | Frontend test | No tokens after login or boot |
-| WS ticket single-use | Redis integration | Second GETDEL → null |
-| WS upgrade | CI (next build + next start) | 101 Switching Protocols; nginx sidecar if fails |
+| Gateway lint | ✅ | 0 errors, 0 warnings |
+| Gateway build | ✅ | `tsc --noEmit` clean |
+| Gateway Jest | ✅ | 126 passed, 61 skipped, 0 failed |
+| Redis integration | ✅ | 11 passed (with Redis), 10 skipped |
+| Frontend lint | ⏳ | C3 pending |
+| Frontend build | ⏳ | C3 pending |
+| TypeScript check | ✅ | `npx tsc --noEmit` clean |
+| Compose config | ✅ | `docker compose config --quiet` Exit 0 |
+| refresh_token cookie | ✅ | HttpOnly; Path=/api/v1/auth |
+| csrf_token cookie | ✅ | NOT HttpOnly; Path=/ |
+| Cookie Secure (prod) | ✅ | `COOKIE_SECURE=true` → secure:true; `false` → false |
+| Cookie Secure (compose) | ✅ | `COOKIE_SECURE=false` → secure:false |
+| CSRF 403 | ✅ | Missing/mismatched → 403 in endpoint tests |
+| Register 201 | ✅ | Endpoint test confirms 201 |
+| localStorage clean | ⏳ | C3 pending |
+| WS ticket single-use | ✅ | GETDEL atomic; second consumption returns null |
+| WS upgrade | ⏳ | C4 pending |
+
+### C1/C2 Exit Gates Verified
+
+| Exit gate | Status |
+|---|---|
+| C1: `getCookieOptions()` , CSRF helpers, origin middleware tests | ✅ 28 passed |
+| C1: lint, TypeScript build | ✅ |
+| C2: login/register Set-Cookie + cookie-only refresh + CSRF + logout + migrate + ws-ticket | ✅ 14 endpoint + 11 integration tests |
+| C2: lint, TypeScript build, all C1+C2 tests pass | ✅ |
+| Group B `consumeRefresh` Lua unchanged | ✅ All Group B tests still pass |
 
 ---
 

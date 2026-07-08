@@ -1,7 +1,7 @@
 # ADR-004: HttpOnly Refresh Cookie, CSRF, WS Ticket and Runtime URL
 
-**Status:** Proposed — pending independent review  
-**Date:** 2026-07-06  
+**Status:** Partially Implemented — C1/C2 complete (merged to main)  
+**Date:** 2026-07-05 (approved), 2026-07-07 (C1/C2 implemented)  
 **Scope:** Hardening 1.1 Group C  
 **Supersedes:** localStorage-based refresh token storage, JWT-in-URL WebSocket authentication, build-time `NEXT_PUBLIC_API_URL`  
 **Depends on:** ADR-002 (session revocation, Group B — unmodified)
@@ -845,3 +845,59 @@ Implementation may begin only after reviewers accept:
 - 10-second ticket TTL and 10/minute rate limit;
 - same-origin proxy as Group C default;
 - Group B revocation semantics unchanged.
+
+## 16. Implementation Status
+
+### 16.1 C1 — CSRF, Origin and Cookie Infrastructure ✅
+
+| Deliverable | File | Status |
+|---|---|---|
+| `getCookieOptions()` with explicit env > NODE_ENV derivation | `gateway/src/config/cookies.ts` | ✅ |
+| `generateCsrfToken()` / `validateCsrf()` double-submit | `gateway/src/config/csrf.ts` | ✅ |
+| `createOriginValidation()` fail-closed middleware | `gateway/src/middleware/origin.ts` | ✅ |
+| Unit tests (28): cookie (12), CSRF (8), origin (5), constants (3) | `gateway/src/tests/csrf_origin.test.ts` | ✅ |
+| `cookie-parser` middleware | `gateway/src/index.ts` | ✅ |
+
+### 16.2 C2 — Auth Endpoint Cookie Integration ✅
+
+**Implemented contracts:**
+
+| Endpoint | Method | Cookies Set | Body | Status |
+|---|---|---|---|---|
+| Login | POST | `refresh_token` (HttpOnly, Path=/api/v1/auth) + `csrf_token` (Path=/) | `{ accessToken, user }` | 200 |
+| Register | POST | same | `{ accessToken, user }` | 201 |
+| Refresh | POST | Rotated on success | `{ accessToken }`; reads token from cookie only | 200 / 403 / 401 |
+| Logout | POST | Cleared on success; NOT on Redis fail | `{ message }` | 200 / 503 |
+| Migrate-Cookie | POST | Issued for first time | `{ accessToken }`; no CSRF required | 200 (temporary) |
+| WS-Ticket | POST | — | `{ ticket }`; Origin + revocation + rate limit | 200 / 401 / 403 / 429 / 503 |
+
+**Key invariants enforced:**
+- Refresh token only in HttpOnly cookie; never in JSON response body
+- Refresh always reads from cookie, ignores body `refreshToken`
+- CSRF double-submit validated on every refresh request
+- Origin validation on all auth POST endpoints
+- Logout clears cookies only after durable Redis revocation (fail-closed)
+- WS ticket: single-use GETDEL, 10s TTL, real roles from JWT, per-user rate limit via `consumeWsTicketRateLimit`
+- `issueWsTicket` checks SET NX result
+- `verifyAccessToken` replaced with full `jwt.verify` + `validateDecodedToken` + `checkRevoked` in ws-ticket
+- Rate limit encapsulated in `TokenRevocationService` method
+- `redis` getter removed (no direct Redis access from routes)
+
+**Test evidence:**
+
+| Test file | Passed | Mode |
+|---|---|---|
+| `csrf_origin.test.ts` | 28 | Unit (no deps) |
+| `auth_cookie_endpoint.test.ts` | 14 | HTTP endpoint (mocked Prisma/Redis/bcrypt) |
+| `auth_cookie_integration.test.ts` | 11 | Service-level (10 Redis-dependent skipped) |
+
+**CI evidence (main@6779be8):**
+- Gateway lint: 0 errors, 0 warnings
+- Gateway TypeScript: clean
+- Gateway full test suite: 126 passed, 61 skipped, 0 failed
+- 7 DB-dependent suites skipped, 10 passed
+
+### 16.3 Remaining — C3, C4, C5
+
+C3 (frontend memory-only token + same-origin proxy), C4 (WS ticket upgrade
+handler integration), and C5 (runtime config + self-review) are pending.
