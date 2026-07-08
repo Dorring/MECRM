@@ -153,44 +153,44 @@ const normalizeEndpoint = (endpoint: string) => {
   return `${API_PREFIX}${path}`;
 };
 
+// ---------------------------------------------------------------------------
+// Standalone cookie-based refresh (used by boot recovery in providers.tsx)
+// ---------------------------------------------------------------------------
+// Same logic as ApiClient.tryRefresh() but callable outside the class.
+// Returns the new accessToken on success, null on failure.
+export async function tryCookieRefresh(): Promise<string | null> {
+  const csrfToken = getCsrfToken();
+  if (!csrfToken) return null;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const resp = await fetch(`${BASE_URL}/api/v1/auth/refresh`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        [CSRF_HEADER]: csrfToken,
+      },
+      credentials: 'include',
+      signal: controller.signal,
+    });
+    if (!resp.ok) return null;
+    const body = await resp.json();
+    if (!body?.accessToken) return null;
+    setAccessToken(body.accessToken);
+    return body.accessToken;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 class ApiClient {
   private refreshing: Promise<boolean> | null = null;
 
-  // Attempt to refresh the access token using the HttpOnly refresh_token
-  // cookie (set by gateway on login/register/refresh/migrate). No refresh
-  // token is sent in the request body — the cookie is attached automatically
-  // via credentials: 'include'.
-  // CSRF double-submit: reads csrf_token from document.cookie and sends it
-  // as X-CSRF-Token header.
-  // Returns true on success (new accessToken stored in memory).
-  // Returns false if there is no csrf_token cookie, the gateway rejects the
-  // refresh, or the request errors.
+  // Delegates to standalone tryCookieRefresh().
   private async tryRefresh(): Promise<boolean> {
-    const csrfToken = getCsrfToken();
-    if (!csrfToken) return false;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
-    try {
-      const resp = await fetch(`${BASE_URL}/api/v1/auth/refresh`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          [CSRF_HEADER]: csrfToken,
-        },
-        credentials: 'include',
-        signal: controller.signal,
-      });
-      if (!resp.ok) return false;
-      const body = await resp.json();
-      // C2 contract: /refresh returns { accessToken } only — no refreshToken in body
-      if (!body?.accessToken) return false;
-      setAccessToken(body.accessToken);
-      return true;
-    } catch {
-      return false;
-    } finally {
-      clearTimeout(timeout);
-    }
+    return (await tryCookieRefresh()) !== null;
   }
 
   private async request<T>(endpoint: string, options?: RequestInit & { timeoutMs?: number; _retried?: boolean }): Promise<{ data: T }> {
