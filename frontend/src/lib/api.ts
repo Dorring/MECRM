@@ -620,6 +620,11 @@ export const authApi = {
   // Access token from Authorization header identifies the session.
   logout: () =>
     api.post<{ message: string }>('/api/v1/auth/logout', undefined),
+  // C5: GET /me — return authenticated user profile from access token.
+  // Used after cookie refresh or migration to restore AuthUser without
+  // depending on localStorage cache.
+  me: () =>
+    api.get<{ id: string; email: string; name: string; tenantId: string; roles: string[] }>('/api/v1/auth/me'),
 };
 
 // Persist the login/migrate response: access token in memory only, user profile

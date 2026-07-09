@@ -17,6 +17,36 @@ import {
 import { initRuntimeConfig, getRuntimeConfig } from '@/lib/runtime-config';
 
 // ---------------------------------------------------------------------------
+// Helper: resolve user profile via /auth/me, with localStorage cache fallback
+// ---------------------------------------------------------------------------
+// After cookie refresh or legacy migration, the access token is in memory but
+// no user profile is available. Call /me to get the authoritative profile;
+// cache it in localStorage as a display-only fallback for next boot.
+async function resolveUserProfile(): Promise<AuthUser | null> {
+  try {
+    const resp = await authApi.me();
+    const profile = resp.data;
+    // Map /me response shape to AuthUser
+    const user: AuthUser = {
+      id: profile.id,
+      email: profile.email,
+      name: profile.name || '',
+      roles: profile.roles || [],
+      tenant: { id: profile.tenantId, name: '' },
+    };
+    // Update localStorage cache so getCachedUser() works on next boot
+    // as a fallback if /me is temporarily unavailable.
+    if (typeof window !== 'undefined') {
+      try { window.localStorage.setItem('authUser', JSON.stringify(user)); } catch { /* ignore */ }
+    }
+    return user;
+  } catch {
+    // /me unavailable — fall back to legacy cached user
+    return getCachedUser();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Auth context (defined here to keep the change within scope; exported for
 // Header / login / settings consumption).
 //
@@ -89,12 +119,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (!mountedRef.current) return;
 
         if (newToken) {
-          // /refresh only returns { accessToken } — no user profile.
-          // Restore user from the cached authUser (display-only cache).
-          // If cache is missing, user stays null (TD-C3-1: /auth/me gap).
-          const cachedUser = getCachedUser();
+          // C5: call /auth/me to get the authoritative user profile.
+          // Falls back to localStorage cache if /me is unavailable.
+          const user = await resolveUserProfile();
           if (mountedRef.current) {
-            if (cachedUser) setUser(cachedUser);
+            if (user) setUser(user);
             setIsLoading(false);
           }
           return;
@@ -105,9 +134,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (!mountedRef.current) return;
 
         if (migrated) {
-          const cachedUser = getCachedUser();
+          const user = await resolveUserProfile();
           if (mountedRef.current) {
-            if (cachedUser) setUser(cachedUser);
+            if (user) setUser(user);
             setIsLoading(false);
           }
           return;
