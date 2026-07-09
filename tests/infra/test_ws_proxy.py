@@ -85,15 +85,45 @@ def test_helm_frontend_uses_server_side_runtime_env_only():
     assert "name: WS_URL" in template
 
 
-def test_helm_ingress_ws_routes_to_gateway_and_has_long_timeouts():
-    for values_file in ("values.yaml", "values-production.yaml"):
+def test_helm_ingress_routes_and_timeouts():
+    for values_file in ("values.yaml", "values-staging.yaml", "values-production.yaml"):
         values = _load_yaml(CHART_DIR / values_file)
-        annotations = values["ingress"]["annotations"]
-        assert annotations["nginx.ingress.kubernetes.io/proxy-read-timeout"] == "3600"
-        assert annotations["nginx.ingress.kubernetes.io/proxy-send-timeout"] == "3600"
+
+        # Annotations may be inherited from the default values.yaml in some
+        # override files. Only assert when present at this file level.
+        annotations = values["ingress"].get("annotations", {})
+        if annotations:
+            assert annotations["nginx.ingress.kubernetes.io/proxy-read-timeout"] == "3600", (
+                f"{values_file}: proxy-read-timeout must be 3600"
+            )
+            assert annotations["nginx.ingress.kubernetes.io/proxy-send-timeout"] == "3600", (
+                f"{values_file}: proxy-send-timeout must be 3600"
+            )
 
         paths = values["ingress"]["hosts"][0]["paths"]
-        ws_paths = [path for path in paths if path.get("path") == "/ws"]
+
+        # /api/config must be Exact → frontend (not caught by /api Prefix → gateway)
+        config_paths = [p for p in paths if p.get("path") == "/api/config"]
+        assert config_paths, f"{values_file}: /api/config ingress path missing"
+        assert config_paths[0]["pathType"] == "Exact", (
+            f"{values_file}: /api/config must be Exact (not Prefix) to beat /api"
+        )
+        assert config_paths[0]["service"] == "frontend", (
+            f"{values_file}: /api/config must route to frontend (Next.js route handler)"
+        )
+
+        # / must be Prefix → frontend
+        root_paths = [p for p in paths if p.get("path") == "/"]
+        assert root_paths, f"{values_file}: / ingress path missing"
+        assert root_paths[0]["service"] == "frontend"
+
+        # /api must be Prefix → gateway
+        api_paths = [p for p in paths if p.get("path") == "/api"]
+        assert api_paths, f"{values_file}: /api ingress path missing"
+        assert api_paths[0]["service"] == "gateway"
+
+        # /ws must be Prefix → gateway
+        ws_paths = [p for p in paths if p.get("path") == "/ws"]
         assert ws_paths, f"{values_file}: /ws ingress path missing"
         assert ws_paths[0]["service"] == "gateway"
 

@@ -493,9 +493,13 @@ CSRF double-submit, WS ticket exchange, and same-origin relative API paths.
 
 | Path | Compose | Helm/Ingress |
 |------|---------|-------------|
-| `/` | nginx → frontend:3000 | Ingress → frontend:3000 |
-| `/api/` | nginx → gateway:4000 | Ingress → gateway:4000 |
-| `/ws` | nginx → gateway:4000 (Upgrade) | Ingress → gateway:4000 (Upgrade) |
+| `/` | nginx → frontend:3000 | Ingress Prefix → frontend:3000 |
+| `/api/config` | nginx exact → frontend:3000 | Ingress Exact → frontend:3000 |
+| `/api/` | nginx → gateway:4000 | Ingress Prefix → gateway:4000 |
+| `/ws` | nginx → gateway:4000 (Upgrade) | Ingress Prefix → gateway:4000 (Upgrade) |
+
+Both layers now have an exact match for `/api/config` → frontend so the Next.js
+route handler is served correctly, not caught by the `/api` → gateway route.
 
 ---
 

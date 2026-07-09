@@ -56,7 +56,7 @@
 | Path | Destination | Notes |
 |---|---|---|
 | `/` | `frontend:3000` | Next.js frontend |
-| `/api/config` | `frontend:3000` | Exact route for Next runtime config |
+| `/api/config` | `frontend:3000` | Exact nginx route → frontend (Next.js route handler) |
 | `/api/` | `gateway:4000` | Direct Gateway API path |
 | `/ws` | `gateway:4000` | WebSocket Upgrade, no Next.js rewrite dependency |
 
@@ -64,9 +64,10 @@
 
 | Path | Destination | Notes |
 |---|---|---|
-| `/` | frontend service | Next.js frontend |
-| `/api` | gateway service | Prefix match |
-| `/ws` | gateway service | Prefix match; nginx-ingress handles Upgrade |
+| `/` | frontend service | Prefix — Next.js frontend |
+| `/api/config` | frontend service | Exact — Next.js route handler; must beat `/api` Prefix |
+| `/api` | gateway service | Prefix — REST API |
+| `/ws` | gateway service | Prefix — nginx-ingress handles Upgrade |
 
 ---
 
@@ -165,6 +166,15 @@ docker compose --profile ws-proxy-test run --rm ws-proxy-test
 **Verification:**
 - `test_api_config_route_uses_strict_undefined_check` — asserts `!== undefined` and absence of `||` pattern.
 - WS proxy smoke test Stage 0: asserts `wsUrl=""` (not `localhost:4000`).
+
+### Bug 3: Helm Ingress `/api/config` caught by `/api` Prefix → Gateway
+
+**Root cause:** All three Helm values files (`values.yaml`, `values-staging.yaml`, `values-production.yaml`) had only `/api` Prefix → gateway. K8s Ingress uses longest prefix — `/api/config` matches `/api` prefix and routes to Gateway (same class of bug as Bug #1, but in the K8s layer).
+
+**Fix:** Added `path: /api/config, pathType: Exact, service: frontend` before `/api` Prefix in all three values files. K8s Ingress Exact match takes priority over Prefix.
+
+**Verification:**
+- `test_helm_ingress_routes_and_timeouts` — asserts `/api/config` Exact → frontend, `/api` Prefix → gateway, `/ws` Prefix → gateway across all three values files.
 
 ### Smoke test enhancement
 
