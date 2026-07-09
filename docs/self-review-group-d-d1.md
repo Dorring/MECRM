@@ -17,7 +17,7 @@
 | `ws-proxy-test` | `frontend-proxy` | `service_started` | `service_healthy` | nginx now has a healthcheck (§3). Safe to strengthen. |
 
 **Retained `service_started`:**
-- `frontend-proxy` → `frontend`, `gateway`: bare depends_on (defaults to `service_started`). Acceptable — nginx handles upstream failures at HTTP layer. Strengthening would require adding healthchecks to the Nginx image (no wget) or switching to a heavier image. Deferred.
+- `frontend-proxy` → `frontend`, `gateway`: bare depends_on (defaults to `service_started`). Acceptable — nginx handles upstream failures at HTTP layer. Strengthening frontend-proxy → frontend would require a frontend Compose healthcheck. This is deferred because nginx can tolerate brief upstream unavailability and the browser-facing smoke tests already validate the full path.
 
 ---
 
