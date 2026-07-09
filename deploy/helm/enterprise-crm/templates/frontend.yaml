@@ -41,16 +41,12 @@ spec:
           env:
             - name: NODE_ENV
               value: {{ .Values.environment | quote }}
-            - name: NEXT_PUBLIC_API_URL
-              value: "https://{{ .Values.global.domain }}/api"
-            - name: NEXT_PUBLIC_WS_URL
-              value: "wss://{{ .Values.global.domain }}/ws"
-            - name: NEXT_PUBLIC_KEYCLOAK_URL
-              value: {{ .Values.frontend.keycloakUrl | default (printf "https://%s/auth" .Values.global.domain) | quote }}
-            - name: NEXT_PUBLIC_KEYCLOAK_REALM
-              value: {{ .Values.frontend.keycloakRealm | default "crm" | quote }}
-            - name: NEXT_PUBLIC_KEYCLOAK_CLIENT_ID
-              value: {{ .Values.frontend.keycloakClientId | default "crm-frontend" | quote }}
+            - name: GATEWAY_INTERNAL_URL
+              value: "http://{{ include "enterprise-crm.fullname" . }}-gateway:{{ .Values.services.gateway.port }}"
+            - name: API_URL
+              value: ""
+            - name: WS_URL
+              value: ""
           livenessProbe:
             httpGet:
               path: /api/health
