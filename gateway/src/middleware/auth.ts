@@ -339,3 +339,89 @@ export function verifyAccessToken(token: string): DecodedToken {
     exp: decoded.exp as number,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Shared helper: verify access token + revocation (used by /ws-ticket and /me)
+// ---------------------------------------------------------------------------
+// Centralises JWT verification, claim validation, type-check, and revocation
+// check so that /ws-ticket and /me don't drift. Uses the same verifyAccessToken
+// + checkRevoked chain as authMiddleware — no hand-rolled JWT unpack.
+
+export interface VerifyAccessTokenOk {
+  ok: true;
+  decoded: DecodedToken;
+  roles: string[];
+  email: string;
+}
+
+export interface VerifyAccessTokenErr {
+  ok: false;
+  status: 401 | 503;
+  code: string;
+  message: string;
+}
+
+export type VerifyAccessTokenResult = VerifyAccessTokenOk | VerifyAccessTokenErr;
+
+export async function verifyAccessTokenWithRevocation(
+  req: Request,
+  revocationService: TokenRevocationService,
+): Promise<VerifyAccessTokenResult> {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'UNAUTHORIZED',
+      message: 'Missing or invalid authorization header',
+    };
+  }
+
+  const token = authHeader.substring(7);
+
+  // Reuse verifyAccessToken for JWT signature, algorithm, claims, and type checks
+  let decoded: DecodedToken;
+  try {
+    decoded = verifyAccessToken(token);
+  } catch (err) {
+    const msg = err instanceof jwt.TokenExpiredError
+      ? 'Token has expired'
+      : 'Invalid token';
+    return { ok: false, status: 401, code: 'UNAUTHORIZED', message: msg };
+  }
+
+  // Extract roles + email from the raw payload (verifyAccessToken drops them)
+  let rawPayload: Record<string, unknown>;
+  try {
+    rawPayload = jwt.decode(token) as Record<string, unknown>;
+  } catch {
+    return { ok: false, status: 401, code: 'UNAUTHORIZED', message: 'Invalid token' };
+  }
+  const roles: string[] = Array.isArray(rawPayload?.roles) ? (rawPayload.roles as string[]) : [];
+  const email = typeof rawPayload?.email === 'string' ? (rawPayload.email as string) : '';
+
+  // Check revocation state (fail-closed)
+  try {
+    const revResult = await revocationService.checkRevoked(decoded);
+    if (revResult.revoked) {
+      return {
+        ok: false,
+        status: 401,
+        code: 'UNAUTHORIZED',
+        message: 'Token has been revoked',
+      };
+    }
+  } catch (redisError) {
+    logger.error('Revocation check failed — dependency unavailable', {
+      error: redisError instanceof Error ? redisError.message : String(redisError),
+    });
+    return {
+      ok: false,
+      status: 503,
+      code: 'AUTH_DEPENDENCY_UNAVAILABLE',
+      message: 'Unable to verify authentication state',
+    };
+  }
+
+  return { ok: true, decoded, roles, email };
+}

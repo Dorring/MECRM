@@ -155,6 +155,8 @@ import { generateCsrfToken } from '../config/csrf';
 import { TokenRevocationService } from '../services/authSession';
 import { redisClient as mockRedisClient } from '../services/redis';
 import { generateRefreshToken, generateToken } from '../middleware/auth';
+import jwt from 'jsonwebtoken';
+import { JWT_SECRET } from '../config/jwt';
 
 // ---------------------------------------------------------------------------
 // Test app factory
@@ -519,5 +521,100 @@ describe('POST /ws-ticket (mocked)', () => {
       .expect(429);
 
     expect(res.body.error.code).toBe('RATE_LIMITED');
+  });
+});
+
+describe('GET /me (mocked)', () => {
+  let app: ReturnType<typeof buildApp>;
+  beforeAll(() => { app = buildApp(); });
+
+  it('401 without access token', async () => {
+    await request(app)
+      .get('/api/v1/auth/me')
+      .expect(401);
+  });
+
+  it('401 with invalid token (garbage)', async () => {
+    await request(app)
+      .get('/api/v1/auth/me')
+      .set('Authorization', 'Bearer not.a.real.jwt')
+      .expect(401);
+  });
+
+  it('401 with expired access token', async () => {
+    // Create a token that expired 1 hour ago using jwt.sign directly.
+    // The helper always produces valid (non-expired) tokens.
+    const expiredToken = jwt.sign(
+      {
+        jti: 'expired-jti',
+        sid: TEST_SID,
+        sub: TEST_USER_ID,
+        tenantId: TEST_TENANT_ID,
+        email: 'a@b.com',
+        roles: ['admin'],
+        type: 'access',
+        uv: 0,
+        sexp: futureSessionExpiry(),
+      },
+      JWT_SECRET,
+      { algorithm: 'HS256', expiresIn: '0s' as any },
+    );
+
+    const res = await request(app)
+      .get('/api/v1/auth/me')
+      .set('Authorization', `Bearer ${expiredToken}`)
+      .expect(401);
+
+    expect(res.body.error.code).toBe('UNAUTHORIZED');
+  });
+
+  it('401 when refresh token is used as access token', async () => {
+    const refreshToken = makeRefreshToken();
+
+    const res = await request(app)
+      .get('/api/v1/auth/me')
+      .set('Authorization', `Bearer ${refreshToken}`)
+      .expect(401);
+
+    expect(res.body.error.code).toBe('UNAUTHORIZED');
+  });
+
+  it('503 when revocation dependency fails (me)', async () => {
+    mockRevocationState.checkRevokedError = new Error('redis down');
+
+    const res = await request(app)
+      .get('/api/v1/auth/me')
+      .set('Authorization', `Bearer ${makeAccessToken()}`)
+      .expect(503);
+
+    expect(res.body.error.code).toBe('AUTH_DEPENDENCY_UNAVAILABLE');
+  });
+
+  it('401 when access token is revoked (me)', async () => {
+    mockRevocationState.checkRevokedResult = { revoked: true, reason: 'jti' };
+
+    await request(app)
+      .get('/api/v1/auth/me')
+      .set('Authorization', `Bearer ${makeAccessToken()}`)
+      .expect(401);
+  });
+
+  it('200 with minimal user from valid access token', async () => {
+    const res = await request(app)
+      .get('/api/v1/auth/me')
+      .set('Authorization', `Bearer ${makeAccessToken(['admin', 'sales'])}`)
+      .expect(200);
+
+    expect(res.body).toMatchObject({
+      id: TEST_USER_ID,
+      email: 'a@b.com',
+      tenantId: TEST_TENANT_ID,
+      roles: ['admin', 'sales'],
+    });
+    expect(res.body).toHaveProperty('name');
+    expect(res.body).toHaveProperty('id');
+    expect(res.body).toHaveProperty('email');
+    expect(res.body).toHaveProperty('tenantId');
+    expect(res.body).toHaveProperty('roles');
   });
 });

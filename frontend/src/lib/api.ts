@@ -620,6 +620,11 @@ export const authApi = {
   // Access token from Authorization header identifies the session.
   logout: () =>
     api.post<{ message: string }>('/api/v1/auth/logout', undefined),
+  // C5: GET /me — return authenticated user profile from access token.
+  // Used after cookie refresh or migration to restore AuthUser without
+  // depending on localStorage cache.
+  me: () =>
+    api.get<{ id: string; email: string; name: string; tenantId: string; roles: string[] }>('/api/v1/auth/me'),
 };
 
 // Persist the login/migrate response: access token in memory only, user profile
@@ -636,6 +641,16 @@ export function persistSession(login: LoginResponse): AuthUser {
   };
   setCachedUser(user);
   return user;
+}
+
+// C5: cache display-only user profile (name, tenant.name) in localStorage.
+// This is a DISPLAY cache ONLY — it is NOT an authentication authority.
+// The /auth/me endpoint is the sole authority for user identity (id, email,
+// tenantId, roles). This cache supplements display fields that /me may not
+// return (name, tenant.name). Never stores tokens.
+export function cacheAuthUserDisplay(user: AuthUser): void {
+  if (typeof window === 'undefined') return;
+  try { window.localStorage.setItem('authUser', JSON.stringify(user)); } catch { /* ignore */ }
 }
 
 // Clear client-side session artifacts. Called ONLY after a successful server
