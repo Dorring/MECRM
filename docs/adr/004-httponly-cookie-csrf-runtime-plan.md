@@ -1,6 +1,6 @@
 # ADR-004 Implementation Plan: Group C
 
-**Status:** Partially Implemented — C1/C2/C3 complete (merged to main@6b0cf3c); C4/C5 pending  
+**Status:** Partially Implemented — C1/C2/C3 complete; C4 gateway ticket handler implemented; `/ws` proxy validation and C5 pending
 **Target branch:** `hardening/http-cookie-csrf-runtime` (merged)  
 **Baseline:** `main@9e44a64` (hardening-group-b-stabilized.1)  
 **ADR:** `docs/adr/004-httponly-cookie-csrf-runtime.md`
@@ -470,7 +470,19 @@ CSRF double-submit, WS ticket exchange, and same-origin relative API paths.
 - Rate limit: 11th ticket request → 429.
 - Redis down on ticket issue → 503.
 
-**Exit gate:** all C1-C4 tests pass with real Redis.
+**Current C4 implementation status (2026-07-09):**
+
+- Gateway upgrade handler consumes `?ticket=<uuid>` through `TokenRevocationService.consumeWsTicket()`.
+- Ticket payload includes `jti` and `exp`, is schema-validated, and is mapped into Group B `DecodedToken` metadata.
+- Invalid/expired/consumed ticket closes with `4401`; ticket-store failure closes with `1013`.
+- JTI/SID indexes are populated from ticket metadata, preserving revocation close semantics.
+- Legacy `?token=<jwt>` remains only for internal tests/backward compatibility while migration completes.
+- Verified locally:
+  - `npx jest src/tests/ws_revocation_integration.test.ts --runInBand` → 10 passed, 3 skipped.
+  - `npx jest src/tests/auth_cookie_endpoint.test.ts --runInBand` → 23 passed.
+  - `npx jest src/tests/auth_cookie_integration.test.ts --runInBand` → 11 passed, 10 skipped.
+
+**Remaining full C4 exit gate:** same-origin browser `/ws` upgrade proxy validation still pending. Verify with `next build && next start` or Compose/browser path; if Next.js cannot proxy upgrade reliably, add nginx/Traefik/Ingress `/ws` routing before marking C4 complete.
 
 ---
 
@@ -617,7 +629,7 @@ is modified.
 |---|---|---|
 | Gateway lint | ✅ | 0 errors, 0 warnings |
 | Gateway build | ✅ | `tsc --noEmit` clean |
-| Gateway Jest | ✅ | 135 passed, 61 skipped, 0 failed (196 total) |
+| Gateway Jest | ✅ | 139 passed, 61 skipped, 0 failed (200 total) |
 | Redis integration | ✅ | 11 passed, 10 skipped (Redis-dependent gated) |
 | Frontend lint | ✅ | 0 errors, 0 warnings |
 | Frontend build | ✅ | 19 routes, `/api/config` as dynamic route |
@@ -634,6 +646,8 @@ is modified.
 | No NEXT_PUBLIC_* in bundle | ✅ | grep .next/static/ → 0 matches (C3) |
 | WS upgrade | ⏳ | C4/infra — same-origin WS proxy validation pending |
 
+**C4 status note:** Gateway-side WS ticket upgrade handling is implemented and covered by `ws_revocation_integration.test.ts` (valid ticket, invalid/consumed ticket `4401`, Redis failure `1013`). Same-origin browser `/ws` proxy upgrade remains the C4 infra exit gate.
+
 ### C1/C2 Exit Gates Verified
 
 | Exit gate | Status |
@@ -647,6 +661,8 @@ is modified.
 | Group B `consumeRefresh` Lua unchanged | ✅ All Group B tests still pass |
 
 ---
+
+**C4 exit-gate clarification:** the `C3/C4/C5` row above is stale for Gateway-side C4. The Gateway ticket upgrade handler is now implemented and tested; the remaining C4 blocker is same-origin browser `/ws` proxy upgrade validation.
 
 ## 11. Independent Review Checklist
 

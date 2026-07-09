@@ -50,7 +50,9 @@ export interface RevocationEvent {
 export interface WsTicketPayload {
   tenantId: string;
   userId: string;
+  jti: string;
   sid: string;
+  exp: number;
   sexp: number;
   uv: number;
   roles: string[];
@@ -112,6 +114,32 @@ export interface TokenValidationResult {
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isWsTicketPayload(value: unknown): value is WsTicketPayload {
+  if (!value || typeof value !== 'object') return false;
+  const payload = value as Record<string, unknown>;
+  return (
+    typeof payload.tenantId === 'string' &&
+    UUID_PATTERN.test(payload.tenantId) &&
+    typeof payload.userId === 'string' &&
+    UUID_PATTERN.test(payload.userId) &&
+    typeof payload.jti === 'string' &&
+    UUID_PATTERN.test(payload.jti) &&
+    typeof payload.sid === 'string' &&
+    UUID_PATTERN.test(payload.sid) &&
+    typeof payload.exp === 'number' &&
+    Number.isInteger(payload.exp) &&
+    payload.exp > 0 &&
+    typeof payload.sexp === 'number' &&
+    Number.isInteger(payload.sexp) &&
+    payload.sexp > 0 &&
+    typeof payload.uv === 'number' &&
+    Number.isInteger(payload.uv) &&
+    payload.uv >= 0 &&
+    Array.isArray(payload.roles) &&
+    payload.roles.every((role) => typeof role === 'string')
+  );
+}
 
 export function validateDecodedToken(
   decoded: Record<string, unknown>,
@@ -640,7 +668,9 @@ export class TokenRevocationService {
     const payload = JSON.stringify({
       tenantId: auth.tenantId,
       userId: auth.userId,
+      jti: auth.jti,
       sid: auth.sid,
+      exp: auth.exp,
       sexp: auth.sexp,
       uv: auth.uv,
       roles: auth.roles,
@@ -667,7 +697,9 @@ export class TokenRevocationService {
     const raw = await this.client.getdel(authKeys.wsTicket(ticket));
     if (!raw) return null;
     try {
-      return JSON.parse(raw) as WsTicketPayload;
+      const parsed: unknown = JSON.parse(raw);
+      if (!isWsTicketPayload(parsed)) return null;
+      return parsed;
     } catch {
       return null;
     }

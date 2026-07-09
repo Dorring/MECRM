@@ -176,16 +176,16 @@ describeRedis('WS ticket (real Redis)', () => {
 
   it('issueWsTicket returns UUID', async () => {
     const ticket = await service.issueWsTicket({
-      tenantId: randomUUID(), userId: randomUUID(), sid: randomUUID(),
-      sexp: Math.floor(Date.now() / 1000) + 86400, uv: 0, roles: ['admin'],
+      tenantId: randomUUID(), userId: randomUUID(), jti: randomUUID(), sid: randomUUID(),
+      exp: Math.floor(Date.now() / 1000) + 3600, sexp: Math.floor(Date.now() / 1000) + 86400, uv: 0, roles: ['admin'],
     });
     expect(ticket).toMatch(/^[0-9a-f-]{36}$/);
   });
 
   it('consumeWsTicket returns payload with roles on first use', async () => {
     const payload = {
-      tenantId: randomUUID(), userId: randomUUID(), sid: randomUUID(),
-      sexp: Math.floor(Date.now() / 1000) + 86400, uv: 0, roles: ['admin', 'user'],
+      tenantId: randomUUID(), userId: randomUUID(), jti: randomUUID(), sid: randomUUID(),
+      exp: Math.floor(Date.now() / 1000) + 3600, sexp: Math.floor(Date.now() / 1000) + 86400, uv: 0, roles: ['admin', 'user'],
     };
     const ticket = await service.issueWsTicket(payload);
     const consumed = await service.consumeWsTicket(ticket);
@@ -196,8 +196,8 @@ describeRedis('WS ticket (real Redis)', () => {
 
   it('consumeWsTicket returns null on second use (GETDEL)', async () => {
     const ticket = await service.issueWsTicket({
-      tenantId: randomUUID(), userId: randomUUID(), sid: randomUUID(),
-      sexp: Math.floor(Date.now() / 1000) + 86400, uv: 0, roles: [],
+      tenantId: randomUUID(), userId: randomUUID(), jti: randomUUID(), sid: randomUUID(),
+      exp: Math.floor(Date.now() / 1000) + 3600, sexp: Math.floor(Date.now() / 1000) + 86400, uv: 0, roles: [],
     });
     expect(await service.consumeWsTicket(ticket)).not.toBeNull();
     expect(await service.consumeWsTicket(ticket)).toBeNull();
@@ -205,8 +205,8 @@ describeRedis('WS ticket (real Redis)', () => {
 
   it('ws ticket TTL ≤ 10 seconds', async () => {
     const ticket = await service.issueWsTicket({
-      tenantId: randomUUID(), userId: randomUUID(), sid: randomUUID(),
-      sexp: Math.floor(Date.now() / 1000) + 86400, uv: 0, roles: [],
+      tenantId: randomUUID(), userId: randomUUID(), jti: randomUUID(), sid: randomUUID(),
+      exp: Math.floor(Date.now() / 1000) + 3600, sexp: Math.floor(Date.now() / 1000) + 86400, uv: 0, roles: [],
     });
     const ttl = await redis.ttl(authKeys.wsTicket(ticket));
     expect(ttl).toBeGreaterThan(0);
@@ -329,7 +329,10 @@ describeRedis('WS ticket cross-instance (real Redis)', () => {
   });
 
   it('ticket issued by A consumed by B', async () => {
-    const payload = { tenantId: randomUUID(), userId: randomUUID(), sid: randomUUID(), sexp: Math.floor(Date.now() / 1000) + 86400, uv: 0, roles: ['admin'] };
+    const payload = {
+      tenantId: randomUUID(), userId: randomUUID(), jti: randomUUID(), sid: randomUUID(),
+      exp: Math.floor(Date.now() / 1000) + 3600, sexp: Math.floor(Date.now() / 1000) + 86400, uv: 0, roles: ['admin'],
+    };
     const ticket = await sa.issueWsTicket(payload);
     const consumed = await sb.consumeWsTicket(ticket);
     expect(consumed).not.toBeNull();
