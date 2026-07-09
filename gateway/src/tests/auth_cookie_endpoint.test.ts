@@ -521,3 +521,60 @@ describe('POST /ws-ticket (mocked)', () => {
     expect(res.body.error.code).toBe('RATE_LIMITED');
   });
 });
+
+describe('GET /me (mocked)', () => {
+  let app: ReturnType<typeof buildApp>;
+  beforeAll(() => { app = buildApp(); });
+
+  it('401 without access token', async () => {
+    await request(app)
+      .get('/api/v1/auth/me')
+      .expect(401);
+  });
+
+  it('401 with invalid token (garbage)', async () => {
+    await request(app)
+      .get('/api/v1/auth/me')
+      .set('Authorization', 'Bearer not.a.real.jwt')
+      .expect(401);
+  });
+
+  it('401 when access token is revoked', async () => {
+    mockRevocationState.checkRevokedResult = { revoked: true, reason: 'jti' };
+
+    await request(app)
+      .get('/api/v1/auth/me')
+      .set('Authorization', `Bearer ${makeAccessToken()}`)
+      .expect(401);
+  });
+
+  it('503 when revocation dependency fails', async () => {
+    mockRevocationState.checkRevokedError = new Error('redis down');
+
+    const res = await request(app)
+      .get('/api/v1/auth/me')
+      .set('Authorization', `Bearer ${makeAccessToken()}`)
+      .expect(503);
+
+    expect(res.body.error.code).toBe('AUTH_DEPENDENCY_UNAVAILABLE');
+  });
+
+  it('200 with minimal user from valid access token', async () => {
+    const res = await request(app)
+      .get('/api/v1/auth/me')
+      .set('Authorization', `Bearer ${makeAccessToken(['admin', 'sales'])}`)
+      .expect(200);
+
+    expect(res.body).toMatchObject({
+      id: TEST_USER_ID,
+      email: 'a@b.com',
+      tenantId: TEST_TENANT_ID,
+      roles: ['admin', 'sales'],
+    });
+    expect(res.body).toHaveProperty('name');
+    expect(res.body).toHaveProperty('id');
+    expect(res.body).toHaveProperty('email');
+    expect(res.body).toHaveProperty('tenantId');
+    expect(res.body).toHaveProperty('roles');
+  });
+});
