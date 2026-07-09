@@ -579,7 +579,7 @@ describe('GET /me (mocked)', () => {
     expect(res.body.error.code).toBe('UNAUTHORIZED');
   });
 
-  it('401 when access token is revoked (me)', async () => {
+  it('503 when revocation dependency fails (me)', async () => {
     mockRevocationState.checkRevokedError = new Error('redis down');
 
     const res = await request(app)
@@ -588,6 +588,15 @@ describe('GET /me (mocked)', () => {
       .expect(503);
 
     expect(res.body.error.code).toBe('AUTH_DEPENDENCY_UNAVAILABLE');
+  });
+
+  it('401 when access token is revoked (me)', async () => {
+    mockRevocationState.checkRevokedResult = { revoked: true, reason: 'jti' };
+
+    await request(app)
+      .get('/api/v1/auth/me')
+      .set('Authorization', `Bearer ${makeAccessToken()}`)
+      .expect(401);
   });
 
   it('200 with minimal user from valid access token', async () => {
