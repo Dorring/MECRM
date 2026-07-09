@@ -32,6 +32,8 @@ function deriveWsUrl(): string {
   return `${protocol}//${window.location.host}/ws`;
 }
 
+export { deriveWsUrl };
+
 export async function getRuntimeConfig(): Promise<RuntimeConfig> {
   if (cached) return cached;
 

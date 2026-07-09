@@ -2,19 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback, createContext, useContext, ReactNode } from 'react';
 import { getAccessToken, tryCookieRefresh, decodeToken, CSRF_HEADER, getCsrfToken } from '@/lib/api';
-
-// ---------------------------------------------------------------------------
-// WebSocket URL
-// ---------------------------------------------------------------------------
-// Default: derived from window.location (same-origin mode).
-// In local/dev direct mode, /api/config may supply a custom wsUrl.
-// No NEXT_PUBLIC_WS_URL — the WS URL is resolved at runtime.
-
-function deriveWsUrl(): string {
-  if (typeof window === 'undefined') return 'ws://localhost:4000';
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${window.location.host}/ws`;
-}
+import { deriveWsUrl } from '@/lib/runtime-config';
 
 // ---------------------------------------------------------------------------
 // Ticket exchange
