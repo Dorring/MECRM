@@ -1,8 +1,9 @@
 # ADR-004: HttpOnly Refresh Cookie, CSRF, WS Ticket and Runtime URL
 
 **Status:** Partially Implemented — C1/C2/C3/C4 complete; C5 pending
-**Date:** 2026-07-05 (approved), 2026-07-07 (C1/C2 implemented), 2026-07-08 (C3 implemented), 2026-07-09 (C3 merged, C4 implemented)  
+**Date:** 2026-07-05 (approved), 2026-07-07 (C1/C2 implemented), 2026-07-08 (C3 implemented), 2026-07-09 (C3 merged, C4 implemented and merged)  
 **Scope:** Hardening 1.1 Group C  
+**Tag:** `hardening-group-c-c4-stabilized`  
 **Supersedes:** localStorage-based refresh token storage, JWT-in-URL WebSocket authentication, build-time `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_WS_URL`  
 **Depends on:** ADR-002 (session revocation, Group B — unmodified)
 
@@ -915,6 +916,10 @@ Implementation may begin only after reviewers accept:
 
 ### 16.4 C4 — WebSocket Same-Origin Proxy ✅
 
+**Merged:** `main@1f4287c` (PR #9, squash merge of `codex/group-c-c4-ws-proxy`, 6 commits)
+**Tag:** `hardening-group-c-c4-stabilized`
+**CI:** GitHub Actions all-green (lint, build, test, ws-proxy-smoke)
+
 **Implemented in Gateway (merged to main@d69644b):**
 - WebSocket upgrade accepts `?ticket=<uuid>` and consumes `ws:ticket:{uuid}` via `GETDEL`.
 - Ticket payload carries `jti`, `exp`, tenant, user, session, user-version, and roles.
@@ -953,19 +958,20 @@ Implementation may begin only after reviewers accept:
 - Invalid/consumed ticket → 4401 ✅
 - Redis failure → 1013 (no auth downgrade) ✅
 
-**C4 exit criteria:**
+**C4 exit criteria (all satisfied, CI-verified):**
 1. Gateway ticket handler merged ✅ (main@d69644b)
-2. Compose same-origin `/ws` via nginx: 101 + connected ✅
-3. Consumed/invalid ticket → 4401 through proxy ✅
-4. Helm Ingress `/ws` → Gateway, no `NEXT_PUBLIC_*` in frontend template ✅
-5. CI or local Docker with reproducible evidence ✅ (CI job + manual script)
+2. Compose same-origin `/ws` via nginx Upgrade ✅ (CI ws-proxy-smoke passed)
+3. Consumed/invalid ticket → 4401 through proxy ✅ (CI ws-proxy-smoke passed)
+4. Helm Ingress `/ws` → Gateway, no `NEXT_PUBLIC_*` in frontend template ✅ (static verification + CI)
+5. CI reproducible evidence ✅ (ws-proxy-smoke job in ci-cd.yml, passed on main)
+6. Identical route topology across Compose and Helm ✅ (exact /api/config, prefix /api, /ws Upgrade)
 
-**Tech debt:**
+**Tech debt (carried forward to C5):**
 - TD-C3-1: `/refresh` returns no user profile — need `GET /api/v1/auth/me`
 - TD-C3-2: Runtime Gateway switching needs custom Next.js server proxy
 - ~~TD-C3-3: Same-origin `/ws` upgrade proxy validation~~ — resolved by C4
 - TD-C3-4: Frontend test framework gap (no jest/vitest config)
-- TD-C4-1: Docker Desktop unavailable on dev machine — `ws-proxy-test.js` not run locally
+- ~~TD-C4-1: Docker Desktop unavailable on dev machine~~ — resolved by CI ws-proxy-smoke passing on main
 - TD-C4-2: Helm rendered templates not tested on a real K8s cluster (static verification only)
 
 C5 (runtime config finalization + self-review) is pending.

@@ -1,8 +1,9 @@
 # ADR-004 Implementation Plan: Group C
 
 **Status:** Partially Implemented — C1/C2/C3/C4 complete; C5 pending
-**Target branch:** `codex/group-c-c4-ws-proxy` (active)  
-**Baseline:** `main@d69644b` (C4 gateway ticket handler merged)  
+**Target branch:** *(merged to main)*  
+**Baseline:** `main@1f4287c` (C4 squash-merged)  
+**Tag:** `hardening-group-c-c4-stabilized`  
 **ADR:** `docs/adr/004-httponly-cookie-csrf-runtime.md`
 
 ---
@@ -471,7 +472,11 @@ CSRF double-submit, WS ticket exchange, and same-origin relative API paths.
 - Rate limit: 11th ticket request → 429.
 - Redis down on ticket issue → 503.
 
-**C4 implementation status (2026-07-09):** ✅ COMPLETE
+**C4 implementation status (2026-07-09):** ✅ COMPLETE & MERGED
+
+**Merge:** `main@1f4287c` (PR #9, squash merge of `codex/group-c-c4-ws-proxy`, 6 commits)
+**Tag:** `hardening-group-c-c4-stabilized`
+**CI:** All GitHub Actions jobs green (lint, build, test, ws-proxy-smoke)
 
 **Gateway (merged to main@d69644b):**
 - Gateway upgrade handler consumes `?ticket=<uuid>` through `TokenRevocationService.consumeWsTicket()`.
@@ -664,7 +669,7 @@ is modified.
 | No NEXT_PUBLIC_* in bundle | ✅ | grep .next/static/ → 0 matches (C3) |
 | WS upgrade | ✅ | C4 — Gateway ticket handler + nginx/Ingress same-origin /ws proxy |
 
-**C4 exit-gate status:** Gateway-side WS ticket handler ✅ merged to main@d69644b. Infra-side same-origin proxy ✅ (nginx in Compose, Ingress in K8s). WS smoke test validates valid→connected, consumed→4401, invalid→4401.
+**C4 exit-gate status:** ✅ Complete. Gateway ticket handler merged (main@d69644b). Infra proxy merged (main@1f4287c). WS smoke test CI-verified. Static regression tests (7/7). Tag `hardening-group-c-c4-stabilized` pushed.
 
 ### C1/C2 Exit Gates Verified
 
