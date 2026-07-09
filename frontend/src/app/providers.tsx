@@ -13,36 +13,64 @@ import {
   authApi,
   tryCookieRefresh,
   migrateFromLocalStorage,
+  cacheAuthUserDisplay,
+  setAccessToken,
 } from '@/lib/api';
 import { initRuntimeConfig, getRuntimeConfig } from '@/lib/runtime-config';
 
 // ---------------------------------------------------------------------------
-// Helper: resolve user profile via /auth/me, with localStorage cache fallback
+// Helper: resolve user profile via /auth/me (authoritative identity source)
 // ---------------------------------------------------------------------------
-// After cookie refresh or legacy migration, the access token is in memory but
-// no user profile is available. Call /me to get the authoritative profile;
-// cache it in localStorage as a display-only fallback for next boot.
+// /auth/me is the SOLE authority for user identity (id, email, tenantId, roles).
+// localStorage cache is a DISPLAY-ONLY supplement — it must NEVER be used to
+// maintain an authenticated state when /me fails.
+//
+// On success: /me claims are authoritative; cached name and tenant.name are
+// merged ONLY when identity matches (same id + tenantId). The merged profile
+// is written back to the display cache.
+//
+// On failure (401, 503, network error): returns null. The caller MUST clear
+// local auth state — no authenticated UI without a verified /me response.
 async function resolveUserProfile(): Promise<AuthUser | null> {
   try {
     const resp = await authApi.me();
     const profile = resp.data;
-    // Map /me response shape to AuthUser
+    const cached = getCachedUser();
+
+    // Identity must match before we trust cached display fields
+    const sameIdentity =
+      cached?.id === profile.id &&
+      cached?.tenant?.id === profile.tenantId;
+
     const user: AuthUser = {
       id: profile.id,
       email: profile.email,
-      name: profile.name || '',
+      name: sameIdentity ? (cached!.name || profile.name || '') : (profile.name || ''),
       roles: profile.roles || [],
-      tenant: { id: profile.tenantId, name: '' },
+      tenant: {
+        id: profile.tenantId,
+        name: sameIdentity ? (cached!.tenant?.name || '') : '',
+      },
     };
-    // Update localStorage cache so getCachedUser() works on next boot
-    // as a fallback if /me is temporarily unavailable.
-    if (typeof window !== 'undefined') {
-      try { window.localStorage.setItem('authUser', JSON.stringify(user)); } catch { /* ignore */ }
-    }
+
+    // Update display cache for next boot (display-only, no tokens)
+    cacheAuthUserDisplay(user);
     return user;
   } catch {
-    // /me unavailable — fall back to legacy cached user
-    return getCachedUser();
+    // /me failed — do NOT fall back to localStorage for authenticated state.
+    // The caller must clear local state and show login.
+    return null;
+  }
+}
+
+// Clear local auth artifacts without calling server logout (preserves HttpOnly
+// cookie for next boot). Used when /me fails after a successful cookie refresh
+// or migration — the session may still be valid, but we can't prove the user's
+// identity right now.
+function clearLocalAuthState(): void {
+  setAccessToken(null);
+  if (typeof window !== 'undefined') {
+    try { window.localStorage.removeItem('authUser'); } catch { /* ignore */ }
   }
 }
 
@@ -119,13 +147,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (!mountedRef.current) return;
 
         if (newToken) {
-          // C5: call /auth/me to get the authoritative user profile.
-          // Falls back to localStorage cache if /me is unavailable.
+          // C5: /auth/me is the sole authority for user identity.
+          // If /me fails (401/503/network), clear local state and show login —
+          // the HttpOnly cookie is preserved for next boot retry.
           const user = await resolveUserProfile();
-          if (mountedRef.current) {
-            if (user) setUser(user);
-            setIsLoading(false);
+          if (!mountedRef.current) return;
+
+          if (user) {
+            setUser(user);
+          } else {
+            clearLocalAuthState();
           }
+          setIsLoading(false);
           return;
         }
 
@@ -135,10 +168,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
         if (migrated) {
           const user = await resolveUserProfile();
-          if (mountedRef.current) {
-            if (user) setUser(user);
-            setIsLoading(false);
+          if (!mountedRef.current) return;
+
+          if (user) {
+            setUser(user);
+          } else {
+            clearLocalAuthState();
           }
+          setIsLoading(false);
           return;
         }
 
@@ -165,8 +202,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
     const cached = getCachedUser();
     if (cached) setUser(cached);
-    // If no cached user exists (e.g. after cookie refresh without /auth/me),
-    // user stays at its previous value. TD-C3-1: add GET /auth/me to fill this gap.
+    // If no display cache exists, user stays at its previous value.
+    // Next boot will call /auth/me to re-resolve the authoritative profile.
   }, []);
 
   // Listen for auth-change events and cross-tab storage changes.

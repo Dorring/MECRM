@@ -643,6 +643,16 @@ export function persistSession(login: LoginResponse): AuthUser {
   return user;
 }
 
+// C5: cache display-only user profile (name, tenant.name) in localStorage.
+// This is a DISPLAY cache ONLY — it is NOT an authentication authority.
+// The /auth/me endpoint is the sole authority for user identity (id, email,
+// tenantId, roles). This cache supplements display fields that /me may not
+// return (name, tenant.name). Never stores tokens.
+export function cacheAuthUserDisplay(user: AuthUser): void {
+  if (typeof window === 'undefined') return;
+  try { window.localStorage.setItem('authUser', JSON.stringify(user)); } catch { /* ignore */ }
+}
+
 // Clear client-side session artifacts. Called ONLY after a successful server
 // logout (2xx). Does NOT clear on 503/network error — the caller must show
 // an error to the user and keep the local session intact.
