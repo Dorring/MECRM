@@ -49,12 +49,12 @@ class CookieJar {
   ingest(response) {
     const setCookie = response.headers.get('set-cookie');
     if (!setCookie) return;
-    // Set-Cookie may appear multiple times; headers.get returns the first.
-    // We need headers.raw() or headers.getSetCookie() for all values.
-    // Node 20 fetch's Headers supports getSetCookie().
+    // Set-Cookie may appear multiple times. Node 20+ exposes getSetCookie()
+    // in newer undici versions; older versions may return a comma-joined
+    // header through get('set-cookie'). Split only at cookie boundaries.
     const all = typeof response.headers.getSetCookie === 'function'
       ? response.headers.getSetCookie()
-      : [setCookie];
+      : setCookie.split(/,\s*(?=[^;,]+=)/);
     for (const sc of all) {
       const match = sc.match(/^([^=;]+)=([^;]*)/);
       if (match) {
@@ -98,6 +98,44 @@ async function assertHttp(stage, response, expectedStatus, note) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------------------
+// Stage 0: Validate /api/config
+// ---------------------------------------------------------------------------
+
+async function stageRuntimeConfig() {
+  console.log('\n[0] GET /api/config');
+  const resp = await fetch(`${TARGET}/api/config`);
+  const body = await assertHttp('api-config', resp, 200, 'runtime config');
+  if (!body) return false;
+
+  if (typeof body.apiUrl !== 'string') {
+    fail('api-config', `apiUrl missing or not string: ${JSON.stringify(body)}`);
+    return false;
+  }
+  if (typeof body.wsUrl !== 'string') {
+    fail('api-config', `wsUrl missing or not string: ${JSON.stringify(body)}`);
+    return false;
+  }
+  if (body.wsUrl === 'ws://localhost:4000') {
+    fail('api-config', `wsUrl must not be ws://localhost:4000 (hardcoded dev fallback leaked)`);
+    return false;
+  }
+  if (body.wsUrl === 'ws://gateway:4000') {
+    fail('api-config', `wsUrl must not be ws://gateway:4000 (internal hostname leaked to browser)`);
+    return false;
+  }
+  if (body.apiUrl !== '') {
+    fail('api-config', `apiUrl expected "" in same-origin mode, got "${body.apiUrl}"`);
+    return false;
+  }
+  if (body.wsUrl !== '') {
+    fail('api-config', `wsUrl expected "" in same-origin mode, got "${body.wsUrl}"`);
+    return false;
+  }
+  console.log(`  OK  [api-config]: apiUrl="" wsUrl="" — same-origin defaults`);
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +320,13 @@ async function main() {
   console.log(`Tenant: ${TENANT_SLUG} | Email: ${EMAIL}`);
 
   const jar = new CookieJar();
+
+  // 0. Validate /api/config
+  const configOk = await stageRuntimeConfig();
+  if (!configOk) {
+    console.error('\nAborting: runtime config validation failed');
+    process.exit(1);
+  }
 
   // 1. Register
   const regBody = await stageRegister(jar);

@@ -146,8 +146,9 @@ Planned commits (do not mix with formatting or Group D work):
    ```yaml
    frontend:
      environment:
-       - API_URL=http://gateway:4000
-       - WS_URL=ws://gateway:4000
+       - GATEWAY_INTERNAL_URL=http://gateway:4000
+       - API_URL=
+       - WS_URL=
        # NEXT_PUBLIC_API_URL and NEXT_PUBLIC_WS_URL intentionally omitted
    ```
    Update `docker-compose.yml` gateway service environment to add:
@@ -483,7 +484,7 @@ CSRF double-submit, WS ticket exchange, and same-origin relative API paths.
 - `conf/nginx.conf`: Edge proxy with `map $http_upgrade $connection_upgrade` — routes `/api`→gateway, `/ws`→gateway (Upgrade), `/`→frontend.
 - `docker-compose.yml`: Added `frontend-proxy` (nginx:1.27-alpine, port 3000:80). Frontend no longer publishes host port. `WS_URL=""`.
 - `deploy/helm/.../templates/frontend.yaml`: Removed all `NEXT_PUBLIC_*` env vars. Replaced with `GATEWAY_INTERNAL_URL`, `API_URL=""`, `WS_URL=""`.
-- `deploy/helm/.../values.yaml` + `values-production.yaml`: Ingress `proxy-read-timeout` increased to 3600s.
+- `deploy/helm/.../values.yaml` + `values-production.yaml`: Ingress `proxy-read-timeout` and `proxy-send-timeout` increased to 3600s.
 - `scripts/ws-proxy-test.js`: E2E smoke — register→login→ws-ticket→connect(valid)→connected, consumed→4401, invalid→4401.
 - `.github/workflows/ci-cd.yml`: `ws-proxy-smoke` job added.
 - Static verification: no `NEXT_PUBLIC_*` in bundle, no `gateway:4000`, no `?token=`. Frontend lint/build ✅, Gateway lint/build/test ✅.
@@ -552,7 +553,8 @@ CSRF double-submit, WS ticket exchange, and same-origin relative API paths.
 
 4. **Docker Compose frontend env update:**
    - Remove `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_WS_URL` from frontend service.
-   - Add `API_URL=http://gateway:4000` and `WS_URL=ws://gateway:4000`.
+   - Keep `API_URL=""` and `WS_URL=""`; browser uses same-origin `/api` and `/ws`.
+   - Keep `GATEWAY_INTERNAL_URL=http://gateway:4000` for server-side Next.js fallback only.
 
 5. **ADR-004 status:** update from "Proposed" to "Accepted/Implemented".
 

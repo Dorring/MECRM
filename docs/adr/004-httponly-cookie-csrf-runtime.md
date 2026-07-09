@@ -571,7 +571,8 @@ endpoint requires a rebuild and redeployment.
 
 **Runtime config endpoint** (`/api/config`):
 
-- `GET /api/config` (served by Next.js, not proxied to Gateway).
+- `GET /api/config` (served by Next.js; in Compose nginx uses an exact
+  `location = /api/config` route to keep it on the frontend).
 - Returns `{ apiUrl: "<from env API_URL>", wsUrl: "<from env WS_URL>" }`.
 - Used for runtime URL resolution in local/dev environments where the frontend
   connects directly to the Gateway (no same-origin proxy).
@@ -652,8 +653,8 @@ Compose → `strict` (NODE_ENV=production), Helm/Prod → `strict`.
 |---|---|---|---|
 | `NEXT_PUBLIC_API_URL` | *(unset — uses proxy)* | *(unset — uses proxy)* | *(unset — uses proxy)* |
 | `NEXT_PUBLIC_WS_URL` | *(unset — uses proxy)* | *(unset — uses proxy)* | *(unset — uses proxy)* |
-| `API_URL` | `http://localhost:4000` | `http://gateway:4000` | `http://gateway:4000` |
-| `WS_URL` | `ws://localhost:4000` | `ws://gateway:4000` | `ws://gateway:4000` |
+| `API_URL` | `""` | `""` | `""` |
+| `WS_URL` | `""` | `""` | `""` |
 
 When `NEXT_PUBLIC_API_URL` is unset, the frontend uses same-origin relative
 paths. `API_URL`/`WS_URL` are only used by the Next.js server for proxy
@@ -923,7 +924,7 @@ Implementation may begin only after reviewers accept:
 
 **Implemented in Infra (this PR):**
 - **Docker Compose**: `frontend-proxy` nginx edge container (port 3000:80) routes `/api` and `/ws` to Gateway, `/` to Frontend. Compose route semantics now match K8s Ingress.
-- **Helm**: Removed all `NEXT_PUBLIC_*` env vars from frontend template. Replaced with `GATEWAY_INTERNAL_URL`, `API_URL=""`, `WS_URL=""`. Ingress `/ws` → Gateway unchanged. `proxy-read-timeout` increased to 3600s for WS long-lived connections.
+- **Helm**: Removed all `NEXT_PUBLIC_*` env vars from frontend template. Replaced with `GATEWAY_INTERNAL_URL`, `API_URL=""`, `WS_URL=""`. Ingress `/ws` → Gateway unchanged. `proxy-read-timeout` and `proxy-send-timeout` increased to 3600s for WS long-lived connections.
 - **WS Proxy Smoke Test**: `scripts/ws-proxy-test.js` validates register→login→ws-ticket→connect→connected→reuse 4401→invalid 4401 end-to-end through the edge proxy.
 - **CI**: `ws-proxy-smoke` job in `.github/workflows/ci-cd.yml` runs the full topology and smoke test.
 
