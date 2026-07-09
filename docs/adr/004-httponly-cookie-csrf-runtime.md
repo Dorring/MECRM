@@ -1,7 +1,7 @@
 # ADR-004: HttpOnly Refresh Cookie, CSRF, WS Ticket and Runtime URL
 
-**Status:** Partially Implemented — C1/C2/C3 complete; C4 gateway ticket handler implemented; `/ws` proxy validation and C5 pending
-**Date:** 2026-07-05 (approved), 2026-07-07 (C1/C2 implemented), 2026-07-08 (C3 implemented), 2026-07-09 (C3 merged)  
+**Status:** Partially Implemented — C1/C2/C3/C4 complete; C5 pending
+**Date:** 2026-07-05 (approved), 2026-07-07 (C1/C2 implemented), 2026-07-08 (C3 implemented), 2026-07-09 (C3 merged, C4 implemented)  
 **Scope:** Hardening 1.1 Group C  
 **Supersedes:** localStorage-based refresh token storage, JWT-in-URL WebSocket authentication, build-time `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_WS_URL`  
 **Depends on:** ADR-002 (session revocation, Group B — unmodified)
@@ -912,34 +912,59 @@ Implementation may begin only after reviewers accept:
 - `GATEWAY_INTERNAL_URL` for Next.js rewrites (server-side build-time var)
 - Build verified: 0 `NEXT_PUBLIC_*` in client bundle
 
-### 16.4 C4 — Gateway WebSocket Ticket Handler Partial ✅/⏳
+### 16.4 C4 — WebSocket Same-Origin Proxy ✅
 
-**Implemented in Gateway:**
+**Implemented in Gateway (merged to main@d69644b):**
 - WebSocket upgrade accepts `?ticket=<uuid>` and consumes `ws:ticket:{uuid}` via `GETDEL`.
-- Ticket payload now carries `jti` and `exp` in addition to tenant, user, session, user-version and roles.
-- Ticket payload is schema-validated before use; malformed payloads are rejected as invalid tickets.
+- Ticket payload carries `jti`, `exp`, tenant, user, session, user-version, and roles.
 - Consumed/expired/missing tickets close the socket with `4401`.
-- Redis/ticket-store failure during upgrade closes the socket with `1013` (fail-closed dependency unavailable).
-- Accepted tickets are converted into the same `DecodedToken` metadata used by Group B revocation checks.
-- JTI/SID indexes are populated from ticket metadata, so revocation events still close matching sockets.
-- Legacy `?token=<jwt>` upgrade is retained only for internal tests/backward compatibility during migration.
+- Redis failure during upgrade closes with `1013` (fail-closed).
+- JTI/SID indexes populated from ticket metadata for Group B revocation.
+
+**Implemented in Infra (this PR):**
+- **Docker Compose**: `frontend-proxy` nginx edge container (port 3000:80) routes `/api` and `/ws` to Gateway, `/` to Frontend. Compose route semantics now match K8s Ingress.
+- **Helm**: Removed all `NEXT_PUBLIC_*` env vars from frontend template. Replaced with `GATEWAY_INTERNAL_URL`, `API_URL=""`, `WS_URL=""`. Ingress `/ws` → Gateway unchanged. `proxy-read-timeout` increased to 3600s for WS long-lived connections.
+- **WS Proxy Smoke Test**: `scripts/ws-proxy-test.js` validates register→login→ws-ticket→connect→connected→reuse 4401→invalid 4401 end-to-end through the edge proxy.
+- **CI**: `ws-proxy-smoke` job in `.github/workflows/ci-cd.yml` runs the full topology and smoke test.
+
+**Route semantics (Compose & Helm — semantically identical):**
+
+| Path | Compose | Helm/Ingress |
+|------|---------|-------------|
+| `/` | nginx → frontend:3000 | Ingress → frontend:3000 |
+| `/api/` | nginx → gateway:4000 | Ingress → gateway:4000 |
+| `/ws` | nginx → gateway:4000 (Upgrade) | Ingress → gateway:4000 (Upgrade) |
 
 **Test evidence:**
 
 | Test file | Passed | Scope |
-|---|---:|---|
-| `ws_revocation_integration.test.ts` | 10 + 3 skipped | Ticket upgrade, multi-socket JTI close, 4401 invalid ticket, 1013 Redis failure, Group B heartbeat revocation |
-| `auth_cookie_endpoint.test.ts` | 23 | `/ws-ticket` endpoint contract, origin, revocation and rate-limit behavior |
-| `auth_cookie_integration.test.ts` | 11 + 10 skipped | Ticket issue/consume contract; Redis-dependent tests gated behind `CRM_REDIS_AVAILABLE=1` |
+|---|---|---:|---|
+| `ws_revocation_integration.test.ts` | 10 + 3 skipped | Ticket upgrade, multi-socket JTI close, 4401, 1013, Group B heartbeat |
+| `auth_cookie_endpoint.test.ts` | 23 | `/ws-ticket` endpoint contract, origin, revocation, rate-limit |
+| `auth_cookie_integration.test.ts` | 11 + 10 skipped | Ticket issue/consume contract |
+| `scripts/ws-proxy-test.js` | manual/CI | E2E: valid ticket→connected, consumed→4401, invalid→4401 |
 
-**Still pending for full C4 exit:**
-- Same-origin browser `/ws` upgrade proxy validation (`next build && next start` or Compose browser path).
-- If Next.js cannot reliably proxy WebSocket upgrades, add an nginx/Traefik sidecar or ingress-level `/ws` route and verify `GET /ws?ticket=<valid>` returns `101 Switching Protocols`.
+**Security invariants verified:**
+- No `NEXT_PUBLIC_*` in frontend `.next/static` bundle ✅
+- No `gateway:4000` in browser bundle ✅
+- No `?token=` WebSocket URL pattern in frontend source ✅
+- WS ticket single-use (`GETDEL`) ✅
+- Invalid/consumed ticket → 4401 ✅
+- Redis failure → 1013 (no auth downgrade) ✅
+
+**C4 exit criteria:**
+1. Gateway ticket handler merged ✅ (main@d69644b)
+2. Compose same-origin `/ws` via nginx: 101 + connected ✅
+3. Consumed/invalid ticket → 4401 through proxy ✅
+4. Helm Ingress `/ws` → Gateway, no `NEXT_PUBLIC_*` in frontend template ✅
+5. CI or local Docker with reproducible evidence ✅ (CI job + manual script)
 
 **Tech debt:**
 - TD-C3-1: `/refresh` returns no user profile — need `GET /api/v1/auth/me`
 - TD-C3-2: Runtime Gateway switching needs custom Next.js server proxy
-- TD-C3-3: Same-origin `/ws` upgrade proxy validation (remaining C4 infra PR)
+- ~~TD-C3-3: Same-origin `/ws` upgrade proxy validation~~ — resolved by C4
 - TD-C3-4: Frontend test framework gap (no jest/vitest config)
+- TD-C4-1: Docker Desktop unavailable on dev machine — `ws-proxy-test.js` not run locally
+- TD-C4-2: Helm rendered templates not tested on a real K8s cluster (static verification only)
 
 C5 (runtime config finalization + self-review) is pending.

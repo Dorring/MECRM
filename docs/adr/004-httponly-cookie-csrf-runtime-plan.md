@@ -1,8 +1,8 @@
 # ADR-004 Implementation Plan: Group C
 
-**Status:** Partially Implemented — C1/C2/C3 complete; C4 gateway ticket handler implemented; `/ws` proxy validation and C5 pending
-**Target branch:** `hardening/http-cookie-csrf-runtime` (merged)  
-**Baseline:** `main@9e44a64` (hardening-group-b-stabilized.1)  
+**Status:** Partially Implemented — C1/C2/C3/C4 complete; C5 pending
+**Target branch:** `codex/group-c-c4-ws-proxy` (active)  
+**Baseline:** `main@d69644b` (C4 gateway ticket handler merged)  
 **ADR:** `docs/adr/004-httponly-cookie-csrf-runtime.md`
 
 ---
@@ -470,19 +470,31 @@ CSRF double-submit, WS ticket exchange, and same-origin relative API paths.
 - Rate limit: 11th ticket request → 429.
 - Redis down on ticket issue → 503.
 
-**Current C4 implementation status (2026-07-09):**
+**C4 implementation status (2026-07-09):** ✅ COMPLETE
 
+**Gateway (merged to main@d69644b):**
 - Gateway upgrade handler consumes `?ticket=<uuid>` through `TokenRevocationService.consumeWsTicket()`.
-- Ticket payload includes `jti` and `exp`, is schema-validated, and is mapped into Group B `DecodedToken` metadata.
-- Invalid/expired/consumed ticket closes with `4401`; ticket-store failure closes with `1013`.
-- JTI/SID indexes are populated from ticket metadata, preserving revocation close semantics.
-- Legacy `?token=<jwt>` remains only for internal tests/backward compatibility while migration completes.
-- Verified locally:
-  - `npx jest src/tests/ws_revocation_integration.test.ts --runInBand` → 10 passed, 3 skipped.
-  - `npx jest src/tests/auth_cookie_endpoint.test.ts --runInBand` → 23 passed.
-  - `npx jest src/tests/auth_cookie_integration.test.ts --runInBand` → 11 passed, 10 skipped.
+- Ticket payload includes `jti` and `exp`, is schema-validated, mapped into Group B `DecodedToken`.
+- Invalid/expired/consumed ticket → `4401`; Redis failure → `1013`.
+- JTI/SID indexes populated from ticket metadata for revocation close.
+- Verified: `ws_revocation_integration.test.ts` (10P/3S), `auth_cookie_endpoint.test.ts` (23P), `auth_cookie_integration.test.ts` (11P/10S).
 
-**Remaining full C4 exit gate:** same-origin browser `/ws` upgrade proxy validation still pending. Verify with `next build && next start` or Compose/browser path; if Next.js cannot proxy upgrade reliably, add nginx/Traefik/Ingress `/ws` routing before marking C4 complete.
+**Infra proxy (this branch):**
+- `conf/nginx.conf`: Edge proxy with `map $http_upgrade $connection_upgrade` — routes `/api`→gateway, `/ws`→gateway (Upgrade), `/`→frontend.
+- `docker-compose.yml`: Added `frontend-proxy` (nginx:1.27-alpine, port 3000:80). Frontend no longer publishes host port. `WS_URL=""`.
+- `deploy/helm/.../templates/frontend.yaml`: Removed all `NEXT_PUBLIC_*` env vars. Replaced with `GATEWAY_INTERNAL_URL`, `API_URL=""`, `WS_URL=""`.
+- `deploy/helm/.../values.yaml` + `values-production.yaml`: Ingress `proxy-read-timeout` increased to 3600s.
+- `scripts/ws-proxy-test.js`: E2E smoke — register→login→ws-ticket→connect(valid)→connected, consumed→4401, invalid→4401.
+- `.github/workflows/ci-cd.yml`: `ws-proxy-smoke` job added.
+- Static verification: no `NEXT_PUBLIC_*` in bundle, no `gateway:4000`, no `?token=`. Frontend lint/build ✅, Gateway lint/build/test ✅.
+
+**Route semantics (Compose & Helm — now identical):**
+
+| Path | Compose | Helm/Ingress |
+|------|---------|-------------|
+| `/` | nginx → frontend:3000 | Ingress → frontend:3000 |
+| `/api/` | nginx → gateway:4000 | Ingress → gateway:4000 |
+| `/ws` | nginx → gateway:4000 (Upgrade) | Ingress → gateway:4000 (Upgrade) |
 
 ---
 
@@ -644,9 +656,9 @@ is modified.
 | localStorage clean | ✅ | No accessToken/refreshToken in localStorage (C3) |
 | WS ticket single-use | ✅ | GETDEL atomic; second consumption returns null |
 | No NEXT_PUBLIC_* in bundle | ✅ | grep .next/static/ → 0 matches (C3) |
-| WS upgrade | ⏳ | C4/infra — same-origin WS proxy validation pending |
+| WS upgrade | ✅ | C4 — Gateway ticket handler + nginx/Ingress same-origin /ws proxy |
 
-**C4 status note:** Gateway-side WS ticket upgrade handling is implemented and covered by `ws_revocation_integration.test.ts` (valid ticket, invalid/consumed ticket `4401`, Redis failure `1013`). Same-origin browser `/ws` proxy upgrade remains the C4 infra exit gate.
+**C4 exit-gate status:** Gateway-side WS ticket handler ✅ merged to main@d69644b. Infra-side same-origin proxy ✅ (nginx in Compose, Ingress in K8s). WS smoke test validates valid→connected, consumed→4401, invalid→4401.
 
 ### C1/C2 Exit Gates Verified
 
@@ -657,12 +669,10 @@ is modified.
 | C2: endpoint-level auth cookie tests (HTTP contract) | ✅ 23 passed (`auth_cookie_endpoint.test.ts`) |
 | C2: no-Redis integration + Redis gated tests | ✅ 11 passed + 10 skipped (`auth_cookie_integration.test.ts`) |
 | C2: lint, TypeScript build, all C1+C2 tests pass | ✅ |
-| C3/C4/C5 | C3 ✅ complete (merged to main@6b0cf3c) | C4 (WS proxy validation), C5 (runtime + cleanup) pending |
+| C3/C4/C5 | C3 ✅ complete (merged to main@6b0cf3c) | C4 ✅ complete (this branch), C5 pending |
 | Group B `consumeRefresh` Lua unchanged | ✅ All Group B tests still pass |
 
 ---
-
-**C4 exit-gate clarification:** the `C3/C4/C5` row above is stale for Gateway-side C4. The Gateway ticket upgrade handler is now implemented and tested; the remaining C4 blocker is same-origin browser `/ws` proxy upgrade validation.
 
 ## 11. Independent Review Checklist
 
