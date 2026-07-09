@@ -1,9 +1,9 @@
 # ADR-004 Implementation Plan: Group C
 
-**Status:** Partially Implemented — C1/C2/C3/C4 complete; C5 pending
-**Target branch:** *(merged to main)*  
-**Baseline:** `main@1f4287c` (C4 squash-merged)  
-**Tag:** `hardening-group-c-c4-stabilized`  
+**Status:** Implemented — C1/C2/C3/C4/C5 complete
+**Target branch:** *(merged to main)*
+**Baseline:** `main@63f1935` (C5 squash-merged)
+**Tag:** `hardening-group-c-stabilized`
 **ADR:** `docs/adr/004-httponly-cookie-csrf-runtime.md`
 
 ---
@@ -669,7 +669,9 @@ is modified.
 | No NEXT_PUBLIC_* in bundle | ✅ | grep .next/static/ → 0 matches (C3) |
 | WS upgrade | ✅ | C4 — Gateway ticket handler + nginx/Ingress same-origin /ws proxy |
 
-**C4 exit-gate status:** ✅ Complete. Gateway ticket handler merged (main@d69644b). Infra proxy merged (main@1f4287c). WS smoke test CI-verified. Static regression tests (7/7). Tag `hardening-group-c-c4-stabilized` pushed.
+**C4 exit-gate status:** ✅ Complete. Gateway ticket handler merged (main@d69644b). Infra proxy merged (main@1f4287c). WS smoke test CI-verified. Static regression tests (7/7).
+
+**C5 exit-gate status:** ✅ Complete. `/auth/me` endpoint merged (main@63f1935). Shared `verifyAccessTokenWithRevocation` helper. Frontend boot uses `/me` as sole identity authority. 7 `/me` tests. Gateway: 147P/0F. All CI green.
 
 ### C1/C2 Exit Gates Verified
 
@@ -677,13 +679,23 @@ is modified.
 |---|---|
 | C1: `getCookieOptions()` , CSRF helpers, origin middleware tests | ✅ 28 passed (`csrf_origin.test.ts`) |
 | C1: lint, TypeScript build | ✅ |
-| C2: endpoint-level auth cookie tests (HTTP contract) | ✅ 23 passed (`auth_cookie_endpoint.test.ts`) |
+| C2: endpoint-level auth cookie tests (HTTP contract) | ✅ 30 passed (`auth_cookie_endpoint.test.ts`) |
 | C2: no-Redis integration + Redis gated tests | ✅ 11 passed + 10 skipped (`auth_cookie_integration.test.ts`) |
 | C2: lint, TypeScript build, all C1+C2 tests pass | ✅ |
-| C3/C4/C5 | C3 ✅ complete (merged to main@6b0cf3c) | C4 ✅ complete (merged to main@1f4287c), C5 pending |
+| C3: Frontend runtime auth migration | ✅ complete (merged to main@6b0cf3c) |
+| C4: Same-origin WS proxy | ✅ complete (merged to main@1f4287c) |
+| C5: `/auth/me` auth recovery finalization | ✅ complete (merged to main@63f1935) |
 | Group B `consumeRefresh` Lua unchanged | ✅ All Group B tests still pass |
 
----
+### Deferred to Backlog
+
+| ID | Item | Rationale |
+|----|------|-----------|
+| TD-C3-2 | Custom Next.js server proxy for runtime Gateway switching | `/api/config` already handles env-based switching; no production demand |
+| TD-C3-4 | Vitest frontend unit test framework | Deferred to keep C5 PR scope tight; recommended as separate follow-up PR |
+| TD-C4-2 | Helm real-cluster WSS validation | Static verification covers config shape; WSS test deferred to staging deploy |
+
+Group C is stabilized at tag `hardening-group-c-stabilized`.
 
 ## 11. Independent Review Checklist
 

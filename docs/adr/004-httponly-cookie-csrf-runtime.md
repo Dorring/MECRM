@@ -1,10 +1,10 @@
 # ADR-004: HttpOnly Refresh Cookie, CSRF, WS Ticket and Runtime URL
 
-**Status:** Partially Implemented — C1/C2/C3/C4 complete; C5 pending
-**Date:** 2026-07-05 (approved), 2026-07-07 (C1/C2 implemented), 2026-07-08 (C3 implemented), 2026-07-09 (C3 merged, C4 implemented and merged)  
-**Scope:** Hardening 1.1 Group C  
-**Tag:** `hardening-group-c-c4-stabilized`  
-**Supersedes:** localStorage-based refresh token storage, JWT-in-URL WebSocket authentication, build-time `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_WS_URL`  
+**Status:** Implemented — C1/C2/C3/C4/C5 complete
+**Date:** 2026-07-05 (approved), 2026-07-07 (C1/C2 implemented), 2026-07-08 (C3 implemented), 2026-07-09 (C3 merged, C4 implemented and merged), 2026-07-10 (C5 merged, Group C stabilized)
+**Scope:** Hardening 1.1 Group C
+**Tag:** `hardening-group-c-stabilized`
+**Supersedes:** localStorage-based refresh token storage, JWT-in-URL WebSocket authentication, build-time `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_WS_URL`
 **Depends on:** ADR-002 (session revocation, Group B — unmodified)
 
 ---
@@ -967,11 +967,39 @@ Implementation may begin only after reviewers accept:
 6. Identical route topology across Compose and Helm ✅ (exact /api/config, prefix /api, /ws Upgrade)
 
 **Tech debt (carried forward to C5):**
-- TD-C3-1: `/refresh` returns no user profile — need `GET /api/v1/auth/me`
+- ~~TD-C3-1: `/refresh` returns no user profile~~ — resolved by C5 `GET /auth/me`
 - TD-C3-2: Runtime Gateway switching needs custom Next.js server proxy
 - ~~TD-C3-3: Same-origin `/ws` upgrade proxy validation~~ — resolved by C4
-- TD-C3-4: Frontend test framework gap (no jest/vitest config)
+- TD-C3-4: Frontend test framework gap (no jest/vitest config) — deferred to post-C5 backlog
 - ~~TD-C4-1: Docker Desktop unavailable on dev machine~~ — resolved by CI ws-proxy-smoke passing on main
 - TD-C4-2: Helm rendered templates not tested on a real K8s cluster (static verification only)
 
-C5 (runtime config finalization + self-review) is pending.
+### 16.5 C5 — Auth Recovery Finalization ✅
+
+**Merged:** `main@63f1935` (PR #10, squash merge of `codex/group-c-c5-finalization`, 5 commits)
+**CI:** GitHub Actions all-green (lint, build, test, ws-proxy-smoke)
+
+**Deliverables:**
+- `GET /api/v1/auth/me` endpoint — returns `{ id, email, name, tenantId, roles }` from verified access token
+- Shared `verifyAccessTokenWithRevocation` helper — reused by `/ws-ticket` and `/me` (no hand-rolled JWT logic)
+- Frontend `resolveUserProfile()` — `/me` as sole identity authority; no localStorage fallback for auth state
+- `clearLocalAuthState()` — clears memory token + display cache on `/me` failure, preserves HttpOnly cookie
+- `cacheAuthUserDisplay()` — explicit display-only cache write, never stores tokens
+- Code cleanup: deduplicated `deriveWsUrl`, removed stale TD-C3-1 comments
+
+**Test evidence:**
+
+| Suite | Passed | Scope |
+|-------|--------|-------|
+| `auth_cookie_endpoint.test.ts` | 30 | 7 new `/me` tests (no-token→401, garbage→401, expired→401 UNAUTHORIZED, refresh-type→401 UNAUTHORIZED, revoked→401, redis-fail→503, valid→200) |
+| Gateway full suite | 147 / 0 failed | All C1-C5 tests green |
+| Frontend lint/tsc/build | 0 errors | 19 routes, no bundle leaks |
+| `test_ws_proxy.py` | 7 passed | Static regression |
+| Bundle grep | 0 `NEXT_PUBLIC_*`, 0 `gateway:4000`, 0 `localhost:4000` | Clean |
+
+**Post-C5 deferred items (backlog, not blocking Group C stabilization):**
+- Vitest frontend unit test framework (TD-C3-4)
+- Helm real-cluster WSS validation (TD-C4-2)
+- Custom Next.js server proxy for runtime Gateway switching (TD-C3-2)
+
+**C5 exit criteria all satisfied.** Group C is stabilized at tag `hardening-group-c-stabilized`.
