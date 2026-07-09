@@ -13,8 +13,8 @@
  */
 
 export async function GET() {
-  const apiUrl = process.env.API_URL || '';
-  const wsUrl = process.env.WS_URL || 'ws://localhost:4000';
+  const apiUrl = process.env.API_URL !== undefined ? process.env.API_URL : '';
+  const wsUrl = process.env.WS_URL !== undefined ? process.env.WS_URL : 'ws://localhost:4000';
 
   return Response.json({ apiUrl, wsUrl });
 }

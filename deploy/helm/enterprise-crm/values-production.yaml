@@ -47,7 +47,8 @@ ingress:
   annotations:
     kubernetes.io/tls-acme: "true"
     nginx.ingress.kubernetes.io/proxy-body-size: "100m"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
     nginx.ingress.kubernetes.io/limit-connections: "100"
     nginx.ingress.kubernetes.io/limit-rps: "50"
   hosts:
@@ -55,6 +56,9 @@ ingress:
       paths:
         - path: /
           pathType: Prefix
+          service: frontend
+        - path: /api/config
+          pathType: Exact
           service: frontend
         - path: /api
           pathType: Prefix

@@ -5,7 +5,7 @@
 # global.imageRegistry is prepended to images.*.repository when non-empty
 # (consumed by templates/gateway.yaml, agents.yaml, frontend.yaml).
 # global.imagePullSecrets is rendered into pod specs when non-empty.
-# global.domain is consumed by ingress hosts and frontend NEXT_PUBLIC_* env.
+# global.domain is consumed by ingress hosts and CORS_ORIGINS in gateway env.
 global:
   imageRegistry: ""
   imagePullSecrets: []
@@ -76,12 +76,16 @@ ingress:
   annotations:
     kubernetes.io/tls-acme: "true"
     nginx.ingress.kubernetes.io/proxy-body-size: "100m"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
   hosts:
     - host: crm.example.com
       paths:
         - path: /
           pathType: Prefix
+          service: frontend
+        - path: /api/config
+          pathType: Exact
           service: frontend
         - path: /api
           pathType: Prefix
