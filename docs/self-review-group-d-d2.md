@@ -1,9 +1,12 @@
 # D2 Self-Review — Image Pinning & OPA Version Convergence
 
 **Date:** 2026-07-10
-**Branch:** `codex/group-d-d2-image-pinning`
+**Branch:** `codex/group-d-d2-image-pinning` (deleted — squash-merged as #12)
 **Baseline:** `main@1b4a689` (D1 stabilized)
-**Status:** In progress, awaiting review/PR
+**Status:** ✅ **MERGED / STABILIZED**
+**Merge commit:** `main@4422593` (squash-merge PR #12)
+**Tag:** `hardening-group-d-d2-stabilized`
+**CI:** [All checks passed](https://github.com/Dorring/MECRM/actions/runs/PR-12)
 
 ---
 
