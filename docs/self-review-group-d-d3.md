@@ -1,8 +1,12 @@
 # D3 Self-Review — Chaos Cleanup
 
 **Date:** 2026-07-10
-**Branch:** `codex/group-d-d3-chaos-cleanup`
+**Branch:** `codex/group-d-d3-chaos-cleanup` (deleted — squash-merged as #13)
 **Baseline:** `main@c13a523` (D2 stabilized)
+**Status:** ✅ **MERGED / STABILIZED**
+**Merge commit:** `main@2014732` (squash-merge PR #13)
+**Tag:** `hardening-group-d-d3-stabilized`
+**CI:** All checks passed + Chaos Tests (Isolated) manual dispatch passed
 
 ---
 

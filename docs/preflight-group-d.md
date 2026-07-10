@@ -1,7 +1,7 @@
 # Group D Preflight Investigation — Compose / Chaos / Health / Image Pinning
 
 **Date:** 2026-07-10
-**Status:** D1 ✅ merged/stabilized (`main@4336889`, tag `hardening-group-d-d1-stabilized`); D2 ✅ merged/stabilized (`main@4422593`, tag `hardening-group-d-d2-stabilized`)
+**Status:** D1 ✅ merged/stabilized (`main@4336889`, tag `hardening-group-d-d1-stabilized`); D2 ✅ merged/stabilized (`main@4422593`, tag `hardening-group-d-d2-stabilized`); D3 ✅ merged/stabilized (`main@2014732`, tag `hardening-group-d-d3-stabilized`)
 **Baseline:** `main@a55b7de` (Group C stabilized)
 **Investigator:** Codex
 
