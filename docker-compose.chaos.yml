@@ -82,30 +82,35 @@ services:
       - crm-network
 
   chaos-migrations:
-    image: postgres:16-alpine
+    # Run the unified migration runner (scripts/migrate.sh) inside a
+    # gateway-like context so Prisma migrate deploy can operate against
+    # the Postgres health-verified by depends_on.  The gateway image is
+    # used because it already contains the Node.js and Prisma toolchain
+    # needed by npx prisma migrate deploy.  Raw SQL and RLS checks are
+    # handled by psql inside migrate.sh; psql is present in the Node base
+    # image (it is not multi-stage stripped).
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
       - ./database/migrations:/migrations:ro
+      - ./scripts/migrate.sh:/scripts/migrate.sh:ro
+    env_file:
+      - .env
     environment:
-      - PGPASSWORD=${POSTGRES_PASSWORD:-crm_password}
       - POSTGRES_USER=${POSTGRES_USER:-crm_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-crm_password}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
       - POSTGRES_DB=${POSTGRES_DB:-enterprise_crm}
-    entrypoint: ["/bin/sh", "-lc"]
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-crm_user}:${POSTGRES_PASSWORD:-crm_password}@postgres:5432/${POSTGRES_DB:-enterprise_crm}
+      - GATEWAY_DIR=/app
+    entrypoint: ["/bin/sh"]
     command:
-      - |
-        set -e
-        for f in /migrations/*.sql; do
-          case "$$f" in
-            */02-rls-policies.sql) continue ;;
-          esac
-          echo "apply $$f"
-          psql -h postgres -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -v ON_ERROR_STOP=1 -f "$$f"
-        done
-        echo "apply /migrations/02-rls-policies.sql"
-        psql -h postgres -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -v ON_ERROR_STOP=1 -f "/migrations/02-rls-policies.sql"
-        echo "migrations done"
+      - "/scripts/migrate.sh"
     networks:
       - crm-network
 
@@ -128,7 +133,7 @@ services:
       redis:
         condition: service_healthy
       opa:
-        condition: service_started
+        condition: service_healthy
     networks:
       - crm-network
 
