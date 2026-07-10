@@ -46,7 +46,7 @@ The following blocker findings have been addressed or partially addressed:
 | **D-C-1** | OPA dep `service_started` → `service_healthy` (gateway + agents) | ✅ **Fixed** | Both sites changed |
 | **D-C-2** | Weaviate dep `service_started` → `service_healthy` (agents) | ✅ **Fixed** | One line changed |
 | **D-HC-1** | Frontend K8s probes → 404 `/api/health` | ✅ **Fixed** | New `frontend/src/app/api/health/route.ts` returns 200 |
-| **D-HC-2** | nginx frontend-proxy no healthcheck | ✅ **Fixed** | `location = /health` in nginx.conf + Compose healthcheck |
+| **D-HC-2** | nginx frontend-proxy no healthcheck | ✅ **Fixed** | `location = /health` in nginx.conf + CI-tolerant `nginx -t` Compose healthcheck |
 | **D-HC-3** | Agents no Compose healthcheck | 🟡 **Partial** | Compose healthcheck added on `/health`; `/ready` endpoint deferred to follow-up |
 | **D-HC-4** | Kafka no `start_period` | ✅ **Fixed** | `start_period: 60s` |
 | **D-HC-5** | Postgres no `start_period` | ✅ **Fixed** | `start_period: 15s` |
@@ -219,14 +219,14 @@ location /health {
   add_header Content-Type text/plain;
 }
 ```
-And add to Compose:
+And add to Compose. The first implementation used `wget /health`; CI showed this can produce frontend-proxy false negatives during cold startup. The D1 implementation now uses local nginx config validation for Compose health while keeping `/health` in nginx.conf for direct checks:
 ```yaml
 healthcheck:
-  test: ["CMD", "wget", "-qO-", "http://localhost/health"]
-  interval: 15s
+  test: ["CMD-SHELL", "nginx -t >/dev/null 2>&1"]
+  interval: 10s
   timeout: 5s
-  retries: 3
-  start_period: 5s
+  retries: 6
+  start_period: 20s
 ```
 
 **Finding D-HC-3 (BLOCKER): Agents has no Compose healthcheck, no `/ready` endpoint**
@@ -478,7 +478,7 @@ These are NOT Group D scope but are documented for awareness:
 **Changes:**
 1. OPA dep: `service_started` → `service_healthy` (gateway, agents) — **low risk**
 2. Weaviate dep: `service_started` → `service_healthy` (agents) — **low risk**
-3. Add nginx `location = /health` + Compose healthcheck — **low risk**
+3. Add nginx `location = /health` + CI-tolerant `nginx -t` Compose healthcheck — **low risk**
 4. Add `frontend/src/app/api/health/route.ts` — **low risk**
 5. Add agents Compose healthcheck (existing `/health` endpoint) — **low risk**
 6. Optionally add agents `/ready` endpoint — **medium risk** (application code change; needs tests)

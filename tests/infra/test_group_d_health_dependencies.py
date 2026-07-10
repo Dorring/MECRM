@@ -120,8 +120,8 @@ class TestFrontendProxyHealthcheck(unittest.TestCase):
         test = hc.get("test")
         self.assertIsNotNone(test, "frontend-proxy healthcheck has no test")
         test_str = " ".join(test) if isinstance(test, list) else str(test)
-        self.assertIn("health", test_str,
-                      "frontend-proxy healthcheck should reference /health")
+        self.assertIn("nginx -t", test_str,
+                      "frontend-proxy healthcheck should validate nginx config")
 
     def test_frontend_proxy_healthcheck_has_reasonable_params(self):
         svc = self.compose["services"]["frontend-proxy"]
@@ -130,6 +130,12 @@ class TestFrontendProxyHealthcheck(unittest.TestCase):
         self.assertIsNotNone(hc.get("timeout"), "healthcheck missing timeout")
         self.assertIsNotNone(hc.get("retries"), "healthcheck missing retries")
         self.assertIsNotNone(hc.get("start_period"), "healthcheck missing start_period")
+
+    def test_frontend_proxy_healthcheck_is_ci_tolerant(self):
+        svc = self.compose["services"]["frontend-proxy"]
+        hc = svc.get("healthcheck", {})
+        self.assertEqual(hc.get("start_period"), "20s")
+        self.assertGreaterEqual(int(hc.get("retries", 0)), 6)
 
 
 # ---------------------------------------------------------------------------

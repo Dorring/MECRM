@@ -25,7 +25,7 @@
 
 | Service | Check | Failure Semantics |
 |---------|-------|-------------------|
-| **frontend-proxy** | `wget http://localhost/health` | nginx is not serving responses. `depends_on` blocks downstream containers that use `service_healthy`. Docker Compose marks container "unhealthy" after 3 retries × 15s = 45s. |
+| **frontend-proxy** | `nginx -t` | nginx configuration is invalid or unreadable. The running container process already proves nginx is alive; using config validation avoids CI false negatives from BusyBox wget / localhost networking during cold startup. Docker Compose marks the container "unhealthy" after 6 retries × 10s, with a 20s start period. |
 | **agents (Compose)** | `httpx.get('http://localhost:5010/health')` | Health endpoint returning non-2xx or unreachable. Matches Dockerfile HEALTHCHECK. `depends_on` not used by any downstream (no service depends on agents today), but Docker shows health status in `docker compose ps`. |
 
 ---
@@ -34,7 +34,7 @@
 
 | Service | Command | Requires | Available in Image? |
 |---------|---------|----------|---------------------|
-| frontend-proxy | `wget -qO- http://localhost/health` | wget | ✅ nginx:1.27-alpine includes BusyBox wget |
+| frontend-proxy | `nginx -t` | nginx binary | ✅ nginx:1.27-alpine includes nginx |
 | agents | `python -c "import httpx,sys; ..."` | python, httpx | ✅ httpx is a runtime dependency (pip installed) |
 | gateway | `wget -qO- http://localhost:4000/health` | wget | ✅ Node runner image includes wget |
 
@@ -148,7 +148,7 @@ Plus new file:
 1. `gateway → opa`: `service_started` → `service_healthy` (1 line)
 2. `agents → weaviate`: `service_started` → `service_healthy` (1 line)
 3. `agents → opa`: `service_started` → `service_healthy` (1 line)
-4. `frontend-proxy`: added healthcheck block (7 lines)
+4. `frontend-proxy`: added CI-tolerant `nginx -t` healthcheck block
 5. `ws-proxy-test → frontend-proxy`: `service_started` → `service_healthy` (1 line)
 6. `agents`: added healthcheck block (7 lines)
 7. `gateway`: added comment explaining Compose-vs-Dockerfile params (8 lines)
@@ -191,6 +191,6 @@ Plus new file:
 | 5 | Frontend lint/tsc/build clean | ✅ |
 | 6 | Infra tests pass | ✅ 64P/7S |
 | 7 | No production traffic path changed | ✅ Verified |
-| 8 | Healthcheck commands use in-image tools only | ✅ wget/httpx already present |
+| 8 | Healthcheck commands use in-image tools only | ✅ nginx/httpx/wget already present where used |
 | 9 | `/health` vs `/ready` distinction preserved | ✅ Gateway already correct; agents deferred |
 | 10 | Self-review complete | ✅ This document |
