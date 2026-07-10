@@ -509,7 +509,7 @@ These are NOT Group D scope but are documented for awareness:
 
 ---
 
-### D2 — Image Pinning (in progress on `codex/group-d-d2-image-pinning`)
+### D2 — Image Pinning (✅ merged/stabilized as #12, tag `hardening-group-d-d2-stabilized`)
 
 **Goal:** Eliminate all Compose `:latest` tags; converge OPA to CI-validated 0.70.0.
 

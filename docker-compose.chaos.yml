@@ -82,30 +82,30 @@ services:
       - crm-network
 
   chaos-migrations:
-    image: postgres:16-alpine
+    # Uses the dedicated migration runner (database/Dockerfile.migrate) which
+    # bundles Node.js + pinned Prisma + postgresql-client.  The unified
+    # scripts/migrate.sh runs: npx prisma migrate deploy → raw SQL 01-12 → RLS
+    # enforcement audit.  migrate.sh derives SQL_DIR from its own location
+    # (/scripts/migrate.sh → REPO_ROOT=/) so the mount must land at
+    # /database/migrations.
+    build:
+      context: .
+      dockerfile: database/Dockerfile.migrate
+    command: ["bash", "/scripts/migrate.sh"]
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
-      - ./database/migrations:/migrations:ro
+      - ./database/migrations:/database/migrations:ro
+      - ./scripts/migrate.sh:/scripts/migrate.sh:ro
     environment:
-      - PGPASSWORD=${POSTGRES_PASSWORD:-crm_password}
       - POSTGRES_USER=${POSTGRES_USER:-crm_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-crm_password}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
       - POSTGRES_DB=${POSTGRES_DB:-enterprise_crm}
-    entrypoint: ["/bin/sh", "-lc"]
-    command:
-      - |
-        set -e
-        for f in /migrations/*.sql; do
-          case "$$f" in
-            */02-rls-policies.sql) continue ;;
-          esac
-          echo "apply $$f"
-          psql -h postgres -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -v ON_ERROR_STOP=1 -f "$$f"
-        done
-        echo "apply /migrations/02-rls-policies.sql"
-        psql -h postgres -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -v ON_ERROR_STOP=1 -f "/migrations/02-rls-policies.sql"
-        echo "migrations done"
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-crm_user}:${POSTGRES_PASSWORD:-crm_password}@postgres:5432/${POSTGRES_DB:-enterprise_crm}
+      - GATEWAY_DIR=/app
     networks:
       - crm-network
 
@@ -128,7 +128,7 @@ services:
       redis:
         condition: service_healthy
       opa:
-        condition: service_started
+        condition: service_healthy
     networks:
       - crm-network
 

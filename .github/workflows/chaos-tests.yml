@@ -1,15 +1,22 @@
 name: Chaos Tests (Isolated)
 
+# Only trigger manually (workflow_dispatch).  Scheduled chaos runs were
+# removed in D3: they produced silent exit 2 failures from the inline
+# raw-SQL migration runner without surfacing diagnostics.  Re-enable
+# schedule only after chaos-migrations has been validated end-to-end.
+
 on:
   workflow_dispatch: {}
-  schedule:
-    - cron: "0 3 * * *"
 
 jobs:
   chaos:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    # Only allow manual dispatch — no auto-fire on main push either.
+    # The guard was previously if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main',
+    # which caught schedule runs but also pulled in any push to main.
+    # Now that schedule is removed, this guard is a no-op safety backstop.
+    if: github.event_name == 'workflow_dispatch'
 
     steps:
       - name: Checkout
@@ -30,6 +37,18 @@ jobs:
         run: |
           docker compose -f docker-compose.chaos.yml up -d --build
 
+      - name: Show service health (diagnostics)
+        if: always()
+        run: |
+          echo "=== docker compose ps ==="
+          docker compose -f docker-compose.chaos.yml ps
+          echo ""
+          echo "=== chaos-migrations logs ==="
+          docker compose -f docker-compose.chaos.yml logs --tail=200 chaos-migrations || true
+          echo ""
+          echo "=== postgres logs ==="
+          docker compose -f docker-compose.chaos.yml logs --tail=50 postgres || true
+
       - name: Run chaos suite
         env:
           CHAOS_TESTS_ENABLED: "true"
@@ -39,6 +58,18 @@ jobs:
           CHAOS_REDIS_URL: "redis://localhost:6379"
         run: |
           pytest agents/tests/chaos -v
+
+      - name: Show agent and replay diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== agents logs ==="
+          docker compose -f docker-compose.chaos.yml logs --tail=200 agents || true
+          echo ""
+          echo "=== replay-service logs ==="
+          docker compose -f docker-compose.chaos.yml logs --tail=200 replay-service || true
+          echo ""
+          echo "=== kafka logs ==="
+          docker compose -f docker-compose.chaos.yml logs --tail=50 kafka || true
 
       - name: Upload chaos reports
         if: always()

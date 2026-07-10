@@ -19,7 +19,7 @@ COPY gateway/package*.json ./
 COPY gateway/prisma ./prisma
 RUN npm ci
 
-# Raw SQL migrations are mounted at runtime via ./database/migrations:/migrations:ro
+# Raw SQL migrations are mounted at runtime via ./database/migrations:/database/migrations:ro
 # (see docker-compose.yml migrate service).
 
 CMD ["npx", "prisma", "migrate", "deploy"]
