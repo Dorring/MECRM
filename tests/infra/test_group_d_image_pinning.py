@@ -153,14 +153,9 @@ class TestOPAVersionConvergence(unittest.TestCase):
 # -- D2-HR: Helm latest fallback is deferred -------------------------
 
 class TestHelmLatestDeferred(unittest.TestCase):
-    """Helm values contain `tag: latest` for app images, but CI always
-    overrides with `--set images.*.tag=${{ github.sha }}`.  D2 does NOT
-    change these Helm fallbacks — they are deferred to Phase 4 CI/CD
-    hardening.
-
-    This test documents that the Helm fallback exists (so future CI
-    hardening has a regression test asserting the override is still in
-    place), and confirms the fallback is NOT treated as a D2 blocker.
+    """D2 deferred Helm `latest` fallbacks to Phase 4.
+    E1 replaced `tag: latest` with `tag: ""` + `required` fail-fast in templates.
+    The Helm fallback is now empty-string instead of `latest` — CI still overrides.
     """
 
     def _find_latest_tags(self, path):
@@ -174,34 +169,50 @@ class TestHelmLatestDeferred(unittest.TestCase):
                 tags.append(svc)
         return tags
 
-    def test_values_yaml_has_latest_fallback(self):
-        """Documented: values.yaml has latest fallbacks that CI overrides."""
+    def _find_empty_tags(self, path):
+        with open(path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+        tags = []
+        images = data.get("images") or {}
+        for svc in ["frontend", "gateway", "agents"]:
+            tag = images.get(svc, {}).get("tag", "")
+            if tag == "":
+                tags.append(svc)
+        return tags
+
+    def test_values_yaml_tag_is_empty_not_latest(self):
+        """E1: values.yaml tags are empty string (fail-fast), not 'latest'."""
         path = os.path.join(HELM_VALUES_DIR, "values.yaml")
-        tags = self._find_latest_tags(path)
-        self.assertTrue(
-            len(tags) > 0,
-            f"values.yaml: expected at least one 'tag: latest' fallback; found none"
-        )
+        latest_tags = self._find_latest_tags(path)
+        self.assertEqual(len(latest_tags), 0,
+                         f"values.yaml: should have ZERO 'tag: latest', found {latest_tags}")
+        empty_tags = self._find_empty_tags(path)
+        self.assertEqual(len(empty_tags), 3,
+                         f"values.yaml: expected 3 empty tags, found {len(empty_tags)}")
 
-    def test_values_staging_yaml_has_latest_fallback(self):
+    def test_values_staging_yaml_tag_is_empty_not_latest(self):
+        """E1: staging values tags are empty string, not 'latest'."""
         path = os.path.join(HELM_VALUES_DIR, "values-staging.yaml")
-        tags = self._find_latest_tags(path)
-        self.assertTrue(
-            len(tags) > 0,
-            f"values-staging.yaml: expected at least one 'tag: latest' fallback"
-        )
+        latest_tags = self._find_latest_tags(path)
+        self.assertEqual(len(latest_tags), 0,
+                         f"values-staging.yaml: should have ZERO 'tag: latest', found {latest_tags}")
+        empty_tags = self._find_empty_tags(path)
+        self.assertEqual(len(empty_tags), 3,
+                         f"values-staging.yaml: expected 3 empty tags, found {len(empty_tags)}")
 
-    def test_values_production_yaml_has_latest_fallback(self):
+    def test_values_production_yaml_tag_is_empty_not_latest(self):
+        """E1: production values tags are empty string, not 'latest'."""
         path = os.path.join(HELM_VALUES_DIR, "values-production.yaml")
-        tags = self._find_latest_tags(path)
-        self.assertTrue(
-            len(tags) > 0,
-            f"values-production.yaml: expected at least one 'tag: latest' fallback"
-        )
+        latest_tags = self._find_latest_tags(path)
+        self.assertEqual(len(latest_tags), 0,
+                         f"values-production.yaml: should have ZERO 'tag: latest', found {latest_tags}")
+        empty_tags = self._find_empty_tags(path)
+        self.assertEqual(len(empty_tags), 3,
+                         f"values-production.yaml: expected 3 empty tags, found {len(empty_tags)}")
 
-    def test_ci_overrides_helm_latest(self):
-        """Verify that CI deploy steps override with github.sha, confirming
-        the Helm 'latest' fallback is never used in CI/CD."""
+    def test_ci_overrides_helm_tags(self):
+        """E1: CI deploy steps still override with --set images.*.tag=${{ github.sha }},
+        which satisfies the `required` guard in templates."""
         with open(CICD_WORKFLOW_PATH, "r", encoding="utf-8") as fh:
             content = fh.read()
         # staging deploy (L694-696)

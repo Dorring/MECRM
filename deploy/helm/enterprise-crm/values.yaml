@@ -31,10 +31,6 @@ serviceAccount:
 # include the frontend workload are not surprised; enable for full topologies.
 frontend:
   enabled: true
-  # Keycloak public endpoints (browser-facing, non-secret)
-  keycloakUrl: ""
-  keycloakRealm: "crm"
-  keycloakClientId: "crm-frontend"
 
 # Replica counts
 replicaCount:
@@ -44,17 +40,21 @@ replicaCount:
 
 # Images
 images:
+  # tag is intentionally empty — CI (.github/workflows/ci-cd.yml) overrides
+  # every image tag to the current commit SHA via --set.  A plain `helm
+  # install` / `helm template` without --set will fail with a `required`
+  # error in the template, which is safer than silently deploying `latest`.
   frontend:
     repository: enterprise-crm/frontend
-    tag: latest
+    tag: ""
     pullPolicy: IfNotPresent
   gateway:
     repository: enterprise-crm/gateway
-    tag: latest
+    tag: ""
     pullPolicy: IfNotPresent
   agents:
     repository: enterprise-crm/agents
-    tag: latest
+    tag: ""
     pullPolicy: IfNotPresent
 
 # Service configurations
@@ -192,47 +192,15 @@ externalRedis:
 externalKafka:
   host: ""
 
-# OPA
-# NOTE: opa is referenced by agents.yaml/gateway.yaml (http://<fullname>-opa:8181) and by
-# templates/networkpolicy.yaml, but NO template renders an OPA Deployment/Service and OPA
-# is NOT a Chart.yaml dependency. The chart currently assumes OPA is provisioned out-of-band.
-# Declared here for documentation; consuming it requires adding an OPA template or subchart
-# (out of scope for this fix batch — tracked in Phase 4 task list).
-opa:
-  enabled: true
-  replicaCount: 2
-  resources:
-    limits:
-      cpu: 500m
-      memory: 512Mi
-    requests:
-      cpu: 100m
-      memory: 128Mi
-
-# Weaviate
-# NOTE: weaviate is referenced by agents.yaml (http://<fullname>-weaviate:8080) and
-# networkpolicy.yaml, but NO template renders a Weaviate Deployment/Service and Weaviate
-# is NOT a Chart.yaml dependency. Assumed provisioned out-of-band. See OPA note above.
-weaviate:
-  enabled: true
-  replicas: 2
-  storage:
-    size: 20Gi
-
-# Ollama
-# NOTE: ollama is referenced by agents.yaml (http://<fullname>-ollama:11434) and
-# networkpolicy.yaml, and .Values.ollama.model IS consumed by agents.yaml, but NO template
-# renders an Ollama Deployment/Service and Ollama is NOT a Chart.yaml dependency. Assumed
-# provisioned out-of-band (typically on GPU node pools). See OPA note above.
+# Ollama (optional GPU profile)
+# Ollama is NOT a Chart.yaml dependency and this chart does NOT render an Ollama
+# Deployment/Service.  When enabled, agents receive OLLAMA_URL / OLLAMA_MODEL env
+# vars pointing at an out-of-band Ollama instance labelled app: ollama.
+# Default disabled — Ollama requires GPU node pools and is not part of the base
+# CRM topology.
 ollama:
-  enabled: true
+  enabled: false
   model: llama3.1
-  resources:
-    limits:
-      nvidia.com/gpu: 1
-      memory: 16Gi
-    requests:
-      memory: 8Gi
 
 # Keycloak
 keycloak:
@@ -241,25 +209,6 @@ keycloak:
     adminUser: admin
     adminPassword: ""  # Use secret
   replicaCount: 2
-
-# Monitoring
-# NOTE: monitoring.* is declared but NOT consumed by any template, and prometheus/grafana/loki
-# are NOT Chart.yaml dependencies. Pod annotations (prometheus.io/scrape) in gateway/agents/
-# frontend templates rely on an externally provisioned Prometheus with scrape discovery.
-# Declared for documentation; add a kube-prometheus-stack subchart or external monitoring
-# to actually consume these values. Tracked as a known alignment gap.
-monitoring:
-  enabled: true
-  prometheus:
-    enabled: true
-    retention: 15d
-    storage: 50Gi
-  grafana:
-    enabled: true
-    adminPassword: ""  # Use secret
-  loki:
-    enabled: true
-    retention: 7d
 
 # Secrets (reference existing K8s secrets)
 # P0-3: secretKeyRef `key` in gateway.yaml/agents.yaml MUST match the key name
@@ -279,9 +228,6 @@ secrets:
   jwt:
     existingSecret: crm-jwt-secret
     secretKey: jwt-secret
-  keycloak:
-    existingSecret: crm-keycloak-secret
-    adminPasswordKey: admin-password
 
 # Pod disruption budgets
 podDisruptionBudget:
