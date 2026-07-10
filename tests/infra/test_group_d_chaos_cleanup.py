@@ -72,24 +72,25 @@ class TestChaosMigrationRunner(unittest.TestCase):
         cls.data = _load_yaml(CHAOS_COMPOSE_PATH)
 
     def test_chaos_migrations_uses_migrate_sh(self):
-        """command or entrypoint should reference /scripts/migrate.sh."""
+        """command must be ["bash", "/scripts/migrate.sh"]."""
+        services = self.data.get("services") or {}
+        cm = services.get("chaos-migrations") or {}
+        cmd = cm.get("command") or []
+
+        self.assertEqual(
+            cmd, ["bash", "/scripts/migrate.sh"],
+            f"chaos-migrations command must be [\"bash\", \"/scripts/migrate.sh\"], got {cmd!r}"
+        )
+
+    def test_chaos_migrations_no_entrypoint(self):
+        """chaos-migrations must not override entrypoint.
+        database/Dockerfile.migrate provides CMD, not entrypoint."""
         services = self.data.get("services") or {}
         cm = services.get("chaos-migrations") or {}
         entry = cm.get("entrypoint") or []
-        cmd = cm.get("command") or []
-
-        # Flatten to searchable text
-        def _flatten(v):
-            if isinstance(v, str):
-                return v
-            if isinstance(v, list):
-                return " ".join(str(x) for x in v)
-            return ""
-
-        body = _flatten(entry) + " " + _flatten(cmd)
-        self.assertIn(
-            "migrate.sh", body,
-            "chaos-migrations must reference scripts/migrate.sh"
+        self.assertEqual(
+            entry, [],
+            f"chaos-migrations must not set entrypoint, got {entry!r}"
         )
 
     def test_chaos_migrations_no_inline_sql_loop(self):
@@ -109,28 +110,52 @@ class TestChaosMigrationRunner(unittest.TestCase):
         )
 
     def test_chaos_migrations_is_build_not_bare_image(self):
-        """chaos-migrations should have a build context, not a bare postgres image.
-        The gateway Dockerfile provides Node + Prisma toolchain needed by
-        npx prisma migrate deploy inside migrate.sh."""
+        """chaos-migrations should have a build context, not a bare postgres image."""
         services = self.data.get("services") or {}
         cm = services.get("chaos-migrations") or {}
         build = cm.get("build") or {}
         image = cm.get("image") or ""
         self.assertTrue(
             build or "postgres" not in image,
-            "chaos-migrations must be a build (gateway) context, "
-            "not a bare postgres image (no npx/Prisma toolchain). "
+            "chaos-migrations must use a build context, "
+            "not a bare postgres image (no Prisma toolchain). "
             f"Got image={image!r}, build={build!r}"
         )
 
-    def test_chaos_migrations_build_context_is_gateway(self):
-        """The build context should be ./gateway to provide Prisma + psql."""
+    def test_chaos_migrations_build_context_is_repo_root(self):
+        """Build context must be '.' so database/Dockerfile.migrate can
+        COPY gateway/package*.json and gateway/prisma."""
         services = self.data.get("services") or {}
         cm = services.get("chaos-migrations") or {}
         build = cm.get("build") or {}
         context = build.get("context", "")
-        self.assertIn("gateway", context,
-                      f"chaos-migrations build context should be gateway, got {context!r}")
+        self.assertEqual(
+            context, ".",
+            f"chaos-migrations build context must be '.', got {context!r}"
+        )
+
+    def test_chaos_migrations_dockerfile_is_migrate(self):
+        """Dockerfile must be database/Dockerfile.migrate (dedicated migration
+        runner with Node + pinned Prisma + postgresql-client)."""
+        services = self.data.get("services") or {}
+        cm = services.get("chaos-migrations") or {}
+        build = cm.get("build") or {}
+        dockerfile = build.get("dockerfile", "")
+        self.assertEqual(
+            dockerfile, "database/Dockerfile.migrate",
+            f"chaos-migrations dockerfile must be database/Dockerfile.migrate, got {dockerfile!r}"
+        )
+
+    def test_chaos_migrations_no_env_file(self):
+        """chaos-migrations must not use env_file: .env.
+        migrate.sh loads .env internally at REPO_ROOT/.env."""
+        services = self.data.get("services") or {}
+        cm = services.get("chaos-migrations") or {}
+        env_file = cm.get("env_file") or []
+        self.assertEqual(
+            env_file, [],
+            f"chaos-migrations must not use env_file, got {env_file!r}"
+        )
 
     def test_chaos_migrations_volumes_include_migrate_sh(self):
         """migrate.sh must be mounted into the container."""

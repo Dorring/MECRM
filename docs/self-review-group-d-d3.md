@@ -27,23 +27,24 @@ entrypoint: ["/bin/sh", "-lc"]
 command: inline for-loop over /migrations/*.sql (psql only, skips 02 then applies last)
 ```
 
-**New `chaos-migrations`:**
+**New `chaos-migrations` (aligned with main compose `migrate` service):**
 ```yaml
-build:                            # gateway Dockerfile (Node.js + Prisma + psql)
-  context: ./gateway
-  dockerfile: Dockerfile
+build:                            # database/Dockerfile.migrate (Node + pinned Prisma + postgresql-client)
+  context: .
+  dockerfile: database/Dockerfile.migrate
+command: ["bash", "/scripts/migrate.sh"]
 volumes:
+  - ./database/migrations:/database/migrations:ro
   - ./scripts/migrate.sh:/scripts/migrate.sh:ro
-command: ["/scripts/migrate.sh"]  # Prisma migrate deploy → raw SQL → RLS audit
+environment:
+  - GATEWAY_DIR=/app
+  # ... POSTGRES_*, DATABASE_URL
 ```
 
-The unified `scripts/migrate.sh` runs:
-1. `npx prisma migrate deploy` — creates application tables, indexes, FK constraints
-2. Raw SQL 01–12 in fixed order — event store, outbox, read models, twins, governance
-3. RLS policies — `ENABLE + FORCE ROW LEVEL SECURITY`, `crm_app` grants
-4. Schema drift + RLS enforcement audit
-
-This mirrors what `docker compose --profile migrate run migrate` does in the main stack.
+Key design points:
+- `database/Dockerfile.migrate` is a dedicated migration runner: `node:20-bullseye-slim` + `postgresql-client` + `npm ci` (pinned Prisma CLI). It is lighter than the full gateway image and does not bundle the app build.
+- `migrate.sh` derives `REPO_ROOT` from its own path: `/scripts/migrate.sh` → `REPO_ROOT=/`. No `REPO_ROOT` env override is needed.
+- No `env_file: .env` — `migrate.sh` loads `.env` internally via `source "${REPO_ROOT}/.env"`.
 
 ### 2.2 — `docker-compose.chaos.yml`: OPA dependency condition
 

@@ -82,32 +82,23 @@ services:
       - crm-network
 
   chaos-migrations:
-    # Run the unified migration runner (scripts/migrate.sh) inside a
-    # gateway-like context so Prisma migrate deploy can operate against
-    # the Postgres health-verified by depends_on.  The gateway image is
-    # used because it already contains the Node.js and Prisma toolchain
-    # needed by npx prisma migrate deploy.  Raw SQL and RLS checks are
-    # handled by psql inside migrate.sh; psql is present in the Node base
-    # image (it is not multi-stage stripped).
+    # Uses the dedicated migration runner (database/Dockerfile.migrate) which
+    # bundles Node.js + pinned Prisma + postgresql-client.  The unified
+    # scripts/migrate.sh runs: npx prisma migrate deploy → raw SQL 01-12 → RLS
+    # enforcement audit.  migrate.sh derives SQL_DIR from its own location
+    # (/scripts/migrate.sh → REPO_ROOT=/) so the mount must land at
+    # /database/migrations.
     build:
-      context: ./gateway
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: database/Dockerfile.migrate
+    command: ["bash", "/scripts/migrate.sh"]
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
-      # scripts/migrate.sh derives SQL_DIR from REPO_ROOT → /database/migrations.
-      # Mount at /database/migrations so the derivation matches even when
-      # migrate.sh is at /scripts/migrate.sh (REPO_ROOT = /).
       - ./database/migrations:/database/migrations:ro
       - ./scripts/migrate.sh:/scripts/migrate.sh:ro
-    env_file:
-      - .env
     environment:
-      # REPO_ROOT is set so migrate.sh can resolve .env at /REPO_ROOT/.env
-      # (the env_file stanza above loads the same .env into Compose env; this
-      # is a guard for the migrate.sh-internal source-of-.env logic).
-      - REPO_ROOT=/
       - POSTGRES_USER=${POSTGRES_USER:-crm_user}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-crm_password}
       - POSTGRES_HOST=postgres
@@ -115,9 +106,6 @@ services:
       - POSTGRES_DB=${POSTGRES_DB:-enterprise_crm}
       - DATABASE_URL=postgresql://${POSTGRES_USER:-crm_user}:${POSTGRES_PASSWORD:-crm_password}@postgres:5432/${POSTGRES_DB:-enterprise_crm}
       - GATEWAY_DIR=/app
-    entrypoint: ["/bin/sh"]
-    command:
-      - "/scripts/migrate.sh"
     networks:
       - crm-network
 
