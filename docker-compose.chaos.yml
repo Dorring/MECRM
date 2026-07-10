@@ -68,7 +68,7 @@ services:
       retries: 10
 
   opa:
-    image: openpolicyagent/opa:0.55.0
+    image: openpolicyagent/opa:0.70.0
     ports:
       - "8181:8181"
     command:
@@ -156,7 +156,7 @@ services:
       - crm-network
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.5.2
     ports:
       - "9090:9090"
     volumes:
@@ -170,7 +170,7 @@ services:
         condition: service_started
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:13.0.2
     ports:
       - "3001:3000"
     environment:
