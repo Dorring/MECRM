@@ -31,7 +31,7 @@ spec:
         runAsUser: 1000
       containers:
         - name: gateway
-          image: "{{ if .Values.global.imageRegistry }}{{ .Values.global.imageRegistry }}/{{ end }}{{ .Values.images.gateway.repository }}:{{ .Values.images.gateway.tag }}"
+          image: "{{ if .Values.global.imageRegistry }}{{ .Values.global.imageRegistry }}/{{ end }}{{ .Values.images.gateway.repository }}:{{ required "images.gateway.tag is required — set via --set images.gateway.tag=$COMMIT_SHA" .Values.images.gateway.tag }}"
           imagePullPolicy: {{ .Values.images.gateway.pullPolicy }}
           ports:
             - name: http

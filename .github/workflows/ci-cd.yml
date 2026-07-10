@@ -510,12 +510,23 @@ jobs:
       - name: Build chart dependencies
         run: helm dependency build deploy/helm/enterprise-crm
 
+      # E1: image tags are intentionally empty in values files.  Templates use
+      # `required` to fail-fast when no tag is set, so CI must always pass an
+      # explicit tag (the actual commit SHA is injected by deploy jobs; here we
+      # use a ci-test sentinel).
       - name: Lint chart
-        run: helm lint deploy/helm/enterprise-crm
+        run: |
+          helm lint deploy/helm/enterprise-crm \
+            --set images.frontend.tag=ci-test \
+            --set images.gateway.tag=ci-test \
+            --set images.agents.tag=ci-test
 
       - name: Render default template
         run: |
           helm template enterprise-crm deploy/helm/enterprise-crm \
+            --set images.frontend.tag=ci-test \
+            --set images.gateway.tag=ci-test \
+            --set images.agents.tag=ci-test \
             --namespace crm-default > /tmp/rendered-default.yaml
           echo "Rendered $(wc -l < /tmp/rendered-default.yaml) lines"
 
@@ -523,7 +534,10 @@ jobs:
         run: |
           if [ -f deploy/helm/enterprise-crm/values-staging.yaml ]; then
             helm lint deploy/helm/enterprise-crm \
-              --values deploy/helm/enterprise-crm/values-staging.yaml
+              --values deploy/helm/enterprise-crm/values-staging.yaml \
+              --set images.frontend.tag=ci-test \
+              --set images.gateway.tag=ci-test \
+              --set images.agents.tag=ci-test
           else
             echo "values-staging.yaml not present yet; skipping staging lint (see docs/project-optimization-plan.md Phase 4)."
           fi
@@ -536,6 +550,9 @@ jobs:
           if [ -f deploy/helm/enterprise-crm/values-staging.yaml ]; then
             helm template enterprise-crm deploy/helm/enterprise-crm \
               --values deploy/helm/enterprise-crm/values-staging.yaml \
+              --set images.frontend.tag=ci-test \
+              --set images.gateway.tag=ci-test \
+              --set images.agents.tag=ci-test \
               --namespace crm-staging > /tmp/rendered-staging.yaml
             echo "Rendered $(wc -l < /tmp/rendered-staging.yaml) lines"
           else
@@ -546,7 +563,10 @@ jobs:
         run: |
           if [ -f deploy/helm/enterprise-crm/values-production.yaml ]; then
             helm lint deploy/helm/enterprise-crm \
-              --values deploy/helm/enterprise-crm/values-production.yaml
+              --values deploy/helm/enterprise-crm/values-production.yaml \
+              --set images.frontend.tag=ci-test \
+              --set images.gateway.tag=ci-test \
+              --set images.agents.tag=ci-test
           else
             echo "values-production.yaml not present yet; skipping production lint (see docs/project-optimization-plan.md Phase 4)."
           fi
@@ -556,6 +576,9 @@ jobs:
           if [ -f deploy/helm/enterprise-crm/values-production.yaml ]; then
             helm template enterprise-crm deploy/helm/enterprise-crm \
               --values deploy/helm/enterprise-crm/values-production.yaml \
+              --set images.frontend.tag=ci-test \
+              --set images.gateway.tag=ci-test \
+              --set images.agents.tag=ci-test \
               --namespace crm-production > /tmp/rendered-production.yaml
             echo "Rendered $(wc -l < /tmp/rendered-production.yaml) lines"
           else

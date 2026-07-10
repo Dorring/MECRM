@@ -32,7 +32,7 @@ spec:
         runAsUser: 1000
       containers:
         - name: frontend
-          image: "{{ if .Values.global.imageRegistry }}{{ .Values.global.imageRegistry }}/{{ end }}{{ .Values.images.frontend.repository }}:{{ .Values.images.frontend.tag }}"
+          image: "{{ if .Values.global.imageRegistry }}{{ .Values.global.imageRegistry }}/{{ end }}{{ .Values.images.frontend.repository }}:{{ required "images.frontend.tag is required — set via --set images.frontend.tag=$COMMIT_SHA" .Values.images.frontend.tag }}"
           imagePullPolicy: {{ .Values.images.frontend.pullPolicy }}
           ports:
             - name: http

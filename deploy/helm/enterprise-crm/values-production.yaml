@@ -21,8 +21,6 @@ serviceAccount:
 
 frontend:
   enabled: true
-  keycloakRealm: "crm"
-  keycloakClientId: "crm-frontend"
 
 # HA replica counts
 replicaCount:
@@ -30,15 +28,20 @@ replicaCount:
   gateway: 5
   agents: 3
 
+# tag is intentionally empty — CI overrides to the current commit SHA via --set.
+# A plain helm install / helm template without --set will fail-fast in the
+# template, which is safer than silently deploying a stale tag.
+# Production deployments SHOULD use immutable digests at the registry layer
+# (Phase 4 CI/CD follow-up).
 images:
   frontend:
-    tag: latest
+    tag: ""
     pullPolicy: IfNotPresent
   gateway:
-    tag: latest
+    tag: ""
     pullPolicy: IfNotPresent
   agents:
-    tag: latest
+    tag: ""
     pullPolicy: IfNotPresent
 
 ingress:
@@ -154,16 +157,6 @@ kafka:
 keycloak:
   enabled: true
   replicaCount: 3
-
-opa:
-  enabled: true
-  replicaCount: 3
-
-weaviate:
-  enabled: true
-  replicas: 3
-  storage:
-    size: 50Gi
 
 # NetworkPolicy enforced in production
 networkPolicy:
