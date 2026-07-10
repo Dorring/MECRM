@@ -1,7 +1,7 @@
 # Group D Preflight Investigation — Compose / Chaos / Health / Image Pinning
 
 **Date:** 2026-07-10
-**Status:** D1 in progress on `codex/group-d-d1-health-dependencies`
+**Status:** D1 ✅ merged/stabilized (`main@4336889`, tag `hardening-group-d-d1-stabilized`); D2 pending
 **Baseline:** `main@a55b7de` (Group C stabilized)
 **Investigator:** Codex
 
@@ -37,17 +37,17 @@ Group D targets four hardening dimensions: Compose health dependency correctness
 | **kafka-init** | kafka | `service_healthy` | — | ✅ Correct |
 | **migrate** | postgres | `service_healthy` | — | ✅ Correct |
 
-### 1.1a D1 Status Update (branch: `codex/group-d-d1-health-dependencies`)
+### 1.1a D1 Status Update (✅ MERGED — `main@4336889`, tag `hardening-group-d-d1-stabilized`)
 
-The following blocker findings have been addressed or partially addressed:
+All D1 blocker findings have been addressed and merged via squash-merge PR #11. CI full green.
 
 | Finding ID | Description | Status | Notes |
 |------------|-------------|--------|-------|
-| **D-C-1** | OPA dep `service_started` → `service_healthy` (gateway + agents) | ✅ **Fixed** | Both sites changed |
-| **D-C-2** | Weaviate dep `service_started` → `service_healthy` (agents) | ✅ **Fixed** | One line changed |
-| **D-HC-1** | Frontend K8s probes → 404 `/api/health` | ✅ **Fixed** | New `frontend/src/app/api/health/route.ts` returns 200 |
-| **D-HC-2** | nginx frontend-proxy no healthcheck | ✅ **Fixed** | `location = /health` in nginx.conf + CI-tolerant `nginx -t` Compose healthcheck |
-| **D-HC-3** | Agents no Compose healthcheck | 🟡 **Partial** | Compose healthcheck added on `/health`; `/ready` endpoint deferred to follow-up |
+| **D-C-1** | OPA dep `service_started` → `service_healthy` (gateway + agents) | ✅ **Merged** | Both sites changed |
+| **D-C-2** | Weaviate dep `service_started` → `service_healthy` (agents) | ✅ **Merged** | One line changed |
+| **D-HC-1** | Frontend K8s probes → 404 `/api/health` | ✅ **Merged** | New `frontend/src/app/api/health/route.ts` returns 200 |
+| **D-HC-2** | nginx frontend-proxy no healthcheck | ✅ **Merged** | `location = /health` in nginx.conf + CI-tolerant `nginx -t` Compose healthcheck |
+| **D-HC-3** | Agents no Compose healthcheck | 🟡 **Partial (merged)** | Compose healthcheck added on `/health`; `/ready` endpoint deferred to follow-up |
 | **D-HC-4** | Kafka no `start_period` | ✅ **Fixed** | `start_period: 60s` |
 | **D-HC-5** | Postgres no `start_period` | ✅ **Fixed** | `start_period: 15s` |
 | **D-HC-6** | Gateway Compose healthcheck params inconsistent | 🟡 **Analyzed** | Intentional — Compose cold-start tolerance needs more generous params than Dockerfile restart. Commented inline. |

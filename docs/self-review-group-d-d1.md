@@ -1,9 +1,12 @@
 # D1 Self-Review — Compose Health Dependencies + Healthcheck Foundation
 
 **Date:** 2026-07-10
-**Branch:** `codex/group-d-d1-health-dependencies`
+**Branch:** `codex/group-d-d1-health-dependencies` (deleted — squash-merged as #11)
 **Baseline:** `main@a55b7de` (Group C stabilized)
-**Reviewer:** Codex
+**Status:** ✅ **MERGED / STABILIZED**
+**Merge commit:** `main@4336889` (squash-merge PR #11)
+**Tag:** `hardening-group-d-d1-stabilized`
+**CI:** [All checks passed](https://github.com/Dorring/MECRM/actions/runs/PR-11) — lint (gateway, frontend, python), validate-schemas, test-gateway (146P/61S), test-agents, test-frontend
 
 ---
 
