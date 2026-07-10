@@ -293,22 +293,22 @@ postgres-exporter, redis-exporter, kafka-exporter, kafka-ui, prometheus, grafana
 
 | # | Service | Image | Current | Recommended Pin |
 |---|---------|-------|---------|-----------------|
-| 1 | postgres-exporter | `prometheuscommunity/postgres-exporter` | `latest` | `v0.15.0` |
-| 2 | redis-exporter | `oliver006/redis_exporter` | `latest` | `v1.62.0` |
-| 3 | kafka-exporter | `danielqsj/kafka-exporter` | `latest` | `v1.7.0` |
-| 4 | kafka-ui | `provectuslabs/kafka-ui` | `latest` | `v1.0.0` |
+| 1 | postgres-exporter | `prometheuscommunity/postgres-exporter` | `latest` | `v0.19.1` |
+| 2 | redis-exporter | `oliver006/redis_exporter` | `latest` | `v1.82.0` |
+| 3 | kafka-exporter | `danielqsj/kafka-exporter` | `latest` | `v1.9.0` |
+| 4 | kafka-ui | `provectuslabs/kafka-ui` | `latest` | `v0.7.2` |
 | 5 | **opa** | **`openpolicyagent/opa`** | **`latest`** | **`0.70.0`** |
-| 6 | ollama | `ollama/ollama` | `latest` | `0.3.0` (profile-gated) |
-| 7 | prometheus | `prom/prometheus` | `latest` | `v2.53.0` |
-| 8 | grafana | `grafana/grafana` | `latest` | `11.1.0` |
-| 9 | loki | `grafana/loki` | `latest` | `3.0.0` |
+| 6 | ollama | `ollama/ollama` | `latest` | `0.22.1` (profile-gated; not pulled by default) |
+| 7 | prometheus | `prom/prometheus` | `latest` | `v3.5.2` |
+| 8 | grafana | `grafana/grafana` | `latest` | `13.0.2` |
+| 9 | loki | `grafana/loki` | `latest` | `3.7.3` |
 
 #### docker-compose.chaos.yml (2 `latest` tags)
 
 | # | Service | Image | Current | Recommended Pin |
 |---|---------|-------|---------|-----------------|
-| 1 | prometheus | `prom/prometheus` | `latest` | `v2.53.0` |
-| 2 | grafana | `grafana/grafana` | `latest` | `11.1.0` |
+| 1 | prometheus | `prom/prometheus` | `latest` | `v3.5.2` |
+| 2 | grafana | `grafana/grafana` | `latest` | `13.0.2` |
 
 #### Helm values.yaml (3 `latest` tags)
 
@@ -509,26 +509,38 @@ These are NOT Group D scope but are documented for awareness:
 
 ---
 
-### D2 — Image Pinning (est. 3 files)
+### D2 — Image Pinning (in progress on `codex/group-d-d2-image-pinning`)
 
-**Goal:** Eliminate all `:latest` tags; fix digest-based deploys.
+**Goal:** Eliminate all Compose `:latest` tags; converge OPA to CI-validated 0.70.0.
 
-**Files:**
-- `docker-compose.yml` — 9 tag pins
-- `docker-compose.chaos.yml` — 2 tag pins + OPA version bump
-- `.github/workflows/ci-cd.yml` — digest-based deploy (if feasible without cluster access)
+**Scope tightened per review feedback:**
 
-**Changes:**
-1. Pin all 9 `:latest` in docker-compose.yml to current stable versions
-2. Pin 2 `:latest` in docker-compose.chaos.yml
-3. Bump chaos OPA from `0.55.0` to `0.70.0`
-4. (Optional) Wire build digests into deploy steps — **may be Deferred if no cluster access**
+| Dimension | Decision |
+|-----------|----------|
+| OPA version convergence | **D2 blocker** — main compose, chaos compose → `0.70.0` (match CI) |
+| Observability/dev-tool `:latest` | **Should Fix** — pin to exact versions; no incomplete major tags |
+| Helm `tag: latest` fallback | **Deferred** — CI always overrides with `${{ github.sha }}` |
+| CI digest-based deploy | **Deferred** — requires architectural change + staging cluster validation |
+
+**Files (actual D2 changes):**
+- `docker-compose.yml` — 11 tag changes (1 OPA blocker + 8 observability + ollama + comment)
+- `docker-compose.chaos.yml` — 3 tag changes (1 OPA + 2 observability)
+- `tests/infra/test_group_d_image_pinning.py` — new test (10 cases)
+- `docs/self-review-group-d-d2.md` — new
+
+**NOT changed (out of scope for D2):**
+- `.github/workflows/ci-cd.yml` — no digest deploy wiring
+- `deploy/helm/enterprise-crm/values*.yaml` — `tag: latest` fallback retained
+- Dockerfiles — no image optimization
+- Ollama provider/API — no migration, pure pin only
 
 **Exit criteria:**
-- `grep ':latest' docker-compose.yml docker-compose.chaos.yml` returns 0
-- `docker compose pull` succeeds with pinned tags
-- CI smoke + ws-proxy-smoke unchanged
-- OPA 0.70.0 policies compile (same as CI)
+- `grep 'image:.*:latest' docker-compose.yml docker-compose.chaos.yml` returns 0 lines
+- `grep 'openpolicyagent/opa' docker-compose.yml docker-compose.chaos.yml` shows `0.70.0` in both
+- CI workflow OPA version is also `0.70.0` (ci-cd.yml + tenant-isolation.yml)
+- `pytest tests/infra/test_group_d_image_pinning.py -v` — 10 passed
+- `docker compose config --quiet` passes on main and chaos
+- Helm `tag: latest` is explicitly documented as deferred
 
 **Rollback risk:** Minimal (tags are pull-only; no build changes). If a pinned tag is unavailable on Docker Hub, revert to previous tag.
 

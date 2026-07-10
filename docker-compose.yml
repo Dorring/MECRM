@@ -287,7 +287,7 @@ services:
       start_period: 15s
 
   postgres-exporter:
-    image: prometheuscommunity/postgres-exporter:latest
+    image: prometheuscommunity/postgres-exporter:v0.19.1
     environment:
       - DATA_SOURCE_NAME=postgresql://${POSTGRES_USER:-crm_user}:${POSTGRES_PASSWORD:-crm_password}@postgres:5432/${POSTGRES_DB:-enterprise_crm}?sslmode=disable
     depends_on:
@@ -311,7 +311,7 @@ services:
       retries: 5
 
   redis-exporter:
-    image: oliver006/redis_exporter:latest
+    image: oliver006/redis_exporter:v1.82.0
     environment:
       - REDIS_ADDR=redis://redis:6379
     depends_on:
@@ -377,7 +377,7 @@ services:
       - crm-network
 
   kafka-exporter:
-    image: danielqsj/kafka-exporter:latest
+    image: danielqsj/kafka-exporter:v1.9.0
     command:
       - "--kafka.server=kafka:9092"
     depends_on:
@@ -386,7 +386,7 @@ services:
       - crm-network
 
   kafka-ui:
-    image: provectuslabs/kafka-ui:latest
+    image: provectuslabs/kafka-ui:v0.7.2
     ports:
       - "8080:8080"
     environment:
@@ -401,7 +401,7 @@ services:
   # Policy Engine
   # ===================
   opa:
-    image: openpolicyagent/opa:latest
+    image: openpolicyagent/opa:0.70.0
     ports:
       - "8181:8181"
     command:
@@ -433,7 +433,10 @@ services:
   #      drive this profile via an override file (e.g. docker-compose.gpu.yml).
   # CPU mode is significantly slower for llama3.1 and not recommended for production.
   ollama:
-    image: ollama/ollama:latest
+    # Profile-gated local-llm image. Pinning eliminates :latest drift;
+    # does NOT run or validate model capability. No AI provider migration
+    # is implied — this is a pure Compose reproducibility fix.
+    image: ollama/ollama:0.22.1
     # Local inference is optional. The default stack does not pull or start the
     # multi-gigabyte Ollama image; enable explicitly with:
     #   docker compose --profile local-llm up -d ollama
@@ -571,7 +574,7 @@ services:
   # Observability
   # ===================
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.5.2
     ports:
       - "${PROMETHEUS_PORT:-9090}:9090"
     volumes:
@@ -582,7 +585,7 @@ services:
       - crm-network
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:13.0.2
     ports:
       - "${GRAFANA_PORT:-3001}:3000"
     environment:
@@ -597,7 +600,7 @@ services:
       - crm-network
 
   loki:
-    image: grafana/loki:latest
+    image: grafana/loki:3.7.3
     ports:
       - "3100:3100"
     volumes:
