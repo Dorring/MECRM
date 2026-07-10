@@ -96,11 +96,18 @@ services:
       postgres:
         condition: service_healthy
     volumes:
-      - ./database/migrations:/migrations:ro
+      # scripts/migrate.sh derives SQL_DIR from REPO_ROOT → /database/migrations.
+      # Mount at /database/migrations so the derivation matches even when
+      # migrate.sh is at /scripts/migrate.sh (REPO_ROOT = /).
+      - ./database/migrations:/database/migrations:ro
       - ./scripts/migrate.sh:/scripts/migrate.sh:ro
     env_file:
       - .env
     environment:
+      # REPO_ROOT is set so migrate.sh can resolve .env at /REPO_ROOT/.env
+      # (the env_file stanza above loads the same .env into Compose env; this
+      # is a guard for the migrate.sh-internal source-of-.env logic).
+      - REPO_ROOT=/
       - POSTGRES_USER=${POSTGRES_USER:-crm_user}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-crm_password}
       - POSTGRES_HOST=postgres

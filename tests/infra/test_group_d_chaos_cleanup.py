@@ -141,6 +141,26 @@ class TestChaosMigrationRunner(unittest.TestCase):
         self.assertIn("migrate.sh", flat,
                       "chaos-migrations volumes must include scripts/migrate.sh")
 
+    def test_chaos_migrations_sql_volume_matches_repo_root_derivation(self):
+        """migrate.sh derives SQL_DIR=$REPO_ROOT/database/migrations.
+        REPO_ROOT is set to / in chaos compose, so the SQL mount must be
+        /database/migrations, not /migrations."""
+        services = self.data.get("services") or {}
+        cm = services.get("chaos-migrations") or {}
+        volumes = cm.get("volumes") or []
+        flat = " ".join(volumes)
+        self.assertIn(
+            "database/migrations", flat,
+            "chaos-migrations volumes must mount at /database/migrations "
+            "to match REPO_ROOT=/ derivation in migrate.sh"
+        )
+        # Explicitly forbid the old mount path
+        self.assertNotIn(
+            ":/migrations", flat,
+            "chaos-migrations must not mount at /migrations "
+            "(REPO_ROOT=/ + migrate.sh derives SQL_DIR=/database/migrations)"
+        )
+
 
 # -- D3-C5: Health dependencies on chaos-migrations ---------------------
 
