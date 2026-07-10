@@ -1,9 +1,13 @@
 # Group E Self-Review — Helm Governance (E1 + E2)
 
 **Date:** 2026-07-11  
-**Branch:** `codex/group-e-e1e2-helm-governance`  
+**Branch:** `codex/group-e-e1e2-helm-governance` (deleted — squash-merged as #14)  
 **Baseline:** `main@2b85ea5` (Group D fully closed)  
-**Status:** Implemented, awaiting review
+**Status:** ✅ **MERGED / STABILIZED**  
+**Merge commit:** `main@d6d60cc` (squash-merge PR #14)  
+**Tag:** `hardening-group-e-e1e2-stabilized`  
+**CI:** All checks passed (Helm Lint & Template validated `required` fail-fast + Ollama conditional rendering on the CI runner)  
+**E3 digest pinning:** Deferred to Phase 4 CI/CD
 
 ## Scope
 

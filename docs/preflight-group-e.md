@@ -2,7 +2,8 @@
 
 **Date:** 2026-07-11  
 **Baseline:** `main@2b85ea5` (Group D fully closed)  
-**Status:** Preflight reviewed; E1/E2 selected for implementation
+**Status:** E1/E2 ✅ merged/stabilized (`main@d6d60cc`, tag `hardening-group-e-e1e2-stabilized`), PR #14 (squash-merge)  
+**E3 (digest pinning):** deferred to Phase 4 CI/CD
 
 ## Executive Summary
 
@@ -22,6 +23,7 @@ Group D stabilized tags are consistent: D1, D2, and D3 all point to their respec
 | `hardening-group-d-d1-stabilized` | `4336889` | D1 merge commit |
 | `hardening-group-d-d2-stabilized` | `4422593` | D2 merge commit |
 | `hardening-group-d-d3-stabilized` | `2014732` | D3 merge commit |
+| `hardening-group-e-e1e2-stabilized` | `d6d60cc` | E1/E2 merge commit |
 
 No tag movement is required.
 
