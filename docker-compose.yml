@@ -15,6 +15,15 @@ services:
       - gateway
     networks:
       - crm-network
+    healthcheck:
+      # Keep this check local to nginx config validation. The container process
+      # itself proves nginx is running; `nginx -t` avoids CI false negatives from
+      # BusyBox wget / localhost networking during cold startup.
+      test: ["CMD-SHELL", "nginx -t >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
 
   # ===================
   # Frontend
@@ -67,10 +76,18 @@ services:
       kafka-init:
         condition: service_completed_successfully
       opa:
-        condition: service_started
+        condition: service_healthy
     networks:
       - crm-network
     healthcheck:
+      # Compose healthcheck is intentionally more conservative than the
+      # Dockerfile (30s/10s/3/5s).  Gateway start_period is 30s instead of
+      # 5s because Compose cold starts (all infra coming up) are slower than
+      # pre-warmed Dockerfile restarts.  10 retries × 15s interval = up to
+      # 150s of tolerance before marking unhealthy — generous but avoids
+      # false restarts during slow Compose boot (Postgres + Redis + Kafka-init
+      # + OPA healthy all in parallel).  The Dockerfile 3-retry 30s-interval
+      # is tuned for a fast restart of an already-running container.
       test: ["CMD-SHELL", "wget -qO- http://localhost:4000/health || exit 1"]
       interval: 15s
       timeout: 5s
@@ -195,11 +212,21 @@ services:
       kafka-init:
         condition: service_completed_successfully
       weaviate:
-        condition: service_started
+        condition: service_healthy
       opa:
-        condition: service_started
+        condition: service_healthy
     networks:
       - crm-network
+    healthcheck:
+      # P0-6: check the response status code, not just that the request completed.
+      # Matches the Dockerfile HEALTHCHECK semantics (interval=30s, timeout=10s,
+      # start_period=10s, retries=3).
+      # Uses only httpx which is already a runtime dependency.
+      test: ["CMD-SHELL", "python -c \"import httpx,sys; r=httpx.get('http://localhost:5010/health'); sys.exit(0 if r.is_success else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
   # Replay service: implementation exists at agents/src/replay/{api,event_ingestor,...}.
   # Enabled. Uses the agents image and runs the FastAPI replay API on :5011.
@@ -257,6 +284,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 15s
 
   postgres-exporter:
     image: prometheuscommunity/postgres-exporter:latest
@@ -323,6 +351,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+      start_period: 60s
 
   # One-shot topic initialization (ADR-001).
   # Creates all CRM topics explicitly and waits for partition leaders before
@@ -633,7 +662,7 @@ services:
       - ./scripts/ws-proxy-test.js:/scripts/ws-proxy-test.js:ro
     depends_on:
       frontend-proxy:
-        condition: service_started
+        condition: service_healthy
       gateway:
         condition: service_healthy
       postgres:
