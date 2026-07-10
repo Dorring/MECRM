@@ -562,8 +562,8 @@ These are NOT Group D scope but are documented for awareness:
 
 | # | Criterion | Phase |
 |---|-----------|-------|
-| 1 | `grep 'condition: service_started' docker-compose.yml` returns only ws-proxy-test→frontend-proxy | D1 |
-| 2 | All long-running services have healthchecks (nginx, agents, keycloak) | D1 |
+| 1 | No explicit `condition: service_started` remains in `docker-compose.yml`. Only documented bare `depends_on` entries remain where `service_started` is acceptable. | D1 |
+| 2 | D1-scoped healthchecks added for frontend-proxy and agents; Keycloak remains Should Fix pending Docker validation. | D1 |
 | 3 | `docker compose up -d --wait` completes with all services healthy | D1 |
 | 4 | `grep ':latest' docker-compose.yml docker-compose.chaos.yml` returns 0 | D2 |
 | 5 | Gateway lint/build/test unchanged (147P/0F) | D1-D3 |
