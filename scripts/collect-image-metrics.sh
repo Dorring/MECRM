@@ -33,6 +33,10 @@ for arg in "$@"; do
   esac
 done
 
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')
+COMMIT=$(git rev-parse HEAD)
+BRANCH=$(git branch --show-current)
+
 # ------------------------------------------------------------------
 # Guard: Docker daemon available?
 # ------------------------------------------------------------------
@@ -57,14 +61,14 @@ DOCKERNA
 
   # Write a pending baseline so the doc exists but is clearly
   # marked as not-yet-collected.
-  cat > "$OUTPUT_MD" <<'PENDING'
+  cat > "$OUTPUT_MD" <<PENDING
 # Group F Baseline -- Image Metrics
 
 **Status:** PENDING -- Docker daemon unavailable
 
-Date: 2026-07-11
-Commit: 0de8b71
-Branch: codex/group-f-image-optimization
+Date: $TIMESTAMP
+Commit: $COMMIT
+Branch: $BRANCH
 
 ## Important
 
@@ -201,9 +205,6 @@ SERVICES=(
   "migrate:.:database/Dockerfile.migrate:migrate"
 )
 
-TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')
-COMMIT=$(git rev-parse HEAD)
-BRANCH=$(git branch --show-current)
 HOSTNAME=$(hostname 2>/dev/null || echo "unknown")
 DOCKER_VERSION=$(docker info --format '{{.ServerVersion}}' 2>/dev/null || echo "unknown")
 BUILDKIT_VERSION=$(docker buildx version 2>/dev/null | head -1 || echo "unknown")
