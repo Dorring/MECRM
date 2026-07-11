@@ -1,0 +1,47 @@
+name: Group F Image Baseline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  image-baseline:
+    name: Collect Image Baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+
+      - name: Validate metrics script
+        run: bash -n scripts/collect-image-metrics.sh
+
+      - name: Collect Group F image metrics
+        env:
+          DOCKER_BUILDKIT: "1"
+          COLLECT_COLD_START: "0"
+        run: bash scripts/collect-image-metrics.sh --json
+
+      - name: Show generated baseline summary
+        if: always()
+        run: |
+          test -f docs/baseline-group-f.md
+          sed -n '1,120p' docs/baseline-group-f.md
+
+      - name: Upload baseline artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: group-f-image-baseline
+          path: |
+            docs/baseline-group-f.md
+            docs/baseline-group-f.json
+          if-no-files-found: error

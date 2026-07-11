@@ -9,6 +9,7 @@
 #   bash scripts/collect-image-metrics.sh            # write to docs/baseline-group-f.md
 #   bash scripts/collect-image-metrics.sh --json      # also write baseline-group-f.json
 #   DRY_RUN=1 bash scripts/collect-image-metrics.sh   # print what would run without building
+#   COLLECT_COLD_START=0 bash scripts/collect-image-metrics.sh --json
 #
 # Prerequisites:
 #   - Docker daemon running (Docker Desktop, Colima, or Linux docker)
@@ -25,6 +26,7 @@ OUTPUT_MD="${REPO_ROOT}/docs/baseline-group-f.md"
 OUTPUT_JSON="${REPO_ROOT}/docs/baseline-group-f.json"
 WRITE_JSON=false
 DRY_RUN="${DRY_RUN:-0}"
+COLLECT_COLD_START="${COLLECT_COLD_START:-1}"
 
 for arg in "$@"; do
   case "$arg" in
@@ -327,6 +329,8 @@ COLD_START_AGENTS="N/A"
 
 if [ "$DRY_RUN" = "1" ]; then
   echo "DRY_RUN -- skipped cold-start measurement"
+elif [ "$COLLECT_COLD_START" = "0" ]; then
+  echo "COLLECT_COLD_START=0 -- skipped cold-start measurement"
 else
   if command -v docker-compose &>/dev/null || docker compose version &>/dev/null; then
     echo "Attempting cold-start measurement (best-effort)..."

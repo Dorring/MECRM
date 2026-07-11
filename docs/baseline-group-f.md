@@ -20,6 +20,12 @@ Run this script from a machine with Docker daemon available:
 bash scripts/collect-image-metrics.sh
 ```
 
+Or run the GitHub Actions workflow:
+
+```text
+Actions -> Group F Image Baseline -> Run workflow
+```
+
 The script will:
 - Build all four images with --no-cache (clean, reproducible metrics)
 - Record per-image: build duration, uncompressed size, layer count,
