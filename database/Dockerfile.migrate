@@ -11,13 +11,9 @@ RUN apt-get update \
 WORKDIR /app
 
 # Prisma schema + migrations (gateway owns the application schema).
-# NOTE: `prisma` CLI is in gateway/devDependencies, so we MUST NOT use
-# --omit=dev here -- otherwise `npx prisma migrate deploy` would download an
-# UNLOCKED prisma version at runtime (not pinned by package-lock). Full `npm ci`
-# keeps the CLI pinned. This is a one-shot tool image; size is a non-blocker
-# (agents/frontend production multi-stage is tracked separately as P1).
-COPY gateway/package*.json ./
-COPY gateway/prisma ./prisma
+# Build context is now ./gateway instead of repo root (F-S3).
+COPY package*.json ./
+COPY prisma ./prisma
 RUN --mount=type=cache,target=/root/.npm npm ci
 
 # Raw SQL migrations are mounted at runtime via ./database/migrations:/database/migrations:ro
