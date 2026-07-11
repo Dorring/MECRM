@@ -1,0 +1,18 @@
+node_modules/
+dist/
+coverage/
+logs/
+*.log
+*.tsbuildinfo
+.env
+.env.*
+.nyc_output/
+
+# Test and tooling — not needed in production image
+tests/
+jest.config.js
+jest.durability.config.js
+
+# Self-referential (best practice)
+Dockerfile
+

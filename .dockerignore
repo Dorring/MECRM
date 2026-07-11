@@ -1,0 +1,33 @@
+.git/
+.github/
+.agents/
+.claude/
+.codex/
+**/node_modules/
+**/.next/
+**/coverage/
+**/__pycache__/
+**/.pytest_cache/
+**/*.py[cod]
+**/*.tsbuildinfo
+.env
+.env.*
+logs/
+tmp/
+reports/
+backups/
+
+# Build output and docs — not needed in any build context (F-S5)
+dist/
+docs/
+tests/
+assets/
+
+# Python tooling cache
+**/.mypy_cache/
+**/.ruff_cache/
+
+# Self-referential (best practice)
+Dockerfile*
+docker-compose*.yml
+

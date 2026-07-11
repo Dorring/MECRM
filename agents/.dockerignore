@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+logs/
+*.log
+dist/
+build/
+
+# Secrets — prevent accidental baking into image (F-B2)
+.env
+.env.*
+
+# Test and tooling — not needed at runtime (F-S4)
+tests/
+test_output.txt
+conftest.py
+pytest.ini
+.mypy_cache/
+.ruff_cache/
+
+# Agent utility scripts — exclude by default; restore with ! if runtime-needed
+scripts/
