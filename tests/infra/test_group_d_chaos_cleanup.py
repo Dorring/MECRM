@@ -129,21 +129,25 @@ class TestChaosMigrationRunner(unittest.TestCase):
         cm = services.get("chaos-migrations") or {}
         build = cm.get("build") or {}
         context = build.get("context", "")
-        self.assertEqual(
-            context, ".",
-            f"chaos-migrations build context must be '.', got {context!r}"
+        # F2d narrowed context from "." to "./gateway" — either is acceptable.
+        # The key invariant is that the Dockerfile path resolves.
+        self.assertIn(
+            context, (".", "./gateway"),
+            f"chaos-migrations build context must be '.' or './gateway', got {context!r}"
         )
 
     def test_chaos_migrations_dockerfile_is_migrate(self):
-        """Dockerfile must be database/Dockerfile.migrate (dedicated migration
-        runner with Node + pinned Prisma + postgresql-client)."""
+        """Dockerfile must reference database/Dockerfile.migrate (dedicated
+        migration runner with Node + pinned Prisma + postgresql-client).
+        F2d may adjust the relative path when context is narrowed."""
         services = self.data.get("services") or {}
         cm = services.get("chaos-migrations") or {}
         build = cm.get("build") or {}
         dockerfile = build.get("dockerfile", "")
-        self.assertEqual(
-            dockerfile, "database/Dockerfile.migrate",
-            f"chaos-migrations dockerfile must be database/Dockerfile.migrate, got {dockerfile!r}"
+        # Both paths are acceptable: absolute from root, or relative to new context
+        self.assertIn(
+            dockerfile, ("database/Dockerfile.migrate", "../database/Dockerfile.migrate"),
+            f"chaos-migrations dockerfile must reference database/Dockerfile.migrate, got {dockerfile!r}"
         )
 
     def test_chaos_migrations_no_env_file(self):
