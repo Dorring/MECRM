@@ -1,0 +1,52 @@
+{
+  "status": "collected",
+  "timestamp": "2026-07-11T10:25:03Z",
+  "commit": "ffef4fbe5ebf308a064d7ef1e027e96e6d0eea65",
+  "branch": "main",
+  "host": "runnervm5mmn9",
+  "dockerVersion": "28.0.4",
+  "buildkitVersion": "github.com/docker/buildx v0.35.0 a319e5b15052cf6557ceb666eb8ff6e32380b782",
+  "images": {
+    "gateway": {
+      "buildDurationS": "107.4",
+      "uncompressedSizeMB": "1238.5",
+      "uncompressedSizeBytes": 1298711511,
+      "layerCount": 14,
+      "imageId": "9f305742666b",
+      "contextSizeMB": "1.0",
+      "contextSizeBytes": 1044480
+    },
+    "frontend": {
+      "buildDurationS": "47.5",
+      "uncompressedSizeMB": "207.2",
+      "uncompressedSizeBytes": 217307722,
+      "layerCount": 9,
+      "imageId": "0ec03ee5eb0b",
+      "contextSizeMB": "0.6",
+      "contextSizeBytes": 655360
+    },
+    "agents": {
+      "buildDurationS": "45.8",
+      "uncompressedSizeMB": "737.5",
+      "uncompressedSizeBytes": 773410818,
+      "layerCount": 9,
+      "imageId": "a3d32bb4e422",
+      "contextSizeMB": "0.9",
+      "contextSizeBytes": 931840
+    },
+    "migrate": {
+      "buildDurationS": "82.8",
+      "uncompressedSizeMB": "596.1",
+      "uncompressedSizeBytes": 625091944,
+      "layerCount": 10,
+      "imageId": "5e37f09e9ee0",
+      "contextSizeMB": "60.8",
+      "contextSizeBytes": 63784960
+    }
+  },
+  "coldStart": {
+    "gateway": "N/A",
+    "frontend": "N/A",
+    "agents": "N/A"
+  }
+}
