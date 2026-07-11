@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# collect-image-metrics.sh — Group F F1 baseline metrics collector
+# collect-image-metrics.sh -- Group F F1 baseline metrics collector
 # ------------------------------------------------------------------
-# Measures build context size, build duration, image size, layer count,
-# and docker history for the four built images (gateway, frontend,
+# Measures build duration, image size, layer count, docker history,
+# and build context size for the four built images (gateway, frontend,
 # agents, migrate) and writes a structured markdown report.
 #
 # Usage:
@@ -37,9 +37,9 @@ done
 # Guard: Docker daemon available?
 # ------------------------------------------------------------------
 if ! docker info --format '{{.ServerVersion}}' &>/dev/null; then
-  cat <<EOF
+  cat <<'DOCKERNA'
 ============================================================
-DOCKER DAEMON UNAVAILABLE — metrics collection SKIPPED
+DOCKER DAEMON UNAVAILABLE -- metrics collection SKIPPED
 ============================================================
 This script requires a running Docker daemon.  Please run it
 from a machine with Docker Desktop or Docker Engine available
@@ -53,70 +53,76 @@ Docker is available to populate real numbers.
   bash scripts/collect-image-metrics.sh
 
 ============================================================
-EOF
+DOCKERNA
 
   # Write a pending baseline so the doc exists but is clearly
   # marked as not-yet-collected.
-  cat > "$OUTPUT_MD" <<PENDING
-# Group F Baseline — Image Metrics
+  cat > "$OUTPUT_MD" <<'PENDING'
+# Group F Baseline -- Image Metrics
 
-**Status:** PENDING — Docker daemon unavailable on this host
-**Date:** $(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')
-**Commit:** $(git rev-parse HEAD)
-**Branch:** $(git branch --show-current)
+**Status:** PENDING -- Docker daemon unavailable
 
-## Context
+Date: 2026-07-11
+Commit: 0de8b71
+Branch: codex/group-f-image-optimization
 
-This baseline must be collected on a machine with Docker daemon running.
-Re-run when Docker is available:
+## Important
+
+No real baseline numbers have been collected yet. All tables below contain
+placeholder values (--). F2 must not start until this baseline is populated
+on a Docker-capable host or CI runner.
+
+## How to Populate
+
+Run this script from a machine with Docker daemon available:
 
 ```bash
 bash scripts/collect-image-metrics.sh
 ```
 
-## Instructions
+The script will:
+- Build all four images with `--no-cache` (clean, reproducible metrics)
+- Record per-image: build duration, uncompressed size, layer count,
+  docker history, build context size
+- Overwrite this file with populated tables
 
-1. Ensure Docker daemon is running.
-2. From the repo root, run the script.
-3. The script will:
-   - Build all four images with \`--no-cache\` (to get clean metrics)
-   - Record per-image: build duration, uncompressed size, layer count, docker history, build context size
-   - Write this file with populated tables
-
-## Expected Output Tables
-
-The tables below will be populated once the script runs successfully.
-
-### Image Sizes & Layers
+## Image Build Metrics
 
 | Image | Build Duration (s) | Uncompressed Size (MB) | Layer Count | Image ID |
 |---|---|---|---|---|
-| gateway | — | — | — | — |
-| frontend | — | — | — | — |
-| agents | — | — | — | — |
-| migrate | — | — | — | — |
+| gateway | -- | -- | -- | -- |
+| frontend | -- | -- | -- | -- |
+| agents | -- | -- | -- | -- |
+| migrate | -- | -- | -- | -- |
 
-### Build Context Sizes
+## Build Context Sizes
 
-| Service | Context Directory | Context Size (MB) |
+Context size is measured as raw tar archive size of the context directory.
+This is an approximation; it does NOT apply `.dockerignore` filtering.
+For accurate before/after comparison in F2, use the "transferring context"
+line from `docker build` output.
+
+| Service | Context Directory | Raw Tar Context Size (MB) |
 |---|---|---|
-| gateway | ./gateway | — |
-| frontend | ./frontend | — |
-| agents | ./agents | — |
-| migrate | . (repo root) | — |
+| gateway | ./gateway | -- |
+| frontend | ./frontend | -- |
+| agents | ./agents | -- |
+| migrate | . (repo root) | -- |
 
-### docker history
-
-See per-image sections below (run script to populate).
-
-### Cold-Start / Health-Ready Time (optional)
+## Cold-Start / Health-Ready Time (optional, best-effort)
 
 | Service | Time to Healthy (s) |
 |---|---|
-| gateway | — |
-| frontend | — |
-| agents | — |
+| gateway | -- |
+| frontend | -- |
+| agents | -- |
 
+## docker history
+
+- gateway: (run script to populate)
+- frontend: (run script to populate)
+- agents: (run script to populate)
+- migrate: (run script to populate)
 PENDING
 
   exit 0
@@ -152,14 +158,29 @@ format_bytes_mb() {
   fi
 }
 
+find_python() {
+  # Return the first available Python interpreter (python3 or python).
+  for candidate in python3 python; do
+    if command -v "$candidate" &>/dev/null; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  echo "python3"
+}
+
+PYTHON="$(find_python)"
+
 measure_context_size_bytes() {
-  # Measure the build context size by tar-ing (like Docker does) and
-  # piping to wc. Uses the same .dockerignore as `docker build`.
+  # Raw tar approximation of the build context directory.
+  # WARNING: This does NOT apply .dockerignore filtering.  For accurate
+  # before/after comparison, capture the "transferring context" line from
+  # `docker build` output (e.g. `docker build ... 2>&1 | grep "transferring"`).
+  # This function is provided for a quick off-line estimate when Docker is
+  # not running or when building without BuildKit.
   local ctx_dir="$1"
   local tarfile
   tarfile="$(mktemp -t ctx-metrics.XXXXXX.tar)"
-  # Create a tar of the context directory, then measure compressed size.
-  # This approximates what Docker sends to the daemon.
   tar -cf "$tarfile" -C "$ctx_dir" . 2>/dev/null || true
   if [ -f "$tarfile" ]; then
     wc -c < "$tarfile" 2>/dev/null || stat -f%z "$tarfile" 2>/dev/null || stat -c%s "$tarfile" 2>/dev/null || echo "0"
@@ -171,8 +192,7 @@ measure_context_size_bytes() {
 
 # ------------------------------------------------------------------
 # Service definitions
-#   Each entry: name context_dir dockerfile compose_target [profile]
-#   profile is optional and used only for cold-start measurement.
+#   Each entry: name:context_dir:dockerfile:compose_target
 # ------------------------------------------------------------------
 SERVICES=(
   "gateway:./gateway:gateway/Dockerfile:gateway"
@@ -212,10 +232,6 @@ echo ""
 TMPDIR="$(mktemp -d -t f1-metrics.XXXXXX)"
 trap "rm -rf $TMPDIR" EXIT
 
-# We build all images without cache for reproducible metrics.
-# The migrate image has a different context (repo root); it gets built
-# separately to avoid polluting gateway metrics with an unrelated context.
-
 for entry in "${SERVICES[@]}"; do
   IFS=":" read -r name ctx dockerfile compose_target <<< "$entry"
 
@@ -224,8 +240,8 @@ for entry in "${SERVICES[@]}"; do
   echo "  Context:    $ctx"
   echo "  Dockerfile: $dockerfile"
 
-  # ----- Build context size -----
-  echo -n "  Measuring build context size... "
+  # ----- Build context size (raw tar, no .dockerignore) -----
+  echo -n "  Measuring raw context size (tar, no .dockerignore)... "
   ctx_bytes="$(measure_context_size_bytes "$ctx")"
   ctx_mb="$(format_bytes_mb "$ctx_bytes")"
   CONTEXT_SIZE_BYTES[$name]="$ctx_bytes"
@@ -237,7 +253,7 @@ for entry in "${SERVICES[@]}"; do
   echo -n "  Building ${IMAGE_TAG} (no cache)... "
 
   if [ "$DRY_RUN" = "1" ]; then
-    echo "DRY_RUN — skipped"
+    echo "DRY_RUN -- skipped"
     BUILD_DURATION[$name]="N/A"
     IMAGE_SIZE_BYTES[$name]="0"
     IMAGE_SIZE_MB[$name]="N/A"
@@ -263,7 +279,7 @@ for entry in "${SERVICES[@]}"; do
   echo -n "  Inspecting image... "
   inspect_json="$(docker image inspect "$IMAGE_TAG" 2>/dev/null || echo "{}")"
 
-  img_size="$(echo "$inspect_json" | python3 -c "
+  img_size="$(echo "$inspect_json" | "$PYTHON" -c "
 import sys,json
 d=json.load(sys.stdin)
 print(d[0]['Size'] if d else 0)
@@ -272,14 +288,14 @@ print(d[0]['Size'] if d else 0)
   IMAGE_SIZE_BYTES[$name]="$img_size"
   IMAGE_SIZE_MB[$name]="$img_size_mb"
 
-  layers="$(echo "$inspect_json" | python3 -c "
+  layers="$(echo "$inspect_json" | "$PYTHON" -c "
 import sys,json
 d=json.load(sys.stdin)
 print(len(d[0]['RootFS']['Layers']) if d else 0)
 " 2>/dev/null || echo "0")"
   LAYER_COUNT[$name]="$layers"
 
-  img_id="$(echo "$inspect_json" | python3 -c "
+  img_id="$(echo "$inspect_json" | "$PYTHON" -c "
 import sys,json
 d=json.load(sys.stdin)
 print(d[0]['Id'].split(':')[1][:12] if d else 'N/A')
@@ -309,45 +325,36 @@ COLD_START_FRONTEND="N/A"
 COLD_START_AGENTS="N/A"
 
 if [ "$DRY_RUN" = "1" ]; then
-  echo "DRY_RUN — skipped cold-start measurement"
+  echo "DRY_RUN -- skipped cold-start measurement"
 else
-  # Only measure if we're on a system that can run the stack.
-  # This is best-effort; if the full compose stack is not viable
-  # (e.g. insufficient RAM, no Compose), we skip gracefully.
   if command -v docker-compose &>/dev/null || docker compose version &>/dev/null; then
     echo "Attempting cold-start measurement (best-effort)..."
     COMPOSE_CMD="docker compose"
     docker compose version &>/dev/null || COMPOSE_CMD="docker-compose"
 
-    # Bring up dependencies + gateway, wait for healthy
-    postgres_start="$(now_epoch)"
     $COMPOSE_CMD up -d --wait postgres 2>/dev/null || true
-    # The gateway depends on kafka-init (which depends on kafka),
-    # so we bring up the core chain and measure gateway health-ready time.
+
     gate_start="$(now_epoch)"
     $COMPOSE_CMD up -d --wait gateway 2>/dev/null && \
       COLD_START_GATEWAY="$(elapsed_s "$gate_start" "$(now_epoch)")" || \
       COLD_START_GATEWAY="FAILED"
     echo "  gateway healthy after: ${COLD_START_GATEWAY}s"
 
-    # Frontend depends on gateway
     fe_start="$(now_epoch)"
     $COMPOSE_CMD up -d --wait frontend 2>/dev/null && \
       COLD_START_FRONTEND="$(elapsed_s "$fe_start" "$(now_epoch)")" || \
       COLD_START_FRONTEND="FAILED"
     echo "  frontend healthy after: ${COLD_START_FRONTEND}s"
 
-    # Agents depends on kafka-init too
     ag_start="$(now_epoch)"
     $COMPOSE_CMD up -d --wait agents 2>/dev/null && \
       COLD_START_AGENTS="$(elapsed_s "$ag_start" "$(now_epoch)")" || \
       COLD_START_AGENTS="FAILED"
     echo "  agents healthy after: ${COLD_START_AGENTS}s"
 
-    # Tear down what we started
     $COMPOSE_CMD down --remove-orphans 2>/dev/null || true
   else
-    echo "docker compose not available — skipped cold-start measurement"
+    echo "docker compose not available -- skipped cold-start measurement"
   fi
 fi
 
@@ -358,7 +365,7 @@ echo ""
 echo "--- Writing report ---"
 
 cat > "$OUTPUT_MD" <<MDHEAD
-# Group F Baseline — Image Metrics
+# Group F Baseline -- Image Metrics
 
 **Status:** COLLECTED
 **Date:** $TIMESTAMP
@@ -372,14 +379,12 @@ cat > "$OUTPUT_MD" <<MDHEAD
 
 To reproduce these metrics on another machine:
 
-```bash
+\`\`\`bash
 git checkout $COMMIT
 bash scripts/collect-image-metrics.sh
-```
+\`\`\`
 
 All images were built with \`--no-cache\` to ensure clean, reproducible builds.
-Build context sizes are measured by tar-ing the context directory (approximating
-the Docker build context after \`.dockerignore\` filtering).
 
 ## Image Build Metrics
 
@@ -392,7 +397,12 @@ the Docker build context after \`.dockerignore\` filtering).
 
 ## Build Context Sizes
 
-| Service | Context Directory | Context Size (MB) | Context Size (bytes) |
+Context size is measured as raw tar archive size of the context directory.
+This is an approximation; it does NOT apply \`.dockerignore\` filtering.
+For accurate before/after comparison, use the "transferring context" line
+from \`docker build\` output.
+
+| Service | Context Directory | Raw Tar Context Size (MB) | Raw Tar Context Size (bytes) |
 |---|---|---|---|
 | gateway | ./gateway | ${CONTEXT_SIZE_MB[gateway]} | ${CONTEXT_SIZE_BYTES[gateway]} |
 | frontend | ./frontend | ${CONTEXT_SIZE_MB[frontend]} | ${CONTEXT_SIZE_BYTES[frontend]} |
@@ -433,7 +443,7 @@ for entry in "${SERVICES[@]}"; do
       echo ""
       echo "### $name"
       echo ""
-      echo "(Not collected — DRY_RUN or build skipped)"
+      echo "(Not collected -- DRY_RUN or build skipped)"
       echo ""
     } >> "$OUTPUT_MD"
   fi
@@ -445,7 +455,7 @@ echo "Report written: $OUTPUT_MD"
 # Optional JSON output
 # ------------------------------------------------------------------
 if [ "$WRITE_JSON" = true ]; then
-  python3 -c "
+  "$PYTHON" -c "
 import json, sys
 data = {
   'status': 'collected',
@@ -502,7 +512,7 @@ data = {
 with open('$OUTPUT_JSON', 'w') as f:
     json.dump(data, f, indent=2)
 print(f'JSON written: $OUTPUT_JSON')
-" 2>/dev/null || echo "Warning: could not write JSON (python3 not available?)"
+" 2>/dev/null || echo "Warning: could not write JSON ($PYTHON not available?)"
 fi
 
 echo ""
