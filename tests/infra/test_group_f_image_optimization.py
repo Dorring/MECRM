@@ -101,6 +101,28 @@ class TestRootDockerignore(unittest.TestCase):
                       "F-S5: root .dockerignore must exclude docker-compose*.yml")
 
 
+class TestGatewayDockerignore(unittest.TestCase):
+    """gateway/.dockerignore must keep Jest config for Dockerized gateway tests."""
+
+    @classmethod
+    def setUpClass(cls):
+        path = os.path.join(REPO_ROOT, "gateway", ".dockerignore")
+        with open(path, "r", encoding="utf-8") as fh:
+            cls.patterns = [line.strip() for line in fh if line.strip() and not line.strip().startswith("#")]
+
+    def test_keeps_jest_config_for_builder_target_tests(self):
+        self.assertNotIn(
+            "jest.config.js",
+            self.patterns,
+            "gateway/.dockerignore must not exclude jest.config.js; test-gateway runs npm test in Docker builder target",
+        )
+        self.assertNotIn(
+            "jest.durability.config.js",
+            self.patterns,
+            "gateway/.dockerignore must not exclude jest.durability.config.js; durability tests need their Jest config",
+        )
+
+
 # -- F-S1: frontend HEALTHCHECK -----------------------------------------
 
 class TestFrontendHealthcheck(unittest.TestCase):

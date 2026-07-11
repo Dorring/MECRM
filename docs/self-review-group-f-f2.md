@@ -46,6 +46,7 @@
 | agents/.dockerignore: add .env, .env.* | Zero -- context-only filter | Remove lines from .dockerignore | Static test (F-B2) |
 | agents/.dockerignore: add tests/, caches, scripts/ | Low -- these files should not be imported at runtime via COPY; if any script is imported, `scripts/` exclusion may cause missing file; recovery: add `!scripts/<file>` negation | Remove `scripts/` line from .dockerignore | Static test (F-S4) |
 | root/.dockerignore: add dist/, docs/, tests/, assets/, caches | Zero -- these paths are not COPY'd by any Dockerfile using root context | Remove lines | Static test (F-S5) |
+| gateway/.dockerignore keeps jest config files | Low -- keeps tiny test config files in builder context; production runner image is unaffected because it copies only package/prisma/dist | Re-add ignore only if test-gateway no longer runs npm test inside Docker builder target | Static test: gateway Jest configs not excluded |
 | Migrate context narrowing (. to ./gateway, COPY path adjustments) | Low-Medium -- if COPY paths are wrong, migrate image won't build; if context misses files, `docker compose build migrate` fails | Revert context to `.`, revert COPY paths to `gateway/` prefix | Static test (F-S3); CI docker compose build |
 | Frontend HEALTHCHECK | Low -- adds HTTP request; if /api/health is missing, container shows unhealthy but doesn't crash | Remove HEALTHCHECK | Static test (F-S1); CI compose up --wait |
 | BuildKit cache mounts + # syntax= | Low -- # syntax=docker/dockerfile:1.7 requires BuildKit; CI already uses buildx v3; non-BuildKit builds will fail (documented requirement) | Remove # syntax= line and --mount= flags | Static test (F-S2) |
@@ -62,6 +63,7 @@
 | `root dist/` (F2c) | Zero risk -- migrate Dockerfile no longer references this path. |
 | `root tests/` (F2c) | Zero risk -- no Dockerfile COPYs tests/ from root context. |
 | `root assets/` (F2c) | Zero risk -- no Dockerfile COPYs assets/. |
+| `gateway/jest.config.js` and `gateway/jest.durability.config.js` | Must remain included -- Dockerized `test-gateway` builds the `builder` target and runs `npm test`; excluding Jest config makes Jest parse `.ts` tests as plain JavaScript. | Guarded by F2 regression test. |
 
 ## Local Verification
 
