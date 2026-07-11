@@ -8,7 +8,7 @@ RUN apt-get update \
 
 COPY package*.json ./
 COPY prisma ./prisma/
-RUN npm ci
+RUN --mount=type=cache,target=/root/.npm npm ci
 
 RUN npx prisma generate
 
@@ -22,11 +22,16 @@ ENV NODE_ENV=production
 
 COPY package*.json ./
 COPY prisma ./prisma/
-RUN npm ci --omit=dev
+RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev
 
 RUN npx prisma generate
 
 COPY --from=builder /app/dist ./dist
+
+# Ensure the node user can read the app directory
+RUN chown -R node:node /app
+
+USER node
 
 EXPOSE 4000
 

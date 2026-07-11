@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # Single-purpose migration runner: has BOTH Prisma (node) and psql, so one
 # service can run the full Prisma -> SQL 01-11 -> RLS verification sequence.
 # Lighter than the full gateway image (no app build).
@@ -17,7 +18,7 @@ WORKDIR /app
 # (agents/frontend production multi-stage is tracked separately as P1).
 COPY gateway/package*.json ./
 COPY gateway/prisma ./prisma
-RUN npm ci
+RUN --mount=type=cache,target=/root/.npm npm ci
 
 # Raw SQL migrations are mounted at runtime via ./database/migrations:/database/migrations:ro
 # (see docker-compose.yml migrate service).
