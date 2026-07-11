@@ -56,7 +56,7 @@ class TestAgentsDockerignore(unittest.TestCase):
         path = os.path.join(REPO_ROOT, "agents", ".dockerignore")
         with open(path, "r", encoding="utf-8") as fh:
             content = fh.read()
-        mojibake_chars = ["—", "–", "‘", "’", "“", "”", "："]
+        mojibake_chars = ["\ufffd", "\u301e", "\u6bcf", "\uff06", "\uff0a", "\u203b", "\u00a7", "\u3129"]
         for char in mojibake_chars:
             self.assertNotIn(char, content,
                              f"agents/.dockerignore must not contain Unicode char U+{ord(char):04X}")
@@ -147,6 +147,20 @@ class TestBuildKitCacheMounts(unittest.TestCase):
 
 class TestBuildKitSyntaxDirective(unittest.TestCase):
     """Dockerfiles with RUN --mount must begin with # syntax=docker/dockerfile:1.7."""
+
+    def test_gateway_has_syntax(self):
+        path = os.path.join(REPO_ROOT, "gateway", "Dockerfile")
+        with open(path, "r", encoding="utf-8") as fh:
+            first_line = fh.readline().strip()
+        self.assertEqual(first_line, "# syntax=docker/dockerfile:1.7",
+                         "gateway/Dockerfile must start with # syntax=docker/dockerfile:1.7")
+
+    def test_frontend_has_syntax(self):
+        path = os.path.join(REPO_ROOT, "frontend", "Dockerfile")
+        with open(path, "r", encoding="utf-8") as fh:
+            first_line = fh.readline().strip()
+        self.assertEqual(first_line, "# syntax=docker/dockerfile:1.7",
+                         "frontend/Dockerfile must start with # syntax=docker/dockerfile:1.7")
 
     def test_agents_has_syntax(self):
         path = os.path.join(REPO_ROOT, "agents", "Dockerfile")

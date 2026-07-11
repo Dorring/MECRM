@@ -3,7 +3,7 @@
 **Date:** 2026-07-12
 **Branch:** codex/group-f-f1-baseline-record
 **Baseline:** ffef4fb (baseline collected from CI runner)
-**Status:** F2 COMPLETE — awaiting review
+**Status:** F2 COMPLETE -- awaiting review
 
 ## F2 Scope Checklist
 
@@ -22,7 +22,7 @@
 ## Items Explicitly Not Done
 
 - **F-B1 (agents multi-stage):** This is the Group F exit blocker but belongs to F4. The preflight explicitly states: "implementation MUST happen in F4, AFTER F1 baseline metrics are captured." The single-stage agents image with build-essential retained is still present and will be addressed in F4.
-- **F-B2 (gateway non-root for builder):** Only the runner stage was changed. Compilers (builder stage) run as root — standard practice.
+- **F-B2 (gateway non-root for builder):** Only the runner stage was changed. Compilers (builder stage) run as root -- standard practice.
 - **F-D1 (libssl1.1 removal):** Deferred to F4b. Needs ldd verification.
 - **Digest pinning (E3/Phase 4):** Out of scope per Group F charter.
 - **requirements.txt split (F-D7):** Recorded as follow-on optimization point for F4b.
@@ -43,37 +43,37 @@
 
 | Change | Risk | Rollback | Verified By |
 |---|---|---|---|
-| agents/.dockerignore: add .env, .env.* | Zero — context-only filter | Remove lines from .dockerignore | Static test (F-B2) |
-| agents/.dockerignore: add tests/, caches, scripts/ | Low — these files should not be imported at runtime via COPY; if any script is imported, `scripts/` exclusion may cause missing file; recovery: add `!scripts/<file>` negation | Remove `scripts/` line from .dockerignore | Static test (F-S4) |
-| root/.dockerignore: add dist/, docs/, tests/, assets/, caches | Zero — these paths are not COPY'd by any Dockerfile using root context | Remove lines | Static test (F-S5) |
-| Migrate context narrowing (. to ./gateway, COPY path adjustments) | Low-Medium — if COPY paths are wrong, migrate image won't build; if context misses files, `docker compose build migrate` fails | Revert context to `.`, revert COPY paths to `gateway/` prefix | Static test (F-S3); CI docker compose build |
-| Frontend HEALTHCHECK | Low — adds HTTP request; if /api/health is missing, container shows unhealthy but doesn't crash | Remove HEALTHCHECK | Static test (F-S1); CI compose up --wait |
-| BuildKit cache mounts + # syntax= | Low — # syntax=docker/dockerfile:1.7 requires BuildKit; CI already uses buildx v3; non-BuildKit builds will fail (documented requirement) | Remove # syntax= line and --mount= flags | Static test (F-S2) |
-| Gateway USER node + chown | Medium — permission errors if /app/dist or node_modules are not readable; HEALTHCHECK catches immediately | Remove chown and USER lines | Static test (F-S7); CI compose up --wait gateway |
-| Frontend ENV combine + addgroup/adduser combine | Zero — cosmetic, saves one layer each | Revert to separate lines | Static test (F-D4) |
+| agents/.dockerignore: add .env, .env.* | Zero -- context-only filter | Remove lines from .dockerignore | Static test (F-B2) |
+| agents/.dockerignore: add tests/, caches, scripts/ | Low -- these files should not be imported at runtime via COPY; if any script is imported, `scripts/` exclusion may cause missing file; recovery: add `!scripts/<file>` negation | Remove `scripts/` line from .dockerignore | Static test (F-S4) |
+| root/.dockerignore: add dist/, docs/, tests/, assets/, caches | Zero -- these paths are not COPY'd by any Dockerfile using root context | Remove lines | Static test (F-S5) |
+| Migrate context narrowing (. to ./gateway, COPY path adjustments) | Low-Medium -- if COPY paths are wrong, migrate image won't build; if context misses files, `docker compose build migrate` fails | Revert context to `.`, revert COPY paths to `gateway/` prefix | Static test (F-S3); CI docker compose build |
+| Frontend HEALTHCHECK | Low -- adds HTTP request; if /api/health is missing, container shows unhealthy but doesn't crash | Remove HEALTHCHECK | Static test (F-S1); CI compose up --wait |
+| BuildKit cache mounts + # syntax= | Low -- # syntax=docker/dockerfile:1.7 requires BuildKit; CI already uses buildx v3; non-BuildKit builds will fail (documented requirement) | Remove # syntax= line and --mount= flags | Static test (F-S2) |
+| Gateway USER node + chown | Medium -- permission errors if /app/dist or node_modules are not readable; HEALTHCHECK catches immediately | Remove chown and USER lines | Static test (F-S7); CI compose up --wait gateway |
+| Frontend ENV combine + addgroup/adduser combine | Zero -- cosmetic, saves one layer each | Revert to separate lines | Static test (F-D4) |
 
 ## Build Context / .dockerignore Mis-Exclusion Risk
 
 | Path Excluded | Risk of Breaking Build | Mitigation |
 |---|---|---|
-| `agents/scripts/` (F2b) | Low risk — these are utility scripts, not imported as Python modules by the orchestrator. If `scripts/` contains runtime-needed files, the build will fail with ModuleNotFoundError. | Can add `!scripts/<needed_file>` negation. |
-| `agents/tests/` (F2b) | Zero risk — tests are never imported at runtime. |
-| `root docs/` (F2c) | Zero risk — no Dockerfile COPYs docs/. |
-| `root dist/` (F2c) | Zero risk — migrate Dockerfile no longer references this path. |
-| `root tests/` (F2c) | Zero risk — no Dockerfile COPYs tests/ from root context. |
-| `root assets/` (F2c) | Zero risk — no Dockerfile COPYs assets/. |
+| `agents/scripts/` (F2b) | Low risk -- these are utility scripts, not imported as Python modules by the orchestrator. If `scripts/` contains runtime-needed files, the build will fail with ModuleNotFoundError. | Can add `!scripts/<needed_file>` negation. |
+| `agents/tests/` (F2b) | Zero risk -- tests are never imported at runtime. |
+| `root docs/` (F2c) | Zero risk -- no Dockerfile COPYs docs/. |
+| `root dist/` (F2c) | Zero risk -- migrate Dockerfile no longer references this path. |
+| `root tests/` (F2c) | Zero risk -- no Dockerfile COPYs tests/ from root context. |
+| `root assets/` (F2c) | Zero risk -- no Dockerfile COPYs assets/. |
 
 ## Local Verification
 
 | Verification | Result |
 |---|---|
 | git diff --check | PASS |
-| pytest tests/infra/test_group_f_image_optimization.py -v | 27 passed |
-| pytest tests/infra/*.py -v | 98 passed, 3 skipped (Helm binary unavailable) |
-| docker compose config --quiet | NOT RUN (Docker unavailable) |
-| docker compose -f docker-compose.chaos.yml config --quiet | NOT RUN (Docker unavailable) |
+| pytest tests/infra/test_group_f_image_optimization.py -v | 29 passed |
+| pytest tests/infra -v | 163 passed, 11 skipped |
+| docker compose config --quiet | NOT RUN (local Docker CLI lacks Compose v2 / config access denied) |
+| docker compose -f docker-compose.chaos.yml config --quiet | NOT RUN (local Docker CLI lacks Compose v2 / config access denied) |
 | docker compose build gateway frontend agents migrate | NOT RUN (Docker unavailable) |
-| MojiBake check (all changed files) | PASS — no Unicode chars found in Dockerfiles or dockerignore files |
+| MojiBake check (all changed files) | PASS -- no Unicode chars found in Dockerfiles or dockerignore files |
 
 ## Unverified Items (Require Docker)
 
@@ -87,7 +87,7 @@ These will be validated by the PR CI pipeline (build job with buildx v3).
 
 ## Self-Review Conclusion
 
-- All F2 changes are static/config-only — no business logic modified, no application source code touched.
+- All F2 changes are static/config-only -- no business logic modified, no application source code touched.
 - All Should Fix items from the preflight are addressed except F-B1 (agents multi-stage, reserved for F4).
 - Baseline is preserved and not overwritten by F2 changes.
 - Regression tests cover all F2 requirements plus backward compatibility with D1/D2/D3/E tests.

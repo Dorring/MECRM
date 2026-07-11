@@ -17,7 +17,7 @@ tmp/
 reports/
 backups/
 
-# Build output and docs — not needed in any build context (F-S5)
+# Build output and docs -- not needed in any build context (F-S5)
 dist/
 docs/
 tests/

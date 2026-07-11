@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 FROM node:20-bullseye AS builder
 WORKDIR /app
 RUN apt-get update \

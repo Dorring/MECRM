@@ -8,7 +8,7 @@ logs/
 .env.*
 .nyc_output/
 
-# Test and tooling — not needed in production image
+# Test and tooling -- not needed in production image
 tests/
 jest.config.js
 jest.durability.config.js
