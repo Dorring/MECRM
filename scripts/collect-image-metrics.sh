@@ -157,11 +157,7 @@ elapsed_s() {
 
 format_bytes_mb() {
   local bytes="$1"
-  if command -v bc &>/dev/null; then
-    echo "scale=1; $bytes / 1048576" | bc
-  else
-    awk -v b="$bytes" 'BEGIN { printf "%.1f", b / 1048576 }'
-  fi
+  awk -v b="$bytes" 'BEGIN { printf "%.1f", b / 1048576 }'
 }
 
 find_python() {
