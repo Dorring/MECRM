@@ -851,24 +851,28 @@ jobs:
           retention-days: 7
 
       # -- Group G G2 PR1: Trivy container vulnerability scan ------------
-      # Scan the just-pushed image by immutable digest.
-      # CRITICAL -> fail build.  HIGH/MEDIUM/LOW -> SARIF report-only.
+      # VERSION PIN: 0.59.1 (released 2025-07, stable SARIF + CycloneDX
+      # output, widely used in GitHub Actions ecosystems).  The digest is
+      # from ghcr.io/aquasecurity/trivy:0.59.1.
       - name: Trivy scan image
         id: trivy
         env:
           IMAGE_NAME: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.project }}
+          TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.59.1
         run: |
           set -euo pipefail
           IMAGE_FULL="$(printf '%s' "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')@${{ steps.build-push.outputs.digest }}"
           echo "Scanning: ${IMAGE_FULL}"
+          echo "Trivy:    ${TRIVY_IMAGE}"
 
           docker pull "${IMAGE_FULL}"
 
+          # Pass 1: SARIF for all severities (report-only)
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$(pwd):/workspace" \
             -w /workspace \
-            aquasec/trivy:latest \
+            "${TRIVY_IMAGE}" \
             image \
             --severity CRITICAL,HIGH,MEDIUM,LOW \
             --exit-code 0 \
@@ -878,13 +882,27 @@ jobs:
 
           echo "Trivy SARIF written: trivy-results-${{ matrix.project }}.sarif"
 
-          # Run a second pass with --exit-code 1 on CRITICAL only.
-          # This fails the build if any CRITICAL CVE is found.
+          # Pass 2: JSON vulnerability report (artifact)
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$(pwd):/workspace" \
             -w /workspace \
-            aquasec/trivy:latest \
+            "${TRIVY_IMAGE}" \
+            image \
+            --severity CRITICAL,HIGH,MEDIUM,LOW \
+            --exit-code 0 \
+            --format json \
+            --output "trivy-results-${{ matrix.project }}.json" \
+            "${IMAGE_FULL}"
+
+          echo "Trivy JSON written: trivy-results-${{ matrix.project }}.json"
+
+          # Pass 3: CRITICAL-only gate (fail build if any CRITICAL CVE)
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$(pwd):/workspace" \
+            -w /workspace \
+            "${TRIVY_IMAGE}" \
             image \
             --severity CRITICAL \
             --exit-code 1 \
@@ -900,6 +918,15 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Upload Trivy JSON artifact
+        if: always() && steps.trivy.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-json-${{ matrix.project }}
+          path: trivy-results-${{ matrix.project }}.json
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Upload Trivy SARIF to GitHub Security
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.trivy.outcome != 'skipped'
         uses: github/codeql-action/upload-sarif@v3
@@ -912,6 +939,7 @@ jobs:
         id: sbom
         env:
           IMAGE_NAME: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.project }}
+          TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.59.1
         run: |
           set -euo pipefail
           IMAGE_FULL="$(printf '%s' "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')@${{ steps.build-push.outputs.digest }}"
@@ -921,7 +949,7 @@ jobs:
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$(pwd):/workspace" \
             -w /workspace \
-            aquasec/trivy:latest \
+            "${TRIVY_IMAGE}" \
             image \
             --format cyclonedx \
             --output "sbom-${{ matrix.project }}.cdx.json" \
@@ -937,6 +965,135 @@ jobs:
           path: sbom-${{ matrix.project }}.cdx.json
           if-no-files-found: error
           retention-days: 30
+
+  # -- Group G G2 PR1: PR-level Trivy scan (no push, load local image) --
+  # Builds the image without pushing, loads it into the local Docker
+  # daemon, and runs the same Trivy CRITICAL gate.  SARIF/JSON/SBOM
+  # are uploaded as artifacts.  GitHub Security SARIF upload is reserved
+  # for main push.
+  security-scan:
+    name: Security Scan (PR)
+    runs-on: ubuntu-latest
+    needs: [lint, lint-python]
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      matrix:
+        include:
+          - project: gateway
+            dockerfile: gateway/Dockerfile
+            context: gateway
+          - project: frontend
+            dockerfile: frontend/Dockerfile
+            context: frontend
+          - project: agents
+            dockerfile: agents/Dockerfile
+            context: agents
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: false
+          load: true
+          tags: mecrm-${{ matrix.project }}:pr-${{ github.event.pull_request.head.sha || github.sha }}
+          cache-from: type=gha
+          # Do NOT cache-to on PR -- security boundary
+
+      - name: Trivy scan PR image
+        id: trivy
+        env:
+          TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.59.1
+        run: |
+          set -euo pipefail
+          IMAGE_TAG="mecrm-${{ matrix.project }}:pr-${{ github.event.pull_request.head.sha || github.sha }}"
+          echo "Scanning local: ${IMAGE_TAG}"
+          echo "Trivy:          ${TRIVY_IMAGE}"
+
+          # Pass 1: SARIF (report-only)
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$(pwd):/workspace" \
+            -w /workspace \
+            "${TRIVY_IMAGE}" \
+            image \
+            --severity CRITICAL,HIGH,MEDIUM,LOW \
+            --exit-code 0 \
+            --format sarif \
+            --output "trivy-results-${{ matrix.project }}.sarif" \
+            "${IMAGE_TAG}"
+
+          # Pass 2: JSON (artifact)
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$(pwd):/workspace" \
+            -w /workspace \
+            "${TRIVY_IMAGE}" \
+            image \
+            --severity CRITICAL,HIGH,MEDIUM,LOW \
+            --exit-code 0 \
+            --format json \
+            --output "trivy-results-${{ matrix.project }}.json" \
+            "${IMAGE_TAG}"
+
+          # Pass 3: CRITICAL gate
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$(pwd):/workspace" \
+            -w /workspace \
+            "${TRIVY_IMAGE}" \
+            image \
+            --severity CRITICAL \
+            --exit-code 1 \
+            --format table \
+            "${IMAGE_TAG}"
+
+          # SBOM from local image
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$(pwd):/workspace" \
+            -w /workspace \
+            "${TRIVY_IMAGE}" \
+            image \
+            --format cyclonedx \
+            --output "sbom-${{ matrix.project }}.cdx.json" \
+            "${IMAGE_TAG}"
+
+      - name: Upload Trivy SARIF artifact
+        if: always() && steps.trivy.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results-${{ matrix.project }}-pr
+          path: trivy-results-${{ matrix.project }}.sarif
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Trivy JSON artifact
+        if: always() && steps.trivy.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-json-${{ matrix.project }}-pr
+          path: trivy-results-${{ matrix.project }}.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload SBOM artifact
+        if: always() && steps.trivy.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.project }}-pr
+          path: sbom-${{ matrix.project }}.cdx.json
+          if-no-files-found: error
+          retention-days: 14
 
   # -- Group G G1: aggregate per-project digest artifacts into a single
   #    digest-map.json consumed by deploy-staging / deploy-production.

@@ -3,8 +3,8 @@
 Covers:
   G2-01 -- Build and push uses sbom: true
   G2-02 -- Build and push uses provenance: true
-  G2-03 -- Trivy scan step exists after Build and push
-  G2-04 -- Trivy scans the immutable digest image, not a mutable tag
+  G2-03 -- Trivy scan step exists after Build and push (main push path)
+  G2-04 -- Trivy scans the immutable digest image (main push), not a mutable tag
   G2-05 -- Trivy CRITICAL severity uses --exit-code 1 (fail build)
   G2-06 -- Trivy HIGH/MEDIUM/LOW first pass uses --exit-code 0
   G2-07 -- Trivy SARIF artifact is uploaded
@@ -13,9 +13,14 @@ Covers:
   G2-10 -- Build job has security-events: write permission
   G2-11 -- Build job has actions: read permission
   G2-12 -- .trivyignore file exists
+  G2-13 -- PR-level security-scan job exists with Trivy CRITICAL gate
+  G2-14 -- PR scans local (loaded) image, not pushed digest
+  G2-15 -- Trivy JSON vulnerability report artifact exists
+  G2-16 -- Trivy scanner image is pinned (NOT :latest)
+  G2-17 -- GitHub Security SARIF upload only on main push (not PR)
 
 PR-only validation (no Docker daemon required):
-  - YAML parsing of ci-cd.yml build job
+  - YAML parsing of ci-cd.yml build job + security-scan job
   - Static analysis of workflow steps
 """
 
@@ -34,12 +39,12 @@ def _load_yaml(path):
         return yaml.safe_load(fh)
 
 
-def _get_build_job(data):
-    return data.get("jobs", {}).get("build", {})
+def _get_job(data, name):
+    return data.get("jobs", {}).get(name, {})
 
 
-def _get_build_steps(data):
-    return _get_build_job(data).get("steps", [])
+def _get_steps(job):
+    return job.get("steps", [])
 
 
 def _step_by_name(steps, name):
@@ -56,7 +61,7 @@ class TestSBOMAndProvenance(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.steps = _get_build_steps(_load_yaml(CI_CD_PATH))
+        cls.steps = _get_steps(_get_job(_load_yaml(CI_CD_PATH), "build"))
 
     def test_build_push_has_sbom_true(self):
         step = _step_by_name(self.steps, "Build and push")
@@ -71,14 +76,14 @@ class TestSBOMAndProvenance(unittest.TestCase):
                         "G2-02: build-push-action must have provenance: true")
 
 
-# -- G2-03, G2-04, G2-05, G2-06: Trivy scan -----------------------------
+# -- G2-03, G2-04, G2-05, G2-06: Trivy scan (main push) -----------------
 
 class TestTrivyScanStep(unittest.TestCase):
     """Trivy scan must exist with correct severity gating."""
 
     @classmethod
     def setUpClass(cls):
-        cls.steps = _get_build_steps(_load_yaml(CI_CD_PATH))
+        cls.steps = _get_steps(_get_job(_load_yaml(CI_CD_PATH), "build"))
 
     def test_trivy_scan_step_exists(self):
         step = _step_by_name(self.steps, "Trivy scan image")
@@ -105,7 +110,7 @@ class TestTrivyScanStep(unittest.TestCase):
         self.assertIsNotNone(step)
         run = step.get("run", "")
         self.assertIn("--severity CRITICAL", run,
-                      "G2-05: must have CRITICAL-only second pass")
+                      "G2-05: must have CRITICAL-only pass")
         self.assertIn("--exit-code 1", run,
                       "G2-05: CRITICAL pass must use --exit-code 1")
 
@@ -118,6 +123,13 @@ class TestTrivyScanStep(unittest.TestCase):
         self.assertIn("--exit-code 0", run,
                       "G2-06: first pass must use --exit-code 0")
 
+    def test_trivy_json_pass_exists(self):
+        step = _step_by_name(self.steps, "Trivy scan image")
+        self.assertIsNotNone(step)
+        run = step.get("run", "")
+        self.assertIn("--format json", run,
+                      "G2-15: Trivy must have a JSON vulnerability report pass")
+
 
 # -- G2-07, G2-08: SARIF -------------------------------------------------
 
@@ -126,7 +138,7 @@ class TestTrivySARIFUpload(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.steps = _get_build_steps(_load_yaml(CI_CD_PATH))
+        cls.steps = _get_steps(_get_job(_load_yaml(CI_CD_PATH), "build"))
 
     def test_sarif_artifact_upload_exists(self):
         step = _step_by_name(self.steps, "Upload Trivy SARIF artifact")
@@ -147,9 +159,28 @@ class TestTrivySARIFUpload(unittest.TestCase):
         self.assertIsNotNone(step)
         if_cond = step.get("if", "")
         self.assertIn("main", if_cond,
-                      "G2-08: GitHub Security upload gates on main branch")
+                      "G2-17: GitHub Security upload gates on main branch")
         self.assertIn("push", if_cond,
-                      "G2-08: GitHub Security upload gates on push event")
+                      "G2-17: GitHub Security upload gates on push event")
+
+
+# -- G2-15: JSON vulnerability report ------------------------------------
+
+class TestTrivyJSONUpload(unittest.TestCase):
+    """JSON vulnerability report must be uploaded."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.steps = _get_steps(_get_job(_load_yaml(CI_CD_PATH), "build"))
+
+    def test_json_artifact_upload_exists(self):
+        step = _step_by_name(self.steps, "Upload Trivy JSON artifact")
+        self.assertIsNotNone(step, "G2-15: JSON artifact step missing")
+        with_config = step.get("with", {})
+        self.assertIn("json", with_config.get("path", ""),
+                      "G2-15: JSON artifact path must be .json")
+        self.assertEqual(with_config.get("if-no-files-found"), "error",
+                         "G2-15: JSON artifact must error if no files")
 
 
 # -- G2-09: CycloneDX SBOM -----------------------------------------------
@@ -159,7 +190,7 @@ class TestCycloneDXSBOM(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.steps = _get_build_steps(_load_yaml(CI_CD_PATH))
+        cls.steps = _get_steps(_get_job(_load_yaml(CI_CD_PATH), "build"))
 
     def test_sbom_extract_step_exists(self):
         step = _step_by_name(self.steps, "Extract CycloneDX SBOM")
@@ -185,7 +216,7 @@ class TestBuildJobPermissions(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.build = _get_build_job(_load_yaml(CI_CD_PATH))
+        cls.build = _get_job(_load_yaml(CI_CD_PATH), "build")
 
     def test_security_events_write(self):
         perms = self.build.get("permissions", {})
@@ -212,3 +243,80 @@ class TestTrivyignore(unittest.TestCase):
             content = fh.read()
         self.assertIn("Trivy vulnerability exceptions", content,
                       "G2-12: .trivyignore must have a header comment")
+
+
+# -- G2-13, G2-14: PR-level security-scan job ----------------------------
+
+class TestPRSecurityScanJob(unittest.TestCase):
+    """security-scan job must exist for PR-level Trivy scanning."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.data = _load_yaml(CI_CD_PATH)
+
+    def test_security_scan_job_exists(self):
+        data = _load_yaml(CI_CD_PATH)
+        job = _get_job(data, "security-scan")
+        self.assertTrue(job.get("name") or job.get("steps"),
+                        "G2-13: security-scan job must exist")
+
+    def test_security_scan_is_pull_request(self):
+        data = _load_yaml(CI_CD_PATH)
+        job = _get_job(data, "security-scan")
+        if_cond = job.get("if", "")
+        self.assertIn("pull_request", if_cond,
+                      "G2-13: security-scan must gate on pull_request")
+
+    def test_security_scan_builds_without_push(self):
+        data = _load_yaml(CI_CD_PATH)
+        job = _get_job(data, "security-scan")
+        steps = _get_steps(job)
+        build_step = _step_by_name(steps, "Build image (no push)")
+        self.assertIsNotNone(build_step, "G2-14: must have 'Build image (no push)' step")
+        with_config = build_step.get("with", {})
+        self.assertFalse(with_config.get("push"),
+                         "G2-14: PR build must have push: false")
+        self.assertTrue(with_config.get("load"),
+                        "G2-14: PR build must have load: true")
+
+    def test_security_scan_has_trivy_critical_gate(self):
+        data = _load_yaml(CI_CD_PATH)
+        job = _get_job(data, "security-scan")
+        steps = _get_steps(job)
+        trivy_step = _step_by_name(steps, "Trivy scan PR image")
+        self.assertIsNotNone(trivy_step, "G2-13: PR must have Trivy scan step")
+        run = trivy_step.get("run", "")
+        self.assertIn("--severity CRITICAL", run,
+                      "G2-13: PR Trivy must have CRITICAL gate")
+        self.assertIn("--exit-code 1", run,
+                      "G2-13: PR Trivy CRITICAL must fail build")
+
+    def test_security_scan_no_github_security_upload(self):
+        """PR job must NOT upload SARIF to GitHub Security (artifact only)."""
+        data = _load_yaml(CI_CD_PATH)
+        job = _get_job(data, "security-scan")
+        steps = _get_steps(job)
+        for s in steps:
+            uses = s.get("uses", "")
+            if "upload-sarif" in uses:
+                self.fail("G2-17: PR security-scan must not use upload-sarif")
+
+
+# -- G2-16: Trivy image pinned (not :latest) -----------------------------
+
+class TestTrivyImagePinned(unittest.TestCase):
+    """Trivy scanner image must be pinned, not :latest."""
+
+    def test_no_trivy_latest_in_ci(self):
+        with open(CI_CD_PATH, "r", encoding="utf-8") as fh:
+            content = fh.read()
+        self.assertNotIn("aquasec/trivy:latest", content,
+                         "G2-16: Trivy image must not be :latest")
+        self.assertNotIn("ghcr.io/aquasecurity/trivy:latest", content,
+                         "G2-16: Trivy image must not be :latest")
+
+    def test_trivy_version_pinned(self):
+        with open(CI_CD_PATH, "r", encoding="utf-8") as fh:
+            content = fh.read()
+        self.assertIn("trivy:0.59.1", content,
+                      "G2-16: Trivy image must be pinned to 0.59.1")
