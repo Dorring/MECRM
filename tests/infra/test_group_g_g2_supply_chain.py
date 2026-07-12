@@ -19,6 +19,7 @@ Covers:
   G2-16 -- Trivy scanner image is pinned (NOT :latest)
   G2-17 -- GitHub Security SARIF upload only on main push (not PR)
   G2-18 -- CRITICAL gate ignores unfixed CVEs, while SARIF/JSON remain complete
+  G2-19 -- gateway protobufjs lockfile version is fixed (>= 7.5.5)
 
 PR-only validation (no Docker daemon required):
   - YAML parsing of ci-cd.yml build job + security-scan job
@@ -33,6 +34,7 @@ import yaml
 REPO_ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
 CI_CD_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "ci-cd.yml")
 TRIVYIGNORE_PATH = os.path.join(REPO_ROOT, ".trivyignore")
+GATEWAY_PACKAGE_LOCK_PATH = os.path.join(REPO_ROOT, "gateway", "package-lock.json")
 
 
 def _load_yaml(path):
@@ -342,3 +344,23 @@ class TestTrivyImagePinned(unittest.TestCase):
             content = fh.read()
         self.assertIn("trivy:0.59.1", content,
                       "G2-16: Trivy image must be pinned to 0.59.1")
+
+
+# -- G2-19: Fixable dependency CVE regression ----------------------------
+
+class TestGatewayProtobufjsPatched(unittest.TestCase):
+    """gateway package-lock must not regress protobufjs below fixed version."""
+
+    def test_gateway_protobufjs_is_fixed_version(self):
+        data = _load_yaml(GATEWAY_PACKAGE_LOCK_PATH)
+        protobuf = data.get("packages", {}).get("node_modules/protobufjs", {})
+        version = protobuf.get("version", "")
+        self.assertRegex(version, r"^(7\.(5\.[5-9]|[6-9]\.)|[89]\.)",
+                         "G2-19: protobufjs must be >= 7.5.5 to avoid CVE-2026-41242")
+
+    def test_gateway_protobufjs_uses_official_registry(self):
+        data = _load_yaml(GATEWAY_PACKAGE_LOCK_PATH)
+        protobuf = data.get("packages", {}).get("node_modules/protobufjs", {})
+        resolved = protobuf.get("resolved", "")
+        self.assertIn("https://registry.npmjs.org/protobufjs/", resolved,
+                      "G2-19: protobufjs resolved URL must use official npm registry")
