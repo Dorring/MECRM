@@ -934,7 +934,7 @@ jobs:
 
       - name: Upload Trivy SARIF to GitHub Security
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.trivy.outcome != 'skipped'
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results-${{ matrix.project }}.sarif
           category: trivy-${{ matrix.project }}
