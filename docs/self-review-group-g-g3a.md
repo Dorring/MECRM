@@ -42,8 +42,9 @@ G3a delivers the Helm pre-upgrade migration Job (G-H6 blocker). It covers:
 
 ### Secret Management
 - `DATABASE_URL` sourced exclusively from `secretKeyRef` -> `migration.database.existingSecret` / `migration.database.urlKey`
-- `POSTGRES_PASSWORD` also sourced from same secret (not plaintext)
-- Non-sensitive env vars (`POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`) use `value:` (correct -- they are not secrets)
+- `GATEWAY_DIR=/app` is a non-secret static env (pointed at the directory with Prisma schema + migrations inside the image)
+- No `POSTGRES_*` split env vars are set in the Job (no `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`)
+- This avoids the original G3a bug where `migration.database.urlKey` was reused as `POSTGRES_PASSWORD`, incorrectly passing a full DSN as a password
 - Default secret: `crm-postgresql-secret` (same as gateway/agents)
 
 ### Helm Hook Strategy

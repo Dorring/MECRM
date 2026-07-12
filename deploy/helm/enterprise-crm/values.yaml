@@ -211,7 +211,7 @@ externalKafka:
 # Ollama is NOT a Chart.yaml dependency and this chart does NOT render an Ollama
 # Deployment/Service.  When enabled, agents receive OLLAMA_URL / OLLAMA_MODEL env
 # vars pointing at an out-of-band Ollama instance labelled app: ollama.
-# Default disabled — Ollama requires GPU node pools and is not part of the base
+# Default disabled - Ollama requires GPU node pools and is not part of the base
 # CRM topology.
 ollama:
   enabled: false
