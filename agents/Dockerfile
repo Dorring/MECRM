@@ -1,31 +1,54 @@
 # syntax=docker/dockerfile:1.7
-FROM python:3.11-slim
+
+# --- builder: compile native extensions ---
+FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for caching
 COPY requirements.txt .
-RUN --mount=type=cache,target=/root/.cache/pip pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --user --no-cache-dir -r requirements.txt
 
-# Copy source code
-COPY . .
+# --- runner: runtime only, no build toolchain ---
+FROM python:3.11-slim AS runner
 
-# Set Python path
+WORKDIR /app
+
+# Create non-root user (consistent with frontend non-root pattern)
+RUN addgroup --system --gid 1001 app && \
+    adduser --system --uid 1001 --gid 1001 app
+
+# Copy pip-installed packages from builder.
+# pip --user installs to /root/.local/lib/python*/site-packages and
+# /root/.local/bin.  After COPY to /home/app/.local, Python auto-discovers
+# the packages because the app user's home is /home/app and Python adds
+# ~/.local/lib/python3.11/site-packages to sys.path at startup.
+COPY --from=builder /root/.local /home/app/.local
+
+# Runtime source (selective -- no tests, scripts, or tooling)
+COPY src/ /app/src/
+
+# sitecustomize.py adds /app/src (and conditionally core_services/src/) to
+# sys.path.  Python loads it from CWD (/app) during site initialization.
+COPY sitecustomize.py /app/
+
+# PATH so any pip-installed executables (uvicorn, etc.) are reachable.
+# PYTHONPATH ensures orchestrator and intelligence modules are importable.
+ENV HOME=/home/app
+ENV PATH=/home/app/.local/bin:$PATH
 ENV PYTHONPATH=/app/src
 
-# Expose port for health checks
+RUN chown -R app:app /app /home/app/.local
+
+USER app
+
 EXPOSE 5010
 
-# Health check
-# P0-6: check the response status code, not just that the request completed.
-# A bare httpx.get() returns even on HTTP 500; a failing endpoint must be unhealthy.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
   CMD python -c "import httpx,sys; r=httpx.get('http://localhost:5010/health'); sys.exit(0 if r.is_success else 1)"
 
-# Run the orchestrator
 CMD ["python", "-m", "orchestrator.main"]
