@@ -5,7 +5,11 @@
 **G2 PR1 Status:** COMPLETED / STABILIZED
 **G2 PR1 Tag:** `hardening-group-g-g2-pr1-stabilized` -> `99c957e`
 **G2 PR1 CI:** CI/CD Pipeline + Security Scan (PR) + Tenant Isolation Proof all green
-**G2 PR2:** CodeQL + Dependabot -- PENDING
+**G2 PR2:** CodeQL + Dependabot -- COMPLETED / STABILIZED
+**G2 PR2 Tag:** `hardening-group-g-g2-pr2-stabilized` -> `101e784`
+**G2 PR2 CI:** CI/CD Pipeline + CodeQL Analysis all green
+**G2 PR2 Dependabot:** Active -- multiple PRs generated automatically
+**Remaining G2 items:** None (G2 fully closed)
 
 ## Executive Summary
 
