@@ -2,8 +2,9 @@
 
 **Date:** 2026-07-11
 **Baseline:** `main@e41a3fa` (Group E fully closed)
-**Status:** F1/F2 COMPLETED / STABILIZED
-**Tag:** `hardening-group-f-f2-stabilized` -> `d6d5568` (PR #17 squash-merge)
+**Status:** F1/F2/F3 COMPLETED / STABILIZED
+**F2 Tag:** `hardening-group-f-f2-stabilized` -> `d6d5568` (PR #17 squash-merge)
+**F3 Tag:** `hardening-group-f-f3-stabilized` -> `402a273` (PR #18 squash-merge)
 **F-B1 (agents multi-stage):** PENDING, deferred to F4
 
 ## Executive Summary
@@ -501,33 +502,45 @@ includes before/after size comparison using F1 baseline data.
 
 ### F3 -- CI Metrics Artifact / Regression Guard
 
+**Status:** STABILIZED
+**PR:** #18 (squash-merge)
+**Merge commit:** `main@402a273`
+**Tag:** `hardening-group-f-f3-stabilized` -> `402a273`
+**CI:** All checks passed on PR #18
+
 **Goal:** Make image size and build performance visible in every CI run.
 
-**Actions:**
-1. Add a post-build step in the CI `build` job that:
-   - Pulls the just-pushed image (`docker pull <image>@<digest>`)
-   - Runs `docker image inspect` and extracts: uncompressed size, layer count
-   - Records build duration per matrix project
-   - Writes a JSON artifact (`image-metrics.json`) and uploads via `actions/upload-artifact@v4`
-2. Optionally (F3b): Add a PR-check job that builds images without pushing and
-   compares metrics against the main-branch baseline. Warn if image size grows
-   >10% without an explicit exemption. Start as a warning, not a hard fail.
-3. Record build duration per matrix project (already available via GitHub Actions
-   job timing, but extract explicitly for the artifact).
+**Implemented:**
+1. New script `scripts/ci-inspect-image.sh`:
+   - Pulls just-pushed image by digest, runs `docker image inspect` and `docker history`
+   - Outputs JSON artifact with: image, imageName, digest, uncompressedSize,
+     uncompressedSizeMB, layerCount, created, buildTimestamp, buildDurationS,
+     dockerHistory
+   - Supports `--build-duration-seconds` flag for CI duration injection
+2. CI `build` job (`.github/workflows/ci-cd.yml`) updated with 5 new steps:
+   - Mark build start time (epoch in /tmp)
+   - Build and push (unchanged)
+   - Record build duration (end - start seconds)
+   - Validate metrics script (`bash -n scripts/ci-inspect-image.sh`)
+   - Collect image metrics (per matrix project)
+   - Upload artifact (`image-metrics-gateway`, `image-metrics-frontend`, `image-metrics-agents`)
+3. Artifact configuration:
+   - Name: `image-metrics-${{ matrix.project }}`
+   - Retention: 30 days
+   - `if-no-files-found`: error
+4. 32 regression tests in `tests/infra/test_group_f_image_metrics_ci.py` covering:
+   - Step presence, ordering (after build-push), artifact naming, upload-action version,
+     retention days, build duration recording, matrix project validation,
+     script static analysis, bash syntax, no-mojibake, no push guard on individual steps
 
-**Example artifact JSON:**
-```json
-{
-  "baseline": "main@e41a3fa",
-  "images": {
-    "gateway": { "size": "342MB", "layers": 12, "buildDuration": "87s" },
-    "frontend": { "size": "156MB", "layers": 8, "buildDuration": "112s" },
-    "agents": { "size": "1.2GB", "layers": 7, "buildDuration": "145s" }
-  }
-}
-```
+**Artifacts produced per main push:**
+- `image-metrics-gateway`
+- `image-metrics-frontend`
+- `image-metrics-agents`
 
-**Deliverable:** Updated `.github/workflows/ci-cd.yml` with metric artifact steps.
+**Not implemented (F3b deferred):**
+- PR-check job comparing metrics against main baseline (>10% size growth warning). This
+  can be added later when baseline data from regular CI runs is accumulated.
 
 **Risk:** Low (additive CI steps, no change to build output).
 
