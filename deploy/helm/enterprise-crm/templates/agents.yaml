@@ -27,10 +27,10 @@ spec:
       {{- end }}
       securityContext:
         runAsNonRoot: true
-        runAsUser: 1000
+        runAsUser: {{ .Values.securityContext.agents.runAsUser }}
       containers:
         - name: agents
-          image: "{{ if .Values.global.imageRegistry }}{{ .Values.global.imageRegistry }}/{{ end }}{{ .Values.images.agents.repository }}:{{ required "images.agents.tag is required — set via --set images.agents.tag=$COMMIT_SHA" .Values.images.agents.tag }}"
+          image: {{ include "enterprise-crm.image" (dict "root" . "image" .Values.images.agents) }}
           imagePullPolicy: {{ .Values.images.agents.pullPolicy }}
           ports:
             - name: http

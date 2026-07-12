@@ -82,8 +82,29 @@ Redis host
 {{- end }}
 
 {{/*
-Kafka host
+Image reference helper -- digest preferred, tag fallback.
+
+Usage:
+  {{ include "enterprise-crm.image" (dict "root" . "image" .Values.images.gateway) }}
+
+When digest is set, renders:
+  registry/repo@sha256:abcdef...
+When digest is empty, renders:
+  registry/repo:tag  (with required(tag) fail-fast if tag is also empty)
 */}}
+{{- define "enterprise-crm.image" -}}
+{{- $root := .root -}}
+{{- $img := .image -}}
+{{- $registry := "" -}}
+{{- if $root.Values.global.imageRegistry -}}
+{{- $registry = printf "%s/" $root.Values.global.imageRegistry -}}
+{{- end -}}
+{{- if $img.digest -}}
+{{- printf "%s%s@%s" $registry $img.repository $img.digest -}}
+{{- else -}}
+{{- printf "%s%s:%s" $registry $img.repository (required (printf "images.%s.tag is required when digest is not set -- use --set images.%s.tag=<tag>" $img.repository $img.repository) $img.tag) -}}
+{{- end -}}
+{{- end -}}
 {{- define "enterprise-crm.kafkaHost" -}}
 {{- if .Values.kafka.enabled }}
 {{- printf "%s-kafka" (include "enterprise-crm.fullname" .) }}

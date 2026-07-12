@@ -17,6 +17,15 @@ namespace: crm
 # Environment
 environment: production
 
+# Per-workload securityContext (G-H3: uid must match the USER in each Dockerfile)
+securityContext:
+  gateway:
+    runAsUser: 1000   # node user on node:20-bullseye (gateway/Dockerfile)
+  frontend:
+    runAsUser: 1001   # nextjs user (frontend/Dockerfile)
+  agents:
+    runAsUser: 1001   # app user (agents/Dockerfile F4 multi-stage)
+
 # ServiceAccount
 # Consumed by templates/serviceaccount.yaml and the serviceAccountName helper in _helpers.tpl.
 # When create=false, workloads fall back to the namespace "default" service account.
@@ -40,20 +49,26 @@ replicaCount:
 
 # Images
 images:
-  # tag is intentionally empty — CI (.github/workflows/ci-cd.yml) overrides
-  # every image tag to the current commit SHA via --set.  A plain `helm
-  # install` / `helm template` without --set will fail with a `required`
-  # error in the template, which is safer than silently deploying `latest`.
+  # digest is the preferred immutable image reference (sha256:...).
+  # When set, the template renders repository@digest.
+  # When empty, the template falls back to tag (required).
+  # CI (.github/workflows/ci-cd.yml) overrides digest via --set for
+  # deploy-staging / deploy-production.  A plain `helm install` /
+  # `helm template` without --set will fail with a `required` error
+  # unless at least one of digest or tag is provided.
   frontend:
     repository: enterprise-crm/frontend
+    digest: ""
     tag: ""
     pullPolicy: IfNotPresent
   gateway:
     repository: enterprise-crm/gateway
+    digest: ""
     tag: ""
     pullPolicy: IfNotPresent
   agents:
     repository: enterprise-crm/agents
+    digest: ""
     tag: ""
     pullPolicy: IfNotPresent
 

@@ -211,24 +211,25 @@ class TestHelmLatestDeferred(unittest.TestCase):
                          f"values-production.yaml: expected 3 empty tags, found {len(empty_tags)}")
 
     def test_ci_overrides_helm_tags(self):
-        """E1: CI deploy steps still override with --set images.*.tag=${{ github.sha }},
-        which satisfies the `required` guard in templates."""
+        """G1: CI deploy steps now use --set images.*.digest=... (immutable digest)
+        instead of --set images.*.tag=${{ github.sha }} (mutable tag).
+        Digest pinning is stronger than tag-based pinning."""
         with open(CICD_WORKFLOW_PATH, "r", encoding="utf-8") as fh:
             content = fh.read()
-        # staging deploy (L694-696)
-        has_staging_override = (
-            "--set images.gateway.tag=${{ github.sha }}" in content
-            and "--set images.frontend.tag=${{ github.sha }}" in content
-            and "--set images.agents.tag=${{ github.sha }}" in content
+        # staging deploy uses digest, not tag
+        has_staging_digest = (
+            "--set images.gateway.digest=" in content
+            and "--set images.frontend.digest=" in content
+            and "--set images.agents.digest=" in content
         )
         self.assertTrue(
-            has_staging_override,
-            "CI/CD staging deploy must override Helm latest tags with github.sha"
+            has_staging_digest,
+            "CI/CD staging deploy must override Helm images with digest (G1 digest pinning)"
         )
-        # production deploy (L793-795) — same pattern
-        staging_count = content.count("--set images.gateway.tag=${{ github.sha }}")
+        # production deploy — same pattern
+        staging_count = content.count("--set images.gateway.digest=")
         self.assertGreaterEqual(
             staging_count, 2,
             "Expected at least 2 occurrences (staging + production) of "
-            "--set images.gateway.tag=${{ github.sha }}"
+            "--set images.gateway.digest="
         )

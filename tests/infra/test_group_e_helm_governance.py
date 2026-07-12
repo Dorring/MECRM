@@ -75,8 +75,19 @@ class TestImageTagGovernance:
     @pytest.mark.parametrize("service,template_file", TEMPLATE_FILES.items())
     def test_templates_require_image_tags(self, service: str, template_file: Path) -> None:
         text = template_file.read_text(encoding="utf-8")
-        assert f'required "images.{service}.tag is required' in text, (
-            f"{template_file.name}: image tag must be guarded with Helm required()"
+        # G1: image reference moved to enterprise-crm.image helper which has
+        # required(tag) when digest is empty.  The template itself uses
+        # {{ include "enterprise-crm.image" }}, not inline required().
+        assert 'include "enterprise-crm.image"' in text, (
+            f"{template_file.name}: must use enterprise-crm.image helper for image reference"
+        )
+        # The required(tag) guard lives in _helpers.tpl.  The helper uses
+        # required(printf "images.%s.tag is required..." $img.repository ...)
+        # which is a generic pattern for all services (gateway/frontend/agents).
+        # Verify the generic guard exists, not hardcoded service names.
+        helpers = (HELM_DIR / "templates" / "_helpers.tpl").read_text(encoding="utf-8")
+        assert 'required (printf "images.%s.tag is required' in helpers, (
+            "_helpers.tpl: image tag fallback must use required() with printf guard"
         )
 
     def test_templates_do_not_hardcode_latest(self) -> None:
@@ -105,9 +116,14 @@ class TestCiHelmStepsPassImageTags:
 
     def test_deploy_jobs_still_set_commit_sha_tags(self) -> None:
         text = CI_CD_YML.read_text(encoding="utf-8")
+        # G1: deploy jobs now use digest instead of tag.
+        # The tag-based deploy is replaced by --set images.*.digest=...
+        # sourced from the aggregate-digests job artifact digest-map.json.
+        # The digest is the immutable image reference (sha256:...) which is
+        # stronger than the mutable github.sha tag.
         for service in ("frontend", "gateway", "agents"):
-            assert f"--set images.{service}.tag=${{{{ github.sha }}}}" in text, (
-                f"Deploy jobs must still set images.{service}.tag to github.sha"
+            assert f"--set images.{service}.digest=" in text, (
+                f"Deploy jobs must now set images.{service}.digest (digest pinning)"
             )
 
 

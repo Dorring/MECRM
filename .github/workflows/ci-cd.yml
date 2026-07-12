@@ -695,6 +695,71 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      # -- Group G G1: upload per-project digest artifact for aggregation -----
+      - name: Write digest artifact
+        id: digest-artifact
+        env:
+          IMAGE_NAME: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.project }}
+        run: |
+          IMAGE_FULL="$(printf '%s' "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
+          DIGEST="${{ steps.build-push.outputs.digest }}"
+          cat > "digest-${{ matrix.project }}.json" <<JSON
+          {
+            "project": "${{ matrix.project }}",
+            "image": "${IMAGE_FULL}",
+            "digest": "${DIGEST}"
+          }
+          JSON
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.project }}
+          path: digest-${{ matrix.project }}.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # -- Group G G1: aggregate per-project digest artifacts into a single
+  #    digest-map.json consumed by deploy-staging / deploy-production.
+  #    Each matrix build uploads digest-{project}; this job downloads all
+  #    three and produces the unified map.
+  aggregate-digests:
+    name: Aggregate Digests
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Download digest artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: digests
+
+      - name: Assemble digest map
+        id: digest-map
+        run: |
+          echo '{' > digest-map.json
+          first=true
+          for f in digests/digest-*.json; do
+            project="$(jq -r '.project' "$f")"
+            digest="$(jq -r '.digest' "$f")"
+            image="$(jq -r '.image' "$f")"
+            if [ "$first" = "true" ]; then first=false; else echo ',' >> digest-map.json; fi
+            printf '  "%s": {"digest": "%s", "image": "%s"}' "$project" "$digest" "$image" >> digest-map.json
+          done
+          echo '' >> digest-map.json
+          echo '}' >> digest-map.json
+          cat digest-map.json
+
+      - name: Upload digest map artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-map
+          path: digest-map.json
+          if-no-files-found: error
+          retention-days: 7
+
   # Deploy to staging.
   # NOTE: job-level `if:` cannot reference the `secrets` context reliably
   # (`if: ${{ secrets.X != '' }}` does not evaluate as intended and makes the
@@ -705,7 +770,7 @@ jobs:
   deploy-staging:
     name: Deploy to Staging
     runs-on: ubuntu-latest
-    needs: build
+    needs: aggregate-digests
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     environment: staging
     env:
@@ -716,6 +781,12 @@ jobs:
       TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download digest map
+        uses: actions/download-artifact@v4
+        with:
+          name: digest-map
+          path: /tmp/digest-map
 
       - name: Guard required staging secrets
         run: |
@@ -738,21 +809,21 @@ jobs:
           kubeconfig: ${{ env.KUBE_CONFIG_STAGING }}
 
       - name: Deploy with Helm
-        # Phase 4 CI/CD: deploys SHOULD reference the immutable image digest
-        # rather than the mutable `${{ github.sha }}` tag. The build job publishes
-        # `steps.build-push.outputs.digest` per matrix image; once a non-matrix
-        # build aggregation is added (or a digest map step), switch the
-        # `--set images.*.tag` lines to `--set images.*.digest=<sha256:...>`.
-        # Tag-based deploy is retained for now and tracked as a follow-up.
+        # Group G G1: deploy by immutable image digest instead of mutable
+        # ${{ github.sha }} tag.  Digests are aggregated from the 3 matrix
+        # build jobs by the aggregate-digests job into digest-map.json.
         if: ${{ env.SKIP_REMAINING != 'true' }}
         run: |
+          GW_DIGEST=$(jq -r '.gateway.digest' /tmp/digest-map/digest-map.json)
+          FE_DIGEST=$(jq -r '.frontend.digest' /tmp/digest-map/digest-map.json)
+          AG_DIGEST=$(jq -r '.agents.digest' /tmp/digest-map/digest-map.json)
           helm upgrade --install enterprise-crm ./deploy/helm/enterprise-crm \
             --namespace crm-staging \
             --create-namespace \
             --values ./deploy/helm/enterprise-crm/values-staging.yaml \
-            --set images.gateway.tag=${{ github.sha }} \
-            --set images.frontend.tag=${{ github.sha }} \
-            --set images.agents.tag=${{ github.sha }} \
+            --set images.gateway.digest="${GW_DIGEST}" \
+            --set images.frontend.digest="${FE_DIGEST}" \
+            --set images.agents.digest="${AG_DIGEST}" \
             --wait --timeout 10m
 
   # Integration tests on staging. Runs only when the staging API is actually
@@ -819,6 +890,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Download digest map
+        uses: actions/download-artifact@v4
+        with:
+          name: digest-map
+          path: /tmp/digest-map
+
       - name: Guard required production secrets
         run: |
           if [ -z "${KUBE_CONFIG_PRODUCTION}" ]; then
@@ -840,18 +917,21 @@ jobs:
           kubeconfig: ${{ env.KUBE_CONFIG_PRODUCTION }}
 
       - name: Deploy with Helm
-        # Phase 4 CI/CD: production deploy SHOULD reference the immutable image
-        # digest, not the mutable `${{ github.sha }}` tag. See deploy-staging
-        # note for the migration plan. Tag-based deploy is retained for now.
+        # Group G G1: deploy by immutable image digest.  Same pattern as
+        # deploy-staging -- digests are resolved from the aggregate-digests
+        # job artifact digest-map.json.
         if: ${{ env.SKIP_REMAINING != 'true' }}
         run: |
+          GW_DIGEST=$(jq -r '.gateway.digest' /tmp/digest-map/digest-map.json)
+          FE_DIGEST=$(jq -r '.frontend.digest' /tmp/digest-map/digest-map.json)
+          AG_DIGEST=$(jq -r '.agents.digest' /tmp/digest-map/digest-map.json)
           helm upgrade --install enterprise-crm ./deploy/helm/enterprise-crm \
             --namespace crm-production \
             --create-namespace \
             --values ./deploy/helm/enterprise-crm/values-production.yaml \
-            --set images.gateway.tag=${{ github.sha }} \
-            --set images.frontend.tag=${{ github.sha }} \
-            --set images.agents.tag=${{ github.sha }} \
+            --set images.gateway.digest="${GW_DIGEST}" \
+            --set images.frontend.digest="${FE_DIGEST}" \
+            --set images.agents.digest="${AG_DIGEST}" \
             --wait --timeout 15m
 
       - name: Notify deployment
