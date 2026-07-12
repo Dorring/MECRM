@@ -500,7 +500,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Helm
-        uses: azure/setup-helm@v3
+        uses: azure/setup-helm@v5
 
       # P0-4: Chart.yaml declares bitnami subchart dependencies (postgresql, redis,
       # kafka, keycloak). `helm lint` and `helm template` fail with "found in
@@ -1207,7 +1207,7 @@ jobs:
 
       - name: Setup Helm
         if: ${{ env.SKIP_REMAINING != 'true' }}
-        uses: azure/setup-helm@v3
+        uses: azure/setup-helm@v5
 
       - name: Configure kubectl
         if: ${{ env.SKIP_REMAINING != 'true' }}
@@ -1324,7 +1324,7 @@ jobs:
 
       - name: Setup Helm
         if: ${{ env.SKIP_REMAINING != 'true' }}
-        uses: azure/setup-helm@v3
+        uses: azure/setup-helm@v5
 
       - name: Configure kubectl
         if: ${{ env.SKIP_REMAINING != 'true' }}
