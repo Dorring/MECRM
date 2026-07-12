@@ -632,6 +632,10 @@ jobs:
             type=ref,event=branch
             type=semver,pattern={{version}}
 
+      - name: Mark build start time
+        id: build-start
+        run: date -u +%s > /tmp/build-start-epoch
+
       - name: Build and push
         id: build-push
         uses: docker/build-push-action@v5
@@ -644,6 +648,15 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Record build duration
+        id: build-duration
+        if: success()
+        run: |
+          START=$(cat /tmp/build-start-epoch)
+          END=$(date -u +%s)
+          DURATION=$((END - START))
+          echo "duration_seconds=${DURATION}" >> "$GITHUB_OUTPUT"
 
       # Publish the immutable image digest so deploy jobs can resolve the
       # exact bytes that were built, instead of the mutable sha tag.
@@ -658,6 +671,29 @@ jobs:
           test -n "${DIGEST}"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "image=${IMAGE_NAME}@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      # -- Group F F3: collect image metrics and upload as CI artifact -----
+      - name: Validate metrics script
+        run: bash -n scripts/ci-inspect-image.sh
+
+      - name: Collect image metrics
+        id: collect-metrics
+        env:
+          IMAGE_NAME: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.project }}
+        run: |
+          IMAGE_FULL="$(printf '%s' "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')@${{ steps.build-push.outputs.digest }}"
+          bash scripts/ci-inspect-image.sh \
+            --image "${IMAGE_FULL}" \
+            --output "image-metrics-${{ matrix.project }}.json" \
+            --build-duration-seconds "${{ steps.build-duration.outputs.duration_seconds }}"
+
+      - name: Upload image metrics artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-metrics-${{ matrix.project }}
+          path: image-metrics-${{ matrix.project }}.json
+          if-no-files-found: error
+          retention-days: 30
 
   # Deploy to staging.
   # NOTE: job-level `if:` cannot reference the `secrets` context reliably
