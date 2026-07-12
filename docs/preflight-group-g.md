@@ -2,7 +2,9 @@
 
 **Date:** 2026-07-12
 **Baseline:** `main@54bfc31` (Group F fully closed)
-**Status:** SURVEY COMPLETE -- PENDING REVIEW
+**G1 Status:** COMPLETED / STABILIZED
+**G1 Tag:** `hardening-group-g-g1-stabilized` -> `8690ee5`
+**G1 CI:** CI/CD Pipeline #94 + Tenant Isolation Proof #94 all green
 
 ## Executive Summary
 
@@ -333,22 +335,22 @@ Same as G-C8 -- recorded in CI section for visibility. Duplicate reference for c
 
 | ID | Finding | Phase |
 |---|---|---|
-| **G-C1** | Deploy uses mutable `${{ github.sha }}` tag, not digest. Tags are not immutable. | G1 |
+| **G-C1** | Deploy uses mutable `${{ github.sha }}` tag, not digest. Tags are not immutable. | **CLOSED (G1)** |
 | **G-C4** | No container image vulnerability scanning (Trivy). All images pushed to GHCR unscanned. | G2 |
-| **G-H3** | Helm `securityContext.runAsUser: 1000` mismatches agents image uid 1001 and frontend image uid 1001. Pods may fail to start. | G1 |
+| **G-H3** | Helm `securityContext.runAsUser: 1000` mismatches agents image uid 1001 and frontend image uid 1001. Pods may fail to start. | **CLOSED (G1)** |
 | **G-H6** | No Kubernetes migration Job in Helm chart. Database schema cannot be deployed to K8s. | G3 |
 
 ### Should Fix
 
 | ID | Finding | Phase |
 |---|---|---|
-| **G-C2** | No digest-map aggregation for matrix build outputs. | G1 |
+| **G-C2** | No digest-map aggregation for matrix build outputs. | **CLOSED (G1)** |
 | **G-C3** | Node.js 20 EOL 2026-04-30. Plan migration to Node 22. | G2 |
 | **G-C5** | No Dependabot or automated dependency vulnerability scanning. | G2 |
 | **G-C6** | No SBOM/provenance for container images. | G2 |
 | **G-C7** | No CodeQL/SAST on source code. | G2 |
 | **G-C8** | No image size regression PR-check gate (F3b deferred). | G4 |
-| **G-H1** | Helm chart has no `digest` field for images. | G1 |
+| **G-H1** | Helm chart has no `digest` field for images. | **CLOSED (G1)** |
 | **G-H2** | Bitnami subchart versions need periodic audit. | G2 |
 | **G-H4** | WebSocket/Ingress routing has no real-cluster validation. | G3 |
 | **G-H5** | Ingress WSS has no real-cluster validation; existing timeout annotations are likely sufficient. | G3 |
@@ -385,7 +387,7 @@ G0 (doc) --> G1 (digest) --> G2 (security) --> G3 (cluster) --> G4 (reliability)
 | Phase | Title | Depends On | Blocker? | Needs K8s/Secrets? |
 |---|---|---|---|---|
 | **G0** | Preflight doc cleanup | — | No | No |
-| **G1** | Digest Pinning + Helm UID Fix | G0 | **Yes** (G-C1, G-H3) | Yes -- `KUBE_CONFIG_STAGING` |
+| **G1** | Digest Pinning + Helm UID Fix | G0 | **CLOSED** -- `main@8690ee5`, tag `hardening-group-g-g1-stabilized` | — |
 | **G2** | Supply-Chain Security Scan | G1 (needs digest ref for Trivy) | **Yes** (G-C4) | No -- CI-only |
 | **G3** | Migration Job + Real-Cluster Validation | G1 (needs digest deploy) + G2 (scanned images) | **Yes** (G-H6) | Yes -- `KUBE_CONFIG_STAGING`, `STAGING_API_URL`, `TEST_USER_EMAIL`, `TEST_USER_PASSWORD` |
 | **G4** | Reliability Backlog | G3 (real cluster validates readiness probes) | No | No (except readiness probe testing) |
