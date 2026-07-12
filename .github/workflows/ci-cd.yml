@@ -897,7 +897,11 @@ jobs:
 
           echo "Trivy JSON written: trivy-results-${{ matrix.project }}.json"
 
-          # Pass 3: CRITICAL-only gate (fail build if any CRITICAL CVE)
+          # Pass 3: actionable CRITICAL-only gate.
+          # Fail only CRITICAL vulnerabilities with an upstream fix available.
+          # Unfixed/fix_deferred CRITICAL CVEs remain visible in SARIF/JSON
+          # artifacts and GitHub Security, but do not block main while the base
+          # image vendor has no patched package.
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$(pwd):/workspace" \
@@ -905,6 +909,7 @@ jobs:
             "${TRIVY_IMAGE}" \
             image \
             --severity CRITICAL \
+            --ignore-unfixed \
             --exit-code 1 \
             --format table \
             "${IMAGE_FULL}"
@@ -1045,7 +1050,11 @@ jobs:
             --output "trivy-results-${{ matrix.project }}.json" \
             "${IMAGE_TAG}"
 
-          # Pass 3: CRITICAL gate
+          # Pass 3: actionable CRITICAL gate.
+          # Fail only CRITICAL vulnerabilities with an upstream fix available.
+          # Unfixed/fix_deferred CRITICAL CVEs remain visible in SARIF/JSON
+          # artifacts, but do not block PRs while the base image vendor has no
+          # patched package.
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$(pwd):/workspace" \
@@ -1053,6 +1062,7 @@ jobs:
             "${TRIVY_IMAGE}" \
             image \
             --severity CRITICAL \
+            --ignore-unfixed \
             --exit-code 1 \
             --format table \
             "${IMAGE_TAG}"

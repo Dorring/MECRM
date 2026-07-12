@@ -18,6 +18,7 @@ Covers:
   G2-15 -- Trivy JSON vulnerability report artifact exists
   G2-16 -- Trivy scanner image is pinned (NOT :latest)
   G2-17 -- GitHub Security SARIF upload only on main push (not PR)
+  G2-18 -- CRITICAL gate ignores unfixed CVEs, while SARIF/JSON remain complete
 
 PR-only validation (no Docker daemon required):
   - YAML parsing of ci-cd.yml build job + security-scan job
@@ -113,6 +114,15 @@ class TestTrivyScanStep(unittest.TestCase):
                       "G2-05: must have CRITICAL-only pass")
         self.assertIn("--exit-code 1", run,
                       "G2-05: CRITICAL pass must use --exit-code 1")
+
+    def test_trivy_critical_gate_ignores_unfixed_only_once(self):
+        step = _step_by_name(self.steps, "Trivy scan image")
+        self.assertIsNotNone(step)
+        run = step.get("run", "")
+        self.assertIn("--ignore-unfixed", run,
+                      "G2-18: CRITICAL gate must ignore unfixed/fix_deferred CVEs")
+        self.assertEqual(run.count("--ignore-unfixed"), 1,
+                         "G2-18: --ignore-unfixed must only be on the CRITICAL gate, not SARIF/JSON")
 
     def test_trivy_full_severity_exit_code_0(self):
         step = _step_by_name(self.steps, "Trivy scan image")
@@ -290,6 +300,18 @@ class TestPRSecurityScanJob(unittest.TestCase):
                       "G2-13: PR Trivy must have CRITICAL gate")
         self.assertIn("--exit-code 1", run,
                       "G2-13: PR Trivy CRITICAL must fail build")
+
+    def test_security_scan_critical_gate_ignores_unfixed_only_once(self):
+        data = _load_yaml(CI_CD_PATH)
+        job = _get_job(data, "security-scan")
+        steps = _get_steps(job)
+        trivy_step = _step_by_name(steps, "Trivy scan PR image")
+        self.assertIsNotNone(trivy_step, "G2-18: PR must have Trivy scan step")
+        run = trivy_step.get("run", "")
+        self.assertIn("--ignore-unfixed", run,
+                      "G2-18: PR CRITICAL gate must ignore unfixed/fix_deferred CVEs")
+        self.assertEqual(run.count("--ignore-unfixed"), 1,
+                         "G2-18: PR --ignore-unfixed must only be on the CRITICAL gate, not SARIF/JSON")
 
     def test_security_scan_no_github_security_upload(self):
         """PR job must NOT upload SARIF to GitHub Security (artifact only)."""
