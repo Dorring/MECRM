@@ -66,20 +66,21 @@ updates:
     commit-message:
       prefix: chore(deps)
 
-  # Core services pip
-  - package-ecosystem: pip
-    directory: /core_services
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 5
-    labels: [dependencies, security, core_services]
-    groups:
-      core-pip:
-        patterns: ['*']
-        update-types: [minor, patch]
-    commit-message:
-      prefix: chore(deps)
+  # Core services -- no requirements.txt yet; pip Dependabot skipped.
+  # When a pip manifest is added, uncomment the block below.
+  # - package-ecosystem: pip
+  #   directory: /core_services
+  #   schedule:
+  #     interval: weekly
+  #     day: monday
+  #   open-pull-requests-limit: 5
+  #   labels: [dependencies, security, core_services]
+  #   groups:
+  #     core-pip:
+  #       patterns: ['*']
+  #       update-types: [minor, patch]
+  #   commit-message:
+  #     prefix: chore(deps)
 
   # Gateway Dockerfile
   - package-ecosystem: docker

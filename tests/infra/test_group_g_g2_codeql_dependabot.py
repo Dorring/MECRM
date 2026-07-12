@@ -11,6 +11,7 @@ Covers:
   G2-28 -- Dependabot covers gateway npm
   G2-29 -- Dependabot covers frontend npm
   G2-30 -- Dependabot covers agents pip
+  G2-30b -- Dependabot core_services pip is commented (no manifest yet)
   G2-31 -- Dependabot covers Docker directories
   G2-32 -- Dependabot PR limit is 5 per ecosystem
   G2-33 -- Dependabot groups minor/patch, not major
@@ -147,6 +148,12 @@ class TestDependabotConfig(unittest.TestCase):
                   and u.get("directory") == "/agents"]
         self.assertEqual(len(agents), 1,
                          "G2-30: Dependabot must cover /agents pip")
+
+    def test_core_services_pip_removed_no_manifest(self):
+        core = [u for u in self.data.get("updates", [])
+                if u.get("directory") == "/core_services"]
+        self.assertEqual(len(core), 0,
+                         "G2-30b: core_services pip must be removed (no requirements.txt)")
 
     def test_covers_docker_directories(self):
         docker_dirs = {u.get("directory") for u in self.data.get("updates", [])
