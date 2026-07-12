@@ -212,7 +212,7 @@ jobs:
 
       - name: Upload coverage
         if: always()
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: gateway/coverage/lcov.info
           flags: gateway
@@ -283,7 +283,7 @@ jobs:
           DATABASE_URL: postgresql://crm_app:crm_password@localhost:5432/test_db
 
       - name: Upload coverage
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: agents/coverage.xml
           flags: agents
