@@ -2,10 +2,11 @@
 
 **Date:** 2026-07-11
 **Baseline:** `main@e41a3fa` (Group E fully closed)
-**Status:** F1/F2/F3 COMPLETED / STABILIZED
+**Status:** F1/F2/F3/F4 COMPLETED / STABILIZED — GROUP F CLOSED
 **F2 Tag:** `hardening-group-f-f2-stabilized` -> `d6d5568` (PR #17 squash-merge)
 **F3 Tag:** `hardening-group-f-f3-stabilized` -> `402a273` (PR #18 squash-merge)
-**F-B1 (agents multi-stage):** PENDING, deferred to F4
+**F4 Tag:** `hardening-group-f-f4-stabilized` -> `ef591ff`
+**F-B1 (agents multi-stage):** CLOSED — agents: 737.5 MB → 410.5 MB (-44.3%)
 
 ## Executive Summary
 

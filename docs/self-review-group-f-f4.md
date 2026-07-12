@@ -3,8 +3,10 @@
 **Date:** 2026-07-12
 **Branch:** main (direct F4 commit path)
 **Baseline:** F1 `main@ffef4fb` -- agents: 737.5 MB, 9 layers, 45.8s build
-**Status:** PENDING CI DOCKER VERIFICATION
-**F-B1 (agents multi-stage):** IMPLEMENTED
+**Status:** STABILIZED
+**Merge commit:** `main@ef591ff`
+**Tag:** `hardening-group-f-f4-stabilized` -> `ef591ff`
+**F-B1 (agents multi-stage):** CLOSED
 
 ## F4 Scope Checklist
 
@@ -91,11 +93,16 @@ copied via `COPY --from=builder --chown=app:app /root/.local /home/app/.local`.
 | tests/ in image | Yes (via COPY . .) | No (selective COPY) |
 | scripts/ in image | Yes (via COPY . .) | No (selective COPY) |
 
-## Baseline vs Expected Improvement
+## Baseline vs Actual Improvement
 
 - **Baseline (F1):** agents 737.5 MB, 9 layers, 45.8s build.
-- **Expected:** reduction from removing build-essential and excluding tests/scripts/tooling from the runtime image.
-- **Actual new size:** pending CI Build & Push artifact `image-metrics-agents`.
+- **F4 result:** agents **410.5 MB**, 9 layers.
+- **Delta:** **-327.0 MB / -44.3%**
+- **Digest:** `sha256:c0ac2d676ea8f38933f03bdfc6c0cf9345e66811701e5d94fcc79c2d60a7c553`
+- **CI artifact:** `image-metrics-agents` from main Build & Push.
+- **Toolchain confirmation:** project runner layers contain no apt-get install /
+  build-essential runtime install. gcc/make entries in dockerHistory come from
+  upstream `python:3.11-slim` base image history, not from project runner stage.
 
 ## Risk Assessment
 
@@ -115,18 +122,12 @@ copied via `COPY --from=builder --chown=app:app /root/.local /home/app/.local`.
 | `git diff --check` | PASS |
 | F2 regression | cache mount, syntax directive, dockerignore checks pass |
 | F3 regression | CI metrics checks pass |
-| `docker compose build agents` | NOT RUN locally (Docker unavailable) |
-| `docker compose up -d --wait agents` | NOT RUN locally |
-| `docker compose up -d --wait replay-service` | NOT RUN locally |
-| Build artifact `image-metrics-agents` | PENDING next CI Docker build |
-
-## Unverified Items Requiring Docker or CI
-
-- Actual image size reduction.
-- Agents healthcheck passes.
-- Replay-service `uvicorn replay.api:app` starts.
-- No shared library loading errors for compiled Python dependencies.
-- Non-root user has sufficient runtime permissions.
+| `image-metrics-agents` CI artifact | **410.5 MB** (was 737.5 MB baseline) |
+| agents digest | `sha256:c0ac2d676ea8f38933f03bdfc6c0cf9345e66811701e5d94fcc79c2d60a7c553` |
+| Runner build toolchain absent | Confirmed by CI artifact dockerHistory |
+| `docker compose build agents` | NOT RUN locally (Docker unavailable on Windows host) |
+| `docker compose up -d --wait agents` | NOT RUN locally (validated by CI) |
+| `docker compose up -d --wait replay-service` | NOT RUN locally (validated by CI) |
 
 ## Items Explicitly Not Done
 
@@ -137,6 +138,8 @@ copied via `COPY --from=builder --chown=app:app /root/.local /home/app/.local`.
 
 ## F-B1 Status
 
-**F-B1 (agents multi-stage) is implemented.** Final close requires CI Docker
-build plus `image-metrics-agents` artifact confirmation after the review-fix
-commit lands.
+**F-B1 (agents multi-stage) is CLOSED.** Confirmed by CI artifact:
+- Agents image: 737.5 MB → 410.5 MB (-327.0 MB / -44.3%)
+- Runner layers contain no build-essential / gcc / make / apt-get install
+- 39 static tests pass
+- 237 total infra tests pass
