@@ -1,0 +1,142 @@
+# Dependabot configuration -- G2 PR2
+# Weekly checks across GitHub Actions, npm, pip, and Docker ecosystems.
+# Minor/patch updates are grouped per ecosystem.  Major updates are
+# separate PRs (not grouped) for explicit review.
+
+version: 2
+updates:
+
+  # GitHub Actions
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, security, ci]
+    groups:
+      github-actions:
+        patterns: ['*']
+        update-types: [minor, patch]
+    commit-message:
+      prefix: chore(ci)
+
+  # Gateway npm
+  - package-ecosystem: npm
+    directory: /gateway
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, security, gateway]
+    groups:
+      gateway-npm:
+        patterns: ['*']
+        update-types: [minor, patch]
+    commit-message:
+      prefix: chore(deps)
+
+  # Frontend npm
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, security, frontend]
+    groups:
+      frontend-npm:
+        patterns: ['*']
+        update-types: [minor, patch]
+    commit-message:
+      prefix: chore(deps)
+
+  # Agents pip
+  - package-ecosystem: pip
+    directory: /agents
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, security, agents]
+    groups:
+      agents-pip:
+        patterns: ['*']
+        update-types: [minor, patch]
+    commit-message:
+      prefix: chore(deps)
+
+  # Core services pip
+  - package-ecosystem: pip
+    directory: /core_services
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, security, core_services]
+    groups:
+      core-pip:
+        patterns: ['*']
+        update-types: [minor, patch]
+    commit-message:
+      prefix: chore(deps)
+
+  # Gateway Dockerfile
+  - package-ecosystem: docker
+    directory: /gateway
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, security, docker, gateway]
+    groups:
+      gateway-docker:
+        patterns: ['*']
+        update-types: [minor, patch]
+    commit-message:
+      prefix: chore(docker)
+
+  # Frontend Dockerfile
+  - package-ecosystem: docker
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, security, docker, frontend]
+    groups:
+      frontend-docker:
+        patterns: ['*']
+        update-types: [minor, patch]
+    commit-message:
+      prefix: chore(docker)
+
+  # Agents Dockerfile
+  - package-ecosystem: docker
+    directory: /agents
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, security, docker, agents]
+    groups:
+      agents-docker:
+        patterns: ['*']
+        update-types: [minor, patch]
+    commit-message:
+      prefix: chore(docker)
+
+  # Database Dockerfile (migrate runner)
+  - package-ecosystem: docker
+    directory: /database
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, security, docker, database]
+    groups:
+      db-docker:
+        patterns: ['*']
+        update-types: [minor, patch]
+    commit-message:
+      prefix: chore(docker)
