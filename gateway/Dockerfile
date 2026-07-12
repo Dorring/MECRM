@@ -2,10 +2,9 @@
 FROM node:20-bullseye AS builder
 WORKDIR /app
 RUN apt-get update \
+  && apt-get upgrade -y \
   && apt-get install -y --no-install-recommends openssl libssl1.1 \
   && rm -rf /var/lib/apt/lists/*
-
-
 
 COPY package*.json ./
 COPY prisma ./prisma/
@@ -20,6 +19,13 @@ FROM node:20-bullseye AS runner
 
 WORKDIR /app
 ENV NODE_ENV=production
+
+# Keep runtime OS packages current so Trivy's actionable CRITICAL gate only
+# fails on vulnerabilities that remain after Debian security updates.
+RUN apt-get update \
+  && apt-get upgrade -y \
+  && apt-get install -y --no-install-recommends openssl libssl1.1 \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY package*.json ./
 COPY prisma ./prisma/

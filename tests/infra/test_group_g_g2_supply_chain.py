@@ -20,6 +20,7 @@ Covers:
   G2-17 -- GitHub Security SARIF upload only on main push (not PR)
   G2-18 -- CRITICAL gate ignores unfixed CVEs, while SARIF/JSON remain complete
   G2-19 -- gateway protobufjs lockfile version is fixed (>= 7.5.5)
+  G2-20 -- gateway image applies Debian security upgrades in builder and runner
 
 PR-only validation (no Docker daemon required):
   - YAML parsing of ci-cd.yml build job + security-scan job
@@ -35,6 +36,7 @@ REPO_ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
 CI_CD_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "ci-cd.yml")
 TRIVYIGNORE_PATH = os.path.join(REPO_ROOT, ".trivyignore")
 GATEWAY_PACKAGE_LOCK_PATH = os.path.join(REPO_ROOT, "gateway", "package-lock.json")
+GATEWAY_DOCKERFILE_PATH = os.path.join(REPO_ROOT, "gateway", "Dockerfile")
 
 
 def _load_yaml(path):
@@ -364,3 +366,33 @@ class TestGatewayProtobufjsPatched(unittest.TestCase):
         resolved = protobuf.get("resolved", "")
         self.assertIn("https://registry.npmjs.org/protobufjs/", resolved,
                       "G2-19: protobufjs resolved URL must use official npm registry")
+
+
+# -- G2-20: Fixable OS CVE regression ------------------------------------
+
+class TestGatewayDebianSecurityUpgrades(unittest.TestCase):
+    """gateway Dockerfile must apply Debian security upgrades before Trivy gate."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(GATEWAY_DOCKERFILE_PATH, "r", encoding="utf-8") as fh:
+            cls.content = fh.read()
+        cls.builder_stage = cls.content.split("FROM node:20-bullseye AS runner")[0]
+        cls.runner_stage = cls.content.split("FROM node:20-bullseye AS runner", 1)[1]
+
+    def test_gateway_builder_runs_apt_upgrade(self):
+        self.assertIn("apt-get upgrade -y", self.builder_stage,
+                      "G2-20: builder stage must apply Debian security upgrades")
+
+    def test_gateway_runner_runs_apt_upgrade(self):
+        self.assertIn("apt-get upgrade -y", self.runner_stage,
+                      "G2-20: runner stage must apply Debian security upgrades")
+
+    def test_gateway_runner_keeps_required_openssl_runtime(self):
+        self.assertIn("apt-get install -y --no-install-recommends openssl libssl1.1",
+                      self.runner_stage,
+                      "G2-20: runner must explicitly include Prisma OpenSSL runtime packages")
+
+    def test_gateway_apt_lists_removed_after_upgrade(self):
+        self.assertGreaterEqual(self.content.count("rm -rf /var/lib/apt/lists/*"), 2,
+                                "G2-20: both stages must remove apt lists after upgrades")
