@@ -514,14 +514,14 @@ jobs:
       # `required` to fail-fast when no tag is set, so CI must always pass an
       # explicit tag (the actual commit SHA is injected by deploy jobs; here we
       # use a ci-test sentinel).
-      - name: Lint chart
+      - name: Lint chart (tag mode)
         run: |
           helm lint deploy/helm/enterprise-crm \
             --set images.frontend.tag=ci-test \
             --set images.gateway.tag=ci-test \
             --set images.agents.tag=ci-test
 
-      - name: Render default template
+      - name: Render default template (tag mode)
         run: |
           helm template enterprise-crm deploy/helm/enterprise-crm \
             --set images.frontend.tag=ci-test \
@@ -529,6 +529,60 @@ jobs:
             --set images.agents.tag=ci-test \
             --namespace crm-default > /tmp/rendered-default.yaml
           echo "Rendered $(wc -l < /tmp/rendered-default.yaml) lines"
+
+      # -- Group G G1: validate digest-mode rendering.  When digest is set the
+      #    enterprise-crm.image helper renders repository@digest.  This verifies
+      #    the digest rendering path does not produce malformed image references
+      #    (e.g. double registry prefix, missing @, wrong repository).
+
+      - name: Lint chart (digest mode)
+        env:
+          DIGEST_REPO: ghcr.io/dorring/mecrm
+          DIGEST_GW: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          DIGEST_FE: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          DIGEST_AG: sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+        run: |
+          helm lint deploy/helm/enterprise-crm \
+            --set-string images.gateway.repository="${DIGEST_REPO}/gateway" \
+            --set images.gateway.digest="${DIGEST_GW}" \
+            --set-string images.frontend.repository="${DIGEST_REPO}/frontend" \
+            --set images.frontend.digest="${DIGEST_FE}" \
+            --set-string images.agents.repository="${DIGEST_REPO}/agents" \
+            --set images.agents.digest="${DIGEST_AG}"
+
+      - name: Render default template (digest mode)
+        env:
+          DIGEST_REPO: ghcr.io/dorring/mecrm
+          DIGEST_GW: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          DIGEST_FE: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          DIGEST_AG: sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+        run: |
+          helm template enterprise-crm deploy/helm/enterprise-crm \
+            --set-string images.gateway.repository="${DIGEST_REPO}/gateway" \
+            --set images.gateway.digest="${DIGEST_GW}" \
+            --set-string images.frontend.repository="${DIGEST_REPO}/frontend" \
+            --set images.frontend.digest="${DIGEST_FE}" \
+            --set-string images.agents.repository="${DIGEST_REPO}/agents" \
+            --set images.agents.digest="${DIGEST_AG}" \
+            --namespace crm-default > /tmp/rendered-digest.yaml
+          echo "Rendered $(wc -l < /tmp/rendered-digest.yaml) lines"
+
+          # G1: verify digest-mode rendering produces correct image references
+          grep -qE 'ghcr\.io/dorring/mecrm/gateway@sha256:' /tmp/rendered-digest.yaml || {
+            echo "FATAL: digest-mode render missing ghcr.io/dorring/mecrm/gateway@sha256:" >&2; exit 1;
+          }
+          grep -qE 'ghcr\.io/dorring/mecrm/frontend@sha256:' /tmp/rendered-digest.yaml || {
+            echo "FATAL: digest-mode render missing ghcr.io/dorring/mecrm/frontend@sha256:" >&2; exit 1;
+          }
+          grep -qE 'ghcr\.io/dorring/mecrm/agents@sha256:' /tmp/rendered-digest.yaml || {
+            echo "FATAL: digest-mode render missing ghcr.io/dorring/mecrm/agents@sha256:" >&2; exit 1;
+          }
+
+          # G1: verify NO stale enterprise-crm/ prefix leaked into digest rendering
+          if grep -q 'enterprise-crm/gateway@sha256:\|enterprise-crm/frontend@sha256:\|enterprise-crm/agents@sha256:' /tmp/rendered-digest.yaml; then
+            echo "FATAL: digest-mode render contains enterprise-crm/{service}@sha256 (default repo instead of ghcr.io)" >&2; exit 1;
+          fi
+          echo "OK: all three services render correct ghcr.io/...@sha256:... in digest mode"
 
       - name: Lint staging values if present
         run: |
@@ -545,7 +599,7 @@ jobs:
       # P0-4: also render (template) the staging values, not just lint. `helm template`
       # catches rendering errors that `helm lint` (a manifest/structure check) does not,
       # e.g. bad {{ }} expressions that only break when a value is actually substituted.
-      - name: Render staging template if present
+      - name: Render staging template if present (tag mode)
         run: |
           if [ -f deploy/helm/enterprise-crm/values-staging.yaml ]; then
             helm template enterprise-crm deploy/helm/enterprise-crm \
@@ -557,6 +611,28 @@ jobs:
             echo "Rendered $(wc -l < /tmp/rendered-staging.yaml) lines"
           else
             echo "values-staging.yaml not present yet; skipping staging template."
+          fi
+
+      - name: Render staging template if present (digest mode)
+        env:
+          DIGEST_REPO: ghcr.io/dorring/mecrm
+          DIGEST_GW: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          DIGEST_FE: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          DIGEST_AG: sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+        run: |
+          if [ -f deploy/helm/enterprise-crm/values-staging.yaml ]; then
+            helm template enterprise-crm deploy/helm/enterprise-crm \
+              --values deploy/helm/enterprise-crm/values-staging.yaml \
+              --set-string images.gateway.repository="${DIGEST_REPO}/gateway" \
+              --set images.gateway.digest="${DIGEST_GW}" \
+              --set-string images.frontend.repository="${DIGEST_REPO}/frontend" \
+              --set images.frontend.digest="${DIGEST_FE}" \
+              --set-string images.agents.repository="${DIGEST_REPO}/agents" \
+              --set images.agents.digest="${DIGEST_AG}" \
+              --namespace crm-staging > /tmp/rendered-staging-digest.yaml
+            echo "Rendered $(wc -l < /tmp/rendered-staging-digest.yaml) lines"
+          else
+            echo "values-staging.yaml not present yet; skipping staging digest template."
           fi
 
       - name: Lint production values if present
@@ -571,7 +647,7 @@ jobs:
             echo "values-production.yaml not present yet; skipping production lint (see docs/project-optimization-plan.md Phase 4)."
           fi
 
-      - name: Render production template if present
+      - name: Render production template if present (tag mode)
         run: |
           if [ -f deploy/helm/enterprise-crm/values-production.yaml ]; then
             helm template enterprise-crm deploy/helm/enterprise-crm \
@@ -583,6 +659,28 @@ jobs:
             echo "Rendered $(wc -l < /tmp/rendered-production.yaml) lines"
           else
             echo "values-production.yaml not present yet; skipping production template."
+          fi
+
+      - name: Render production template if present (digest mode)
+        env:
+          DIGEST_REPO: ghcr.io/dorring/mecrm
+          DIGEST_GW: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          DIGEST_FE: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          DIGEST_AG: sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+        run: |
+          if [ -f deploy/helm/enterprise-crm/values-production.yaml ]; then
+            helm template enterprise-crm deploy/helm/enterprise-crm \
+              --values deploy/helm/enterprise-crm/values-production.yaml \
+              --set-string images.gateway.repository="${DIGEST_REPO}/gateway" \
+              --set images.gateway.digest="${DIGEST_GW}" \
+              --set-string images.frontend.repository="${DIGEST_REPO}/frontend" \
+              --set images.frontend.digest="${DIGEST_FE}" \
+              --set-string images.agents.repository="${DIGEST_REPO}/agents" \
+              --set images.agents.digest="${DIGEST_AG}" \
+              --namespace crm-production > /tmp/rendered-production-digest.yaml
+            echo "Rendered $(wc -l < /tmp/rendered-production-digest.yaml) lines"
+          else
+            echo "values-production.yaml not present yet; skipping production digest template."
           fi
 
   # Build and push images
@@ -739,17 +837,38 @@ jobs:
       - name: Assemble digest map
         id: digest-map
         run: |
+          set -euo pipefail
+
+          REQUIRED_PROJECTS="gateway frontend agents"
+          for p in $REQUIRED_PROJECTS; do
+            f="digests/digest-${p}.json"
+            test -f "$f" || { echo "FATAL: missing digest artifact for $p" >&2; exit 1; }
+            jq -e '.project == "'"$p"'"' "$f" >/dev/null 2>&1 || {
+              echo "FATAL: digest-${p}.json project field is not '$p'" >&2; exit 1;
+            }
+            img="$(jq -r '.image' "$f")"
+            dig="$(jq -r '.digest' "$f")"
+            test -n "$img" || { echo "FATAL: digest-${p}.json image is empty" >&2; exit 1; }
+            test -n "$dig" || { echo "FATAL: digest-${p}.json digest is empty" >&2; exit 1; }
+            echo "$dig" | grep -qE '^sha256:[a-f0-9]{64}$' || {
+              echo "FATAL: digest-${p}.json digest does not match ^sha256:[a-f0-9]{64}$: $dig" >&2; exit 1;
+            }
+          done
+
           echo '{' > digest-map.json
           first=true
-          for f in digests/digest-*.json; do
-            project="$(jq -r '.project' "$f")"
-            digest="$(jq -r '.digest' "$f")"
-            image="$(jq -r '.image' "$f")"
+          for p in $REQUIRED_PROJECTS; do
+            f="digests/digest-${p}.json"
+            img="$(jq -r '.image' "$f")"
+            dig="$(jq -r '.digest' "$f")"
             if [ "$first" = "true" ]; then first=false; else echo ',' >> digest-map.json; fi
-            printf '  "%s": {"digest": "%s", "image": "%s"}' "$project" "$digest" "$image" >> digest-map.json
+            printf '  "%s": {"image": "%s", "digest": "%s"}' "$p" "$img" "$dig" >> digest-map.json
           done
           echo '' >> digest-map.json
           echo '}' >> digest-map.json
+
+          # Validate JSON is parsable
+          jq empty digest-map.json || { echo "FATAL: digest-map.json is not valid JSON" >&2; exit 1; }
           cat digest-map.json
 
       - name: Upload digest map artifact
@@ -809,20 +928,29 @@ jobs:
           kubeconfig: ${{ env.KUBE_CONFIG_STAGING }}
 
       - name: Deploy with Helm
-        # Group G G1: deploy by immutable image digest instead of mutable
-        # ${{ github.sha }} tag.  Digests are aggregated from the 3 matrix
-        # build jobs by the aggregate-digests job into digest-map.json.
+        # Group G G1: deploy by immutable image digest + full repository.
+        # The digest-map.json includes both 'image' (full registry path) and
+        # 'digest' per project.  We override repository + digest together so
+        # that {{ include "enterprise-crm.image" }} renders
+        #    ghcr.io/dorring/mecrm/{gateway,frontend,agents}@sha256:...
+        # instead of the default enterprise-crm/{service}@sha256:...
         if: ${{ env.SKIP_REMAINING != 'true' }}
         run: |
+          GW_IMAGE=$(jq -r '.gateway.image' /tmp/digest-map/digest-map.json)
           GW_DIGEST=$(jq -r '.gateway.digest' /tmp/digest-map/digest-map.json)
+          FE_IMAGE=$(jq -r '.frontend.image' /tmp/digest-map/digest-map.json)
           FE_DIGEST=$(jq -r '.frontend.digest' /tmp/digest-map/digest-map.json)
+          AG_IMAGE=$(jq -r '.agents.image' /tmp/digest-map/digest-map.json)
           AG_DIGEST=$(jq -r '.agents.digest' /tmp/digest-map/digest-map.json)
           helm upgrade --install enterprise-crm ./deploy/helm/enterprise-crm \
             --namespace crm-staging \
             --create-namespace \
             --values ./deploy/helm/enterprise-crm/values-staging.yaml \
+            --set-string images.gateway.repository="${GW_IMAGE}" \
             --set images.gateway.digest="${GW_DIGEST}" \
+            --set-string images.frontend.repository="${FE_IMAGE}" \
             --set images.frontend.digest="${FE_DIGEST}" \
+            --set-string images.agents.repository="${AG_IMAGE}" \
             --set images.agents.digest="${AG_DIGEST}" \
             --wait --timeout 10m
 
@@ -917,20 +1045,25 @@ jobs:
           kubeconfig: ${{ env.KUBE_CONFIG_PRODUCTION }}
 
       - name: Deploy with Helm
-        # Group G G1: deploy by immutable image digest.  Same pattern as
-        # deploy-staging -- digests are resolved from the aggregate-digests
-        # job artifact digest-map.json.
+        # Group G G1: deploy by immutable image digest + full repository.
+        # Same pattern as deploy-staging.
         if: ${{ env.SKIP_REMAINING != 'true' }}
         run: |
+          GW_IMAGE=$(jq -r '.gateway.image' /tmp/digest-map/digest-map.json)
           GW_DIGEST=$(jq -r '.gateway.digest' /tmp/digest-map/digest-map.json)
+          FE_IMAGE=$(jq -r '.frontend.image' /tmp/digest-map/digest-map.json)
           FE_DIGEST=$(jq -r '.frontend.digest' /tmp/digest-map/digest-map.json)
+          AG_IMAGE=$(jq -r '.agents.image' /tmp/digest-map/digest-map.json)
           AG_DIGEST=$(jq -r '.agents.digest' /tmp/digest-map/digest-map.json)
           helm upgrade --install enterprise-crm ./deploy/helm/enterprise-crm \
             --namespace crm-production \
             --create-namespace \
             --values ./deploy/helm/enterprise-crm/values-production.yaml \
+            --set-string images.gateway.repository="${GW_IMAGE}" \
             --set images.gateway.digest="${GW_DIGEST}" \
+            --set-string images.frontend.repository="${FE_IMAGE}" \
             --set images.frontend.digest="${FE_DIGEST}" \
+            --set-string images.agents.repository="${AG_IMAGE}" \
             --set images.agents.digest="${AG_DIGEST}" \
             --wait --timeout 15m
 

@@ -1,7 +1,8 @@
 # Staging values for Enterprise CRM
 # Lower replicas and resource limits for cost-conscious pre-production.
-# CI (.github/workflows/ci-cd.yml deploy-staging) overrides image tags to the
-# current commit SHA via --set, so tags here are only fallbacks.
+# CI (.github/workflows/ci-cd.yml deploy-staging) overrides image repository
+# + digest from the aggregate-digests job artifact, so repository/tag
+# here is only a tag-mode fallback.
 
 global:
   domain: staging.crm.example.com
@@ -23,9 +24,10 @@ replicaCount:
   gateway: 2
   agents: 1
 
-# tag is intentionally empty — CI overrides to the current commit SHA via --set.
-# A plain helm install / helm template without --set will fail-fast in the
-# template, which is safer than silently deploying a stale tag.
+# repository + tag below are tag-mode fallbacks.  CI deploy-staging uses
+# --set-string images.*.repository=<full GHCR path> + --set images.*.digest=sha256:...
+# from the aggregate-digests job artifact.  A plain helm install/template without
+# --set will fail-fast in the template (required() in _helpers.tpl).
 images:
   frontend:
     tag: ""

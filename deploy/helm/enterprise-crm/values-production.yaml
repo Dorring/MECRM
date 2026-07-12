@@ -1,9 +1,8 @@
 # Production values for Enterprise CRM
 # High-availability replicas and bounded resource limits.
-# CI (.github/workflows/ci-cd.yml deploy-production) overrides image tags to the
-# current commit SHA via --set; tags here are fallbacks only. Production deployments
-# must use immutable image digests at the registry layer per the optimization plan
-# (Phase 4 CI/CD), which is enforced outside the chart.
+# CI (.github/workflows/ci-cd.yml deploy-production) overrides image repository
+# + digest from the aggregate-digests job artifact. Production deployments
+# reference immutable image digests (Group G G1).
 
 global:
   domain: crm.example.com
@@ -28,11 +27,10 @@ replicaCount:
   gateway: 5
   agents: 3
 
-# tag is intentionally empty — CI overrides to the current commit SHA via --set.
-# A plain helm install / helm template without --set will fail-fast in the
-# template, which is safer than silently deploying a stale tag.
-# Production deployments SHOULD use immutable digests at the registry layer
-# (Phase 4 CI/CD follow-up).
+# repository + tag below are tag-mode fallbacks.  CI deploy-production uses
+# --set-string images.*.repository=<full GHCR path> + --set images.*.digest=sha256:...
+# from the aggregate-digests job artifact.  A plain helm install/template without
+# --set will fail-fast in the template (required() in _helpers.tpl).
 images:
   frontend:
     tag: ""

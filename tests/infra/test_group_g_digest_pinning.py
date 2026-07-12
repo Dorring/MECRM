@@ -221,6 +221,15 @@ class TestCIDigestAggregation(unittest.TestCase):
         run = assemble_step.get("run", "")
         self.assertIn("digest-map.json", run,
                       "G-09: assemble step must produce digest-map.json")
+        # G1: defensive validation
+        self.assertIn("set -euo pipefail", run,
+                      "G-09: assemble step must have set -euo pipefail")
+        self.assertIn("test -f", run,
+                      "G-09: assemble step must check digest artifact files exist")
+        self.assertIn("sha256:", run,
+                      "G-09: assemble step must validate digest matches ^sha256:")
+        self.assertIn("jq empty digest-map.json", run,
+                      "G-09: assemble step must validate digest-map.json is parsable")
 
     def test_deploy_staging_needs_aggregate_digests(self):
         needs = _job_needs(self.data, "deploy-staging")
@@ -242,12 +251,14 @@ class TestCIDigestAggregation(unittest.TestCase):
                 break
         self.assertIsNotNone(helm_step, "deploy-staging must have 'Deploy with Helm' step")
         run = helm_step.get("run", "")
-        self.assertIn("images.gateway.digest=", run,
-                      "G-10: deploy-staging must use --set images.gateway.digest=...")
-        self.assertIn("images.frontend.digest=", run,
-                      "G-10: deploy-staging must use --set images.frontend.digest=...")
-        self.assertIn("images.agents.digest=", run,
-                      "G-10: deploy-staging must use --set images.agents.digest=...")
+        # G1: deploy must set both repository AND digest from digest-map
+        for svc in ("gateway", "frontend", "agents"):
+            self.assertIn(f"images.{svc}.repository=", run,
+                          f"G-10: deploy-staging must set images.{svc}.repository")
+            self.assertIn(f"images.{svc}.digest=", run,
+                          f"G-10: deploy-staging must set images.{svc}.digest")
+            self.assertIn(f".{svc}.image", run,
+                          f"G-10: deploy-staging must read .{svc}.image from digest-map.json")
         self.assertNotIn("images.gateway.tag=${{ github.sha }}", run,
                          "G-10: deploy-staging must NOT use images.*.tag=${{ github.sha }}")
 
@@ -261,8 +272,12 @@ class TestCIDigestAggregation(unittest.TestCase):
                 break
         self.assertIsNotNone(helm_step, "deploy-production must have 'Deploy with Helm' step")
         run = helm_step.get("run", "")
+        self.assertIn("images.gateway.repository=", run,
+                      "G-11: deploy-production must set images.gateway.repository")
         self.assertIn("images.gateway.digest=", run,
-                      "G-11: deploy-production must use --set images.gateway.digest=...")
+                      "G-11: deploy-production must set images.gateway.digest")
+        self.assertIn(".gateway.image", run,
+                      "G-11: deploy-production must read .gateway.image from digest-map.json")
         self.assertNotIn("images.gateway.tag=${{ github.sha }}", run,
                          "G-11: deploy-production must NOT use images.*.tag=${{ github.sha }}")
 
@@ -291,8 +306,17 @@ class TestCIDigestAggregation(unittest.TestCase):
 
 # -- Helm template rendering sanity check (no real helm binary needed) ---
 
+HELM_LINT_STEPS_TEXT = ""
+
+
 class TestHelmTemplateDigestRendering(unittest.TestCase):
     """Verify template image references statically."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Load CI data once for digest-mode template checks
+        global HELM_LINT_STEPS_TEXT
+        HELM_LINT_STEPS_TEXT = _slurp(CI_CD_PATH)
 
     def test_gateway_template_uses_at_for_digest(self):
         """The image helper must produce repository@digest when digest is set.
@@ -322,3 +346,56 @@ class TestHelmTemplateDigestRendering(unittest.TestCase):
         prod = _load_yaml(prod_path)
         self.assertIsNotNone(prod,
                             "values-production.yaml must be valid YAML")
+
+
+# -- G1: helm-lint CI digest-mode coverage -------------------------------
+
+
+class TestHelmLintDigestMode(unittest.TestCase):
+    """helm-lint CI job must render with digest mode and assert correct
+    ghcr.io image references."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.data = _load_yaml(CI_CD_PATH)
+
+    def _helm_lint_steps(self):
+        job = self.data.get("jobs", {}).get("helm-lint", {})
+        return job.get("steps", [])
+
+    def test_has_digest_mode_lint_step(self):
+        names = [s.get("name", "") for s in self._helm_lint_steps()]
+        self.assertIn("Lint chart (digest mode)", names,
+                      "G1: helm-lint must have 'Lint chart (digest mode)' step")
+
+    def test_has_digest_mode_render_step(self):
+        names = [s.get("name", "") for s in self._helm_lint_steps()]
+        self.assertIn("Render default template (digest mode)", names,
+                      "G1: helm-lint must have 'Render default template (digest mode)' step")
+
+    def test_digest_render_asserts_ghcr_references(self):
+        for s in self._helm_lint_steps():
+            if s.get("name") == "Render default template (digest mode)":
+                run = s.get("run", "")
+                self.assertIn("ghcr.io/dorring/mecrm/gateway@sha256:", run,
+                              "digest-mode render must grep for ghcr.io/dorring/mecrm/gateway@sha256:")
+                self.assertIn("ghcr.io/dorring/mecrm/frontend@sha256:", run,
+                              "digest-mode render must grep for ghcr.io/dorring/mecrm/frontend@sha256:")
+                self.assertIn("ghcr.io/dorring/mecrm/agents@sha256:", run,
+                              "digest-mode render must grep for ghcr.io/dorring/mecrm/agents@sha256:")
+                self.assertIn("enterprise-crm/frontend@sha256:", run,
+                              "digest-mode render must reject enterprise-crm prefix in digest mode")
+                return
+        self.fail("'Render default template (digest mode)' step not found")
+
+    def test_staging_digest_template_if_present(self):
+        """Staging values should have digest mode too."""
+        names = [s.get("name", "") for s in self._helm_lint_steps()]
+        self.assertIn("Render staging template if present (digest mode)", names,
+                      "G1: helm-lint must have staging digest template step")
+
+    def test_production_digest_template_if_present(self):
+        """Production values should have digest mode too."""
+        names = [s.get("name", "") for s in self._helm_lint_steps()]
+        self.assertIn("Render production template if present (digest mode)", names,
+                      "G1: helm-lint must have production digest template step")

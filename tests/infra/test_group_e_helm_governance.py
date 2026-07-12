@@ -105,13 +105,29 @@ class TestCiHelmStepsPassImageTags:
         )
         assert helm_call_count > 0, "CI workflow should contain helm lint/template calls"
 
-        for service in ("frontend", "gateway", "agents"):
-            occurrences = len(
-                re.findall(rf"--set images\.{service}\.tag=ci-test", text)
-            )
-            assert occurrences >= helm_call_count, (
-                f"CI helm lint/template calls must set images.{service}.tag=ci-test; "
-                f"found {occurrences} for {helm_call_count} helm calls"
+        # G1: digest-mode steps use env: + ${} variable substitution instead of
+        # literal --set images.X.digest=sha256:... in the yaml text.  The env var
+        # values contain sha256: but the --set flags use ${DIGEST_GW} etc.
+        # Count tag-mode calls only (those with explicit ci-test tag).
+        tag_mode_calls = len(
+            re.findall(r"--set\s+images\.\w+\.tag=ci-test", text)
+        )
+        # 3 flags per call * 6 tag-mode helm calls = 18
+        assert tag_mode_calls >= 18, (
+            f"Expected >= 18 instances of --set images.X.tag=ci-test "
+            f"(3 services x 6 tag-mode helm calls), found {tag_mode_calls}"
+        )
+
+        # G1: verify digest-mode helm calls exist by checking for the
+        # step names (these use env: digests, not literal sha256: in yaml)
+        for step_name in (
+            "Lint chart (digest mode)",
+            "Render default template (digest mode)",
+            "Render staging template if present (digest mode)",
+            "Render production template if present (digest mode)",
+        ):
+            assert step_name in text, (
+                f"G1: helm-lint must have '{step_name}' step"
             )
 
     def test_deploy_jobs_still_set_commit_sha_tags(self) -> None:
