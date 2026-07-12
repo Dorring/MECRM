@@ -1,7 +1,15 @@
 # syntax=docker/dockerfile:1.7
-# Single-purpose migration runner: has BOTH Prisma (node) and psql, so one
-# service can run the full Prisma -> SQL 01-11 -> RLS verification sequence.
-# Lighter than the full gateway image (no app build).
+# Single-purpose migration runner for K8s pre-upgrade Job and docker-compose.
+#
+# Self-contained: Prisma CLI + psql + migrate.sh + all raw SQL migrations are
+# baked into the image. No runtime volume mounts required.
+#
+# Build from repo root so database/migrations/ and scripts/migrate.sh are available:
+#   docker build -f database/Dockerfile.migrate -t mecrm-migrate .
+#
+# G3a: enhanced from the original docker-compose-only image (which relied on
+# volume mounts for /database/migrations and /scripts/migrate.sh) to support
+# the Helm pre-upgrade migration Job.
 FROM node:20-bullseye-slim
 
 RUN apt-get update \
@@ -11,12 +19,16 @@ RUN apt-get update \
 WORKDIR /app
 
 # Prisma schema + migrations (gateway owns the application schema).
-# Build context is now ./gateway instead of repo root (F-S3).
-COPY package*.json ./
-COPY prisma ./prisma
+# Build context must be repo root so gateway/package*.json and gateway/prisma/
+# are resolvable.
+COPY gateway/package*.json ./
+COPY gateway/prisma ./prisma
 RUN --mount=type=cache,target=/root/.npm npm ci
 
-# Raw SQL migrations are mounted at runtime via ./database/migrations:/database/migrations:ro
-# (see docker-compose.yml migrate service).
+# Raw SQL migrations (G3a: baked into image, no K8s volume mount needed).
+COPY database/migrations/ /database/migrations/
 
-CMD ["npx", "prisma", "migrate", "deploy"]
+# Migration runner script (advisory lock → Prisma → raw SQL → RLS drift audit).
+COPY scripts/migrate.sh /scripts/migrate.sh
+
+CMD ["bash", "/scripts/migrate.sh"]

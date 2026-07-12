@@ -1,0 +1,66 @@
+{{- if .Values.migration.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "enterprise-crm.fullname" . }}-migration
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: migration
+    {{- include "enterprise-crm.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migration.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migration.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        app: migration
+        {{- include "enterprise-crm.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "enterprise-crm.serviceAccountName" . }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ .Values.migration.podSecurityContext.runAsUser }}
+      containers:
+        - name: migrate
+          image: {{ include "enterprise-crm.image" (dict "root" . "image" .Values.migration.image) }}
+          imagePullPolicy: {{ .Values.migration.image.pullPolicy }}
+          command: ["bash", "/scripts/migrate.sh"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.migration.database.existingSecret | required "migration.database.existingSecret is required" }}
+                  key: {{ .Values.migration.database.urlKey }}
+            - name: POSTGRES_HOST
+              value: {{ include "enterprise-crm.postgresHost" . }}
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_DB
+              value: {{ .Values.postgresql.auth.database | quote }}
+            - name: POSTGRES_USER
+              value: {{ .Values.postgresql.auth.username | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.migration.database.existingSecret }}
+                  key: {{ .Values.migration.database.urlKey }}
+          resources:
+            {{- toYaml .Values.migration.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

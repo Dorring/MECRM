@@ -244,6 +244,34 @@ secrets:
     existingSecret: crm-jwt-secret
     secretKey: jwt-secret
 
+# Pre-upgrade database migration Job (G-H6 / G3a)
+# Runs scripts/migrate.sh via the database migration image (database/Dockerfile.migrate).
+# The image must contain psql + Prisma CLI + database/migrations/**/*.sql.
+# Digest is the preferred immutable image reference; tag is a required fallback.
+# DATABASE_URL is sourced exclusively from the referenced Kubernetes Secret —
+# no plaintext database URL is allowed in values files.
+migration:
+  enabled: true
+  backoffLimit: 2
+  activeDeadlineSeconds: 600
+  image:
+    repository: enterprise-crm/migrate
+    digest: ""
+    tag: ""
+    pullPolicy: IfNotPresent
+  database:
+    existingSecret: crm-postgresql-secret
+    urlKey: connection-string
+  podSecurityContext:
+    runAsUser: 1000   # node user on node:20-bullseye-slim (database/Dockerfile.migrate)
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
 # Pod disruption budgets
 podDisruptionBudget:
   gateway:
