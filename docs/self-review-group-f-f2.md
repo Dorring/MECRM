@@ -3,7 +3,10 @@
 **Date:** 2026-07-12
 **Branch:** codex/group-f-f1-baseline-record
 **Baseline:** ffef4fb (baseline collected from CI runner)
-**Status:** F2 COMPLETE -- awaiting review
+**Status:** STABILIZED
+**Merge commit:** `main@d6d5568` (PR #17 squash-merge)
+**Tag:** `hardening-group-f-f2-stabilized`
+**CI:** All checks passed on PR #17 (helm-lint, build, compose, smoke, ws-proxy-test)
 
 ## F2 Scope Checklist
 
@@ -85,7 +88,7 @@ The following can only be verified on a Docker-capable host or CI runner:
 - `docker compose --profile migrate run --rm migrate`
 - Actual image size before/after comparison against baseline
 
-These will be validated by the PR CI pipeline (build job with buildx v3).
+These were validated by the PR #17 CI pipeline (helm-lint, build, compose, smoke, ws-proxy-test all passed).
 
 ## Self-Review Conclusion
 
@@ -93,5 +96,6 @@ These will be validated by the PR CI pipeline (build job with buildx v3).
 - All Should Fix items from the preflight are addressed except F-B1 (agents multi-stage, reserved for F4).
 - Baseline is preserved and not overwritten by F2 changes.
 - Regression tests cover all F2 requirements plus backward compatibility with D1/D2/D3/E tests.
-- Docker runtime verification is deferred to PR CI as Docker is unavailable on this host.
-- **Recommend: create PR for review, merge after CI passes (helm-lint + build + compose health checks).**
+- **PR #17 squash-merged.** CI passed all checks (helm-lint, build, compose, smoke, ws-proxy-test).
+- **Tagged:** `hardening-group-f-f2-stabilized` -> `d6d5568`.
+- **Branches cleaned:** `codex/group-f-f1-baseline-record` deleted (remote + local).

@@ -2,8 +2,9 @@
 
 **Date:** 2026-07-11
 **Baseline:** `main@e41a3fa` (Group E fully closed)
-**Status:** PREFLIGHT -- AWAITING REVIEW
-**Tag anchor:** `hardening-group-e-e1e2-stabilized` -> `d6d60cc`
+**Status:** F1/F2 COMPLETED / STABILIZED
+**Tag:** `hardening-group-f-f2-stabilized` -> `d6d5568` (PR #17 squash-merge)
+**F-B1 (agents multi-stage):** PENDING, deferred to F4
 
 ## Executive Summary
 
