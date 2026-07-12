@@ -1,0 +1,6 @@
+# Trivy vulnerability exceptions -- G2 PR1
+# Format: <CVE-ID>  # reason for suppression
+# Each suppression MUST include a documented rationale and a review date.
+#
+# Example:
+# CVE-2024-9999  # Fixed in upstream base image, not yet released. Review: 2026-08.

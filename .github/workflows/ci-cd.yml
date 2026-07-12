@@ -720,6 +720,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      security-events: write
+      actions: read
     strategy:
       matrix:
         include:
@@ -774,6 +776,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # -- Group G G2 PR1: SBOM + provenance attestation --
+          sbom: true
+          provenance: true
 
       - name: Record build duration
         id: build-duration
@@ -844,6 +849,94 @@ jobs:
           path: digest-${{ matrix.project }}.json
           if-no-files-found: error
           retention-days: 7
+
+      # -- Group G G2 PR1: Trivy container vulnerability scan ------------
+      # Scan the just-pushed image by immutable digest.
+      # CRITICAL -> fail build.  HIGH/MEDIUM/LOW -> SARIF report-only.
+      - name: Trivy scan image
+        id: trivy
+        env:
+          IMAGE_NAME: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.project }}
+        run: |
+          set -euo pipefail
+          IMAGE_FULL="$(printf '%s' "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')@${{ steps.build-push.outputs.digest }}"
+          echo "Scanning: ${IMAGE_FULL}"
+
+          docker pull "${IMAGE_FULL}"
+
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$(pwd):/workspace" \
+            -w /workspace \
+            aquasec/trivy:latest \
+            image \
+            --severity CRITICAL,HIGH,MEDIUM,LOW \
+            --exit-code 0 \
+            --format sarif \
+            --output "trivy-results-${{ matrix.project }}.sarif" \
+            "${IMAGE_FULL}"
+
+          echo "Trivy SARIF written: trivy-results-${{ matrix.project }}.sarif"
+
+          # Run a second pass with --exit-code 1 on CRITICAL only.
+          # This fails the build if any CRITICAL CVE is found.
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$(pwd):/workspace" \
+            -w /workspace \
+            aquasec/trivy:latest \
+            image \
+            --severity CRITICAL \
+            --exit-code 1 \
+            --format table \
+            "${IMAGE_FULL}"
+
+      - name: Upload Trivy SARIF artifact
+        if: always() && steps.trivy.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results-${{ matrix.project }}
+          path: trivy-results-${{ matrix.project }}.sarif
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Trivy SARIF to GitHub Security
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.trivy.outcome != 'skipped'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results-${{ matrix.project }}.sarif
+          category: trivy-${{ matrix.project }}
+
+      # -- Group G G2 PR1: extract CycloneDX SBOM from image ------------
+      - name: Extract CycloneDX SBOM
+        id: sbom
+        env:
+          IMAGE_NAME: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.project }}
+        run: |
+          set -euo pipefail
+          IMAGE_FULL="$(printf '%s' "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')@${{ steps.build-push.outputs.digest }}"
+          echo "Extracting SBOM from: ${IMAGE_FULL}"
+
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$(pwd):/workspace" \
+            -w /workspace \
+            aquasec/trivy:latest \
+            image \
+            --format cyclonedx \
+            --output "sbom-${{ matrix.project }}.cdx.json" \
+            "${IMAGE_FULL}"
+
+          echo "SBOM written: sbom-${{ matrix.project }}.cdx.json"
+
+      - name: Upload SBOM artifact
+        if: always() && steps.sbom.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.project }}
+          path: sbom-${{ matrix.project }}.cdx.json
+          if-no-files-found: error
+          retention-days: 30
 
   # -- Group G G1: aggregate per-project digest artifacts into a single
   #    digest-map.json consumed by deploy-staging / deploy-production.
