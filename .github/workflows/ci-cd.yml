@@ -420,10 +420,10 @@ jobs:
   # C4 WebSocket same-origin proxy smoke test.
   # Builds gateway + frontend, starts the full edge-proxy topology, and runs
   # the ws-proxy-test.js script to verify:
-  #   - /ws upgrade through nginx → Gateway (101 Switching Protocols)
-  #   - valid ticket → { type: "connected" }
-  #   - consumed ticket → close 4401
-  #   - invalid ticket → close 4401
+  #   - /ws upgrade through nginx -> Gateway (101 Switching Protocols)
+  #   - valid ticket -> { type: "connected" }
+  #   - consumed ticket -> close 4401
+  #   - invalid ticket -> close 4401
   ws-proxy-smoke:
     name: WS Proxy Smoke Test
     runs-on: ubuntu-latest
@@ -763,6 +763,9 @@ jobs:
           - project: agents
             dockerfile: agents/Dockerfile
             context: agents
+          - project: migrate
+            dockerfile: database/Dockerfile.migrate
+            context: .
     steps:
       - uses: actions/checkout@v4
 
@@ -1025,6 +1028,9 @@ jobs:
           - project: agents
             dockerfile: agents/Dockerfile
             context: agents
+          - project: migrate
+            dockerfile: database/Dockerfile.migrate
+            context: .
     steps:
       - uses: actions/checkout@v4
 
@@ -1156,7 +1162,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          REQUIRED_PROJECTS="gateway frontend agents"
+          REQUIRED_PROJECTS="gateway frontend agents migrate"
           for p in $REQUIRED_PROJECTS; do
             f="digests/digest-${p}.json"
             test -f "$f" || { echo "FATAL: missing digest artifact for $p" >&2; exit 1; }
@@ -1259,6 +1265,8 @@ jobs:
           FE_DIGEST=$(jq -r '.frontend.digest' /tmp/digest-map/digest-map.json)
           AG_IMAGE=$(jq -r '.agents.image' /tmp/digest-map/digest-map.json)
           AG_DIGEST=$(jq -r '.agents.digest' /tmp/digest-map/digest-map.json)
+          MG_IMAGE=$(jq -r '.migrate.image' /tmp/digest-map/digest-map.json)
+          MG_DIGEST=$(jq -r '.migrate.digest' /tmp/digest-map/digest-map.json)
           helm upgrade --install enterprise-crm ./deploy/helm/enterprise-crm \
             --namespace crm-staging \
             --create-namespace \
@@ -1269,6 +1277,8 @@ jobs:
             --set-string images.frontend.digest="${FE_DIGEST}" \
             --set-string images.agents.repository="${AG_IMAGE}" \
             --set-string images.agents.digest="${AG_DIGEST}" \
+            --set-string migration.image.repository="${MG_IMAGE}" \
+            --set-string migration.image.digest="${MG_DIGEST}" \
             --wait --timeout 10m
 
   # Integration tests on staging. Runs only when the staging API is actually
@@ -1372,6 +1382,8 @@ jobs:
           FE_DIGEST=$(jq -r '.frontend.digest' /tmp/digest-map/digest-map.json)
           AG_IMAGE=$(jq -r '.agents.image' /tmp/digest-map/digest-map.json)
           AG_DIGEST=$(jq -r '.agents.digest' /tmp/digest-map/digest-map.json)
+          MG_IMAGE=$(jq -r '.migrate.image' /tmp/digest-map/digest-map.json)
+          MG_DIGEST=$(jq -r '.migrate.digest' /tmp/digest-map/digest-map.json)
           helm upgrade --install enterprise-crm ./deploy/helm/enterprise-crm \
             --namespace crm-production \
             --create-namespace \
@@ -1382,6 +1394,8 @@ jobs:
             --set-string images.frontend.digest="${FE_DIGEST}" \
             --set-string images.agents.repository="${AG_IMAGE}" \
             --set-string images.agents.digest="${AG_DIGEST}" \
+            --set-string migration.image.repository="${MG_IMAGE}" \
+            --set-string migration.image.digest="${MG_DIGEST}" \
             --wait --timeout 15m
 
       - name: Notify deployment

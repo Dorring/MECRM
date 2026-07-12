@@ -248,7 +248,7 @@ secrets:
 # Runs scripts/migrate.sh via the database migration image (database/Dockerfile.migrate).
 # The image must contain psql + Prisma CLI + database/migrations/**/*.sql.
 # Digest is the preferred immutable image reference; tag is a required fallback.
-# DATABASE_URL is sourced exclusively from the referenced Kubernetes Secret —
+# DATABASE_URL is sourced exclusively from the referenced Kubernetes Secret --
 # no plaintext database URL is allowed in values files.
 migration:
   enabled: true

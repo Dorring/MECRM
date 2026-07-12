@@ -40,19 +40,8 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.migration.database.existingSecret | required "migration.database.existingSecret is required" }}
                   key: {{ .Values.migration.database.urlKey }}
-            - name: POSTGRES_HOST
-              value: {{ include "enterprise-crm.postgresHost" . }}
-            - name: POSTGRES_PORT
-              value: "5432"
-            - name: POSTGRES_DB
-              value: {{ .Values.postgresql.auth.database | quote }}
-            - name: POSTGRES_USER
-              value: {{ .Values.postgresql.auth.username | quote }}
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.migration.database.existingSecret }}
-                  key: {{ .Values.migration.database.urlKey }}
+            - name: GATEWAY_DIR
+              value: "/app"
           resources:
             {{- toYaml .Values.migration.resources | nindent 12 }}
       {{- with .Values.nodeSelector }}

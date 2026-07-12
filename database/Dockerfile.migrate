@@ -28,7 +28,7 @@ RUN --mount=type=cache,target=/root/.npm npm ci
 # Raw SQL migrations (G3a: baked into image, no K8s volume mount needed).
 COPY database/migrations/ /database/migrations/
 
-# Migration runner script (advisory lock → Prisma → raw SQL → RLS drift audit).
+# Migration runner script (advisory lock -> Prisma -> raw SQL -> RLS drift audit).
 COPY scripts/migrate.sh /scripts/migrate.sh
 
 CMD ["bash", "/scripts/migrate.sh"]

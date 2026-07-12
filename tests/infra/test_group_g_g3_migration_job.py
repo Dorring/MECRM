@@ -391,3 +391,134 @@ class TestMigrationNoPlaintextSecrets(unittest.TestCase):
             if 'DATABASE_URL' in stripped or 'POSTGRES_PASSWORD' in stripped:
                 self.assertNotIn('value:', stripped,
                     f"G3-10: sensitive env {stripped} must use secretKeyRef, not value:")
+
+
+# -- G3-17: Blocker 2 -- POSTGRES_PASSWORD not incorrectly using urlKey ----
+
+class TestMigrationEnvDoesNotLeakURLKeyAsPassword(unittest.TestCase):
+    """Blocker 2 fix: POSTGRES_PASSWORD must not reuse DATABASE_URL key."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.content = _slurp(MIGRATION_TPL_PATH)
+
+    def test_no_postgres_password_env(self):
+        self.assertNotIn("POSTGRES_PASSWORD", self.content,
+                         "G3-17: migration Job must not have POSTGRES_PASSWORD env "
+                         "(migrate.sh uses DATABASE_URL directly)")
+
+    def test_no_postgres_host_env(self):
+        self.assertNotIn("POSTGRES_HOST", self.content,
+                         "G3-17: migration Job must not have POSTGRES_HOST env")
+
+    def test_no_postgres_user_env(self):
+        self.assertNotIn("POSTGRES_USER", self.content,
+                         "G3-17: migration Job must not have POSTGRES_USER env")
+
+    def test_only_database_url_and_gateway_dir(self):
+        lines = [l.strip() for l in self.content.splitlines()
+                 if '- name:' in l and 'name:' in l]
+        env_names = set()
+        for line in lines:
+            m = re.search(r'name:\s*(\S+)', line)
+            if m:
+                env_names.add(m.group(1))
+        # Only container env vars -- exclude the container name itself ("migrate")
+        env_only = {n for n in env_names if n != "migrate"}
+        self.assertSetEqual(env_only, {"DATABASE_URL", "GATEWAY_DIR"},
+                            f"G3-17: migration env must be DATABASE_URL + GATEWAY_DIR only, got {env_only}")
+
+
+# -- G3-18 through G3-24: Blocker 1 -- migrate in real digest deploy chain --
+
+def _build_matrix_projects(yaml_data, job_name):
+    """Extract project names from a job's matrix.include."""
+    job = yaml_data.get("jobs", {}).get(job_name, {})
+    strategy = job.get("strategy", {})
+    matrix = strategy.get("matrix", {})
+    includes = matrix.get("include", [])
+    return [(entry.get("project"), entry.get("context"), entry.get("dockerfile"))
+            for entry in includes]
+
+
+def _deploy_step_run(deploy_job, step_name):
+    """Get the run script of a deploy job step."""
+    for s in deploy_job.get("steps", []):
+        if s.get("name") == step_name:
+            return s.get("run", "")
+    return ""
+
+
+class TestCIDigestDeployChainIncludesMigrate(unittest.TestCase):
+    """Blocker 1: migrate must be in the real build/deploy pipeline."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.data = _load_yaml(CI_CD_PATH)
+
+    def test_build_matrix_includes_migrate(self):
+        projects = [p for p, _, _ in _build_matrix_projects(self.data, "build")]
+        self.assertIn("migrate", projects,
+                      "G3-18: build matrix must include migrate")
+        migrate_entry = [(c, d) for p, c, d in _build_matrix_projects(self.data, "build")
+                         if p == "migrate"]
+        self.assertEqual(len(migrate_entry), 1)
+        self.assertEqual(migrate_entry[0][0], ".",
+                         "G3-18: migrate build context must be '.' (repo root)")
+        self.assertEqual(migrate_entry[0][1], "database/Dockerfile.migrate",
+                         "G3-18: migrate dockerfile must be database/Dockerfile.migrate")
+
+    def test_security_scan_matrix_includes_migrate(self):
+        projects = [p for p, _, _ in _build_matrix_projects(self.data, "security-scan")]
+        self.assertIn("migrate", projects,
+                      "G3-19: security-scan matrix must include migrate")
+        # Verify context/dockerfile for migrate in security-scan
+        migrate_entry = [(c, d) for p, c, d in _build_matrix_projects(self.data, "security-scan")
+                         if p == "migrate"]
+        self.assertEqual(len(migrate_entry), 1)
+        self.assertEqual(migrate_entry[0][1], "database/Dockerfile.migrate",
+                         "G3-19: security-scan migrate must use database/Dockerfile.migrate")
+
+    def test_aggregate_digests_includes_migrate(self):
+        agg = self.data.get("jobs", {}).get("aggregate-digests", {})
+        assemble_step = None
+        for s in agg.get("steps", []):
+            if s.get("name") == "Assemble digest map":
+                assemble_step = s
+                break
+        self.assertIsNotNone(assemble_step)
+        run = assemble_step.get("run", "")
+        self.assertIn("REQUIRED_PROJECTS=\"gateway frontend agents migrate\"", run,
+                      "G3-20: REQUIRED_PROJECTS must include migrate")
+
+    def test_deploy_staging_reads_migrate_digest(self):
+        staging = self.data.get("jobs", {}).get("deploy-staging", {})
+        run = _deploy_step_run(staging, "Deploy with Helm")
+        self.assertIn('.migrate.image', run,
+                      "G3-21: deploy-staging must read .migrate.image from digest-map")
+        self.assertIn('.migrate.digest', run,
+                      "G3-21: deploy-staging must read .migrate.digest from digest-map")
+        self.assertIn('MG_IMAGE=', run,
+                      "G3-21: deploy-staging must set MG_IMAGE from digest-map")
+        self.assertIn('MG_DIGEST=', run,
+                      "G3-21: deploy-staging must set MG_DIGEST from digest-map")
+        self.assertIn('migration.image.repository="${MG_IMAGE}"', run,
+                      "G3-21: deploy-staging must --set-string migration.image.repository")
+        self.assertIn('migration.image.digest="${MG_DIGEST}"', run,
+                      "G3-21: deploy-staging must --set-string migration.image.digest")
+
+    def test_deploy_production_reads_migrate_digest(self):
+        prod = self.data.get("jobs", {}).get("deploy-production", {})
+        run = _deploy_step_run(prod, "Deploy with Helm")
+        self.assertIn('.migrate.image', run,
+                      "G3-22: deploy-production must read .migrate.image from digest-map")
+        self.assertIn('.migrate.digest', run,
+                      "G3-22: deploy-production must read .migrate.digest from digest-map")
+        self.assertIn('MG_IMAGE=', run,
+                      "G3-22: deploy-production must set MG_IMAGE from digest-map")
+        self.assertIn('MG_DIGEST=', run,
+                      "G3-22: deploy-production must set MG_DIGEST from digest-map")
+        self.assertIn('migration.image.repository="${MG_IMAGE}"', run,
+                      "G3-22: deploy-production must --set-string migration.image.repository")
+        self.assertIn('migration.image.digest="${MG_DIGEST}"', run,
+                      "G3-22: deploy-production must --set-string migration.image.digest")
