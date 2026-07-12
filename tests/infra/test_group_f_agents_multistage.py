@@ -5,14 +5,14 @@ Covers:
   F4-M2 -- build-essential only appears in builder stage, not runner
   F4-M3 -- runner stage has no apt-get install of build toolchain (gcc, g++, make, binutils, libc-dev)
   F4-M4 -- runner stage has USER app (non-root)
-  F4-M5 -- builder pip --user output copied from /root/.local to /home/app/.local
+  F4-M5 -- builder pip --user output copied with --chown from /root/.local to /home/app/.local
   F4-M6 -- PATH includes /home/app/.local/bin
   F4-M7 -- PYTHONPATH includes /app/src
   F4-M8 -- CMD remains python -m orchestrator.main
   F4-M9 -- HEALTHCHECK is status-code aware (r.is_success / r.ok)
   F4-M10 -- .dockerignore still excludes .env and .env.* (no regression)
   F4-M11 -- COPY only copies src/ and sitecustomize.py (no tests, no scripts)
-  F4-M12 -- syntax directive still present, cache mount still present (F2 regression guard)
+  F4-M12 -- syntax directive still present, cache mount still active (F2 regression guard)
 """
 
 import os
@@ -169,18 +169,25 @@ class TestAgentsNonRootUser(unittest.TestCase):
         self.assertRegex(self.content, r"adduser.*--uid 1001",
                          "F4-M4: app user must have uid 1001")
 
-    def test_chown_before_user(self):
-        chown_idx = None
+    def test_copy_chown_before_user(self):
+        copy_chown_indices = []
         user_idx = None
         for i, line in enumerate(self.lines):
-            if "chown -R app:app" in line:
-                chown_idx = i
+            if "--chown=app:app" in line:
+                copy_chown_indices.append(i)
             if line.strip() == "USER app":
                 user_idx = i
-        self.assertIsNotNone(chown_idx, "chown -R app:app not found")
+        self.assertGreaterEqual(
+            len(copy_chown_indices), 3,
+            "F4-M4: dependency and source COPY instructions must use --chown=app:app"
+        )
         self.assertIsNotNone(user_idx, "USER app not found")
-        self.assertLess(chown_idx, user_idx,
-                        "F4-M4: chown must come BEFORE USER app")
+        self.assertLess(max(copy_chown_indices), user_idx,
+                        "F4-M4: ownership must be assigned before USER app")
+
+    def test_no_recursive_chown_layer(self):
+        self.assertNotIn("chown -R", self.content,
+                         "F4-M4: use COPY --chown instead of a separate recursive chown layer")
 
 
 # -- F4-M5, F4-M6, F4-M7: COPY and env ----------------------------------
@@ -193,8 +200,11 @@ class TestAgentsCopyAndEnv(unittest.TestCase):
         cls.content = _read_dockerfile()
 
     def test_copies_local_from_builder(self):
-        self.assertIn("COPY --from=builder /root/.local /home/app/.local", self.content,
-                      "F4-M5: must COPY /root/.local from builder to /home/app/.local")
+        self.assertIn(
+            "COPY --from=builder --chown=app:app /root/.local /home/app/.local",
+            self.content,
+            "F4-M5: must COPY /root/.local from builder to /home/app/.local with app ownership"
+        )
 
     def test_path_includes_home_app_local_bin(self):
         self.assertIn("PATH=/home/app/.local/bin", self.content,
@@ -276,8 +286,8 @@ class TestAgentsSelectiveCopy(unittest.TestCase):
 
     def test_copies_src_directory(self):
         runner_text = "\n".join(self._runner_lines())
-        self.assertIn("COPY src/ /app/src/", runner_text,
-                      "F4-M11: runner must COPY src/ directory")
+        self.assertIn("COPY --chown=app:app src/ /app/src/", runner_text,
+                      "F4-M11: runner must COPY src/ directory with app ownership")
 
     def test_copies_sitecustomize(self):
         runner_text = "\n".join(self._runner_lines())
@@ -329,6 +339,11 @@ class TestAgentsF2RegressionGuards(unittest.TestCase):
         content = _read_dockerfile()
         self.assertIn("--mount=type=cache,target=/root/.cache/pip", content,
                       "F4-M12: BuildKit cache mount for pip must be preserved")
+
+    def test_cache_mount_not_disabled_by_no_cache_dir(self):
+        content = _read_dockerfile()
+        self.assertNotIn("--no-cache-dir", content,
+                         "F4-M12: --no-cache-dir disables the BuildKit pip cache mount")
 
 
 # -- F4-M13: Runtime source coverage (replay, orchestrator) ---------------
