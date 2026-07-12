@@ -1,0 +1,18 @@
+node_modules/
+dist/
+coverage/
+logs/
+*.log
+*.tsbuildinfo
+.env
+.env.*
+.nyc_output/
+
+# Test fixtures outside src/ are not needed in production image.
+# Keep jest*.config.js in context: the compose test-gateway service builds the
+# Dockerfile builder target and runs npm test there, so Jest needs ts-jest config
+# to transform TypeScript tests.
+tests/
+
+# Self-referential (best practice)
+Dockerfile

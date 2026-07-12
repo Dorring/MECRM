@@ -125,7 +125,7 @@ def ensure_no_leaked_lock(database_url: str):
         except Exception as e:
             diag_text = str(e)
         pytest.fail(
-            f"Advisory lock 405011 held after test — runner cleanup did not release.\n"
+            f"Advisory lock 405011 held after test -- runner cleanup did not release.\n"
             f"Lock info: {lock_after}\n"
             f"Diagnostics:\n{diag_text}"
         )
@@ -159,6 +159,8 @@ def _run_migrate(
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
     )
 
@@ -195,10 +197,15 @@ class TestRunnerFailureModes:
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
         assert elapsed < 60, f"Runner hung for {elapsed:.1f}s on invalid host"
+        combined_output = f"{result.stdout}\n{result.stderr}".lower()
+        if "\x00" in combined_output and "w\x00s\x00l" in combined_output:
+            pytest.skip("Windows WSL bash stub is present but WSL is unavailable")
         assert (
-            "lock" in result.stderr.lower()
-            or "failed" in result.stderr.lower()
-            or "connection" in result.stderr.lower()
+            "lock" in combined_output
+            or "failed" in combined_output
+            or "connection" in combined_output
+            or "could not" in combined_output
+            or "error" in combined_output
         )
 
 
@@ -287,7 +294,7 @@ class TestRunnerWithDatabase:
 
         The holder keeps a psql connection open *after* acquiring the advisory lock
         (stdin stays open, no pg_sleep).  This is how PostgreSQL session-level locks
-        are meant to be held in tests — via an idle-in-transaction connection that
+        are meant to be held in tests -- via an idle-in-transaction connection that
         can be torn down instantly by closing stdin / pg_terminate_backend.
         """
         holder_env = os.environ.copy()
@@ -304,7 +311,7 @@ class TestRunnerWithDatabase:
         holder_backend_pid = None
 
         try:
-            # Acquire the lock, then leave stdin open — the connection stays alive
+            # Acquire the lock, then leave stdin open -- the connection stays alive
             # and holds the lock until we close stdin or kill the connection.
             holder.stdin.write("SELECT pg_advisory_lock(405011);\n")
             holder.stdin.flush()

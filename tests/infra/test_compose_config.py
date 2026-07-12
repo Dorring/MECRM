@@ -96,8 +96,14 @@ class TestMigrateService(unittest.TestCase):
     def test_migrate_builds_from_dedicated_dockerfile(self):
         build = self.migrate.get("build") or {}
         self.assertEqual(
+            build.get("context"),
+            "./gateway",
+            "migrate build context must be narrowed to ./gateway so the migration image "
+            "does not send the whole repo as build context",
+        )
+        self.assertEqual(
             build.get("dockerfile"),
-            "database/Dockerfile.migrate",
+            "../database/Dockerfile.migrate",
             "migrate must build from database/Dockerfile.migrate (node+prisma+psql) "
             "so ONE image can run both Prisma and raw SQL tracks",
         )

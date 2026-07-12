@@ -89,8 +89,8 @@ services:
     # (/scripts/migrate.sh → REPO_ROOT=/) so the mount must land at
     # /database/migrations.
     build:
-      context: .
-      dockerfile: database/Dockerfile.migrate
+      context: ./gateway
+      dockerfile: ../database/Dockerfile.migrate
     command: ["bash", "/scripts/migrate.sh"]
     depends_on:
       postgres:
