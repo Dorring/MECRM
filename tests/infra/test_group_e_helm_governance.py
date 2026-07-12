@@ -132,14 +132,12 @@ class TestCiHelmStepsPassImageTags:
 
     def test_deploy_jobs_still_set_commit_sha_tags(self) -> None:
         text = CI_CD_YML.read_text(encoding="utf-8")
-        # G1: deploy jobs now use digest instead of tag.
-        # The tag-based deploy is replaced by --set images.*.digest=...
-        # sourced from the aggregate-digests job artifact digest-map.json.
-        # The digest is the immutable image reference (sha256:...) which is
-        # stronger than the mutable github.sha tag.
+        # G1: deploy jobs now use --set-string images.*.digest=...
+        # The tag-based deploy is replaced by digest.  The immutable digest
+        # is stronger than the mutable github.sha tag.
         for service in ("frontend", "gateway", "agents"):
-            assert f"--set images.{service}.digest=" in text, (
-                f"Deploy jobs must now set images.{service}.digest (digest pinning)"
+            assert f"--set-string images.{service}.digest=" in text, (
+                f"Deploy jobs must now use --set-string images.{service}.digest (digest pinning)"
             )
 
 

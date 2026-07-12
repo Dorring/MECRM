@@ -388,6 +388,38 @@ class TestHelmLintDigestMode(unittest.TestCase):
                 return
         self.fail("'Render default template (digest mode)' step not found")
 
+    def test_staging_digest_render_asserts_ghcr_references(self):
+        """Staging digest render must also assert ghcr.io references."""
+        for s in self._helm_lint_steps():
+            if s.get("name") == "Render staging template if present (digest mode)":
+                run = s.get("run", "")
+                self.assertIn("ghcr.io/dorring/mecrm/gateway@sha256:", run,
+                              "staging digest render must grep for ghcr.io/dorring/mecrm/gateway@sha256:")
+                self.assertIn("ghcr.io/dorring/mecrm/frontend@sha256:", run,
+                              "staging digest render must grep for ghcr.io/dorring/mecrm/frontend@sha256:")
+                self.assertIn("ghcr.io/dorring/mecrm/agents@sha256:", run,
+                              "staging digest render must grep for ghcr.io/dorring/mecrm/agents@sha256:")
+                self.assertIn("enterprise-crm/frontend@sha256:", run,
+                              "staging digest render must reject enterprise-crm prefix")
+                return
+        self.fail("'Render staging template if present (digest mode)' step not found")
+
+    def test_production_digest_render_asserts_ghcr_references(self):
+        """Production digest render must also assert ghcr.io references."""
+        for s in self._helm_lint_steps():
+            if s.get("name") == "Render production template if present (digest mode)":
+                run = s.get("run", "")
+                self.assertIn("ghcr.io/dorring/mecrm/gateway@sha256:", run,
+                              "production digest render must grep for ghcr.io/dorring/mecrm/gateway@sha256:")
+                self.assertIn("ghcr.io/dorring/mecrm/frontend@sha256:", run,
+                              "production digest render must grep for ghcr.io/dorring/mecrm/frontend@sha256:")
+                self.assertIn("ghcr.io/dorring/mecrm/agents@sha256:", run,
+                              "production digest render must grep for ghcr.io/dorring/mecrm/agents@sha256:")
+                self.assertIn("enterprise-crm/frontend@sha256:", run,
+                              "production digest render must reject enterprise-crm prefix")
+                return
+        self.fail("'Render production template if present (digest mode)' step not found")
+
     def test_staging_digest_template_if_present(self):
         """Staging values should have digest mode too."""
         names = [s.get("name", "") for s in self._helm_lint_steps()]
@@ -399,3 +431,47 @@ class TestHelmLintDigestMode(unittest.TestCase):
         names = [s.get("name", "") for s in self._helm_lint_steps()]
         self.assertIn("Render production template if present (digest mode)", names,
                       "G1: helm-lint must have production digest template step")
+
+
+# -- G1: --set-string consistency for all digest params -------------------
+
+
+class TestCIUsesSetStringForDigest(unittest.TestCase):
+    """All --set images.*.digest=... invocations must use --set-string
+    to prevent Helm from interpreting the sha256: prefix as a number/boolean."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = _slurp(CI_CD_PATH)
+
+    def test_no_bare_set_for_digest(self):
+        # --set (not --set-string) followed by images.X.digest should not exist
+        matches = re.findall(r'^\s+--set\s+images\.\w+\.digest=', self.text, re.MULTILINE)
+        self.assertEqual(len(matches), 0,
+                         f"All images.*.digest args must use --set-string, found bare --set: {matches}")
+
+    def test_deploy_staging_uses_set_string_for_digest(self):
+        data = _load_yaml(CI_CD_PATH)
+        staging = data.get("jobs", {}).get("deploy-staging", {})
+        for s in staging.get("steps", []):
+            if s.get("name") == "Deploy with Helm":
+                run = s.get("run", "")
+                self.assertIn("--set-string images.gateway.repository=", run,
+                              "deploy-staging must use --set-string for repository")
+                self.assertNotIn("--set images.gateway.digest=", run,
+                                 "deploy-staging must NOT use bare --set for digest")
+                return
+        self.fail("deploy-staging 'Deploy with Helm' step not found")
+
+    def test_deploy_production_uses_set_string_for_digest(self):
+        data = _load_yaml(CI_CD_PATH)
+        prod = data.get("jobs", {}).get("deploy-production", {})
+        for s in prod.get("steps", []):
+            if s.get("name") == "Deploy with Helm":
+                run = s.get("run", "")
+                self.assertIn("--set-string images.gateway.repository=", run,
+                              "deploy-production must use --set-string for repository")
+                self.assertNotIn("--set images.gateway.digest=", run,
+                                 "deploy-production must NOT use bare --set for digest")
+                return
+        self.fail("deploy-production 'Deploy with Helm' step not found")
