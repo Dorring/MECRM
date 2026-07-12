@@ -2,7 +2,10 @@
 
 **Date:** 2026-07-12
 **Baseline:** main@8f6e10c (G1 closeout complete)
-**Status:** PREFLIGHT -- PENDING REVIEW
+**G2 PR1 Status:** COMPLETED / STABILIZED
+**G2 PR1 Tag:** `hardening-group-g-g2-pr1-stabilized` -> `99c957e`
+**G2 PR1 CI:** CI/CD Pipeline + Security Scan (PR) + Tenant Isolation Proof all green
+**G2 PR2:** CodeQL + Dependabot -- PENDING
 
 ## Executive Summary
 
@@ -287,32 +290,31 @@ a Python package used only for CLI tooling, not at runtime).
 
 ### PR1: Trivy + SBOM/Provenance + SARIF (items G2a, G2b)
 
-**Scope:**
-1. Add provenance: true and sbom: true to docker/build-push-action@v5 in build job
-2. Add Trivy scan step after Build and push in build job:
-   - Scan the just-pushed image by digest
-   - severity CRITICAL,HIGH --exit-code 1 on CRITICAL
-   - Output SARIF: trivy-results-${{ matrix.project }}.sarif
-3. Upload SARIF to artifact (retention: 30 days)
-4. On push to main: also upload SARIF to GitHub Security tab
-5. Update build job permissions: add security-events: write, actions: read
-6. Add tests: tests/infra/test_group_g_g2_supply_chain.py
-7. Add .trivyignore file (empty initially, with comment explaining suppression format)
+**Status: COMPLETED.** Git history:
+| Commit | Description |
+|---|---|
+| `b71e992` | feat(g2-pr1): add Trivy container scan, CycloneDX SBOM, provenance, SARIF |
+| `ce66062` | fix(g2-pr1): add PR security-scan job, JSON report, pin Trivy version |
+| `3a25e87` | fix(g2-pr1): ignore unfixed critical CVEs in Trivy gate |
+| `b1dbdc1` | fix(g2-pr1): upgrade gateway protobufjs for Trivy gate |
+| `99c957e` | fix(g2-pr1): apply gateway Debian security upgrades |
 
-**Verification:**
-- CI build job passes (no CRITICAL CVEs in current images, or fail and assess)
-- SBOM visible in ghcr.io image metadata
-- Provenance attestation visible in ghcr.io image metadata
-- SARIF artifact uploaded
-- On main push: SARIF visible in GitHub Security tab -> Code scanning alerts
+**CI evidence:** All workflows green.
 
-**Tests:**
-- build-push-action has provenance: true and sbom: true
-- Trivy scan step exists after build-push
-- Trivy uses --exit-code with CRITICAL severity
-- SARIF upload step exists
-- build job has security-events: write permission
-- .trivyignore file exists
+**Trivy gate strategy (as implemented):**
+- CRITICAL fixed CVEs: fail build (`--exit-code 1` after `--ignore-unfixed`)
+- CRITICAL unfixed/fix_deferred CVEs: report-only (excluded from `--exit-code` via `--ignore-unfixed`)
+- HIGH/MEDIUM/LOW: SARIF/JSON artifact report-only
+- GitHub Security SARIF upload: main push only (not PR)
+- Trivy scanner: `ghcr.io/aquasecurity/trivy:0.59.1` (pinned)
+
+**SBOM:** CycloneDX JSON artifact extracted per image, uploaded as `sbom-{project}` (30-day retention).
+
+**Provenance:** `docker/build-push-action@v5` with `provenance: true` enabled.
+
+**.trivyignore:** Empty policy file exists; no suppressions added. CVEs fixed directly (protobufjs >= 7.5.5, gateway Debian security upgrades).
+
+**Remaining G2 PR2:** CodeQL + Dependabot. Node 20 migration plan is a separate assessment (no code change in G2 scope).
 
 ### PR2: CodeQL + Dependabot (items G2c, G2d)
 
