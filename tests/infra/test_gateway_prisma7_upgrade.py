@@ -63,3 +63,11 @@ def test_github_workflows_use_node_24_not_node_20():
     )
     assert 'node-version: "20"' not in workflows
     assert 'node-version: "24"' in workflows
+
+
+def test_tenant_isolation_generates_client_before_direct_jest_run():
+    workflow = read(".github/workflows/tenant-isolation.yml")
+    generate = workflow.index("npm run prisma:generate")
+    migrate = workflow.index("npx prisma migrate deploy")
+    jest = workflow.index("npx jest tests/test_rls_enforcement.ts")
+    assert generate < migrate < jest

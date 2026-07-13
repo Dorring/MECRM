@@ -59,6 +59,10 @@ jobs:
           done
         working-directory: gateway
 
+      - name: Generate Prisma Client
+        run: npm run prisma:generate
+        working-directory: gateway
+
       - name: Run Prisma migrations
         run: npx prisma migrate deploy
         working-directory: gateway
