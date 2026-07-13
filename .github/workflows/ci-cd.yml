@@ -851,7 +851,7 @@ jobs:
             --build-duration-seconds "${{ steps.build-duration.outputs.duration_seconds }}"
 
       - name: Upload image metrics artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: image-metrics-${{ matrix.project }}
           path: image-metrics-${{ matrix.project }}.json
@@ -875,7 +875,7 @@ jobs:
           JSON
 
       - name: Upload digest artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: digest-${{ matrix.project }}
           path: digest-${{ matrix.project }}.json
@@ -962,7 +962,7 @@ jobs:
 
       - name: Upload Trivy SARIF artifact
         if: always() && steps.trivy.outcome != 'skipped'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: trivy-results-${{ matrix.project }}
           path: trivy-results-${{ matrix.project }}.sarif
@@ -971,7 +971,7 @@ jobs:
 
       - name: Upload Trivy JSON artifact
         if: always() && steps.trivy.outcome != 'skipped'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: trivy-json-${{ matrix.project }}
           path: trivy-results-${{ matrix.project }}.json
@@ -990,7 +990,7 @@ jobs:
       # CRITICAL gate) so it always exists even when the gate fails.
       - name: Upload SBOM artifact
         if: always() && steps.trivy.outcome != 'skipped'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom-${{ matrix.project }}
           path: sbom-${{ matrix.project }}.cdx.json
@@ -1110,7 +1110,7 @@ jobs:
 
       - name: Upload Trivy SARIF artifact
         if: always() && steps.trivy.outcome != 'skipped'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: trivy-results-${{ matrix.project }}-pr
           path: trivy-results-${{ matrix.project }}.sarif
@@ -1119,7 +1119,7 @@ jobs:
 
       - name: Upload Trivy JSON artifact
         if: always() && steps.trivy.outcome != 'skipped'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: trivy-json-${{ matrix.project }}-pr
           path: trivy-results-${{ matrix.project }}.json
@@ -1128,7 +1128,7 @@ jobs:
 
       - name: Upload SBOM artifact
         if: always() && steps.trivy.outcome != 'skipped'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom-${{ matrix.project }}-pr
           path: sbom-${{ matrix.project }}.cdx.json
@@ -1190,7 +1190,7 @@ jobs:
           cat digest-map.json
 
       - name: Upload digest map artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: digest-map
           path: digest-map.json
