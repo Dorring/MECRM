@@ -798,7 +798,7 @@ jobs:
 
       - name: Build and push
         id: build-push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           builder: ${{ steps.buildx.outputs.name }}
           context: ${{ matrix.context }}
@@ -1033,7 +1033,7 @@ jobs:
 
       - name: Build image (no push)
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
