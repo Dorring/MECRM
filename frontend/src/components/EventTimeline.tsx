@@ -26,7 +26,7 @@ export function EventTimeline({ tenantId, aggregateType, aggregateId, jobId }: E
   const [fromVersion, setFromVersion] = useState<number | null>(null);
   const [toVersion, setToVersion] = useState<number | null>(null);
 
-  const timelineQuery = useQuery({
+  const timelineQuery = useQuery<TimelineEvent[]>({
     queryKey: ['timeline', tenantId, aggregateType, aggregateId],
     queryFn: async () => {
       const res = await replayApi.timeline(aggregateType, aggregateId, tenantId);
@@ -37,7 +37,7 @@ export function EventTimeline({ tenantId, aggregateType, aggregateId, jobId }: E
   });
 
   const events = useMemo(() => timelineQuery.data || [], [timelineQuery.data]);
-  const eventTypes = useMemo(() => Array.from(new Set(events.map((e) => e.event_type))).sort(), [events]);
+  const eventTypes = useMemo<string[]>(() => Array.from(new Set<string>(events.map((e) => e.event_type))).sort(), [events]);
   const filtered = useMemo(
     () => (filter ? events.filter((e) => e.event_type === filter) : events),
     [events, filter]
