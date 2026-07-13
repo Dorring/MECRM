@@ -48,7 +48,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
           cache: "npm"
           cache-dependency-path: gateway/package-lock.json
 
@@ -57,6 +57,10 @@ jobs:
           for i in 1 2 3; do
             npm ci && break || sleep $((i * 15))
           done
+        working-directory: gateway
+
+      - name: Generate Prisma Client
+        run: npm run prisma:generate
         working-directory: gateway
 
       - name: Run Prisma migrations

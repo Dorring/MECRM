@@ -12,7 +12,7 @@ import {
 } from '../middleware/auth';
 import { badRequest, unauthorized } from '../middleware/errorHandler';
 import { logger } from '../utils/logger';
-import { Prisma } from '@prisma/client';
+import { Prisma } from '../generated/prisma/client';
 import {
   TokenRevocationService,
   DecodedToken,

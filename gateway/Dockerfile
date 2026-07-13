@@ -8,6 +8,7 @@ RUN apt-get update \
 
 COPY package*.json ./
 COPY prisma ./prisma/
+COPY prisma.config.ts ./
 RUN --mount=type=cache,target=/root/.npm npm ci
 
 RUN npx prisma generate
@@ -29,9 +30,8 @@ RUN apt-get update \
 
 COPY package*.json ./
 COPY prisma ./prisma/
+COPY prisma.config.ts ./
 RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev
-
-RUN npx prisma generate
 
 COPY --from=builder /app/dist ./dist
 

@@ -24,6 +24,7 @@ WORKDIR /app
 # are resolvable.
 COPY gateway/package*.json ./
 COPY gateway/prisma ./prisma
+COPY gateway/prisma.config.ts ./prisma.config.ts
 RUN --mount=type=cache,target=/root/.npm npm ci
 
 # Raw SQL migrations (G3a: baked into image, no K8s volume mount needed).
