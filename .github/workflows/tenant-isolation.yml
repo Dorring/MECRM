@@ -123,14 +123,14 @@ jobs:
 
       - name: Upload tenant isolation report artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tenant-isolation-report
           path: reports/security/tenant-isolation-report.json
 
       - name: Upload raw tenant isolation inputs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tenant-isolation-raw-inputs
           path: |
