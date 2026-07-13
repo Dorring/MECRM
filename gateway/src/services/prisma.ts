@@ -1,8 +1,21 @@
+import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient, Prisma } from '@prisma/client';
 import { logger } from '../utils/logger';
 
+const connectionString = process.env.DATABASE_URL;
+if (!connectionString) {
+  throw new Error('DATABASE_URL is required to initialize Prisma');
+}
+
+const adapter = new PrismaPg({
+  connectionString,
+  connectionTimeoutMillis: 5000,
+  idleTimeoutMillis: 300000,
+});
+
 // Create Prisma client with logging
 export const prisma = new PrismaClient({
+  adapter,
   log: [
     { level: 'query', emit: 'event' },
     { level: 'error', emit: 'stdout' },
