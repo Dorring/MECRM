@@ -23,7 +23,7 @@ export interface TokenPayload {
   exp: number;
 }
 
-export interface AuthenticatedRequest extends Request {
+export interface AuthenticatedRequest extends Request<Record<string, string>> {
   user?: TokenPayload;
   tenantId?: string;
 }
