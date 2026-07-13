@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM node:20-bullseye AS builder
+FROM node:26-bullseye AS builder
 WORKDIR /app
 RUN apt-get update \
   && apt-get upgrade -y \
@@ -15,7 +15,7 @@ RUN npx prisma generate
 COPY . .
 RUN npm run build
 
-FROM node:20-bullseye AS runner
+FROM node:26-bullseye AS runner
 
 WORKDIR /app
 ENV NODE_ENV=production
