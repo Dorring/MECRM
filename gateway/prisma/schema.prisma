@@ -2,8 +2,10 @@
 // Multi-tenant, event-driven architecture
 
 generator client {
-  provider   = "prisma-client-js"
-  engineType = "client"
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+  engineType   = "client"
 }
 
 datasource db {

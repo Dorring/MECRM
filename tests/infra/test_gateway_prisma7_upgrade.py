@@ -23,8 +23,10 @@ def test_gateway_uses_prisma_7_pg_adapter_without_esm_uuid_migration():
 
 def test_prisma_schema_moves_url_to_config_and_uses_js_engine():
     schema = read("gateway/prisma/schema.prisma")
-    assert 'provider   = "prisma-client-js"' in schema
-    assert 'engineType = "client"' in schema
+    assert 'provider     = "prisma-client"' in schema
+    assert 'output       = "../src/generated/prisma"' in schema
+    assert 'moduleFormat = "cjs"' in schema
+    assert 'engineType   = "client"' in schema
     assert 'url      = env("DATABASE_URL")' not in schema
     config = read("gateway/prisma.config.ts")
     assert "process.env.DATABASE_URL" in config
@@ -35,16 +37,18 @@ def test_prisma_schema_moves_url_to_config_and_uses_js_engine():
 def test_prisma_client_receives_adapter_and_preserves_tenant_transaction():
     service = read("gateway/src/services/prisma.ts")
     assert "const adapter = new PrismaPg" in service
+    assert "from '../generated/prisma/client'" in service
     assert re.search(r"new PrismaClient\(\{\s*adapter,", service)
     assert "prisma.$transaction" in service
     assert "set_config('app.tenant_id'" in service
 
 
-def test_gateway_image_generates_once_and_reuses_generated_client():
+def test_gateway_image_generates_once_and_compiles_generated_client():
     dockerfile = read("gateway/Dockerfile")
     assert dockerfile.count("RUN npx prisma generate") == 1
     assert "COPY prisma.config.ts ./" in dockerfile
-    assert "COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma" in dockerfile
+    assert "/app/node_modules/.prisma" not in dockerfile
+    assert "COPY --from=builder /app/dist ./dist" in dockerfile
 
 
 def test_migration_image_contains_prisma_config():
