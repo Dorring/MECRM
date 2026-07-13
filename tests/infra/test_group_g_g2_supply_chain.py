@@ -200,27 +200,48 @@ class TestTrivyJSONUpload(unittest.TestCase):
 # -- G2-09: CycloneDX SBOM -----------------------------------------------
 
 class TestCycloneDXSBOM(unittest.TestCase):
-    """SBOM must be extracted in CycloneDX format."""
+    """SBOM must be extracted in CycloneDX format, before the CRITICAL gate."""
 
     @classmethod
     def setUpClass(cls):
         cls.steps = _get_steps(_get_job(_load_yaml(CI_CD_PATH), "build"))
 
-    def test_sbom_extract_step_exists(self):
-        step = _step_by_name(self.steps, "Extract CycloneDX SBOM")
-        self.assertIsNotNone(step, "G2-09: SBOM extract step missing")
-
-    def test_sbom_uses_cyclonedx_format(self):
-        step = _step_by_name(self.steps, "Extract CycloneDX SBOM")
-        self.assertIsNotNone(step)
-        self.assertIn("cyclonedx", step.get("run", ""),
-                      "G2-09: SBOM must use CycloneDX format")
+    def test_sbom_in_trivy_step_before_critical_gate(self):
+        """G3a: SBOM is generated in Pass 3 (inside Trivy scan image step),
+        before Pass 4 CRITICAL gate, so the SBOM file always exists even when
+        the gate fails.  The standalone 'Extract CycloneDX SBOM' step is removed
+        in favor of this inline pass."""
+        step = _step_by_name(self.steps, "Trivy scan image")
+        self.assertIsNotNone(step, "Trivy scan image step must exist")
+        run = step.get("run", "")
+        self.assertIn("cyclonedx", run,
+                      "G2-09/G3a: Trivy step must generate CycloneDX SBOM inline")
+        self.assertIn("sbom-${{ matrix.project }}.cdx.json", run,
+                      "G2-09/G3a: SBOM output path must use matrix project name")
+        # SBOM pass (Pass 3) must appear before --exit-code 1 (Pass 4)
+        sbom_idx = run.index("cyclonedx")
+        gate_idx = run.index("--exit-code 1")
+        self.assertLess(sbom_idx, gate_idx,
+                        "G3a: SBOM generation (Pass 3) must precede CRITICAL gate (Pass 4)")
 
     def test_sbom_artifact_upload_exists(self):
         step = _step_by_name(self.steps, "Upload SBOM artifact")
         self.assertIsNotNone(step, "G2-09: SBOM upload step missing")
         self.assertIn("cdx.json", step.get("with", {}).get("path", ""),
                       "G2-09: SBOM artifact path must be .cdx.json")
+
+    def test_sbom_upload_strict_file_check(self):
+        step = _step_by_name(self.steps, "Upload SBOM artifact")
+        self.assertIsNotNone(step)
+        self.assertEqual(step.get("with", {}).get("if-no-files-found"), "error",
+                         "G2-09/G3a: SBOM upload must remain strict (error if missing)")
+
+    def test_no_standalone_sbom_extract_step(self):
+        """The old standalone 'Extract CycloneDX SBOM' step must not exist;
+        SBOM is now inline in the Trivy scan image step."""
+        step = _step_by_name(self.steps, "Extract CycloneDX SBOM")
+        self.assertIsNone(step,
+                          "G3a: standalone Extract CycloneDX SBOM step must be removed (inline now)")
 
 
 # -- G2-10, G2-11: Permissions -------------------------------------------
@@ -316,6 +337,21 @@ class TestPRSecurityScanJob(unittest.TestCase):
                       "G2-18: PR CRITICAL gate must ignore unfixed/fix_deferred CVEs")
         self.assertEqual(run.count("--ignore-unfixed"), 1,
                          "G2-18: PR --ignore-unfixed must only be on the CRITICAL gate, not SARIF/JSON")
+
+    def test_security_scan_has_sbom_before_critical_gate(self):
+        data = _load_yaml(CI_CD_PATH)
+        job = _get_job(data, "security-scan")
+        steps = _get_steps(job)
+        trivy_step = _step_by_name(steps, "Trivy scan PR image")
+        self.assertIsNotNone(trivy_step, "G2-09/G3a: PR must have Trivy scan step")
+        run = trivy_step.get("run", "")
+        self.assertIn("cyclonedx", run,
+                      "G2-09/G3a: PR Trivy must generate CycloneDX SBOM inline")
+        # SBOM pass must appear before --exit-code 1
+        sbom_idx = run.index("cyclonedx")
+        gate_idx = run.index("--exit-code 1")
+        self.assertLess(sbom_idx, gate_idx,
+                        "G3a: PR SBOM generation must precede CRITICAL gate")
 
     def test_security_scan_no_github_security_upload(self):
         """PR job must NOT upload SARIF to GitHub Security (artifact only)."""

@@ -372,6 +372,14 @@ class TestMigrateDockerfileSelfContained(unittest.TestCase):
         self.assertIn("npm ci", self.content,
                       "G3-16: Dockerfile.migrate must run npm ci for Prisma CLI")
 
+    def test_contains_apt_get_upgrade(self):
+        self.assertIn("apt-get upgrade -y", self.content,
+                      "G3-16: Dockerfile.migrate must run apt-get upgrade -y to patch OS CVEs")
+
+    def test_removes_apt_lists(self):
+        self.assertIn("rm -rf /var/lib/apt/lists/*", self.content,
+                      "G3-16: Dockerfile.migrate must remove apt lists after install")
+
 
 # -- G3-17: values has no migration-specific plaintext secrets --------------
 

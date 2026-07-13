@@ -13,6 +13,7 @@
 FROM node:20-bullseye-slim
 
 RUN apt-get update \
+  && apt-get upgrade -y \
   && apt-get install -y --no-install-recommends postgresql-client \
   && rm -rf /var/lib/apt/lists/*
 

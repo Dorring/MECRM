@@ -929,7 +929,21 @@ jobs:
 
           echo "Trivy JSON written: trivy-results-${{ matrix.project }}.json"
 
-          # Pass 3: actionable CRITICAL-only gate.
+          # Pass 3: CycloneDX SBOM (report-only, before CRITICAL gate so the
+          # SBOM artifact is always produced even when the gate fails).
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$(pwd):/workspace" \
+            -w /workspace \
+            "${TRIVY_IMAGE}" \
+            image \
+            --format cyclonedx \
+            --output "sbom-${{ matrix.project }}.cdx.json" \
+            "${IMAGE_FULL}"
+
+          echo "SBOM written: sbom-${{ matrix.project }}.cdx.json"
+
+          # Pass 4: actionable CRITICAL-only gate.
           # Fail only CRITICAL vulnerabilities with an upstream fix available.
           # Unfixed/fix_deferred CRITICAL CVEs remain visible in SARIF/JSON
           # artifacts and GitHub Security, but do not block main while the base
@@ -971,31 +985,11 @@ jobs:
           sarif_file: trivy-results-${{ matrix.project }}.sarif
           category: trivy-${{ matrix.project }}
 
-      # -- Group G G2 PR1: extract CycloneDX SBOM from image ------------
-      - name: Extract CycloneDX SBOM
-        id: sbom
-        env:
-          IMAGE_NAME: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.project }}
-          TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.59.1
-        run: |
-          set -euo pipefail
-          IMAGE_FULL="$(printf '%s' "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')@${{ steps.build-push.outputs.digest }}"
-          echo "Extracting SBOM from: ${IMAGE_FULL}"
-
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$(pwd):/workspace" \
-            -w /workspace \
-            "${TRIVY_IMAGE}" \
-            image \
-            --format cyclonedx \
-            --output "sbom-${{ matrix.project }}.cdx.json" \
-            "${IMAGE_FULL}"
-
-          echo "SBOM written: sbom-${{ matrix.project }}.cdx.json"
-
+      # -- Group G G2 PR1: upload CycloneDX SBOM artifact ------------
+      # SBOM is generated in Pass 3 of "Trivy scan image" (before the
+      # CRITICAL gate) so it always exists even when the gate fails.
       - name: Upload SBOM artifact
-        if: always() && steps.sbom.outcome != 'skipped'
+        if: always() && steps.trivy.outcome != 'skipped'
         uses: actions/upload-artifact@v4
         with:
           name: sbom-${{ matrix.project }}
@@ -1085,7 +1079,19 @@ jobs:
             --output "trivy-results-${{ matrix.project }}.json" \
             "${IMAGE_TAG}"
 
-          # Pass 3: actionable CRITICAL gate.
+          # Pass 3: CycloneDX SBOM (report-only, before CRITICAL gate so the
+          # SBOM artifact is always produced even when the gate fails).
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$(pwd):/workspace" \
+            -w /workspace \
+            "${TRIVY_IMAGE}" \
+            image \
+            --format cyclonedx \
+            --output "sbom-${{ matrix.project }}.cdx.json" \
+            "${IMAGE_TAG}"
+
+          # Pass 4: actionable CRITICAL gate.
           # Fail only CRITICAL vulnerabilities with an upstream fix available.
           # Unfixed/fix_deferred CRITICAL CVEs remain visible in SARIF/JSON
           # artifacts, but do not block PRs while the base image vendor has no
@@ -1100,17 +1106,6 @@ jobs:
             --ignore-unfixed \
             --exit-code 1 \
             --format table \
-            "${IMAGE_TAG}"
-
-          # SBOM from local image
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$(pwd):/workspace" \
-            -w /workspace \
-            "${TRIVY_IMAGE}" \
-            image \
-            --format cyclonedx \
-            --output "sbom-${{ matrix.project }}.cdx.json" \
             "${IMAGE_TAG}"
 
       - name: Upload Trivy SARIF artifact
