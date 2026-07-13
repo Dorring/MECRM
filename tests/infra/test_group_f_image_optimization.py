@@ -267,10 +267,11 @@ class TestMigrateContextNarrowing(unittest.TestCase):
         data = self._load_yaml(path)
         migrate = data.get("services", {}).get("migrate", {})
         build = migrate.get("build", {})
-        self.assertEqual(build.get("context"), "./gateway",
-                         "F-S3: docker-compose.yml migrate context must be ./gateway")
-        self.assertEqual(build.get("dockerfile"), "../database/Dockerfile.migrate",
-                         "F-S3: docker-compose.yml migrate dockerfile must be ../database/Dockerfile.migrate")
+        self.assertEqual(build.get("context"), ".",
+                         "F-S3: docker-compose.yml migrate context must be repo root "
+                         "(G3a: Dockerfile.migrate is now self-contained)")
+        self.assertEqual(build.get("dockerfile"), "database/Dockerfile.migrate",
+                         "F-S3: docker-compose.yml migrate dockerfile must be database/Dockerfile.migrate")
 
     def test_chaos_compose_migrate_context(self):
         import yaml
@@ -278,24 +279,27 @@ class TestMigrateContextNarrowing(unittest.TestCase):
         data = self._load_yaml(path)
         chaos_migrate = data.get("services", {}).get("chaos-migrations", {})
         build = chaos_migrate.get("build", {})
-        self.assertEqual(build.get("context"), "./gateway",
-                         "F-S3: docker-compose.chaos.yml chaos-migrations context must be ./gateway")
-        self.assertEqual(build.get("dockerfile"), "../database/Dockerfile.migrate",
-                         "F-S3: docker-compose.chaos.yml chaos-migrations dockerfile must be ../database/Dockerfile.migrate")
+        self.assertEqual(build.get("context"), ".",
+                         "F-S3: docker-compose.chaos.yml chaos-migrations context must be repo root "
+                         "(G3a self-contained Dockerfile.migrate)")
+        self.assertEqual(build.get("dockerfile"), "database/Dockerfile.migrate",
+                         "F-S3: docker-compose.chaos.yml chaos-migrations dockerfile must be database/Dockerfile.migrate")
 
     def test_migrate_dockerfile_copy_paths(self):
         path = os.path.join(REPO_ROOT, "database", "Dockerfile.migrate")
         with open(path, "r", encoding="utf-8") as fh:
             content = fh.read()
-        # COPY must reference bare package*.json and prisma (no gateway/ prefix)
-        self.assertIn("COPY package*.json ./", content,
-                      "F-S3: Dockerfile.migrate must COPY package*.json (no gateway/ prefix)")
-        self.assertIn("COPY prisma ./prisma", content,
-                      "F-S3: Dockerfile.migrate must COPY prisma (no gateway/ prefix)")
-        # No remaining gateway/ prefix in COPY instructions
-        copy_lines = [line for line in content.splitlines() if "COPY gateway/" in line]
-        self.assertEqual(len(copy_lines), 0,
-                         f"F-S3: Dockerfile.migrate must not have COPY gateway/ lines: {copy_lines}")
+        # G3a: Dockerfile.migrate now builds from repo root (self-contained).
+        # COPY uses gateway/ prefix since context is the repo root.
+        self.assertIn("COPY gateway/package*.json ./", content,
+                      "F-S3/G3a: Dockerfile.migrate must COPY gateway/package*.json from repo root")
+        self.assertIn("COPY gateway/prisma ./prisma", content,
+                      "F-S3/G3a: Dockerfile.migrate must COPY gateway/prisma from repo root")
+        # Self-contained migration: scripts and SQL are baked in.
+        self.assertIn("COPY database/migrations/", content,
+                      "F-S3/G3a: Dockerfile.migrate must COPY database/migrations/")
+        self.assertIn("COPY scripts/migrate.sh", content,
+                      "F-S3/G3a: Dockerfile.migrate must COPY scripts/migrate.sh")
 
     def test_migrate_volumes_unchanged(self):
         import yaml

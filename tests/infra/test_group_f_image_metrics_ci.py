@@ -144,10 +144,10 @@ class TestCIBuildJobMatrix(unittest.TestCase):
         self.assertIn("agents", projects,
                       "build matrix must include agents")
 
-    def test_matrix_does_not_include_migrate(self):
+    def test_matrix_includes_migrate(self):
         projects = [e.get("project") for e in self.include]
-        self.assertNotIn("migrate", projects,
-                        "build matrix must NOT include migrate (migrate is not built in CI)")
+        self.assertIn("migrate", projects,
+                      "F3/G3a: build matrix must include migrate (G3a digest deploy chain)")
 
 
 class TestCIMetricsArtifactName(unittest.TestCase):
@@ -332,17 +332,17 @@ class TestCIInspectImageScript(unittest.TestCase):
 
 # -- F3-M7: Script must not reference migrate ----------------------------
 
-class TestCIMetricsNoMigrateProject(unittest.TestCase):
-    """ci-inspect-image.sh is only invoked for matrix projects (not migrate)."""
+class TestCIMetricsIncludesMigrateProject(unittest.TestCase):
+    """G3a: migrate is now in the build matrix; ci-inspect-image.sh covers it."""
 
-    def test_ci_build_matrix_excludes_migrate(self):
+    def test_ci_build_matrix_includes_migrate(self):
         build = _get_build_job(_load_yaml(CI_CD_PATH))
         strategy = build.get("strategy", {})
         matrix = strategy.get("matrix", {})
         include = matrix.get("include", [])
         projects = [e.get("project") for e in include]
-        self.assertNotIn("migrate", projects,
-                        "F3-M7: build matrix must not include migrate")
+        self.assertIn("migrate", projects,
+                     "F3/G3a: build matrix must include migrate")
 
 
 # -- F3: CI build job only pushes on main push -- -----------------------

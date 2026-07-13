@@ -515,8 +515,8 @@ services:
   # Usage: docker-compose --profile migrate run --rm migrate
   migrate:
     build:
-      context: ./gateway
-      dockerfile: ../database/Dockerfile.migrate
+      context: .
+      dockerfile: database/Dockerfile.migrate
     command: ["bash", "/scripts/migrate.sh"]
     environment:
       - POSTGRES_HOST=postgres

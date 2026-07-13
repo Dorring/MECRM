@@ -211,7 +211,7 @@ externalKafka:
 # Ollama is NOT a Chart.yaml dependency and this chart does NOT render an Ollama
 # Deployment/Service.  When enabled, agents receive OLLAMA_URL / OLLAMA_MODEL env
 # vars pointing at an out-of-band Ollama instance labelled app: ollama.
-# Default disabled — Ollama requires GPU node pools and is not part of the base
+# Default disabled - Ollama requires GPU node pools and is not part of the base
 # CRM topology.
 ollama:
   enabled: false
@@ -243,6 +243,34 @@ secrets:
   jwt:
     existingSecret: crm-jwt-secret
     secretKey: jwt-secret
+
+# Pre-upgrade database migration Job (G-H6 / G3a)
+# Runs scripts/migrate.sh via the database migration image (database/Dockerfile.migrate).
+# The image must contain psql + Prisma CLI + database/migrations/**/*.sql.
+# Digest is the preferred immutable image reference; tag is a required fallback.
+# DATABASE_URL is sourced exclusively from the referenced Kubernetes Secret --
+# no plaintext database URL is allowed in values files.
+migration:
+  enabled: true
+  backoffLimit: 2
+  activeDeadlineSeconds: 600
+  image:
+    repository: enterprise-crm/migrate
+    digest: ""
+    tag: ""
+    pullPolicy: IfNotPresent
+  database:
+    existingSecret: crm-postgresql-secret
+    urlKey: connection-string
+  podSecurityContext:
+    runAsUser: 1000   # node user on node:20-bullseye-slim (database/Dockerfile.migrate)
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
 
 # Pod disruption budgets
 podDisruptionBudget:

@@ -420,10 +420,10 @@ jobs:
   # C4 WebSocket same-origin proxy smoke test.
   # Builds gateway + frontend, starts the full edge-proxy topology, and runs
   # the ws-proxy-test.js script to verify:
-  #   - /ws upgrade through nginx → Gateway (101 Switching Protocols)
-  #   - valid ticket → { type: "connected" }
-  #   - consumed ticket → close 4401
-  #   - invalid ticket → close 4401
+  #   - /ws upgrade through nginx -> Gateway (101 Switching Protocols)
+  #   - valid ticket -> { type: "connected" }
+  #   - consumed ticket -> close 4401
+  #   - invalid ticket -> close 4401
   ws-proxy-smoke:
     name: WS Proxy Smoke Test
     runs-on: ubuntu-latest
@@ -519,7 +519,8 @@ jobs:
           helm lint deploy/helm/enterprise-crm \
             --set images.frontend.tag=ci-test \
             --set images.gateway.tag=ci-test \
-            --set images.agents.tag=ci-test
+            --set images.agents.tag=ci-test \
+            --set migration.image.tag=ci-test
 
       - name: Render default template (tag mode)
         run: |
@@ -527,6 +528,7 @@ jobs:
             --set images.frontend.tag=ci-test \
             --set images.gateway.tag=ci-test \
             --set images.agents.tag=ci-test \
+            --set migration.image.tag=ci-test \
             --namespace crm-default > /tmp/rendered-default.yaml
           echo "Rendered $(wc -l < /tmp/rendered-default.yaml) lines"
 
@@ -541,6 +543,7 @@ jobs:
           DIGEST_GW: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           DIGEST_FE: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
           DIGEST_AG: sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+          DIGEST_MG: sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
         run: |
           helm lint deploy/helm/enterprise-crm \
             --set-string images.gateway.repository="${DIGEST_REPO}/gateway" \
@@ -548,7 +551,9 @@ jobs:
             --set-string images.frontend.repository="${DIGEST_REPO}/frontend" \
             --set-string images.frontend.digest="${DIGEST_FE}" \
             --set-string images.agents.repository="${DIGEST_REPO}/agents" \
-            --set-string images.agents.digest="${DIGEST_AG}"
+            --set-string images.agents.digest="${DIGEST_AG}" \
+            --set-string migration.image.repository="${DIGEST_REPO}/migrate" \
+            --set-string migration.image.digest="${DIGEST_MG}"
 
       - name: Render default template (digest mode)
         env:
@@ -556,6 +561,7 @@ jobs:
           DIGEST_GW: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           DIGEST_FE: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
           DIGEST_AG: sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+          DIGEST_MG: sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
         run: |
           helm template enterprise-crm deploy/helm/enterprise-crm \
             --set-string images.gateway.repository="${DIGEST_REPO}/gateway" \
@@ -564,6 +570,8 @@ jobs:
             --set-string images.frontend.digest="${DIGEST_FE}" \
             --set-string images.agents.repository="${DIGEST_REPO}/agents" \
             --set-string images.agents.digest="${DIGEST_AG}" \
+            --set-string migration.image.repository="${DIGEST_REPO}/migrate" \
+            --set-string migration.image.digest="${DIGEST_MG}" \
             --namespace crm-default > /tmp/rendered-digest.yaml
           echo "Rendered $(wc -l < /tmp/rendered-digest.yaml) lines"
 
@@ -578,11 +586,16 @@ jobs:
             echo "FATAL: digest-mode render missing ghcr.io/dorring/mecrm/agents@sha256:" >&2; exit 1;
           }
 
+          # G3a: verify migration image renders with digest
+          grep -qE 'ghcr\.io/dorring/mecrm/migrate@sha256:' /tmp/rendered-digest.yaml || {
+            echo "FATAL: digest-mode render missing ghcr.io/dorring/mecrm/migrate@sha256:" >&2; exit 1;
+          }
+
           # G1: verify NO stale enterprise-crm/ prefix leaked into digest rendering
-          if grep -q 'enterprise-crm/gateway@sha256:\|enterprise-crm/frontend@sha256:\|enterprise-crm/agents@sha256:' /tmp/rendered-digest.yaml; then
+          if grep -q 'enterprise-crm/gateway@sha256:\|enterprise-crm/frontend@sha256:\|enterprise-crm/agents@sha256:\|enterprise-crm/migrate@sha256:' /tmp/rendered-digest.yaml; then
             echo "FATAL: digest-mode render contains enterprise-crm/{service}@sha256 (default repo instead of ghcr.io)" >&2; exit 1;
           fi
-          echo "OK: all three services render correct ghcr.io/...@sha256:... in digest mode"
+          echo "OK: all services including migration render correct ghcr.io/...@sha256:... in digest mode"
 
       - name: Lint staging values if present
         run: |
@@ -591,7 +604,8 @@ jobs:
               --values deploy/helm/enterprise-crm/values-staging.yaml \
               --set images.frontend.tag=ci-test \
               --set images.gateway.tag=ci-test \
-              --set images.agents.tag=ci-test
+              --set images.agents.tag=ci-test \
+              --set migration.image.tag=ci-test
           else
             echo "values-staging.yaml not present yet; skipping staging lint (see docs/project-optimization-plan.md Phase 4)."
           fi
@@ -607,6 +621,7 @@ jobs:
               --set images.frontend.tag=ci-test \
               --set images.gateway.tag=ci-test \
               --set images.agents.tag=ci-test \
+              --set migration.image.tag=ci-test \
               --namespace crm-staging > /tmp/rendered-staging.yaml
             echo "Rendered $(wc -l < /tmp/rendered-staging.yaml) lines"
           else
@@ -619,6 +634,7 @@ jobs:
           DIGEST_GW: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           DIGEST_FE: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
           DIGEST_AG: sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+          DIGEST_MG: sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
         run: |
           if [ -f deploy/helm/enterprise-crm/values-staging.yaml ]; then
             helm template enterprise-crm deploy/helm/enterprise-crm \
@@ -629,6 +645,8 @@ jobs:
               --set-string images.frontend.digest="${DIGEST_FE}" \
               --set-string images.agents.repository="${DIGEST_REPO}/agents" \
               --set-string images.agents.digest="${DIGEST_AG}" \
+              --set-string migration.image.repository="${DIGEST_REPO}/migrate" \
+              --set-string migration.image.digest="${DIGEST_MG}" \
               --namespace crm-staging > /tmp/rendered-staging-digest.yaml
             echo "Rendered $(wc -l < /tmp/rendered-staging-digest.yaml) lines"
 
@@ -641,7 +659,10 @@ jobs:
             grep -qE 'ghcr\.io/dorring/mecrm/agents@sha256:' /tmp/rendered-staging-digest.yaml || {
               echo "FATAL: staging digest-mode render missing ghcr.io/dorring/mecrm/agents@sha256:" >&2; exit 1;
             }
-            if grep -q 'enterprise-crm/gateway@sha256:\|enterprise-crm/frontend@sha256:\|enterprise-crm/agents@sha256:' /tmp/rendered-staging-digest.yaml; then
+            grep -qE 'ghcr\.io/dorring/mecrm/migrate@sha256:' /tmp/rendered-staging-digest.yaml || {
+              echo "FATAL: staging digest-mode render missing ghcr.io/dorring/mecrm/migrate@sha256:" >&2; exit 1;
+            }
+            if grep -q 'enterprise-crm/gateway@sha256:\|enterprise-crm/frontend@sha256:\|enterprise-crm/agents@sha256:\|enterprise-crm/migrate@sha256:' /tmp/rendered-staging-digest.yaml; then
               echo "FATAL: staging digest-mode render contains enterprise-crm/{service}@sha256 (default repo instead of ghcr.io)" >&2; exit 1;
             fi
             echo "OK: staging digest-mode render correct"
@@ -656,7 +677,8 @@ jobs:
               --values deploy/helm/enterprise-crm/values-production.yaml \
               --set images.frontend.tag=ci-test \
               --set images.gateway.tag=ci-test \
-              --set images.agents.tag=ci-test
+              --set images.agents.tag=ci-test \
+              --set migration.image.tag=ci-test
           else
             echo "values-production.yaml not present yet; skipping production lint (see docs/project-optimization-plan.md Phase 4)."
           fi
@@ -669,6 +691,7 @@ jobs:
               --set images.frontend.tag=ci-test \
               --set images.gateway.tag=ci-test \
               --set images.agents.tag=ci-test \
+              --set migration.image.tag=ci-test \
               --namespace crm-production > /tmp/rendered-production.yaml
             echo "Rendered $(wc -l < /tmp/rendered-production.yaml) lines"
           else
@@ -681,6 +704,7 @@ jobs:
           DIGEST_GW: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           DIGEST_FE: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
           DIGEST_AG: sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+          DIGEST_MG: sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
         run: |
           if [ -f deploy/helm/enterprise-crm/values-production.yaml ]; then
             helm template enterprise-crm deploy/helm/enterprise-crm \
@@ -691,6 +715,8 @@ jobs:
               --set-string images.frontend.digest="${DIGEST_FE}" \
               --set-string images.agents.repository="${DIGEST_REPO}/agents" \
               --set-string images.agents.digest="${DIGEST_AG}" \
+              --set-string migration.image.repository="${DIGEST_REPO}/migrate" \
+              --set-string migration.image.digest="${DIGEST_MG}" \
               --namespace crm-production > /tmp/rendered-production-digest.yaml
             echo "Rendered $(wc -l < /tmp/rendered-production-digest.yaml) lines"
 
@@ -703,7 +729,10 @@ jobs:
             grep -qE 'ghcr\.io/dorring/mecrm/agents@sha256:' /tmp/rendered-production-digest.yaml || {
               echo "FATAL: production digest-mode render missing ghcr.io/dorring/mecrm/agents@sha256:" >&2; exit 1;
             }
-            if grep -q 'enterprise-crm/gateway@sha256:\|enterprise-crm/frontend@sha256:\|enterprise-crm/agents@sha256:' /tmp/rendered-production-digest.yaml; then
+            grep -qE 'ghcr\.io/dorring/mecrm/migrate@sha256:' /tmp/rendered-production-digest.yaml || {
+              echo "FATAL: production digest-mode render missing ghcr.io/dorring/mecrm/migrate@sha256:" >&2; exit 1;
+            }
+            if grep -q 'enterprise-crm/gateway@sha256:\|enterprise-crm/frontend@sha256:\|enterprise-crm/agents@sha256:\|enterprise-crm/migrate@sha256:' /tmp/rendered-production-digest.yaml; then
               echo "FATAL: production digest-mode render contains enterprise-crm/{service}@sha256 (default repo instead of ghcr.io)" >&2; exit 1;
             fi
             echo "OK: production digest-mode render correct"
@@ -734,6 +763,9 @@ jobs:
           - project: agents
             dockerfile: agents/Dockerfile
             context: agents
+          - project: migrate
+            dockerfile: database/Dockerfile.migrate
+            context: .
     steps:
       - uses: actions/checkout@v4
 
@@ -897,7 +929,21 @@ jobs:
 
           echo "Trivy JSON written: trivy-results-${{ matrix.project }}.json"
 
-          # Pass 3: actionable CRITICAL-only gate.
+          # Pass 3: CycloneDX SBOM (report-only, before CRITICAL gate so the
+          # SBOM artifact is always produced even when the gate fails).
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$(pwd):/workspace" \
+            -w /workspace \
+            "${TRIVY_IMAGE}" \
+            image \
+            --format cyclonedx \
+            --output "sbom-${{ matrix.project }}.cdx.json" \
+            "${IMAGE_FULL}"
+
+          echo "SBOM written: sbom-${{ matrix.project }}.cdx.json"
+
+          # Pass 4: actionable CRITICAL-only gate.
           # Fail only CRITICAL vulnerabilities with an upstream fix available.
           # Unfixed/fix_deferred CRITICAL CVEs remain visible in SARIF/JSON
           # artifacts and GitHub Security, but do not block main while the base
@@ -939,31 +985,11 @@ jobs:
           sarif_file: trivy-results-${{ matrix.project }}.sarif
           category: trivy-${{ matrix.project }}
 
-      # -- Group G G2 PR1: extract CycloneDX SBOM from image ------------
-      - name: Extract CycloneDX SBOM
-        id: sbom
-        env:
-          IMAGE_NAME: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.project }}
-          TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.59.1
-        run: |
-          set -euo pipefail
-          IMAGE_FULL="$(printf '%s' "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')@${{ steps.build-push.outputs.digest }}"
-          echo "Extracting SBOM from: ${IMAGE_FULL}"
-
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$(pwd):/workspace" \
-            -w /workspace \
-            "${TRIVY_IMAGE}" \
-            image \
-            --format cyclonedx \
-            --output "sbom-${{ matrix.project }}.cdx.json" \
-            "${IMAGE_FULL}"
-
-          echo "SBOM written: sbom-${{ matrix.project }}.cdx.json"
-
+      # -- Group G G2 PR1: upload CycloneDX SBOM artifact ------------
+      # SBOM is generated in Pass 3 of "Trivy scan image" (before the
+      # CRITICAL gate) so it always exists even when the gate fails.
       - name: Upload SBOM artifact
-        if: always() && steps.sbom.outcome != 'skipped'
+        if: always() && steps.trivy.outcome != 'skipped'
         uses: actions/upload-artifact@v4
         with:
           name: sbom-${{ matrix.project }}
@@ -996,6 +1022,9 @@ jobs:
           - project: agents
             dockerfile: agents/Dockerfile
             context: agents
+          - project: migrate
+            dockerfile: database/Dockerfile.migrate
+            context: .
     steps:
       - uses: actions/checkout@v4
 
@@ -1050,7 +1079,19 @@ jobs:
             --output "trivy-results-${{ matrix.project }}.json" \
             "${IMAGE_TAG}"
 
-          # Pass 3: actionable CRITICAL gate.
+          # Pass 3: CycloneDX SBOM (report-only, before CRITICAL gate so the
+          # SBOM artifact is always produced even when the gate fails).
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$(pwd):/workspace" \
+            -w /workspace \
+            "${TRIVY_IMAGE}" \
+            image \
+            --format cyclonedx \
+            --output "sbom-${{ matrix.project }}.cdx.json" \
+            "${IMAGE_TAG}"
+
+          # Pass 4: actionable CRITICAL gate.
           # Fail only CRITICAL vulnerabilities with an upstream fix available.
           # Unfixed/fix_deferred CRITICAL CVEs remain visible in SARIF/JSON
           # artifacts, but do not block PRs while the base image vendor has no
@@ -1065,17 +1106,6 @@ jobs:
             --ignore-unfixed \
             --exit-code 1 \
             --format table \
-            "${IMAGE_TAG}"
-
-          # SBOM from local image
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$(pwd):/workspace" \
-            -w /workspace \
-            "${TRIVY_IMAGE}" \
-            image \
-            --format cyclonedx \
-            --output "sbom-${{ matrix.project }}.cdx.json" \
             "${IMAGE_TAG}"
 
       - name: Upload Trivy SARIF artifact
@@ -1127,7 +1157,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          REQUIRED_PROJECTS="gateway frontend agents"
+          REQUIRED_PROJECTS="gateway frontend agents migrate"
           for p in $REQUIRED_PROJECTS; do
             f="digests/digest-${p}.json"
             test -f "$f" || { echo "FATAL: missing digest artifact for $p" >&2; exit 1; }
@@ -1230,6 +1260,8 @@ jobs:
           FE_DIGEST=$(jq -r '.frontend.digest' /tmp/digest-map/digest-map.json)
           AG_IMAGE=$(jq -r '.agents.image' /tmp/digest-map/digest-map.json)
           AG_DIGEST=$(jq -r '.agents.digest' /tmp/digest-map/digest-map.json)
+          MG_IMAGE=$(jq -r '.migrate.image' /tmp/digest-map/digest-map.json)
+          MG_DIGEST=$(jq -r '.migrate.digest' /tmp/digest-map/digest-map.json)
           helm upgrade --install enterprise-crm ./deploy/helm/enterprise-crm \
             --namespace crm-staging \
             --create-namespace \
@@ -1240,6 +1272,8 @@ jobs:
             --set-string images.frontend.digest="${FE_DIGEST}" \
             --set-string images.agents.repository="${AG_IMAGE}" \
             --set-string images.agents.digest="${AG_DIGEST}" \
+            --set-string migration.image.repository="${MG_IMAGE}" \
+            --set-string migration.image.digest="${MG_DIGEST}" \
             --wait --timeout 10m
 
   # Integration tests on staging. Runs only when the staging API is actually
@@ -1343,6 +1377,8 @@ jobs:
           FE_DIGEST=$(jq -r '.frontend.digest' /tmp/digest-map/digest-map.json)
           AG_IMAGE=$(jq -r '.agents.image' /tmp/digest-map/digest-map.json)
           AG_DIGEST=$(jq -r '.agents.digest' /tmp/digest-map/digest-map.json)
+          MG_IMAGE=$(jq -r '.migrate.image' /tmp/digest-map/digest-map.json)
+          MG_DIGEST=$(jq -r '.migrate.digest' /tmp/digest-map/digest-map.json)
           helm upgrade --install enterprise-crm ./deploy/helm/enterprise-crm \
             --namespace crm-production \
             --create-namespace \
@@ -1353,6 +1389,8 @@ jobs:
             --set-string images.frontend.digest="${FE_DIGEST}" \
             --set-string images.agents.repository="${AG_IMAGE}" \
             --set-string images.agents.digest="${AG_DIGEST}" \
+            --set-string migration.image.repository="${MG_IMAGE}" \
+            --set-string migration.image.digest="${MG_DIGEST}" \
             --wait --timeout 15m
 
       - name: Notify deployment
