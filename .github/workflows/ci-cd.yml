@@ -1395,7 +1395,7 @@ jobs:
 
       - name: Notify deployment
         if: ${{ env.SKIP_REMAINING != 'true' }}
-        uses: slackapi/slack-github-action@v2.0.0
+        uses: slackapi/slack-github-action@v3.0.5
         with:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
