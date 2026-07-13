@@ -11,7 +11,7 @@ langchain-ollama>=0.0.1
 
 # Async
 asyncio
-aiohttp>=3.9.0
+aiohttp>=3.14.1
 
 # Kafka
 aiokafka>=0.10.0
@@ -25,7 +25,7 @@ weaviate-client>=4.4.0
 
 # HTTP
 httpx>=0.26.0
-fastapi>=0.110.0
+fastapi>=0.139.0
 uvicorn[standard]>=0.27.0
 
 # Redis
