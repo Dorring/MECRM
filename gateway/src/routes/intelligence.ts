@@ -4,7 +4,7 @@ import { body, validationResult } from 'express-validator';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { badRequest } from '../middleware/errorHandler';
 import { publishEvent, TOPICS } from '../services/kafka';
-import { v4 as uuidv4 } from 'uuid';
+import { uuidv4 } from '../utils/uuid';
 
 const router = Router();
 

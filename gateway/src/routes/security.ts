@@ -1,6 +1,6 @@
 import { Router, Response } from 'express';
 import { body, validationResult } from 'express-validator';
-import { v4 as uuidv4 } from 'uuid';
+import { uuidv4 } from '../utils/uuid';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { badRequest, forbidden } from '../middleware/errorHandler';
 import { publishEvent, TOPICS } from '../services/kafka';

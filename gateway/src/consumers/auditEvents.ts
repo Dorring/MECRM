@@ -1,7 +1,7 @@
 import { createConsumer, startConsumer, TOPICS } from '../services/kafka';
 import { logger } from '../utils/logger';
 import { withTenantDb } from '../services/prisma';
-import { v5 as uuidv5 } from 'uuid';
+import { uuidv5 } from '../utils/uuid';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const NAMESPACE = '00000000-0000-0000-0000-000000000001';

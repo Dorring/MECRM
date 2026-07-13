@@ -6,7 +6,7 @@ import cookieParser from 'cookie-parser';
 import rateLimit from 'express-rate-limit';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
-import { v4 as uuidv4 } from 'uuid';
+import { uuidv4 } from './utils/uuid';
 
 import { logger } from './utils/logger';
 import { errorHandler } from './middleware/errorHandler';

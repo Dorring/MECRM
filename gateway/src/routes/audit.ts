@@ -1,7 +1,7 @@
 import { Router, Response } from 'express';
 import axios from 'axios';
 import { body, query, validationResult } from 'express-validator';
-import { v4 as uuidv4 } from 'uuid';
+import { uuidv4 } from '../utils/uuid';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { badRequest } from '../middleware/errorHandler';
 import { publishEvent, TOPICS } from '../services/kafka';
