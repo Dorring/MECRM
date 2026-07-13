@@ -10,7 +10,7 @@
 # G3a: enhanced from the original docker-compose-only image (which relied on
 # volume mounts for /database/migrations and /scripts/migrate.sh) to support
 # the Helm pre-upgrade migration Job.
-FROM node:20-bullseye-slim
+FROM node:26-bullseye-slim
 
 RUN apt-get update \
   && apt-get upgrade -y \
