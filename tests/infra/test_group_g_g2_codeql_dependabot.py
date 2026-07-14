@@ -162,19 +162,31 @@ class TestDependabotConfig(unittest.TestCase):
         self.assertTrue(expected.issubset(docker_dirs),
                         f"G2-31: Dependabot Docker must cover {expected}, got {docker_dirs}")
 
-    def test_pr_limit_is_5(self):
+    def test_pr_limit_is_3(self):
         for u in self.data.get("updates", []):
             limit = u.get("open-pull-requests-limit")
-            self.assertEqual(limit, 5,
-                             f"G2-32: {u.get('directory')} PR limit must be 5, got {limit}")
+            self.assertEqual(limit, 3,
+                             f"G2-32: {u.get('directory')} PR limit must be 3, got {limit}")
 
-    def test_groups_minor_patch_not_major(self):
+    def test_only_github_actions_groups_major_updates(self):
         for u in self.data.get("updates", []):
             groups = u.get("groups", {})
             for group_name, group_config in groups.items():
                 update_types = group_config.get("update-types", [])
-                self.assertNotIn("major", update_types,
-                                 f"G2-33: {u.get('directory')} group '{group_name}' must not include major")
+                if u.get("package-ecosystem") == "github-actions":
+                    self.assertIn("major", update_types)
+                else:
+                    self.assertNotIn("major", update_types,
+                                     f"G2-33: {u.get('directory')} group '{group_name}' must not include major")
+
+    def test_frontend_defers_unplanned_toolchain_majors(self):
+        frontend = next(u for u in self.data.get("updates", [])
+                        if u.get("package-ecosystem") == "npm"
+                        and u.get("directory") == "/frontend")
+        ignored = {item.get("dependency-name"): item.get("versions", [])
+                   for item in frontend.get("ignore", [])}
+        self.assertIn(">=10", ignored.get("eslint", []))
+        self.assertIn(">=4", ignored.get("tailwindcss", []))
 
     def test_dependabot_has_security_label(self):
         for u in self.data.get("updates", []):
