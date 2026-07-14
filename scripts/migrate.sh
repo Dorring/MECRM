@@ -72,6 +72,7 @@ fi
 
 : "${POSTGRES_USER:=crm_user}"
 : "${POSTGRES_PASSWORD:=crm_password}"
+: "${CRM_APP_PASSWORD:?CRM_APP_PASSWORD is required}"
 : "${POSTGRES_HOST:=localhost}"
 : "${POSTGRES_PORT:=5432}"
 : "${POSTGRES_DB:=enterprise_crm}"
@@ -296,6 +297,17 @@ run_sql_migrations() {
   done
 }
 
+sync_crm_app_password() {
+  require psql
+  log "Synchronizing crm_app role password from CRM_APP_PASSWORD"
+  PGPASSWORD="${POSTGRES_PASSWORD}" psql \
+    -v ON_ERROR_STOP=1 \
+    -v crm_app_password="${CRM_APP_PASSWORD}" \
+    -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT}" \
+    -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" <<'SQL'
+ALTER ROLE crm_app PASSWORD :'crm_app_password';
+SQL
+}
 # ---------------------------------------------------------------------------
 # Schema drift and RLS enforcement audit
 # ---------------------------------------------------------------------------
@@ -342,7 +354,11 @@ detect_drift() {
       printf '  - EXTRA: %s\n' "${t}"; extra_reported=$((extra_reported+1))
     fi
   done <<< "${db_tables}"
-  [[ ${extra_reported} -eq 0 ]] && log "  (none beyond known raw-SQL tables)"
+  if [[ ${extra_reported} -eq 0 ]]; then
+    log "  (none beyond known raw-SQL tables)"
+  else
+    warn "${extra_reported} non-MECRM tables detected; informational in the shared Keycloak database"
+  fi
 
   # RLS enforcement audit: tenant tables missing ENABLE/FORCE or policy.
   log "RLS enforcement audit (tenant tables missing ENABLE, FORCE, or policy):"
@@ -351,12 +367,12 @@ detect_drift() {
   tenant_list=$(printf "'%s'," "${TENANT_TABLES[@]}")
   tenant_list="${tenant_list%,}"
 
-  rls_issues=$(PGPASSWORD="${POSTGRES_PASSWORD}" psql -At \
+  if ! rls_issues=$(PGPASSWORD="${POSTGRES_PASSWORD}" psql -At \
       -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT}" \
       -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
       -c "
         WITH tenant_tables AS (
-          SELECT c.oid, c.relname
+          SELECT c.oid, c.relname, c.relrowsecurity, c.relforcerowsecurity
           FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
           WHERE n.nspname = 'public' AND c.relkind = 'r'
             AND c.relname IN (${tenant_list})
@@ -365,7 +381,7 @@ detect_drift() {
           SELECT pc.relname,
                  pc.relrowsecurity AS enabled,
                  pc.relforcerowsecurity AS forced,
-                 bool_or(p.polcmd = '*') AS has_all_policy,
+                 COALESCE(bool_or(p.polcmd = '*'), false) AS has_all_policy,
                  bool_or(p.polpermissive) AS has_permissive_policy
           FROM tenant_tables pc
           LEFT JOIN pg_policy p ON p.polrelid = pc.oid
@@ -376,7 +392,10 @@ detect_drift() {
                ' all_policy=' || CASE WHEN has_all_policy THEN 'yes' ELSE 'no' END
         FROM policy_check
         WHERE NOT (enabled AND forced AND has_all_policy)
-        ORDER BY relname;" 2>/dev/null || true)
+        ORDER BY relname;" 2>&1); then
+    err "RLS enforcement audit query failed: ${rls_issues}"
+    return 1
+  fi
 
   local rls_failed=0
   if [[ -n "${rls_issues}" ]]; then
@@ -386,7 +405,7 @@ detect_drift() {
     log "  (all tenant tables have ENABLE+FORCE+ALL policy)"
   fi
 
-  if [[ ${missing} -gt 0 || ${extra_reported} -gt 0 || ${rls_failed} -gt 0 ]]; then
+  if [[ ${missing} -gt 0 || ${rls_failed} -gt 0 ]]; then
     if [[ "${AUDIT_WARN:-0}" == "1" ]]; then
       warn "drift/RLS issues detected (--audit-warn enabled; exiting 0)"
       return 0
@@ -428,6 +447,7 @@ acquire_and_hold_lock
 
 [[ ${SKIP_PRISMA} -eq 0 ]] && run_prisma_migrate || warn "skipping Prisma step (--skip-prisma)"
 run_sql_migrations
+sync_crm_app_password
 detect_drift
 
 log "Migration complete."

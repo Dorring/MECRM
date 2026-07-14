@@ -26,7 +26,7 @@ RUN addgroup --system --gid 1001 app && \
 # pip --user installs to /root/.local/lib/python*/site-packages and
 # /root/.local/bin.  After COPY to /home/app/.local, Python auto-discovers
 # the packages because the app user's home is /home/app and Python adds
-# ~/.local/lib/python3.11/site-packages to sys.path at startup.
+# ~/.local/lib/python3.14/site-packages to sys.path at startup.
 COPY --from=builder --chown=app:app /root/.local /home/app/.local
 
 # Runtime source (selective -- no tests, scripts, or tooling)

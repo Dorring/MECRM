@@ -163,11 +163,11 @@ class TestCIMetricsArtifactName(unittest.TestCase):
                 return s
         self.fail("Upload image metrics artifact step not found")
 
-    def test_uses_upload_artifact_v4(self):
+    def test_uses_current_upload_artifact_major(self):
         step = self._get_upload_step()
         uses = step.get("uses", "")
-        self.assertEqual(uses, "actions/upload-artifact@v4",
-                         "F3-M4: must use actions/upload-artifact@v4")
+        self.assertEqual(uses, "actions/upload-artifact@v7",
+                         "F3-M4: metrics must use the reviewed upload-artifact major")
 
     def test_artifact_name_is_per_project(self):
         step = self._get_upload_step()

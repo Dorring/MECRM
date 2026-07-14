@@ -146,6 +146,12 @@ class TestMigrateService(unittest.TestCase):
             "migrate must run the full 00-12 sequence",
         )
 
+    def test_type_convergence_excludes_keycloak_metadata(self):
+        with open("database/migrations/12-type-convergence.sql", encoding="utf-8") as f:
+            guard = f.read()
+        self.assertIn("'databasechangelog'", guard)
+        self.assertIn("'databasechangeloglock'", guard)
+        self.assertIn("data_type IN ('timestamp without time zone', 'timestamp')", guard)
     def test_migrate_runs_rls_verification(self):
         script = self.migrate_script
         self.assertIn(
@@ -442,6 +448,30 @@ class TestMigrateRlsFailsOnViolation(unittest.TestCase):
         )
         self.assertIn("exit 1", script)
 
+    def test_shared_database_extra_tables_are_informational(self):
+        self.assertIn(
+            "non-MECRM tables detected; informational in the shared Keycloak database",
+            self.migrate_script,
+        )
+        self.assertIn(
+            "if [[ ${missing} -gt 0 || ${rls_failed} -gt 0 ]]",
+            self.migrate_script,
+        )
+        self.assertNotIn(
+            "if [[ ${missing} -gt 0 || ${extra_reported} -gt 0 || ${rls_failed} -gt 0 ]]",
+            self.migrate_script,
+        )
+    def test_crm_app_password_is_injected_and_synchronized(self):
+        env = " ".join(_env_list(self.migrate))
+        self.assertIn("CRM_APP_PASSWORD", env)
+        self.assertIn("CRM_APP_PASSWORD is required", env)
+        self.assertIn('-v crm_app_password="${CRM_APP_PASSWORD}"', self.migrate_script)
+        self.assertIn("sync_crm_app_password", self.migrate_script)
+
+        with open("database/migrations/02-rls-policies.sql", encoding="utf-8") as f:
+            rls_sql = f.read()
+        self.assertNotIn("PASSWORD 'crm_password'", rls_sql)
+        self.assertIn("CREATE ROLE crm_app LOGIN NOSUPERUSER", rls_sql)
     def test_migrate_command_does_not_embed_rls_sql(self):
         """The compose command must delegate to the script; RLS logic lives in the script."""
         cmd = _command_str(self.migrate)
@@ -452,6 +482,41 @@ class TestMigrateRlsFailsOnViolation(unittest.TestCase):
             "in docker-compose.yml command",
         )
 
+    def test_rls_query_projects_security_flags(self):
+        self.assertIn(
+            "SELECT c.oid, c.relname, c.relrowsecurity, c.relforcerowsecurity",
+            self.migrate_script,
+        )
+
+    def test_rls_query_failure_is_not_suppressed(self):
+        self.assertNotIn(
+            'ORDER BY relname;" 2>/dev/null || true)',
+            self.migrate_script,
+        )
+        self.assertIn("RLS enforcement audit query failed", self.migrate_script)
+
+    def test_missing_policy_is_reported(self):
+        self.assertIn(
+            "COALESCE(bool_or(p.polcmd = '*'), false) AS has_all_policy",
+            self.migrate_script,
+        )
+
+
+class TestLinuxScriptLineEndings(unittest.TestCase):
+    def test_kafka_init_uses_lf_only(self):
+        with open("scripts/kafka-init.sh", "rb") as script:
+            self.assertNotIn(b"\r\n", script.read())
+
+
+class TestKafkaExporterStartup(unittest.TestCase):
+    def test_waits_for_healthy_broker_and_restarts(self):
+        """Cold starts must not leave kafka-exporter exited with code 255."""
+        exporter = _load_compose()["services"]["kafka-exporter"]
+        self.assertEqual(exporter.get("restart"), "unless-stopped")
+        self.assertEqual(
+            exporter["depends_on"]["kafka"]["condition"],
+            "service_healthy",
+        )
 
 class TestTestGatewayService(unittest.TestCase):
     """A dedicated test service must exist (gateway final image can't run Jest)."""
