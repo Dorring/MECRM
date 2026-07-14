@@ -12,12 +12,12 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
     labels: [dependencies, security, ci]
     groups:
       github-actions:
         patterns: ['*']
-        update-types: [minor, patch]
+        update-types: [major, minor, patch]
     commit-message:
       prefix: chore(ci)
 
@@ -26,8 +26,8 @@ updates:
     directory: /gateway
     schedule:
       interval: weekly
-      day: monday
-    open-pull-requests-limit: 5
+      day: tuesday
+    open-pull-requests-limit: 3
     labels: [dependencies, security, gateway]
     groups:
       gateway-npm:
@@ -41,13 +41,18 @@ updates:
     directory: /frontend
     schedule:
       interval: weekly
-      day: monday
-    open-pull-requests-limit: 5
+      day: wednesday
+    open-pull-requests-limit: 3
     labels: [dependencies, security, frontend]
     groups:
       frontend-npm:
         patterns: ['*']
         update-types: [minor, patch]
+    ignore:
+      - dependency-name: eslint
+        versions: [">=10"]
+      - dependency-name: tailwindcss
+        versions: [">=4"]
     commit-message:
       prefix: chore(deps)
 
@@ -56,8 +61,8 @@ updates:
     directory: /agents
     schedule:
       interval: weekly
-      day: monday
-    open-pull-requests-limit: 5
+      day: thursday
+    open-pull-requests-limit: 3
     labels: [dependencies, security, agents]
     groups:
       agents-pip:
@@ -87,8 +92,8 @@ updates:
     directory: /gateway
     schedule:
       interval: weekly
-      day: monday
-    open-pull-requests-limit: 5
+      day: friday
+    open-pull-requests-limit: 3
     labels: [dependencies, security, docker, gateway]
     groups:
       gateway-docker:
@@ -102,8 +107,8 @@ updates:
     directory: /frontend
     schedule:
       interval: weekly
-      day: monday
-    open-pull-requests-limit: 5
+      day: friday
+    open-pull-requests-limit: 3
     labels: [dependencies, security, docker, frontend]
     groups:
       frontend-docker:
@@ -117,8 +122,8 @@ updates:
     directory: /agents
     schedule:
       interval: weekly
-      day: monday
-    open-pull-requests-limit: 5
+      day: friday
+    open-pull-requests-limit: 3
     labels: [dependencies, security, docker, agents]
     groups:
       agents-docker:
@@ -132,8 +137,8 @@ updates:
     directory: /database
     schedule:
       interval: weekly
-      day: monday
-    open-pull-requests-limit: 5
+      day: friday
+    open-pull-requests-limit: 3
     labels: [dependencies, security, docker, database]
     groups:
       db-docker:
