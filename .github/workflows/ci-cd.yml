@@ -260,7 +260,7 @@ jobs:
           DATABASE_URL: postgresql://test:test@localhost:5432/test_db
           POSTGRES_USER: test
           POSTGRES_PASSWORD: test
-          CRM_APP_PASSWORD: test
+          CRM_APP_PASSWORD: crm_password
           POSTGRES_HOST: localhost
           POSTGRES_PORT: "5432"
           POSTGRES_DB: test_db
