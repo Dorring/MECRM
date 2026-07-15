@@ -1,467 +1,217 @@
-<div align="center">
+# Multi-Agent Enterprise CRM
 
-# 🚀 Multi-Agent Enterprise CRM
+An AI-native CRM portfolio project that demonstrates how an application can
+combine agent workflows with tenant isolation, human approval, event-driven
+processing, and measurable operational safeguards.
 
-### **AI-Native • Event-Driven • Multi-Tenant • Enterprise-Grade**
+> Current deployment target: local Docker Desktop. The project is
+> production-minded engineering work, not a claim of a completed cloud
+> production deployment.
 
-[![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](https://choosealicense.com/licenses/mit/)
-[![Docker](https://img.shields.io/badge/Docker-Ready-blue?logo=docker)](https://www.docker.com/)
-[![Kubernetes](https://img.shields.io/badge/Kubernetes-Enabled-326CE5?logo=kubernetes&logoColor=white)](https://kubernetes.io/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Next.js](https://img.shields.io/badge/Next.js-14-black?logo=next.js)](https://nextjs.org/)
+## Why this project exists
 
-<br/>
+The business problem is not simply "add a chat box to a CRM." Sales and support
+teams need recommendations that are grounded in tenant-owned data, actions that
+remain reviewable by humans, and an audit trail that explains what the system
+did without exposing private reasoning or other customers' data.
 
-> ⚠️ **Under Active Development** — This project is being actively built with enterprise-grade features. Contributions welcome!
+This repository demonstrates that boundary:
 
-<br/>
+- **AI workflows:** LangGraph-based agents for support, knowledge, sales,
+  analytics, automation, compliance, and search.
+- **Grounded interactions:** Weaviate-backed retrieval and structured output
+  validation before a model result can affect downstream work.
+- **Human control:** OPA policy decisions, approval queues, kill switches, and
+  audit records for higher-risk actions.
+- **Tenant safety:** PostgreSQL row-level security (RLS), tenant context, and
+  cross-tenant regression tests.
+- **Reliable operations:** Kafka events, transactional outbox patterns,
+  idempotent consumers, replay utilities, health checks, CI, SBOM, and Trivy
+  image scanning.
 
-<img src="./assets/readme.png" width="200" alt="Multi-Agent Enterprise CRM" />
+## Start here
 
-**A production-grade, AI-native CRM where intelligent agents work alongside humans to automate sales, support, and compliance workflows with complete auditability and governance.**
+| If you want to... | Start with |
+|---|---|
+| Understand the architecture | [Architecture overview](docs/interview/architecture.md) |
+| Run the application locally | [Quick start](#quick-start) |
+| See the intended interview demo | [Demo script](docs/interview/demo-script.md) |
+| Review design decisions | [Engineering trade-offs](docs/interview/engineering-tradeoffs.md) |
+| See stated limitations | [Limitations](docs/interview/limitations.md) |
+| Prepare technical discussion | [Interview Q&A](docs/interview/interview-qa.md) |
+| Follow the optimisation work | [Interview readiness plan](docs/interview-readiness-execution-plan.md) |
 
-[Features](#-key-features) •
-[Architecture](#%EF%B8%8F-architecture) •
-[Quick Start](#-quick-start) •
-[AI Agents](#-ai-agents) •
-[Enterprise Capabilities](#-enterprise-capabilities) •
-[Documentation](#-documentation)
+## Architecture at a glance
 
-</div>
-
----
-
-## ✨ Key Features
-
-<table>
-<tr>
-<td width="50%">
-
-### 🤖 AI-Native Design
-
-- **Autonomous Agents** — Sales, Support, Compliance & Analytics agents as first-class system actors
-- **LangGraph Orchestration** — Sophisticated multi-step agent workflows
-- **Ollama Integration** — Privacy-first local LLM powered by Llama 3.1
-- **Vector Search** — Semantic search with Weaviate for intelligent retrieval
-
-</td>
-<td width="50%">
-
-### 🔄 Event-Driven Architecture
-
-- **Apache Kafka** — Real-time event streaming backbone (KRaft mode)
-- **CQRS + Event Sourcing** — Separate read/write paths with full history
-- **Transactional Outbox** — Reliable exactly-once event publishing
-- **Time-Travel Debugging** — Replay events and rebuild state at any point
-
-</td>
-</tr>
-<tr>
-<td width="50%">
-
-### 🔐 Enterprise Security
-
-- **Multi-Tenant Isolation** — Row-Level Security (RLS) at database level
-- **Zero Trust Architecture** — OPA-based RBAC + ABAC policies
-- **Kill Switch & Governance** — Emergency agent controls with full audit trail
-- **GDPR Compliance** — Data erasure, export, and retention policies
-
-</td>
-<td width="50%">
-
-### 👥 Human-in-the-Loop
-
-- **Approval Workflows** — Human oversight for high-risk AI actions
-- **Explainable AI** — Every agent decision is recorded and explainable
-- **Reversible Actions** — Full audit trail with rollback capabilities
-- **Governance Dashboard** — Real-time monitoring of AI behavior
-
-</td>
-</tr>
-</table>
-
----
-
-## 🏗️ Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          🌐 PRESENTATION LAYER                               │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │                    Next.js 14 + Tailwind CSS                         │    │
-│  │     Real-time Dashboard • Event Timeline • Governance Console        │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-└───────────────────────────────────┬─────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          🚪 API GATEWAY LAYER                                │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │              Node.js + Express + TypeScript + OpenTelemetry          │    │
-│  │    Auth • Rate Limiting • Secure Cache • Tenant Context • Routing    │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-└───────────────────────────────────┬─────────────────────────────────────────┘
-                                    │
-                    ┌───────────────┼───────────────┐
-                    ▼               ▼               ▼
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                      🧠 AI AGENT LAYER (LangGraph + Ollama)                   │
-│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐         │
-│  │    Sales     │ │   Support    │ │  Compliance  │ │  Analytics   │         │
-│  │    Agent     │ │    Agent     │ │    Agent     │ │    Agent     │         │
-│  └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘         │
-│  ┌──────────────────────────────────────────────────────────────────┐        │
-│  │  Kill Switch • Explainability Engine • Agent Telemetry • OPA     │        │
-│  └──────────────────────────────────────────────────────────────────┘        │
-└───────────────────────────────────┬───────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                       📡 EVENT STREAMING LAYER                                 │
-│  ┌─────────────────────────────────────────────────────────────────────┐     │
-│  │             Apache Kafka • Transactional Outbox • Schema Registry    │     │
-│  │        Circuit Breaker • Idempotent Consumers • Event Contracts      │     │
-│  └─────────────────────────────────────────────────────────────────────┘     │
-└───────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                        💾 DATA & INFRASTRUCTURE                                │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────────────┐     │
-│  │ PostgreSQL  │ │    Redis    │ │  Weaviate   │ │        OPA          │     │
-│  │  16 + RLS   │ │ Secure Cache│ │  (Vectors)  │ │  (Policy Engine)    │     │
-│  └─────────────┘ └─────────────┘ └─────────────┘ └─────────────────────┘     │
-│  ┌─────────────────────────────────────────────────────────────────────┐     │
-│  │         Prometheus • Grafana • OpenTelemetry • Loki                  │     │
-│  └─────────────────────────────────────────────────────────────────────┘     │
-└───────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    UI["Next.js frontend"] --> Gateway["Express gateway"]
+    Gateway --> DB["PostgreSQL + RLS"]
+    Gateway --> Kafka["Kafka"]
+    Kafka --> Agents["Python / LangGraph agents"]
+    Agents --> Policy["OPA policy engine"]
+    Agents --> Vector["Weaviate retrieval"]
+    Agents --> Redis["Redis: cache, approval state, revocation"]
+    Gateway --> Audit["Audit and approval records"]
+    Agents --> Audit
 ```
 
----
+The frontend communicates with the gateway only. The gateway owns public API
+validation, authentication, and tenant context. Agent workflows consume events,
+call tenant-scoped tools, consult policy, and create auditable outcomes. RLS is
+the final enforcement layer for tenant-scoped database access.
 
-## 🚀 Quick Start
+## Quick start
 
 ### Prerequisites
 
-| Requirement | Version |
-|-------------|---------|
-| Docker & Docker Compose | Latest |
-| Node.js | 20+ |
-| Python | 3.11+ |
-| Git | Latest |
+- Docker Desktop running
+- Git
+- Optional for source-level development: Node.js 24+ and Python 3.11+
 
-### 🐳 One-Command Setup
+The default stack does **not** download or start Ollama. Local LLM inference is
+an explicit opt-in, described in [Local LLM mode](#local-llm-mode).
 
-```bash
-# Clone the repository
-git clone https://github.com/Mrgig7/Multi-Agent-Enterprise-CRM.git
-cd Multi-Agent-Enterprise-CRM
+### 1. Configure local secrets
 
-# Copy environment configuration
-cp .env.example .env
-
-# Launch the entire stack
-docker-compose up -d
-
-# Run database migrations
-docker-compose exec gateway npx prisma migrate deploy
-
-# Apply RLS policies
-docker-compose exec postgres psql -U crm_user -d enterprise_crm -f /docker-entrypoint-initdb.d/02-rls-policies.sql
+```powershell
+Copy-Item .env.example .env
 ```
 
-### 🌐 Access Points
+For a local environment, set at least the following values in `.env` before
+starting the stack. Use unique, non-default values if the machine is shared.
 
-| Service | URL | Credentials |
-|---------|-----|-------------|
-| **Frontend** | http://localhost:3000 | — |
-| **API Gateway** | http://localhost:4000 | — |
-| **Kafka UI** | http://localhost:8080 | — |
-| **Grafana** | http://localhost:3001 | admin / admin |
-| **Keycloak** | http://localhost:8081 | admin / admin |
-| **Weaviate** | http://localhost:8082 | — |
-| **OPA** | http://localhost:8181 | — |
-
----
-
-## 🤖 AI Agents
-
-Our AI agents are built with **LangGraph** for orchestration and **Ollama** running **Llama 3.1** locally for privacy-first inference.
-
-</td>
-</tr>
-<tr>
-<td align="center" width="25%">
-
-### 📚 Knowledge Agent
-
-**Self-Growing Documentation**
-
-- Auto-generates KB drafts from resolved tickets
-- Summarizes support conversations
-- Human approval workflow
-- Weaviate-embedded semantic search
-
-</td>
-<td align="center" width="25%">
-
-### 💼 Sales Agent
-
-**Lead Qualification & Scoring**
-
-- Analyzes lead behavior patterns
-- Predicts conversion probability
-- Suggests next-best-action
-- Automates follow-up sequences
-
-</td>
-<td align="center" width="25%">
-
-### 🎧 Support Agent
-
-**Intelligent Ticket Triage**
-
-- Auto-categorizes incoming tickets
-- Suggests knowledge base articles
-- Routes to specialist teams
-- Tracks SLA compliance
-
-</td>
-<td align="center" width="25%">
-
-### ⚖️ Compliance Agent
-
-**Policy Enforcement**
-
-- Validates data handling policies
-- Performs risk assessments
-- Generates audit trails
-- Monitors regulatory compliance
-
-</td>
-</tr>
-<tr>
-<td align="center" width="25%">
-
-### 📊 Analytics Agent
-
-**Business Intelligence**
-
-- Identifies trends and patterns
-- Detects anomalies in data
-- Generates predictive insights
-- Creates automated reports
-
-</td>
-</tr>
-</table>
-
----
-
-## 🏢 Enterprise Capabilities
-
-### 🔒 Multi-Tenant Security
-- **Row-Level Security** — Complete tenant isolation at database level
-- **100% Cross-Tenant Access Blocked** — Verified in CI with penetration tests
-- **OPA Policy Engine** — Declarative RBAC + ABAC policies
-- **Keycloak Integration** — Enterprise SSO with OAuth2/OIDC
-
-### 🕐 Event Sourcing & Replay
-- **Complete Event History** — Every state change captured
-- **Time-Travel UI** — Interactive timeline with state diff viewer
-- **Aggregate Rebuild** — Reconstruct any entity at any point in time
-- **Snapshot Optimization** — Fast checkpoint recovery
-
-### 🛡️ AI Governance
-- **Kill Switch** — Emergency stop for any agent (global, tenant, or individual)
-- **Approval Workflows** — Human oversight for high-risk actions
-- **Explainability Engine** — Full decision audit with reasoning chain
-- **Agent Telemetry** — Prometheus metrics for latency, errors, policy violations
-
-### 🧾 GDPR & Compliance
-- **Forget Customer** — Complete data erasure with audit trail
-- **Data Export** — Full DSAR-compliant data portability
-- **Retention Policies** — Configurable per-tenant, per-entity
-- **PII Classification** — Automatic sensitive data handling
-
-### 💥 Chaos Engineering
-- **Kafka Failure Recovery** — Graceful degradation and auto-recovery
-- **Circuit Breakers** — Per-dependency with automatic recovery
-- **Idempotent Consumers** — Exactly-once processing semantics
-- **Chaos Test Suite** — Automated reliability verification
-
-### 🌍 Disaster Recovery
-- **Documented RPO/RTO** — 5 min RPO, 30 min RTO targets
-- **Backup & Restore** — Full database and event store backup
-- **Read Model Rebuild** — Deterministic state reconstruction
-- **Integrity Validation** — Automated checksum verification
-
----
-
-## 🛠️ Technology Stack
-
-### Application Layer
-
-| Component | Technology | Purpose |
-|-----------|------------|---------|
-| Frontend | **Next.js 14** + Tailwind CSS | Modern React with SSR/SSG |
-| API Gateway | **Node.js** + Express + TypeScript | Routing, auth, rate limiting |
-| AI Engine | **LangGraph** + Ollama (Llama 3.1) | Agent orchestration + local LLM |
-| Core Services | **Python 3.11** + asyncpg | Event processing, governance |
-
-### Data Layer
-
-| Component | Technology | Purpose |
-|-----------|------------|---------|
-| Primary DB | **PostgreSQL 16** + RLS | Transactional data + tenant isolation |
-| Cache | **Redis 7** | Secure caching + rate limiting |
-| Vector Store | **Weaviate** | Semantic search, embeddings |
-| ORM | **Prisma** | Type-safe database access |
-
-### Infrastructure
-
-| Component | Technology | Purpose |
-|-----------|------------|---------|
-| Messaging | **Apache Kafka** (KRaft) | Event streaming, no Zookeeper |
-| Auth | **Keycloak** | SSO, OAuth2, OIDC |
-| Policy Engine | **Open Policy Agent** | RBAC + ABAC policies |
-| Container | **Docker** + Kubernetes | Deployment & orchestration |
-
-### Observability
-
-| Component | Technology | Purpose |
-|-----------|------------|---------|
-| Metrics | **Prometheus** | Time-series metrics |
-| Dashboards | **Grafana** | Visualization & alerts |
-| Logging | **Loki** | Log aggregation |
-| Tracing | **OpenTelemetry** | Distributed tracing |
-
----
-
-## 📁 Project Structure
-
-```
-multi-agent-enterprise-crm/
-│
-├── 📱 frontend/                 # Next.js 14 Application
-│   └── src/
-│       ├── app/                # App Router pages
-│       └── components/         # Event Timeline, Governance UI
-│
-├── 🚪 gateway/                  # API Gateway (Node.js + TypeScript)
-│   └── src/
-│       ├── middleware/         # Auth, RLS context, rate limiting
-│       ├── routes/             # REST API endpoints
-│       └── services/           # Kafka, Redis, Secure Cache
-│
-├── 🤖 agents/                   # AI Agent Layer (Python)
-│   └── src/
-│       ├── governance/         # Kill switch, explainability, telemetry
-│       ├── replay/             # Event replay, snapshots, projectors
-│       └── resilience/         # Circuit breaker, retry policies
-│
-├── ⚙️ core_services/            # Shared Services (Python)
-│   └── src/
-│       ├── cache/              # Secure tenant-aware caching
-│       ├── dr/                 # Backup, restore, disaster recovery
-│       ├── governance/         # GDPR erasure, export, retention
-│       └── write/              # Event store, transactional outbox
-│
-├── 📋 policies/                 # OPA Policies (Rego)
-│
-├── 🗄️ database/                 # Migrations
-│   └── migrations/             # RLS, event store, outbox, governance
-│
-├── 📊 observability/            # Monitoring
-│   ├── grafana/                # Dashboards (governance, chaos, DR)
-│   └── prometheus.yml
-│
-├── 🧪 tests/                    # Integration & Chaos Tests
-│
-├── 📄 docs/                     # Documentation
-│
-└── 🐳 docker-compose.yml        # Full development stack
+```dotenv
+CRM_APP_PASSWORD=<local-password>
+JWT_SECRET=<long-random-local-secret>
+KEYCLOAK_ADMIN_PASSWORD=<local-password>
+GRAFANA_ADMIN_PASSWORD=<local-password>
 ```
 
----
+Keep `POSTGRES_PASSWORD`, `CRM_APP_PASSWORD`, and any standalone local
+`DATABASE_URL` consistent. Do not commit `.env`.
 
-## 🧪 Development
+### 2. Start and verify the stack
 
-### Local Development
-
-```bash
-# Start infrastructure
-docker-compose up -d postgres redis kafka opa
-
-# Frontend (terminal 1)
-cd frontend && npm install && npm run dev
-
-# Gateway (terminal 2)
-cd gateway && npm install && npm run dev
-
-# Agents (terminal 3)
-cd agents && pip install -r requirements.txt && python -m src.orchestrator.main
+```powershell
+docker compose up -d --build --wait
+docker compose --profile migrate run --rm migrate
+docker compose --profile smoke-test run --rm smoke-test
+docker compose --profile ws-proxy-test run --rm ws-proxy-test
+docker compose ps
 ```
 
-### Running Tests
+The expected result is that the stateful services and application services are
+healthy, and both smoke tests finish successfully. Re-running the migrate
+command must also succeed: it is intentionally idempotent.
 
-```bash
-# Tenant isolation tests
-pytest agents/tests/test_tenant_isolation.py -v
+### 3. Open local services
 
-# GDPR compliance tests
-pytest tests/test_gdpr_forget.py tests/test_data_export.py -v
+| Service | URL |
+|---|---|
+| Frontend | http://localhost:3000 |
+| Gateway health | http://localhost:4000/health |
+| Kafka UI | http://localhost:8080 |
+| Keycloak | http://localhost:8081 |
+| Weaviate | http://localhost:8082 |
+| OPA | http://localhost:8181 |
+| Prometheus | http://localhost:9090 |
+| Grafana | http://localhost:3001 |
 
-# Chaos tests (local environment only)
-export CHAOS_TESTS_ENABLED=true CHAOS_ENVIRONMENT=local
-pytest agents/tests/chaos -v
+### Local LLM mode
 
-# Gateway tests
-cd gateway && npm test
+Ollama is not needed for the default stack or CI. If local inference is
+explicitly required and the host is prepared for the configured GPU/runtime
+requirements, enable it separately:
+
+```powershell
+docker compose --profile local-llm up -d ollama
 ```
 
----
+The application code currently uses Ollama integrations for several live
+workflows. The interview-readiness plan introduces a deterministic provider for
+the canonical demo before making local inference part of any required flow.
 
-## 📚 Documentation
+## What can be demonstrated today
 
-| Document | Description |
-|----------|-------------|
-| [SETUP_GUIDE.md](./SETUP_GUIDE.md) | Detailed installation instructions |
-| [docs/ai-governance.md](./docs/ai-governance.md) | AI governance and kill switch |
-| [docs/event-replay.md](./docs/event-replay.md) | Event sourcing and time-travel |
-| [docs/data-governance.md](./docs/data-governance.md) | GDPR compliance |
-| [docs/chaos-engineering.md](./docs/chaos-engineering.md) | Reliability testing |
-| [docs/disaster-recovery.md](./docs/disaster-recovery.md) | DR procedures and RPO/RTO |
+- Tenant-isolated CRM CRUD protected by PostgreSQL RLS.
+- Approval workflows and kill-switch controls for agent actions.
+- Explainability artifacts, audit search, and governance UI.
+- Kafka topic initialization, event consumers, dead-letter handling, and replay
+  components.
+- Container health dependencies, idempotent database migration, and WebSocket
+  proxy smoke tests.
+- Image digest deployment paths, SBOM/provenance artifacts, Trivy scanning, and
+  CodeQL/Dependabot governance.
 
----
+The next portfolio phases add deterministic demo fixtures, a run-level agent
+evidence screen, and a versioned AI evaluation suite. They are deliberately
+tracked as work in progress rather than represented as already complete.
 
-## 🤝 Contributing
+## Engineering evidence
 
-We welcome contributions! This project is under active development.
+| Area | Evidence |
+|---|---|
+| Tenant isolation | RLS migrations and tenant-isolation test suites |
+| Policy enforcement | OPA policies, gateway middleware, and governance workflows |
+| Reliability | Compose health checks, migrations, smoke tests, replay, and chaos assets |
+| Supply chain | Pinned images, image metrics, Trivy, SBOM, provenance, CodeQL |
+| AI safety | Approval workflow, kill switch, audit artifacts, data guard, structured output validation |
 
-1. **Fork** the repository
-2. **Create** your feature branch (`git checkout -b feature/AmazingFeature`)
-3. **Commit** your changes (`git commit -m 'Add AmazingFeature'`)
-4. **Push** to the branch (`git push origin feature/AmazingFeature`)
-5. **Open** a Pull Request
+For the detailed architecture, data flow, failure behavior, and scaling path,
+read [Architecture overview](docs/interview/architecture.md).
 
----
+## Repository layout
 
-## 📄 License
+```text
+frontend/             Next.js application and governance UI
+gateway/              Express API, Prisma schema, auth, tenant and OPA middleware
+agents/               Python agents, LangGraph workflows, retrieval, governance helpers
+database/migrations/   SQL schema, RLS, outbox, and role-policy migrations
+policies/              OPA/Rego authorization policies
+observability/         Prometheus and Grafana configuration
+deploy/                Helm chart and deployment configuration
+scripts/               migration, smoke, replay, metrics, and operational helpers
+tests/                 infrastructure, integration, security, DR, and compliance tests
+docs/                  architecture decisions, runbooks, evidence, and interview material
+```
 
-This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
+## Development commands
 
----
+```powershell
+# Gateway
+Set-Location gateway
+npm ci
+npm run lint
+npm test -- --runInBand
 
-<div align="center">
+# Frontend
+Set-Location ../frontend
+npm ci
+npm run lint
+npm run build
 
-### ⭐ Star this repo if you find it helpful!
+# Infrastructure/static regression suite
+Set-Location ..
+pytest tests/infra -q
+```
 
-**Built with ❤️ for the Enterprise AI Community**
+Use the Compose smoke tests for service-to-service validation. The project does
+not require developers to install Ollama or pull a model merely to run ordinary
+checks.
 
-[Report Bug](https://github.com/Mrgig7/Multi-Agent-Enterprise-CRM/issues) •
-[Request Feature](https://github.com/Mrgig7/Multi-Agent-Enterprise-CRM/issues) •
-[Discussions](https://github.com/Mrgig7/Multi-Agent-Enterprise-CRM/discussions)
+## Documentation
 
-</div>
+- [Interview readiness execution plan](docs/interview-readiness-execution-plan.md)
+- [Architecture overview](docs/interview/architecture.md)
+- [Demo script](docs/interview/demo-script.md)
+- [AI governance model](docs/ai-governance.md)
+- [Tenant isolation](docs/tenant-isolation.md)
+- [Event replay](docs/event-replay.md)
+- [Chaos engineering](docs/chaos-engineering.md)
+- [Disaster recovery](docs/disaster-recovery.md)
+- [Developer guidelines](docs/developer-guidelines.md)
+
+## License
+
+MIT. See [LICENSE](LICENSE) if present in the repository.

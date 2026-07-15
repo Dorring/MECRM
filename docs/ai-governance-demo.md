@@ -17,9 +17,9 @@
 5. Observe:
    - Agents resume processing queued messages
 
-Screenshot placeholders:
-- `docs/artifacts/phase4/killswitch-paused.png`
-- `docs/artifacts/phase4/killswitch-resumed.png`
+Capture evidence only after the deterministic fixture is available. Use the
+[interview capture checklist](interview/capture-checklist.md); do not use
+placeholder screenshots as proof.
 
 ## 2) Human-in-the-loop Approval Demo
 1. Trigger a HIGH-impact action path (example: lead qualification requiring approval):
@@ -32,9 +32,8 @@ Screenshot placeholders:
    - Agents receive `crm.approvals.decision`
    - The previously pending action is executed (e.g., `crm.leads.qualified` emitted)
 
-Screenshot placeholders:
-- `docs/artifacts/phase4/approval-queue.png`
-- `docs/artifacts/phase4/approval-approved.png`
+Capture the pending and decided states from the current fixture and record the
+approval ID in the accompanying evidence note.
 
 ## 3) Explainability Demo (Decision Artifacts)
 1. Open Governance UI:
@@ -46,9 +45,8 @@ Screenshot placeholders:
      - reasoning factors
      - evidence references (kafka topic + event id)
 
-Screenshot placeholders:
-- `docs/artifacts/phase4/decision-list.png`
-- `docs/artifacts/phase4/decision-detail.png`
+Capture only redacted decision summaries. Do not include model chain-of-thought,
+private prompts, credentials, or raw customer data.
 
 ## 4) Telemetry + Dashboard Demo
 1. Open Prometheus targets to confirm scrape:
@@ -63,6 +61,5 @@ Screenshot placeholders:
    - kill switch activations/sec
    - agent errors/sec
 
-Screenshot placeholders:
-- `docs/artifacts/phase4/grafana-dashboard.png`
-
+Capture the dashboard from a successful current run and identify the commit and
+scenario used to generate it.
