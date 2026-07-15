@@ -145,6 +145,10 @@ def _run_migrate(
     # (The script can also parse DATABASE_URL, but explicit vars remove ambiguity.)
     env.setdefault("POSTGRES_USER", os.environ.get("POSTGRES_USER", "crm_user"))
     env.setdefault("POSTGRES_PASSWORD", os.environ.get("POSTGRES_PASSWORD", "crm_password"))
+    env.setdefault(
+        "CRM_APP_PASSWORD",
+        os.environ.get("CRM_APP_PASSWORD", env["POSTGRES_PASSWORD"]),
+    )
     env.setdefault("POSTGRES_HOST", os.environ.get("POSTGRES_HOST", "localhost"))
     env.setdefault("POSTGRES_PORT", os.environ.get("POSTGRES_PORT", "5432"))
     env.setdefault("POSTGRES_DB", os.environ.get("POSTGRES_DB", "enterprise_crm"))
@@ -177,6 +181,13 @@ class TestComposeMigrateEnvironment:
             "migrate service must explicitly set POSTGRES_HOST=postgres so the runner "
             "connects to the in-stack postgres service, not localhost"
         )
+
+
+    def test_ci_migration_paths_set_crm_app_password(self):
+        workflow = (REPO_ROOT / ".github" / "workflows" / "ci-cd.yml").read_text(
+            encoding="utf-8"
+        )
+        assert workflow.count("CRM_APP_PASSWORD: test") == 3
 
 
 class TestRunnerFailureModes:
@@ -219,6 +230,10 @@ class TestRunnerWithDatabase:
         env["DATABASE_URL"] = db_available
         env.setdefault("POSTGRES_USER", os.environ.get("POSTGRES_USER", "crm_user"))
         env.setdefault("POSTGRES_PASSWORD", os.environ.get("POSTGRES_PASSWORD", "crm_password"))
+        env.setdefault(
+        "CRM_APP_PASSWORD",
+        os.environ.get("CRM_APP_PASSWORD", env["POSTGRES_PASSWORD"]),
+    )
         env.setdefault("POSTGRES_HOST", os.environ.get("POSTGRES_HOST", "localhost"))
         env.setdefault("POSTGRES_PORT", os.environ.get("POSTGRES_PORT", "5432"))
         env.setdefault("POSTGRES_DB", os.environ.get("POSTGRES_DB", "enterprise_crm"))
