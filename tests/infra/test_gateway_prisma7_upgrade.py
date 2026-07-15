@@ -16,7 +16,10 @@ def test_gateway_uses_prisma_7_pg_adapter_without_esm_uuid_migration():
     assert package["devDependencies"]["prisma"].startswith("^7.")
     assert package["dependencies"]["@prisma/adapter-pg"].startswith("^7.")
     assert package["dependencies"]["pg"].startswith("^8.")
-    assert package["dependencies"]["uuid"].startswith("^9.")
+    assert "uuid" not in package["dependencies"]
+    uuid_util = read("gateway/src/utils/uuid.ts")
+    assert "randomUUID" in uuid_util
+    assert "from 'crypto'" in uuid_util
     assert "type" not in package
     assert package["engines"]["node"].startswith(">=24")
 
@@ -68,6 +71,6 @@ def test_github_workflows_use_node_24_not_node_20():
 def test_tenant_isolation_generates_client_before_direct_jest_run():
     workflow = read(".github/workflows/tenant-isolation.yml")
     generate = workflow.index("npm run prisma:generate")
-    migrate = workflow.index("npx prisma migrate deploy")
+    migrate = workflow.index("bash ./scripts/migrate.sh")
     jest = workflow.index("npx jest tests/test_rls_enforcement.ts")
     assert generate < migrate < jest

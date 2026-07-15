@@ -45,11 +45,11 @@ class TestAgentsMultiStageStructure(unittest.TestCase):
         cls.lines = cls.content.splitlines()
 
     def test_has_builder_stage(self):
-        self.assertIn("FROM python:3.11-slim AS builder", self.content,
+        self.assertRegex(self.content, r"(?m)^FROM python:\d+\.\d+-slim AS builder$",
                       "F4-M1: Dockerfile must have a builder stage")
 
     def test_has_runner_stage(self):
-        self.assertIn("FROM python:3.11-slim AS runner", self.content,
+        self.assertRegex(self.content, r"(?m)^FROM python:\d+\.\d+-slim AS runner$",
                       "F4-M1: Dockerfile must have a runner stage")
 
     def test_builder_before_runner(self):

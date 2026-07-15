@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Kafka topic initialization.
 # Runs once before gateway/agents start. Idempotent: creates missing topics and
-# ensures config on existing topics. Fails fast on any error so downstream
+# ensures config on existing topics. It fails fast on any error so downstream
 # services do not start with a broken Kafka topology.
 set -euo pipefail
 

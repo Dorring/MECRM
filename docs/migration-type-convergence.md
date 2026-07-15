@@ -32,7 +32,8 @@ automation/prediction/knowledge/productivity tables, etc.
 Raw-SQL-track tables (`event_log`, `aggregate_snapshots`, `replay_jobs`,
 `customer_twins`, `twin_simulation_log`, `devx_insights`) already used
 `timestamptz`; `12-type-convergence.sql` asserts this and fails if any plain
-`timestamp` column is found.
+`timestamp` column is found in an MECRM-owned table. Keycloak's Liquibase
+metadata tables are excluded because their schema is controlled by Keycloak.
 
 ## Live-schema drift assessment
 

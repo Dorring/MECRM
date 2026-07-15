@@ -1,6 +1,6 @@
 -- Type convergence guard (Hardening 1.1)
 --
--- Authority: all timestamp columns in the platform schema use `timestamptz`.
+-- Authority: all timestamp columns in MECRM-owned tables use `timestamptz`.
 -- Prisma-managed tables are migrated by the forward Prisma migration
 -- `20260702000000_timestamptz_convergence`; raw-SQL-track tables are guarded
 -- here. This file is idempotent and safe to re-run.
@@ -18,7 +18,12 @@ BEGIN
   FROM information_schema.columns
   WHERE table_schema = 'public'
     AND data_type IN ('timestamp without time zone', 'timestamp')
-    AND table_name NOT IN ('_prisma_migrations');
+    -- Prisma bookkeeping and Keycloak-owned Liquibase metadata are third-party tables.
+    AND table_name NOT IN (
+      '_prisma_migrations',
+      'databasechangelog',
+      'databasechangeloglock'
+    );
 
   IF bad_columns IS NOT NULL THEN
     RAISE EXCEPTION 'Type convergence failed: columns still using plain timestamp: %', bad_columns;
@@ -27,4 +32,4 @@ END $$;
 
 -- Ensure raw-SQL-track tables that have timestamptz columns keep their defaults.
 -- (No DDL changes required if they already use TIMESTAMPTZ; kept as documentation.)
-SELECT 'type-convergence OK: all public timestamp columns are timestamptz' AS status;
+SELECT 'type-convergence OK: all MECRM-owned timestamp columns are timestamptz' AS status;

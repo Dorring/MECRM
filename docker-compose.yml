@@ -380,8 +380,10 @@ services:
     image: danielqsj/kafka-exporter:v1.9.0
     command:
       - "--kafka.server=kafka:9092"
+    restart: unless-stopped
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     networks:
       - crm-network
 
@@ -524,6 +526,7 @@ services:
       - POSTGRES_USER=${POSTGRES_USER:-crm_user}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-crm_password}
       - POSTGRES_DB=${POSTGRES_DB:-enterprise_crm}
+      - CRM_APP_PASSWORD=${CRM_APP_PASSWORD:?CRM_APP_PASSWORD is required}
       - DATABASE_URL=postgresql://${POSTGRES_USER:-crm_user}:${POSTGRES_PASSWORD:-crm_password}@postgres:5432/${POSTGRES_DB:-enterprise_crm}
       - GATEWAY_DIR=/app
     volumes:

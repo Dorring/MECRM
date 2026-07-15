@@ -75,6 +75,7 @@ if (Test-Path $EnvFile) {
 
 if (-not $env:POSTGRES_USER)     { $env:POSTGRES_USER     = 'crm_user' }
 if (-not $env:POSTGRES_PASSWORD) { $env:POSTGRES_PASSWORD = 'crm_password' }
+if (-not $env:CRM_APP_PASSWORD) { throw 'CRM_APP_PASSWORD is required' }
 if (-not $env:POSTGRES_HOST)     { $env:POSTGRES_HOST     = 'localhost' }
 if (-not $env:POSTGRES_PORT)     { $env:POSTGRES_PORT     = '5432' }
 if (-not $env:POSTGRES_DB)       { $env:POSTGRES_DB       = 'enterprise_crm' }
@@ -306,6 +307,17 @@ function Invoke-SqlMigrations {
   }
 }
 
+function Sync-CrmAppPassword {
+  Require-Tool 'psql'
+  Write-Log "Synchronizing crm_app role password from CRM_APP_PASSWORD"
+  $env:PGPASSWORD = $env:POSTGRES_PASSWORD
+  "ALTER ROLE crm_app PASSWORD :'crm_app_password';" | & psql `
+    -v ON_ERROR_STOP=1 `
+    -v "crm_app_password=$($env:CRM_APP_PASSWORD)" `
+    -h $env:POSTGRES_HOST -p $env:POSTGRES_PORT `
+    -U $env:POSTGRES_USER -d $env:POSTGRES_DB
+  if ($LASTEXITCODE -ne 0) { Write-Err2 "failed to synchronize crm_app password"; exit 1 }
+}
 function Invoke-DriftDetection {
   Require-Tool 'psql'
   Write-Log "Schema drift detection (table-presence level)"
@@ -336,12 +348,13 @@ function Invoke-DriftDetection {
     if ($prismaTables -notcontains $t) { Write-Host "  - EXTRA: $t"; $extra++ }
   }
   if ($extra -eq 0) { Write-Log "  (none beyond known raw-SQL tables)" }
+  else { Write-Warn2 "$extra non-MECRM tables detected; informational in the shared Keycloak database" }
 
   Write-Log "RLS enforcement audit (tenant tables missing ENABLE, FORCE, or policy):"
   $tenantList = ($TenantTables | ForEach-Object { "'$_'" }) -join ','
   $rlsQuery = @"
     WITH tenant_tables AS (
-      SELECT c.oid, c.relname
+      SELECT c.oid, c.relname, c.relrowsecurity, c.relforcerowsecurity
       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE n.nspname = 'public' AND c.relkind = 'r'
         AND c.relname IN ($tenantList)
@@ -350,7 +363,7 @@ function Invoke-DriftDetection {
       SELECT pc.relname,
              pc.relrowsecurity AS enabled,
              pc.relforcerowsecurity AS forced,
-             bool_or(p.polcmd = '*') AS has_all_policy
+             COALESCE(bool_or(p.polcmd = '*'), false) AS has_all_policy
       FROM tenant_tables pc
       LEFT JOIN pg_policy p ON p.polrelid = pc.oid
       GROUP BY pc.relname, pc.relrowsecurity, pc.relforcerowsecurity
@@ -368,7 +381,7 @@ function Invoke-DriftDetection {
   if ($rlsIssues) { $rlsIssues | ForEach-Object { Write-Host "  $_" }; $rlsFailed = 1 }
   else { Write-Log "  (all tenant tables have ENABLE+FORCE+ALL policy)" }
 
-  if ($missing -gt 0 -or $extra -gt 0 -or $rlsFailed -gt 0) {
+  if ($missing -gt 0 -or $rlsFailed -gt 0) {
     if ($AuditWarn) {
       Write-Warn2 "drift/RLS issues detected (-AuditWarn enabled; exiting 0)"
       return
@@ -393,6 +406,7 @@ try {
   if (-not $SkipPrisma) { Invoke-PrismaMigrate }
   else { Write-Warn2 "skipping Prisma step (-SkipPrisma)" }
   Invoke-SqlMigrations
+  Sync-CrmAppPassword
   Invoke-DriftDetection
 }
 finally {

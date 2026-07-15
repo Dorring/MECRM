@@ -199,12 +199,13 @@ cd gateway && npx prisma migrate diff \
 
 ## Timestamp type authority
 
-All timestamp columns in the platform schema use `timestamptz`:
+All timestamp columns in MECRM-owned tables use `timestamptz`:
 
 - Prisma-managed tables are converted by the forward migration
   `gateway/prisma/migrations/20260702000000_timestamptz_convergence`.
 - Raw-SQL-track tables are guarded by `12-type-convergence.sql`, which raises
-  an error if any plain `timestamp` column remains.
+  an error if any plain `timestamp` column remains. Keycloak-owned Liquibase
+  metadata tables are excluded from this application-schema guard.
 
 See `docs/migration-type-convergence.md` for upgrade, rollback, vacuum/analyze,
 and lock-risk notes.

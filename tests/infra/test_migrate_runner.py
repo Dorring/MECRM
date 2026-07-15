@@ -145,6 +145,10 @@ def _run_migrate(
     # (The script can also parse DATABASE_URL, but explicit vars remove ambiguity.)
     env.setdefault("POSTGRES_USER", os.environ.get("POSTGRES_USER", "crm_user"))
     env.setdefault("POSTGRES_PASSWORD", os.environ.get("POSTGRES_PASSWORD", "crm_password"))
+    env.setdefault(
+        "CRM_APP_PASSWORD",
+        os.environ.get("CRM_APP_PASSWORD", env["POSTGRES_PASSWORD"]),
+    )
     env.setdefault("POSTGRES_HOST", os.environ.get("POSTGRES_HOST", "localhost"))
     env.setdefault("POSTGRES_PORT", os.environ.get("POSTGRES_PORT", "5432"))
     env.setdefault("POSTGRES_DB", os.environ.get("POSTGRES_DB", "enterprise_crm"))
@@ -176,6 +180,37 @@ class TestComposeMigrateEnvironment:
         assert "POSTGRES_HOST=postgres" in joined, (
             "migrate service must explicitly set POSTGRES_HOST=postgres so the runner "
             "connects to the in-stack postgres service, not localhost"
+        )
+
+    def test_ci_migration_passwords_match_each_job_connection(self):
+        workflow = yaml.safe_load(
+            (REPO_ROOT / ".github" / "workflows" / "ci-cd.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        expected = {
+            "test-gateway": "test",
+            "test-agents": "crm_password",
+            "migration-runner": "test",
+        }
+        for job_name, password in expected.items():
+            steps = workflow["jobs"][job_name]["steps"]
+            migration = next(
+                step for step in steps
+                if step.get("name") in {
+                    "Apply migrations via single runner",
+                    "Run migration runner regression tests",
+                }
+            )
+            assert migration["env"]["CRM_APP_PASSWORD"] == password
+
+        agent_tests = next(
+            step for step in workflow["jobs"]["test-agents"]["steps"]
+            if step.get("name") == "Run tests"
+        )
+        assert (
+            f"postgresql://crm_app:{expected['test-agents']}@"
+            in agent_tests["env"]["DATABASE_URL"]
         )
 
 
@@ -219,6 +254,10 @@ class TestRunnerWithDatabase:
         env["DATABASE_URL"] = db_available
         env.setdefault("POSTGRES_USER", os.environ.get("POSTGRES_USER", "crm_user"))
         env.setdefault("POSTGRES_PASSWORD", os.environ.get("POSTGRES_PASSWORD", "crm_password"))
+        env.setdefault(
+            "CRM_APP_PASSWORD",
+            os.environ.get("CRM_APP_PASSWORD", env["POSTGRES_PASSWORD"]),
+        )
         env.setdefault("POSTGRES_HOST", os.environ.get("POSTGRES_HOST", "localhost"))
         env.setdefault("POSTGRES_PORT", os.environ.get("POSTGRES_PORT", "5432"))
         env.setdefault("POSTGRES_DB", os.environ.get("POSTGRES_DB", "enterprise_crm"))

@@ -413,8 +413,11 @@ class TestGatewayDebianSecurityUpgrades(unittest.TestCase):
     def setUpClass(cls):
         with open(GATEWAY_DOCKERFILE_PATH, "r", encoding="utf-8") as fh:
             cls.content = fh.read()
-        cls.builder_stage = cls.content.split("FROM node:20-bullseye AS runner")[0]
-        cls.runner_stage = cls.content.split("FROM node:20-bullseye AS runner", 1)[1]
+        runner_marker = next(
+            line for line in cls.content.splitlines()
+            if line.startswith("FROM node:") and line.endswith(" AS runner")
+        )
+        cls.builder_stage, cls.runner_stage = cls.content.split(runner_marker, 1)
 
     def test_gateway_builder_runs_apt_upgrade(self):
         self.assertIn("apt-get upgrade -y", self.builder_stage,
