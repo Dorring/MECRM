@@ -63,21 +63,20 @@ jobs:
         run: npm run prisma:generate
         working-directory: gateway
 
-      - name: Run Prisma migrations
-        run: npx prisma migrate deploy
-        working-directory: gateway
-        env:
-          # Use the database owner for DDL migrations; tests use crm_app via DATABASE_URL.
-          DATABASE_URL: ${{ env.ADMIN_DATABASE_URL }}
-
       - name: Install postgres client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
 
-      - name: Apply RLS policies
+      - name: Apply migrations via single runner
+        run: bash ./scripts/migrate.sh
+        env:
+          # DDL uses the owner; migrate.sh synchronizes crm_app from CRM_APP_PASSWORD.
+          DATABASE_URL: ${{ env.ADMIN_DATABASE_URL }}
+          GATEWAY_DIR: ./gateway
+
+      - name: Verify runtime database role login
         run: |
-          psql "${ADMIN_DATABASE_URL}" \
-            -v ON_ERROR_STOP=1 \
-            -f database/migrations/02-rls-policies.sql
+          psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -c "SELECT current_user"
+          test "$(psql "${DATABASE_URL}" -Atc "SELECT current_user")" = "crm_app"
 
       - name: Setup Python
         uses: actions/setup-python@v6
