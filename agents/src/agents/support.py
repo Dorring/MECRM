@@ -265,6 +265,7 @@ Prioritize customer satisfaction. Flag escalation for complex or urgent issues."
                 return {"status": "denied", "reasons": ["kill_switch_active"]}
 
         kb_articles: list[Dict[str, Any]] = []
+        retrieval_degraded = False
         vs = self._get_vector_search()
         if vs is not None:
             try:
@@ -281,6 +282,7 @@ Prioritize customer satisfaction. Flag escalation for complex or urgent issues."
                 # surfaced as a metric, not a hard error.
                 logger.warning("Knowledge base retrieval failed", ticket_id=ticket_id, error=str(e))
                 kb_articles = []
+                retrieval_degraded = True
 
         kb_context = self._format_kb_context(kb_articles)
         # source_ids reserved for future citation in decision evidence / explainability
@@ -379,6 +381,16 @@ Respond with ONLY a JSON object matching this schema:
                 "suggestedBy": self.agent_id,
             },
             correlation_id=event.get("correlationid"),
+            decision_status="degraded" if retrieval_degraded else "completed",
+            decision_evidence=(
+                [{"type": "knowledge_retrieval", "source_id": "unavailable"}]
+                if retrieval_degraded
+                else [
+                    {"type": "knowledge_article", "source_id": str(source_id)}
+                    for source_id in suggestion.sources
+                    if source_id
+                ]
+            ),
         )
 
         logger.info(
@@ -389,7 +401,7 @@ Respond with ONLY a JSON object matching this schema:
         )
 
         return {
-            "status": "completed",
+            "status": "degraded" if retrieval_degraded else "completed",
             "summary": suggestion.summary,
             "step_count": len(suggestion.steps),
             "requires_human": suggestion.requires_human,
