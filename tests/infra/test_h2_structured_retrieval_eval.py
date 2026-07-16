@@ -8,6 +8,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from evals.structured_retrieval import EvalCase, load_cases, load_records, score_case, summarise
+from evals.reporting import render_markdown_summary
 
 
 DATASETS = ROOT / "evals" / "datasets"
@@ -22,7 +23,7 @@ def test_structured_retrieval_dataset_is_valid_and_has_positive_and_negative_cas
 
     assert {record.tenant for record in records} == {"acme", "globex"}
     assert {record.entity_type for record in records} == {"lead", "deal", "ticket", "customer"}
-    assert len(cases) >= 10
+    assert len(cases) >= 35
     assert any(case.expected_record_ids for case in cases)
     assert sum(not case.expected_record_ids for case in cases) >= 2
 
@@ -74,6 +75,7 @@ def test_ci_workflow_runs_real_db_baseline_and_uploads_report() -> None:
     assert "bash ./scripts/migrate.sh" in text
     assert "evals/run_structured_retrieval_eval.py" in text
     assert "ai-eval-structured-retrieval" in text
+    assert "--summary-output reports/ai-evals/structured-retrieval.md" in text
 
 
 def test_ci_workflow_supplies_all_required_compose_interpolation_values() -> None:
@@ -90,3 +92,28 @@ def test_ci_workflow_supplies_all_required_compose_interpolation_values() -> Non
         assert f"  {required_name}:" in text
     assert "if: ${{ success() }}" in text
     assert "if: always()" not in text
+
+
+def test_markdown_summary_exposes_metrics_and_dataset_digests_without_secrets() -> None:
+    summary = render_markdown_summary(
+        {
+            "passed": True,
+            "evaluator": "test-evaluator",
+            "git_commit": "abc123",
+            "duration_ms": 42,
+            "dataset": {"corpus_sha256": "corpus-digest", "cases_sha256": "cases-digest"},
+            "metrics": {
+                "case_count": 35,
+                "recall_at_5": 1.0,
+                "precision_at_5": 0.95,
+                "case_pass_rate": 1.0,
+                "cross_tenant_denial_pass_rate": 1.0,
+                "tenant_leak_count": 0,
+            },
+        }
+    )
+
+    assert "# AI Evaluation Summary" in summary
+    assert "Recall@5 | 1.000" in summary
+    assert "corpus-digest" in summary
+    assert "postgresql://" not in summary
