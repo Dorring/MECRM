@@ -39,6 +39,34 @@ env:
   GRAFANA_ADMIN_PASSWORD: ci-evaluation-grafana-password
 
 jobs:
+  safety-contracts:
+    name: Deterministic Safety Contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Run deterministic safety-contract evaluation
+        run: |
+          mkdir -p reports/ai-evals
+          PYTHONPATH=agents/src python evals/run_safety_contract_eval.py \
+            --output reports/ai-evals/safety-contracts.json \
+            --summary-output reports/ai-evals/safety-contracts.md
+
+      - name: Upload safety-contract report
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ai-eval-safety-contracts
+          path: |
+            reports/ai-evals/safety-contracts.json
+            reports/ai-evals/safety-contracts.md
+          if-no-files-found: error
+
   structured-retrieval:
     name: Structured Retrieval Baseline
     runs-on: ubuntu-latest

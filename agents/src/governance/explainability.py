@@ -8,6 +8,7 @@ from typing import Any, Optional
 import asyncpg
 
 from governance.agent_telemetry import decisions_logged_total, explanation_latency_ms
+from governance.evidence import safe_evidence_identifiers, safe_tool_call_summaries
 
 
 @dataclass(frozen=True)
@@ -49,8 +50,8 @@ class ExplainabilityEngine:
 
         input_context = _redact(decision.input_context)
         reasoning = _redact(decision.reasoning)
-        evidence = _redact(decision.evidence)
-        tool_calls = _redact(decision.tool_calls)
+        evidence = safe_evidence_identifiers(_redact(decision.evidence))
+        tool_calls = safe_tool_call_summaries(_redact(decision.tool_calls))
 
         async with self._pool.acquire() as conn:
             async with conn.transaction():

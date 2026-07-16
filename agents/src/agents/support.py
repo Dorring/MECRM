@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from .base import BaseAgent
 from governance.approval_service import PendingAction
+from governance.input_safety import assess_untrusted_text
 from orchestrator.config import settings
 
 logger = structlog.get_logger()
@@ -253,6 +254,19 @@ Prioritize customer satisfaction. Flag escalation for complex or urgent issues."
         priority = str(data.get("priority") or "medium")
 
         logger.info("Suggesting resolution", ticket_id=ticket_id, tenant_id=tenant_id)
+
+        input_safety = assess_untrusted_text(f"{subject}\n{description}")
+        if not input_safety.allowed:
+            await self._record_safe_decision(
+                tenant_id=tenant_id,
+                action_type="tickets:suggest_resolution",
+                status="denied",
+                confidence=None,
+                factor={"name": "input_safety", "outcome": "blocked"},
+                evidence_type="input_safety",
+                evidence_id=input_safety.reason_code or "blocked",
+            )
+            return {"status": "denied", "reasons": [input_safety.reason_code or "input_blocked"]}
 
         # 1. Retrieve tenant-isolated knowledge-base articles.
         # Tool-call boundary: enforce kill switch / data guard before touching
