@@ -52,7 +52,7 @@ langdetect>=1.0.9
 
 # OpenTelemetry
 opentelemetry-api>=1.21.0
-opentelemetry-sdk>=1.43.0
+opentelemetry-sdk>=1.44.0
 opentelemetry-instrumentation>=0.64b0
 
 # Testing
