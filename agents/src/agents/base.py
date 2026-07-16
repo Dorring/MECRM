@@ -108,6 +108,17 @@ class BaseAgent(ABC):
                 deny_reasons.append("capability_not_allowed")
                 inc_policy_violation(agent_id=self.agent_id, action_type=action)
 
+            if not allowed:
+                await self._record_safe_decision(
+                    tenant_id=tenant_id,
+                    action_type=action,
+                    status="denied",
+                    confidence=confidence,
+                    factor={"name": "policy", "outcome": "denied"},
+                    evidence_type="opa_policy",
+                    evidence_id="denied",
+                )
+
             observe_decision_latency(agent_id=self.agent_id, action_type=action, risk_level="policy", status="checked", duration_ms=(time.perf_counter() - started) * 1000.0)
             return {
                 "allowed": allowed,
@@ -119,6 +130,15 @@ class BaseAgent(ABC):
         except Exception as e:
             logger.error("Policy check failed", error=str(e))
             inc_error(agent_id=self.agent_id, error_type="opa")
+            await self._record_safe_decision(
+                tenant_id=tenant_id,
+                action_type=action,
+                status="denied",
+                confidence=confidence,
+                factor={"name": "policy", "outcome": "unavailable"},
+                evidence_type="opa_policy",
+                evidence_id="unavailable",
+            )
             # Fail closed - deny if policy engine unavailable
             return {"allowed": False, "requires_approval": True, "deny_reasons": ["Policy engine unavailable"]}
             
@@ -129,8 +149,13 @@ class BaseAgent(ABC):
         tenant_id: str,
         data: Dict[str, Any],
         correlation_id: Optional[str] = None,
+        decision_status: str = "completed",
+        decision_evidence: Optional[list[Dict[str, str]]] = None,
     ):
         """Emit an event to Kafka."""
+        if decision_status not in {"completed", "pending_approval", "denied", "degraded", "failed"}:
+            raise ValueError(f"Unsupported decision status: {decision_status}")
+
         if self._data_guard and tenant_id:
             customer_id, user_id = _extract_subjects(data)
             if customer_id or user_id:
@@ -169,11 +194,11 @@ class BaseAgent(ABC):
                     agent_id=self.agent_id,
                     action_type=event_type,
                     risk_level=str(data.get("riskLevel") or "LOW"),
-                    status="executed",
+                    status=decision_status,
                     confidence=float(data["confidence"]) if data.get("confidence") is not None else None,
                     input_context={},
                     reasoning={"factors": data.get("factors")},
-                    evidence=[
+                    evidence=(decision_evidence or []) + [
                         {"type": "kafka_topic", "source_id": topic},
                         {"type": "event_id", "source_id": event["id"]},
                     ],
@@ -181,6 +206,45 @@ class BaseAgent(ABC):
                     approval_id=str(data.get("approvalId")) if data.get("approvalId") else None,
                     correlation_id=str(event.get("correlationid")) if event.get("correlationid") else None,
                 )
+            )
+
+    async def _record_safe_decision(
+        self,
+        *,
+        tenant_id: str,
+        action_type: str,
+        status: str,
+        confidence: float | None,
+        factor: Dict[str, str],
+        evidence_type: str,
+        evidence_id: str,
+    ) -> None:
+        """Record a bounded governance outcome without affecting fail-closed behavior."""
+        if not self._explainability:
+            return
+        try:
+            await self._explainability.record_decision(
+                DecisionArtifact(
+                    id=str(uuid.uuid4()),
+                    tenant_id=tenant_id,
+                    agent_id=self.agent_id,
+                    action_type=action_type,
+                    risk_level="policy",
+                    status=status,
+                    confidence=confidence,
+                    input_context={},
+                    reasoning={"factors": [factor]},
+                    evidence=[{"type": evidence_type, "source_id": evidence_id}],
+                    tool_calls=[],
+                )
+            )
+        except Exception as error:
+            logger.warning(
+                "Safe decision recording failed",
+                agent_id=self.agent_id,
+                action_type=action_type,
+                status=status,
+                error=str(error),
             )
         
     async def emit_reasoning(
@@ -244,6 +308,7 @@ class BaseAgent(ABC):
                 "confidence": confidence,
                 "agentType": self.agent_type,
             },
+            decision_status="pending_approval",
         )
         
         logger.info(

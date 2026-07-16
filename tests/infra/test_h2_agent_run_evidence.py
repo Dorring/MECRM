@@ -37,6 +37,18 @@ def test_frontend_never_renders_reasoning_chain() -> None:
     assert "retrievalEvidence" in source
 
 
+def test_agent_run_detail_route_and_statuses_are_present() -> None:
+    base_agent = _read("agents/src/agents/base.py")
+    support_agent = _read("agents/src/agents/support.py")
+    detail_route = _read("frontend/src/app/agents/runs/[id]/page.tsx")
+
+    assert 'decision_status="pending_approval"' in base_agent
+    assert 'status="denied"' in base_agent
+    assert 'decision_status="degraded" if retrieval_degraded else "completed"' in support_agent
+    assert "Tenant-scoped safe evidence" in detail_route
+    assert "governanceApi.decision(runId)" in detail_route
+
+
 def test_preflight_records_no_second_source_of_truth() -> None:
     source = _read("docs/preflight-h2-agent-run-evidence.md")
 

@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import Link from 'next/link';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Bot, FileText, Search, Shield } from 'lucide-react';
 import { approvalsApi, auditApi, governanceApi } from '@/lib/api';
@@ -149,27 +150,34 @@ export default function GovernancePage() {
             ) : (
               <div className="space-y-2">
                 {decisions.map((d) => (
-                  <button
-                    key={d.id}
-                    onClick={() => setSelectedDecisionId(d.id)}
-                    className={clsx(
-                      'w-full text-left p-3 rounded-lg border transition-colors',
-                      selectedDecisionId === d.id
-                        ? 'border-primary-500 bg-primary-50 dark:bg-primary-950'
-                        : 'border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800'
-                    )}
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="font-medium text-gray-900 dark:text-white truncate">{d.actionType}</div>
-                        <div className="text-xs text-gray-500 truncate">{d.agentId}</div>
+                  <div key={d.id}>
+                    <button
+                      onClick={() => setSelectedDecisionId(d.id)}
+                      className={clsx(
+                        'w-full text-left p-3 rounded-lg border transition-colors',
+                        selectedDecisionId === d.id
+                          ? 'border-primary-500 bg-primary-50 dark:bg-primary-950'
+                          : 'border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800'
+                      )}
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="font-medium text-gray-900 dark:text-white truncate">{d.actionType}</div>
+                          <div className="text-xs text-gray-500 truncate">{d.agentId}</div>
+                        </div>
+                        <div className="text-xs text-gray-500">{d.status}</div>
                       </div>
-                      <div className="text-xs text-gray-500">{d.status}</div>
-                    </div>
-                    <div className="mt-2 text-xs text-gray-500">
-                      {formatDistanceToNow(new Date(d.createdAt), { addSuffix: true })}
-                    </div>
-                  </button>
+                      <div className="mt-2 text-xs text-gray-500">
+                        {formatDistanceToNow(new Date(d.createdAt), { addSuffix: true })}
+                      </div>
+                    </button>
+                    <Link
+                      href={`/agents/runs/${d.id}`}
+                      className="mt-2 inline-block text-xs font-medium text-primary-600 hover:underline"
+                    >
+                      View safe run evidence
+                    </Link>
+                  </div>
                 ))}
               </div>
             )}
