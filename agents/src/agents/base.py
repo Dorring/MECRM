@@ -12,7 +12,9 @@ from datetime import datetime, timezone
 import structlog
 import httpx
 from aiokafka import AIOKafkaProducer
+from langchain_core.messages import HumanMessage, SystemMessage
 
+from intelligence.providers import create_chat_model
 from orchestrator.config import settings
 from governance.guard import GovernanceGuard
 from governance.approval_service import approval_requestor_uuid
@@ -33,6 +35,7 @@ class BaseAgent(ABC):
         self.capabilities = capabilities
         self.producer: Optional[AIOKafkaProducer] = None
         self.http_client: Optional[httpx.AsyncClient] = None
+        self._llm: Any | None = None
         self._governance_guard: GovernanceGuard | None = None
         self._data_guard: DataGuard | None = None
         self._approval_service: ApprovalService | None = None
@@ -256,26 +259,23 @@ class BaseAgent(ABC):
             started = time.perf_counter()
             inc_tool_call(agent_id=self.agent_id, tool_name="llm")
 
-            messages = []
+            messages: list[Any] = []
             if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            messages.append({"role": "user", "content": prompt})
-            
-            if not self.http_client:
-                raise RuntimeError("http_client not initialized")
+                messages.append(SystemMessage(content=system_prompt))
+            messages.append(HumanMessage(content=prompt))
 
-            response = await self.http_client.post(
-                f"{settings.OLLAMA_URL}/api/chat",
-                json={
-                    "model": settings.OLLAMA_MODEL,
-                    "messages": messages,
-                    "stream": False,
-                },
-            )
-            
-            result = response.json()
+            if self._llm is None:
+                self._llm = create_chat_model(temperature=0)
+            response = await self._llm.ainvoke(messages)
+            content = getattr(response, "content", response)
+            if isinstance(content, list):
+                content = "".join(
+                    part.get("text", "") if isinstance(part, dict) else str(part)
+                    for part in content
+                )
+            result = str(content or "")
             observe_decision_latency(agent_id=self.agent_id, action_type="llm", risk_level="tool", status="ok", duration_ms=(time.perf_counter() - started) * 1000.0)
-            return result.get("message", {}).get("content", "")
+            return result
             
         except Exception as e:
             logger.error("LLM call failed", error=str(e))

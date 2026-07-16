@@ -1,0 +1,9 @@
+{"record_id":"acme-lead-aurora","tenant":"acme","entity_type":"lead","fields":{"name":"Aurora Solar Prospect","email":"aurora@example.test","company":"Aurora Solar","status":"new"}}
+{"record_id":"acme-deal-meridian","tenant":"acme","entity_type":"deal","fields":{"name":"Meridian Renewal","stage":"negotiation"}}
+{"record_id":"acme-ticket-vpn","tenant":"acme","entity_type":"ticket","fields":{"subject":"Windows VPN certificate failure","description":"Aurora VPN clients reject the renewed certificate","status":"open","priority":"high"}}
+{"record_id":"acme-customer-northwind","tenant":"acme","entity_type":"customer","fields":{"name":"Northwind Analytics","email":"ops@northwind.example.test","company":"Northwind","status":"active"}}
+{"record_id":"acme-lead-meridian","tenant":"acme","entity_type":"lead","fields":{"name":"Meridian Expansion Lead","email":"meridian@example.test","company":"Meridian Group","status":"qualified"}}
+{"record_id":"globex-lead-aurora","tenant":"globex","entity_type":"lead","fields":{"name":"Aurora Logistics Prospect","email":"aurora@globex.example.test","company":"Aurora Logistics","status":"new"}}
+{"record_id":"globex-deal-orbit","tenant":"globex","entity_type":"deal","fields":{"name":"Orbit Renewal","stage":"proposal"}}
+{"record_id":"globex-ticket-beacon","tenant":"globex","entity_type":"ticket","fields":{"subject":"Private Beacon outage","description":"Globex-only incident reference beacon-77","status":"open","priority":"urgent"}}
+{"record_id":"globex-customer-helix","tenant":"globex","entity_type":"customer","fields":{"name":"Helix Manufacturing","email":"ops@helix.example.test","company":"Helix","status":"active"}}

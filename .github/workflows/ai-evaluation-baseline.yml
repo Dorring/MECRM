@@ -1,0 +1,107 @@
+name: AI Evaluation Baseline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'agents/src/intelligence/search/**'
+      - 'database/migrations/**'
+      - 'gateway/prisma/**'
+      - 'evals/**'
+      - 'scripts/migrate.sh'
+      - '.github/workflows/ai-evaluation-baseline.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'agents/src/intelligence/search/**'
+      - 'database/migrations/**'
+      - 'gateway/prisma/**'
+      - 'evals/**'
+      - 'scripts/migrate.sh'
+      - '.github/workflows/ai-evaluation-baseline.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  POSTGRES_USER: crm_user
+  POSTGRES_PASSWORD: crm_password
+  POSTGRES_DB: enterprise_crm
+  ADMIN_DATABASE_URL: postgresql://crm_user:crm_password@localhost:5432/enterprise_crm
+  DATABASE_URL: postgresql://crm_app:crm_password@localhost:5432/enterprise_crm
+  CRM_APP_PASSWORD: crm_password
+  # Compose resolves every service before selecting postgres. These non-secret
+  # CI-only values satisfy required interpolation for services not started by
+  # this workflow; they are never deployed or uploaded.
+  JWT_SECRET: ci-evaluation-jwt-secret
+  KEYCLOAK_ADMIN_PASSWORD: ci-evaluation-keycloak-password
+  GRAFANA_ADMIN_PASSWORD: ci-evaluation-grafana-password
+
+jobs:
+  structured-retrieval:
+    name: Structured Retrieval Baseline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start PostgreSQL
+        run: docker compose up -d postgres
+
+      - name: Wait for PostgreSQL
+        run: |
+          for i in {1..30}; do
+            if docker compose exec -T postgres pg_isready -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs postgres
+          exit 1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: gateway/package-lock.json
+
+      - name: Install gateway dependencies
+        run: npm ci
+        working-directory: gateway
+
+      - name: Generate Prisma Client
+        run: npm run prisma:generate
+        working-directory: gateway
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Apply unified migrations
+        run: bash ./scripts/migrate.sh
+        env:
+          DATABASE_URL: ${{ env.ADMIN_DATABASE_URL }}
+          GATEWAY_DIR: ./gateway
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install agent dependencies
+        run: pip install -r requirements.txt
+        working-directory: agents
+
+      - name: Run structured retrieval evaluation
+        run: |
+          mkdir -p reports/ai-evals
+          PYTHONPATH=agents/src python evals/run_structured_retrieval_eval.py \
+            --output reports/ai-evals/structured-retrieval.json
+
+      - name: Upload evaluation report
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ai-eval-structured-retrieval
+          path: reports/ai-evals/structured-retrieval.json
+          if-no-files-found: error

@@ -40,9 +40,23 @@ class Settings:
         "crm.knowledge.published",
     ]
     
-    # Ollama (LLM)
+    # AI inference provider. Ollama remains available for offline/local use,
+    # while NVIDIA NIM is an OpenAI-compatible managed API provider.
+    AI_PROVIDER: str = os.getenv("AI_PROVIDER", "ollama").strip().lower()
+    AI_REQUEST_TIMEOUT_SECONDS: float = float(os.getenv("AI_REQUEST_TIMEOUT_SECONDS", "30"))
+    AI_MAX_RETRIES: int = int(os.getenv("AI_MAX_RETRIES", "2"))
+
+    # Ollama (optional local LLM / embeddings)
     OLLAMA_URL: str = os.getenv("OLLAMA_URL", "http://localhost:11434")
     OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.1")
+    OLLAMA_EMBED_MODEL: str = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+
+    # NVIDIA NIM (optional managed LLM / embeddings). The API key is consumed
+    # exclusively by the agents service and must never be exposed to the UI.
+    NVIDIA_BASE_URL: str = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+    NVIDIA_API_KEY: str = os.getenv("NVIDIA_API_KEY", "")
+    NVIDIA_CHAT_MODEL: str = os.getenv("NVIDIA_CHAT_MODEL", "")
+    NVIDIA_EMBED_MODEL: str = os.getenv("NVIDIA_EMBED_MODEL", "")
     
     # Weaviate (Vector Store)
     WEAVIATE_URL: str = os.getenv("WEAVIATE_URL", "http://localhost:8082")

@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
-from langchain_ollama import ChatOllama
+from intelligence.providers import AsyncChatModel
 from pydantic import BaseModel, Field
 
 
@@ -28,7 +28,7 @@ class TopicClassificationResult:
 _JSON_BLOCK = re.compile(r"\{[\s\S]*\}")
 
 
-async def classify_topic(*, llm: ChatOllama, title: str, problem: str, resolution: str) -> TopicClassificationResult:
+async def classify_topic(*, llm: AsyncChatModel, title: str, problem: str, resolution: str) -> TopicClassificationResult:
     prompt = (
         "You are a classifier for support knowledge base articles in a CRM.\n"
         "Return ONLY valid JSON with keys: topic, tags, confidence.\n"

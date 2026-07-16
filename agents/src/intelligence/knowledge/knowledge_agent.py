@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 import asyncpg
 import structlog
-from langchain_ollama import ChatOllama
+from intelligence.providers import create_chat_model
 
 from agents.base import BaseAgent
 from orchestrator.config import settings
@@ -35,7 +35,7 @@ class KnowledgeAgent(BaseAgent):
             capabilities=["knowledge:draft", "knowledge:publish", "knowledge:embed"],
         )
         self._pool: Optional[asyncpg.Pool] = None
-        self._llm = ChatOllama(base_url=settings.OLLAMA_URL, model=settings.OLLAMA_MODEL, temperature=0.1)
+        self._llm = create_chat_model(temperature=0.1)
         self._graph = build_knowledge_draft_graph(deps=KnowledgeDraftDeps(llm=self._llm))
         self._chat_memory = WeaviateChatMemory(
             weaviate_url=settings.WEAVIATE_URL,

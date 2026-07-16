@@ -1,0 +1,10 @@
+{"case_id":"acme-lead-aurora","tenant":"acme","query":"Aurora Solar","entity_type":"lead","expected_record_ids":["acme-lead-aurora"],"limit":5}
+{"case_id":"acme-deal-meridian","tenant":"acme","query":"Meridian","entity_type":"deal","expected_record_ids":["acme-deal-meridian"],"limit":5}
+{"case_id":"acme-ticket-vpn","tenant":"acme","query":"certificate","entity_type":"ticket","expected_record_ids":["acme-ticket-vpn"],"limit":5}
+{"case_id":"acme-customer-northwind","tenant":"acme","query":"Northwind","entity_type":"customer","expected_record_ids":["acme-customer-northwind"],"limit":5}
+{"case_id":"acme-multi-entity-meridian","tenant":"acme","query":"Meridian","entity_type":null,"expected_record_ids":["acme-deal-meridian","acme-lead-meridian"],"limit":5}
+{"case_id":"globex-lead-aurora","tenant":"globex","query":"Aurora Logistics","entity_type":"lead","expected_record_ids":["globex-lead-aurora"],"limit":5}
+{"case_id":"globex-deal-orbit","tenant":"globex","query":"Orbit","entity_type":"deal","expected_record_ids":["globex-deal-orbit"],"limit":5}
+{"case_id":"globex-customer-helix","tenant":"globex","query":"Helix","entity_type":"customer","expected_record_ids":["globex-customer-helix"],"limit":5}
+{"case_id":"acme-cannot-see-globex-ticket","tenant":"acme","query":"Private Beacon","entity_type":"ticket","expected_record_ids":[],"limit":5}
+{"case_id":"globex-cannot-see-acme-customer","tenant":"globex","query":"Northwind Analytics","entity_type":"customer","expected_record_ids":[],"limit":5}

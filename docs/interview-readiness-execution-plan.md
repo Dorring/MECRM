@@ -74,7 +74,7 @@ flowchart LR
     Tools --> Weaviate["Weaviate knowledge retrieval"]
     Agents --> Policy["OPA"]
     Agents --> Approval["Approval and audit records"]
-    Agents --> Model["Deterministic provider by default; Ollama opt-in"]
+    Agents --> Model["Provider boundary: NVIDIA NIM or opt-in Ollama"]
 ```
 
 ### Primary data flow
@@ -201,73 +201,84 @@ Acceptance:
 - The first screen explains use case, architecture, demo, safety, and limits.
 - No documentation claims a production deployment that is not implemented.
 
-### H2-2: Deterministic demo fixture and one-command verification
+### H2-2: AI evaluation baseline and retrieval metrics
 
-**Estimate:** 2-3 days.  
-**Branch:** `codex/h2-deterministic-demo`.
+**Estimate:** 3-4 days.
+**Branch:** `codex/h2-ai-evaluation-baseline`.
 
 Scope:
 
-- Add fixed, idempotent demo fixtures for two tenants and the two canonical
-  scenarios.
-- Add a cross-platform runner, preferably
-  `scripts/interview_demo.py`, with these commands:
+- Add a small, versioned synthetic retrieval corpus with two tenants and
+  expected result identifiers.
+- Run the real Postgres/RLS-backed `HybridRetriever.structured_search` against
+  the corpus. Ollama and Weaviate must not be required for this baseline.
+- Emit a machine-readable report with at least:
 
 ```text
-start    start or check required Compose services
-reset    remove only demo records; never delete Docker volumes
-seed     create deterministic tenant-scoped fixtures
-run      execute Scenario A or Scenario B
-verify   assert expected records, events, decisions, and denial paths
-export   write a redacted JSON evidence bundle
+recall_at_5
+precision_at_5
+case_pass_rate
+tenant_leak_count
+cross_tenant_denial_pass_rate
 ```
 
-- Use stable UUIDs or deterministic keys so screenshots and tests are repeatable.
-- Do not require Ollama in default mode. The deterministic provider must produce
-  the same structured fixture output on every run.
+- Add a GitHub Actions workflow that provisions Postgres, runs the unified
+  migration runner, executes the evaluation, and uploads the JSON report.
+- Hard-fail on tenant leakage, cross-tenant denial failure, or a regression
+  below the documented structured-retrieval threshold.
+- Label the result accurately as a **structured retrieval baseline**. It is not
+  a semantic retrieval, LLM quality, or grounded-answer score.
 
 Acceptance:
 
-```powershell
-python scripts/interview_demo.py reset
-python scripts/interview_demo.py seed
-python scripts/interview_demo.py run --scenario support-copilot
-python scripts/interview_demo.py verify --scenario support-copilot
-python scripts/interview_demo.py run --scenario tenant-denial
-python scripts/interview_demo.py verify --scenario tenant-denial
-```
+- The evaluation is repeatable in CI without a model download or cloud API key.
+- The generated report identifies commit, dataset version, evaluator version,
+  and thresholds.
+- The temporary corpus is removed after every evaluation run.
 
-- Repeating the sequence succeeds without duplicate or cross-tenant records.
-- All created data remains identifiable as demo-only.
-
-### H2-3: Provider boundary on the primary path
+### H2-3: NVIDIA NIM provider boundary
 
 **Estimate:** 2-4 days.  
-**Branch:** `codex/h2-provider-boundary`.
+**Branch:** `codex/h2-nvidia-nim-provider`.
 
 Scope:
 
-- Introduce a narrow provider protocol only for the canonical Support Copilot
-  path; do not refactor every historical agent at once.
-- Supply:
-  - `DeterministicDemoProvider` for local demos and CI.
-  - `OllamaProvider` for explicit `local-llm` usage.
-- Keep structured output contracts and Pydantic validation identical across
-  providers.
-- Report explicit `degraded` status rather than silently inventing an answer if
-  a live model or embeddings service is unavailable.
+- Replace direct Ollama client construction with one server-side provider
+  boundary consumed by agents, retrieval, memory, knowledge, compliance, and
+  translation flows.
+- Support two explicit providers:
+  - `nvidia_nim`: NVIDIA's OpenAI-compatible hosted endpoint.
+  - `ollama`: local inference through the existing opt-in `local-llm` profile.
+- Keep chat and embeddings independently configured:
 
-Non-goal:
+```text
+NVIDIA_CHAT_MODEL     # generation, routing, tool use, summaries
+NVIDIA_EMBED_MODEL    # vectors for Weaviate semantic retrieval
+```
 
-- Do not add a cloud-provider key, account dependency, or cost-bearing model
-  requirement to the default project path.
+- Require `NVIDIA_API_KEY` only when `AI_PROVIDER=nvidia_nim`; inject it only
+  into the agents container. The frontend and gateway must never receive it.
+- Configure request timeout and bounded retries. A provider failure returns a
+  visible degraded/error result; it must not bypass OPA, approval, RLS, or
+  output validation.
+- Keep default CI and structured-retrieval evaluation free of any cloud API
+  key. Use a mock OpenAI-compatible provider for unit coverage.
+
+Embedding compatibility rule:
+
+- Changing `NVIDIA_EMBED_MODEL` changes the vector space. Rebuild Weaviate
+  indexes before enabling semantic search with the new model; do not mix old
+  Ollama vectors with NVIDIA vectors in one collection.
 
 Acceptance:
 
-- CI runs with the deterministic provider and no LLM service.
-- The local-LLM profile is opt-in and documented.
-- Invalid provider output cannot produce a mutation or publish an event.
-
+- `AI_PROVIDER=ollama` remains compatible with the optional local profile.
+- `AI_PROVIDER=nvidia_nim` rejects missing key/model configuration before any
+  remote request.
+- No source module outside the provider boundary constructs an Ollama or
+  OpenAI-compatible client directly.
+- Tests prove that no API key enters provider metadata or Compose services
+  other than `agents`.
 ### H2-4: Agent-run evidence and safe trace view
 
 **Estimate:** 3-4 days.  
@@ -315,10 +326,10 @@ Acceptance:
 - A Weaviate failure produces a visible degraded state.
 - Tests verify tenant isolation and redaction.
 
-### H2-5: Versioned AI evaluation harness and CI evidence
+### H2-5: Evaluation expansion and optional demo fixture
 
 **Estimate:** 4-5 days.  
-**Branch:** `codex/h2-ai-evaluations`.
+**Branch:** `codex/h2-evaluation-expansion`.
 
 Scope:
 
@@ -335,7 +346,9 @@ evals/
   README.md
 ```
 
-Initial dataset target: 35 examples.
+Expand the H2-2 structured retrieval baseline into a 35-example suite and add
+the lightweight deterministic demo fixture only after the metrics baseline is
+stable.
 
 | Category | Target | Required measure |
 |---|---:|---|
@@ -356,7 +369,7 @@ tool_routing_accuracy: 0.90
 citation_coverage: 0.90
 ```
 
-- Create a CI workflow that runs only the deterministic provider and uploads
+- Extend the CI workflow to run the deterministic provider and upload
   `ai-eval-report.json` plus a concise Markdown summary.
 - Treat tenant leakage, unsafe mutation, and malformed structured output as
   hard failures. Treat early relevance/quality measures as report-only until
@@ -470,4 +483,3 @@ For every phase:
 - [ ] Architecture, trade-offs, limits, and scaling path are prepared.
 - [ ] Resume bullets use measured results, not unverified claims.
 - [ ] A 3-5 minute demo can be delivered without editing data manually.
-

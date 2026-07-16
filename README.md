@@ -37,6 +37,8 @@ This repository demonstrates that boundary:
 | Run the application locally | [Quick start](#quick-start) |
 | See the intended interview demo | [Demo script](docs/interview/demo-script.md) |
 | Review design decisions | [Engineering trade-offs](docs/interview/engineering-tradeoffs.md) |
+| Review current retrieval metrics | [AI evaluation baseline](evals/README.md) |
+| Configure remote AI inference | [NVIDIA NIM setup](docs/interview/nvidia-nim.md) |
 | See stated limitations | [Limitations](docs/interview/limitations.md) |
 | Prepare technical discussion | [Interview Q&A](docs/interview/interview-qa.md) |
 | Follow the optimisation work | [Interview readiness plan](docs/interview-readiness-execution-plan.md) |
@@ -205,6 +207,7 @@ checks.
 - [Interview readiness execution plan](docs/interview-readiness-execution-plan.md)
 - [Architecture overview](docs/interview/architecture.md)
 - [Demo script](docs/interview/demo-script.md)
+- [AI evaluation baseline](evals/README.md)
 - [AI governance model](docs/ai-governance.md)
 - [Tenant isolation](docs/tenant-isolation.md)
 - [Event replay](docs/event-replay.md)

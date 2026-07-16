@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 import httpx
-from langchain_ollama import OllamaEmbeddings
+from intelligence.providers import create_embeddings
 
 
 Role = Literal["user", "assistant", "system"]
@@ -32,7 +32,7 @@ class WeaviateChatMemory:
     ):
         self._weaviate_url = weaviate_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
-        self._embeddings = OllamaEmbeddings(base_url=ollama_url, model=embedding_model)
+        self._embeddings = create_embeddings(ollama_url=ollama_url, embedding_model=embedding_model)
 
     async def ensure_schema(self) -> None:
         body = {

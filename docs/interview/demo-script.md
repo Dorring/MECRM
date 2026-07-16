@@ -2,8 +2,9 @@
 
 ## Status
 
-The deterministic fixtures and one-command runner are implemented in H2-2.
-This document defines the stable script before recording screenshots or video.
+The deterministic fixtures and one-command runner are intentionally deferred
+until H2-5, after the retrieval-quality baseline is established. This document
+defines the stable script before recording screenshots or video.
 Do not present placeholder images as evidence.
 
 ## Five-minute primary demo
@@ -53,7 +54,7 @@ trace. State which quality metrics are hard gates and which are report-only.
 - [ ] The evaluation artifact identifies commit, dataset, provider, and result.
 - [ ] All screenshots originate from the current deterministic fixture.
 
-## Commands after H2-2
+## Commands after H2-5
 
 ```powershell
 python scripts/interview_demo.py reset

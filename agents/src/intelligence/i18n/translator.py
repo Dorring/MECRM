@@ -7,10 +7,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 from dataclasses import dataclass
 
-from langchain_ollama import ChatOllama
+from intelligence.providers import AsyncChatModel, create_chat_model
 
 logger = logging.getLogger(__name__)
 
@@ -72,16 +71,14 @@ class TranslationCache:
 _translation_cache = TranslationCache()
 
 
-def _get_llm() -> ChatOllama:
-    """Get the translation LLM."""
-    ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-    model = os.environ.get("TRANSLATION_MODEL", os.environ.get("OLLAMA_MODEL", "llama3.1"))
-    
-    return ChatOllama(
-        base_url=ollama_url,
-        model=model,
-        temperature=0.1,  # Low temperature for consistent translations
-    )
+def _get_llm() -> AsyncChatModel:
+    """Get the configured translation LLM through the provider boundary."""
+    return create_chat_model(temperature=0.1)
+
+
+def _model_name(llm: object) -> str | None:
+    """Read model metadata without assuming an Ollama-specific attribute."""
+    return getattr(llm, "model", None) or getattr(llm, "model_name", None)
 
 
 async def translate_to_english(
@@ -151,7 +148,7 @@ English translation:"""
             source_language=source_language,
             target_language=CANONICAL_LANGUAGE,
             confidence=0.85,  # Reasonable default for LLM translation
-            model_used=llm.model,
+            model_used=_model_name(llm),
         )
         
         if use_cache:
@@ -263,7 +260,7 @@ English text:
             source_language=CANONICAL_LANGUAGE,
             target_language=target_language,
             confidence=0.85,
-            model_used=llm.model,
+            model_used=_model_name(llm),
         )
         
         if use_cache:

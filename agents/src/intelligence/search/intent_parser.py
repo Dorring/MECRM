@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from langchain_ollama import ChatOllama
+from intelligence.providers import AsyncChatModel
 from pydantic import BaseModel, Field
 
 
@@ -30,7 +30,7 @@ class IntentParseResult:
 _JSON_BLOCK = re.compile(r"\{[\s\S]*\}")
 
 
-async def parse_intent(*, llm: ChatOllama, query: str) -> IntentParseResult:
+async def parse_intent(*, llm: AsyncChatModel, query: str) -> IntentParseResult:
     prompt = (
         "You are an intent extractor for a multi-tenant CRM. "
         "Return ONLY valid JSON with keys: entity, action, filters, confidence. "

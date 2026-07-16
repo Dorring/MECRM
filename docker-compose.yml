@@ -198,8 +198,18 @@ services:
     environment:
       - KAFKA_BROKERS=${KAFKA_BROKERS:-kafka:9092}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      # AI provider credentials are injected only into the server-side agents
+      # container. Never add NVIDIA_API_KEY to frontend or gateway services.
+      - AI_PROVIDER=${AI_PROVIDER:-ollama}
+      - AI_REQUEST_TIMEOUT_SECONDS=${AI_REQUEST_TIMEOUT_SECONDS:-30}
+      - AI_MAX_RETRIES=${AI_MAX_RETRIES:-2}
+      - NVIDIA_BASE_URL=${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
+      - NVIDIA_CHAT_MODEL=${NVIDIA_CHAT_MODEL:-}
+      - NVIDIA_EMBED_MODEL=${NVIDIA_EMBED_MODEL:-}
       - OLLAMA_URL=${OLLAMA_URL:-http://ollama:11434}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1}
+      - OLLAMA_EMBED_MODEL=${OLLAMA_EMBED_MODEL:-nomic-embed-text}
       - WEAVIATE_URL=${WEAVIATE_URL:-http://weaviate:8080}
       - OPA_URL=${OPA_URL:-http://opa:8181}
       - DATABASE_URL=postgresql://crm_app:${CRM_APP_PASSWORD:?CRM_APP_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-enterprise_crm}
