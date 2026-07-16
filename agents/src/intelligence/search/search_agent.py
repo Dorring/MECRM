@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import structlog
 from aiokafka import AIOKafkaProducer
-from langchain_ollama import ChatOllama
+from intelligence.providers import AsyncChatModel, create_chat_model
 from opentelemetry import trace
 
 from policy.opa_binding import OpaClient
@@ -28,7 +28,7 @@ tracer = trace.get_tracer(__name__)
 
 @dataclass
 class SearchDeps:
-    llm: ChatOllama
+    llm: AsyncChatModel
     retriever: HybridRetriever
     opa: OpaClient
     limit: int
@@ -46,7 +46,7 @@ class SearchAgent:
             ollama_url=settings.OLLAMA_URL,
             embedding_model=_env("OLLAMA_EMBED_MODEL", "nomic-embed-text"),
         )
-        self._llm = ChatOllama(base_url=settings.OLLAMA_URL, model=settings.OLLAMA_MODEL, temperature=0)
+        self._llm = create_chat_model(temperature=0)
         self._opa = OpaClient(settings.OPA_URL, timeout_seconds=1.0)
         self._deps = SearchDeps(llm=self._llm, retriever=self._retriever, opa=self._opa, limit=12)
         self._graph = build_search_graph(deps=self._deps)

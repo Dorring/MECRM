@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import structlog
-from langchain_ollama import ChatOllama
+from intelligence.providers import create_chat_model
 from opentelemetry import trace
 
 from orchestrator.config import settings
@@ -26,7 +26,7 @@ class AutomationParseResponse:
 
 class AutomationAgent:
     def __init__(self):
-        self._llm = ChatOllama(base_url=settings.OLLAMA_URL, model=settings.OLLAMA_MODEL, temperature=0)
+        self._llm = create_chat_model(temperature=0)
         self._graph = build_automation_graph(deps=AutomationDeps(llm=self._llm))
 
     async def parse(self, *, tenant_id: str, user_id: str, roles: list[str], nl_rule_text: str) -> dict[str, Any]:

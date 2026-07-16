@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from langchain_ollama import ChatOllama
+from intelligence.providers import AsyncChatModel
 from pydantic import BaseModel, Field
 
 
@@ -30,7 +30,7 @@ _JSON_BLOCK = re.compile(r"\{[\s\S]*\}")
 
 async def generate_draft_from_ticket(
     *,
-    llm: ChatOllama,
+    llm: AsyncChatModel,
     subject: str,
     description: str | None,
     resolution: str | None,
@@ -52,7 +52,7 @@ async def generate_draft_from_ticket(
 
 async def generate_draft_from_conversation(
     *,
-    llm: ChatOllama,
+    llm: AsyncChatModel,
     conversation_id: str,
     transcript: list[dict[str, Any]],
 ) -> DraftResult:
@@ -71,7 +71,7 @@ async def generate_draft_from_conversation(
     return await _invoke(llm=llm, prompt=prompt, fallback_title=f"Conversation {conversation_id}")
 
 
-async def _invoke(*, llm: ChatOllama, prompt: str, fallback_title: str) -> DraftResult:
+async def _invoke(*, llm: AsyncChatModel, prompt: str, fallback_title: str) -> DraftResult:
     try:
         msg = await llm.ainvoke(prompt)
         raw = (getattr(msg, "content", None) or "").strip()

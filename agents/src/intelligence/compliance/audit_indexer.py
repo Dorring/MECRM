@@ -9,7 +9,7 @@ from typing import Any, Optional
 import asyncpg
 import httpx
 import structlog
-from langchain_ollama import OllamaEmbeddings
+from intelligence.providers import create_embeddings
 
 from orchestrator.config import settings
 
@@ -70,7 +70,7 @@ class AuditHit:
 class AuditIndexer:
     def __init__(self):
         self._pool: Optional[asyncpg.Pool] = None
-        self._embeddings = OllamaEmbeddings(base_url=settings.OLLAMA_URL, model=_env("OLLAMA_EMBED_MODEL", "nomic-embed-text"))
+        self._embeddings = create_embeddings(ollama_url=settings.OLLAMA_URL, embedding_model=_env("OLLAMA_EMBED_MODEL", "nomic-embed-text"))
         self._weaviate_url = settings.WEAVIATE_URL.rstrip("/")
         self._running = False
         self._task: asyncio.Task | None = None

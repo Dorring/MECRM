@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 import asyncpg
 import httpx
-from langchain_ollama import OllamaEmbeddings
+from intelligence.providers import create_embeddings
 
 
 EntityType = Literal["lead", "deal", "ticket", "customer", "knowledge"]
@@ -46,7 +46,7 @@ class HybridRetriever:
         self._timeout_seconds = timeout_seconds
         self._pool: asyncpg.Pool | None = None
         self._pool_lock = asyncio.Lock()
-        self._embeddings = OllamaEmbeddings(base_url=ollama_url, model=embedding_model)
+        self._embeddings = create_embeddings(ollama_url=ollama_url, embedding_model=embedding_model)
 
     async def start(self) -> None:
         async with self._pool_lock:

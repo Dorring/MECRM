@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import structlog
 from langgraph.graph import END, StateGraph
-from langchain_ollama import ChatOllama
+from intelligence.providers import AsyncChatModel
 from opentelemetry import trace
 from pydantic import BaseModel, Field, ValidationError
 
@@ -69,7 +69,7 @@ class MemoryStore(Protocol):
 
 @dataclass
 class ChatDeps:
-    llm: ChatOllama
+    llm: AsyncChatModel
     tool_executor: ToolExecutor
     memory: MemoryStore | None
     memory_window: int

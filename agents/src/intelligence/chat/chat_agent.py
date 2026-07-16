@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import structlog
 from aiokafka import AIOKafkaProducer
-from langchain_ollama import ChatOllama
+from intelligence.providers import create_chat_model
 from opentelemetry import trace
 
 from orchestrator.config import settings
@@ -39,7 +39,7 @@ class ChatAgent:
     def __init__(self, *, tool_executor: Any, memory: Any | None = None):
         self._producer: AIOKafkaProducer | None = None
         self._producer_lock = asyncio.Lock()
-        self._llm = ChatOllama(base_url=settings.OLLAMA_URL, model=settings.OLLAMA_MODEL, temperature=0)
+        self._llm = create_chat_model(temperature=0)
         if memory is None:
             memory = WeaviateChatMemory(
                 weaviate_url=settings.WEAVIATE_URL,
