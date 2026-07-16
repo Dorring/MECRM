@@ -448,9 +448,13 @@ class TestSupportAgentSuggestResolution:
 
         result = await support_agent.suggest_resolution(event)
 
-        assert result["status"] == "completed"
+        assert result["status"] == "degraded"
         assert support_agent.emit_event.await_count == 1
         assert support_agent.emit_event.await_args.kwargs["data"]["kbHits"] == 0
+        assert support_agent.emit_event.await_args.kwargs["decision_status"] == "degraded"
+        assert support_agent.emit_event.await_args.kwargs["decision_evidence"] == [
+            {"type": "knowledge_retrieval", "source_id": "unavailable"}
+        ]
 
 
 class TestAnalyticsForecast:
