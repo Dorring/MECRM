@@ -96,12 +96,15 @@ jobs:
         run: |
           mkdir -p reports/ai-evals
           PYTHONPATH=agents/src python evals/run_structured_retrieval_eval.py \
-            --output reports/ai-evals/structured-retrieval.json
+            --output reports/ai-evals/structured-retrieval.json \
+            --summary-output reports/ai-evals/structured-retrieval.md
 
       - name: Upload evaluation report
         if: ${{ success() }}
         uses: actions/upload-artifact@v7
         with:
           name: ai-eval-structured-retrieval
-          path: reports/ai-evals/structured-retrieval.json
+          path: |
+            reports/ai-evals/structured-retrieval.json
+            reports/ai-evals/structured-retrieval.md
           if-no-files-found: error

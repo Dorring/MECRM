@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -37,9 +38,10 @@ from evals.structured_retrieval import (  # noqa: E402
     score_case,
     summarise,
 )
+from evals.reporting import dataset_digest, render_markdown_summary  # noqa: E402
 
 
-EVALUATOR_VERSION = "h2-structured-retrieval-v1"
+EVALUATOR_VERSION = "h2-structured-retrieval-v2"
 THRESHOLDS = {
     "recall_at_5": 1.0,
     "precision_at_5": 0.95,
@@ -157,6 +159,7 @@ async def _cleanup_corpus(admin_database_url: str, tenant_ids: dict[str, str]) -
 
 
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
+    started = time.perf_counter()
     corpus_path = Path(args.corpus).resolve()
     cases_path = Path(args.cases).resolve()
     records = load_records(corpus_path)
@@ -216,9 +219,15 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             "evaluation_type": "structured_retrieval_baseline",
             "semantic_retrieval_included": False,
             "llm_quality_included": False,
-            "dataset": {"corpus": corpus_path.name, "cases": cases_path.name},
+            "dataset": {
+                "corpus": corpus_path.name,
+                "cases": cases_path.name,
+                "corpus_sha256": dataset_digest(corpus_path),
+                "cases_sha256": dataset_digest(cases_path),
+            },
             "git_commit": _git_commit(),
             "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "duration_ms": round((time.perf_counter() - started) * 1000),
             "thresholds": THRESHOLDS,
             "metrics": metrics,
             "passed": passed,
@@ -240,6 +249,7 @@ def _parse_args() -> argparse.Namespace:
         default=str(ROOT / "evals" / "datasets" / "structured_retrieval_cases.jsonl"),
     )
     parser.add_argument("--output", required=True, help="Path for the JSON evaluation report")
+    parser.add_argument("--summary-output", help="Optional path for the Markdown evaluation summary")
     parser.add_argument("--database-url", default=os.getenv("DATABASE_URL", ""))
     parser.add_argument("--admin-database-url", default=os.getenv("ADMIN_DATABASE_URL", ""))
     args = parser.parse_args()
@@ -254,6 +264,10 @@ def main() -> int:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if args.summary_output:
+        summary_output = Path(args.summary_output)
+        summary_output.parent.mkdir(parents=True, exist_ok=True)
+        summary_output.write_text(render_markdown_summary(report), encoding="utf-8")
     metrics = report["metrics"]
     print(
         "structured-retrieval: "

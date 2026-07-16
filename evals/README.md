@@ -38,6 +38,7 @@ PYTHONPATH=agents/src python evals/run_structured_retrieval_eval.py \
   --output reports/ai-evals/structured-retrieval.json
 ```
 
-The report records the evaluator version, commit, dataset file names,
-thresholds, metrics, and per-case result identifiers. It never records database
-URLs or secrets.
+The report records the evaluator version, commit, dataset file names and
+SHA-256 digests, thresholds, metrics, elapsed time, and per-case result
+identifiers. It never records database URLs or secrets. CI uploads both the JSON
+report and a concise Markdown summary.

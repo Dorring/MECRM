@@ -8,3 +8,28 @@
 {"case_id":"globex-customer-helix","tenant":"globex","query":"Helix","entity_type":"customer","expected_record_ids":["globex-customer-helix"],"limit":5}
 {"case_id":"acme-cannot-see-globex-ticket","tenant":"acme","query":"Private Beacon","entity_type":"ticket","expected_record_ids":[],"limit":5}
 {"case_id":"globex-cannot-see-acme-customer","tenant":"globex","query":"Northwind Analytics","entity_type":"customer","expected_record_ids":[],"limit":5}
+{"case_id":"acme-lead-aurora-email","tenant":"acme","query":"aurora@example.test","entity_type":"lead","expected_record_ids":["acme-lead-aurora"],"limit":5}
+{"case_id":"acme-lead-aurora-company","tenant":"acme","query":"Aurora Solar","entity_type":"lead","expected_record_ids":["acme-lead-aurora"],"limit":5}
+{"case_id":"acme-lead-aurora-name","tenant":"acme","query":"Solar Prospect","entity_type":"lead","expected_record_ids":["acme-lead-aurora"],"limit":5}
+{"case_id":"acme-deal-meridian-name","tenant":"acme","query":"Meridian Renewal","entity_type":"deal","expected_record_ids":["acme-deal-meridian"],"limit":5}
+{"case_id":"acme-deal-meridian-stage","tenant":"acme","query":"negotiation","entity_type":"deal","expected_record_ids":["acme-deal-meridian"],"limit":5}
+{"case_id":"acme-ticket-vpn-subject","tenant":"acme","query":"Windows VPN","entity_type":"ticket","expected_record_ids":["acme-ticket-vpn"],"limit":5}
+{"case_id":"acme-ticket-vpn-description","tenant":"acme","query":"Aurora VPN","entity_type":"ticket","expected_record_ids":["acme-ticket-vpn"],"limit":5}
+{"case_id":"acme-ticket-vpn-certificate","tenant":"acme","query":"certificate failure","entity_type":"ticket","expected_record_ids":["acme-ticket-vpn"],"limit":5}
+{"case_id":"acme-customer-northwind-name","tenant":"acme","query":"Northwind Analytics","entity_type":"customer","expected_record_ids":["acme-customer-northwind"],"limit":5}
+{"case_id":"acme-customer-northwind-email","tenant":"acme","query":"ops@northwind.example.test","entity_type":"customer","expected_record_ids":["acme-customer-northwind"],"limit":5}
+{"case_id":"acme-customer-northwind-company","tenant":"acme","query":"Northwind","entity_type":"customer","expected_record_ids":["acme-customer-northwind"],"limit":5}
+{"case_id":"acme-lead-meridian-name","tenant":"acme","query":"Expansion Lead","entity_type":"lead","expected_record_ids":["acme-lead-meridian"],"limit":5}
+{"case_id":"acme-lead-meridian-company","tenant":"acme","query":"Meridian Group","entity_type":"lead","expected_record_ids":["acme-lead-meridian"],"limit":5}
+{"case_id":"acme-lead-meridian-email","tenant":"acme","query":"meridian@example.test","entity_type":"lead","expected_record_ids":["acme-lead-meridian"],"limit":5}
+{"case_id":"globex-lead-aurora-name","tenant":"globex","query":"Aurora Logistics Prospect","entity_type":"lead","expected_record_ids":["globex-lead-aurora"],"limit":5}
+{"case_id":"globex-lead-aurora-company","tenant":"globex","query":"Aurora Logistics","entity_type":"lead","expected_record_ids":["globex-lead-aurora"],"limit":5}
+{"case_id":"globex-lead-aurora-email","tenant":"globex","query":"aurora@globex.example.test","entity_type":"lead","expected_record_ids":["globex-lead-aurora"],"limit":5}
+{"case_id":"globex-deal-orbit-name","tenant":"globex","query":"Orbit Renewal","entity_type":"deal","expected_record_ids":["globex-deal-orbit"],"limit":5}
+{"case_id":"globex-deal-orbit-stage","tenant":"globex","query":"proposal","entity_type":"deal","expected_record_ids":["globex-deal-orbit"],"limit":5}
+{"case_id":"globex-ticket-beacon-subject","tenant":"globex","query":"Private Beacon","entity_type":"ticket","expected_record_ids":["globex-ticket-beacon"],"limit":5}
+{"case_id":"globex-ticket-beacon-description","tenant":"globex","query":"Globex-only incident","entity_type":"ticket","expected_record_ids":["globex-ticket-beacon"],"limit":5}
+{"case_id":"globex-ticket-beacon-reference","tenant":"globex","query":"beacon-77","entity_type":"ticket","expected_record_ids":["globex-ticket-beacon"],"limit":5}
+{"case_id":"globex-customer-helix-name","tenant":"globex","query":"Helix Manufacturing","entity_type":"customer","expected_record_ids":["globex-customer-helix"],"limit":5}
+{"case_id":"globex-customer-helix-email","tenant":"globex","query":"ops@helix.example.test","entity_type":"customer","expected_record_ids":["globex-customer-helix"],"limit":5}
+{"case_id":"globex-customer-helix-company","tenant":"globex","query":"Helix","entity_type":"customer","expected_record_ids":["globex-customer-helix"],"limit":5}
