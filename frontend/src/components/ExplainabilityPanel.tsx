@@ -24,15 +24,16 @@ export function ExplainabilityPanel({ decision }: { decision: any }) {
     );
   }
 
-  const reasoning = decision.reasoning || {};
-  const factors = Array.isArray(reasoning.factors) ? reasoning.factors : [];
-  const evidence = Array.isArray(decision.evidence) ? decision.evidence : [];
+  const evidence = Array.isArray(decision.retrievalEvidence) ? decision.retrievalEvidence : [];
   const toolCalls = Array.isArray(decision.toolCalls || decision.tool_calls) ? (decision.toolCalls || decision.tool_calls) : [];
+  const policyDecision = decision.policyDecision || {};
+  const approval = decision.approval || {};
+  const outputValidation = decision.outputValidation || {};
 
   return (
     <div className="card p-6 space-y-4">
       <div className="space-y-1">
-        <div className="text-sm text-gray-500 dark:text-gray-400">Explainability</div>
+        <div className="text-sm text-gray-500 dark:text-gray-400">Safe agent run evidence</div>
         <div className="text-lg font-semibold text-gray-900 dark:text-white">
           {String(header?.actionType || 'Decision')}
         </div>
@@ -47,35 +48,31 @@ export function ExplainabilityPanel({ decision }: { decision: any }) {
         </div>
       </div>
 
-      {factors.length > 0 && (
-        <Section title="Reasoning factors">
-          <pre className="text-xs overflow-auto bg-gray-50 dark:bg-gray-900 p-3 rounded-lg">
-            {JSON.stringify(factors, null, 2)}
-          </pre>
-        </Section>
-      )}
-
-      {reasoning && Object.keys(reasoning).length > 0 && (
-        <Section title="Reasoning chain">
-          <pre className="text-xs overflow-auto bg-gray-50 dark:bg-gray-900 p-3 rounded-lg">
-            {JSON.stringify(reasoning, null, 2)}
-          </pre>
-        </Section>
-      )}
+      <Section title="Run status">
+        <dl className="grid grid-cols-1 gap-2 text-sm sm:grid-cols-3">
+          <div><dt className="text-gray-500">Policy</dt><dd>{String(policyDecision.status || 'not recorded')}</dd></div>
+          <div><dt className="text-gray-500">Approval</dt><dd>{String(approval.status || 'not required')}</dd></div>
+          <div><dt className="text-gray-500">Output validation</dt><dd>{String(outputValidation.status || 'not recorded')}</dd></div>
+        </dl>
+      </Section>
 
       {evidence.length > 0 && (
         <Section title="Evidence">
-          <pre className="text-xs overflow-auto bg-gray-50 dark:bg-gray-900 p-3 rounded-lg">
-            {JSON.stringify(evidence, null, 2)}
-          </pre>
+          <ul className="space-y-1 text-sm">
+            {evidence.map((item: { type?: string; sourceId?: string }, index: number) => (
+              <li key={`${item.type || 'evidence'}-${index}`}>{String(item.type || 'evidence')}: {String(item.sourceId || 'recorded')}</li>
+            ))}
+          </ul>
         </Section>
       )}
 
       {toolCalls.length > 0 && (
         <Section title="Tool calls">
-          <pre className="text-xs overflow-auto bg-gray-50 dark:bg-gray-900 p-3 rounded-lg">
-            {JSON.stringify(toolCalls, null, 2)}
-          </pre>
+          <ul className="space-y-1 text-sm">
+            {toolCalls.map((item: { name?: string; outcome?: string }, index: number) => (
+              <li key={`${item.name || 'tool'}-${index}`}>{String(item.name || 'tool')}: {String(item.outcome || 'recorded')}</li>
+            ))}
+          </ul>
         </Section>
       )}
     </div>
@@ -90,4 +87,3 @@ function Section({ title, children }: { title: string; children: React.ReactNode
     </div>
   );
 }
-

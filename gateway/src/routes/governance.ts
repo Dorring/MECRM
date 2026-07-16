@@ -32,8 +32,8 @@ router.get(
       const where: any = { tenantId: req.tenantId };
       if (req.query.agentId) where.agentId = String(req.query.agentId);
 
-      const [items, total] = await withTenantDb(req.tenantId!, async (db) => {
-        return Promise.all([
+      const { items, total, approvals } = await withTenantDb(req.tenantId!, async (db) => {
+        const [items, total] = await Promise.all([
           db.agentDecision.findMany({
             where,
             skip,
@@ -42,7 +42,17 @@ router.get(
           }),
           db.agentDecision.count({ where }),
         ]);
+
+        const approvalIds = items.flatMap((item) => item.approvalId ? [item.approvalId] : []);
+        const approvals = approvalIds.length
+          ? await db.approval.findMany({
+              where: { tenantId: req.tenantId, id: { in: approvalIds } },
+              select: { id: true, status: true },
+            })
+          : [];
+        return { items, total, approvals };
       });
+      const approvalStatusById = new Map(approvals.map((approval) => [approval.id, approval.status]));
 
       const correlationId = (req.headers['x-correlation-id'] as string) || uuidv4();
       await publishEvent(TOPICS.AUDIT_ACCESSED, {
@@ -63,7 +73,7 @@ router.get(
       auditQueriesTotal.labels('decisions_list').inc();
 
       res.json({
-        data: items,
+        data: items.map((item) => toSafeAgentRun(item, approvalStatusById.get(item.approvalId || ''))),
         pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
       });
     } catch (error) {
@@ -79,10 +89,18 @@ router.get('/decisions/:id', async (req: AuthenticatedRequest, res: Response, ne
       throw badRequest('Insufficient privileges');
     }
 
-    const decision = await withTenantDb(req.tenantId!, async (db) => {
-      return db.agentDecision.findFirst({ where: { id: req.params.id, tenantId: req.tenantId } });
+    const record = await withTenantDb(req.tenantId!, async (db) => {
+      const decision = await db.agentDecision.findFirst({ where: { id: req.params.id, tenantId: req.tenantId } });
+      if (!decision) return null;
+      const approval = decision.approvalId
+        ? await db.approval.findFirst({
+            where: { id: decision.approvalId, tenantId: req.tenantId },
+            select: { status: true },
+          })
+        : null;
+      return { decision, approvalStatus: approval?.status };
     });
-    if (!decision) throw notFound('Decision not found');
+    if (!record) throw notFound('Decision not found');
 
     const correlationId = (req.headers['x-correlation-id'] as string) || uuidv4();
     await publishEvent(TOPICS.AUDIT_ACCESSED, {
@@ -100,7 +118,7 @@ router.get('/decisions/:id', async (req: AuthenticatedRequest, res: Response, ne
     });
     auditQueriesTotal.labels('decision_view').inc();
 
-    res.json(decision);
+    res.json(toSafeAgentRun(record.decision, record.approvalStatus));
   } catch (error) {
     next(error);
   }
@@ -273,3 +291,84 @@ router.post(
 );
 
 export default router;
+
+type DecisionRecord = {
+  id: string;
+  agentId: string;
+  actionType: string;
+  riskLevel: string;
+  status: string;
+  confidence: { toString(): string } | null;
+  evidence: unknown;
+  toolCalls: unknown;
+  approvalId: string | null;
+  correlationId: string | null;
+  createdAt: Date;
+};
+
+function toSafeAgentRun(decision: DecisionRecord, approvalStatus?: string): Record<string, unknown> {
+  const status = normalizeRunStatus(decision.status);
+  return {
+    id: decision.id,
+    agentId: decision.agentId,
+    actionType: decision.actionType,
+    riskLevel: decision.riskLevel,
+    status,
+    confidence: decision.confidence ? Number(decision.confidence.toString()) : null,
+    provider: null,
+    model: null,
+    durationMs: null,
+    toolCalls: safeToolCalls(decision.toolCalls),
+    retrievalEvidence: safeEvidence(decision.evidence),
+    policyDecision: {
+      status: status === 'denied' ? 'denied' : 'checked',
+      requiresApproval: Boolean(decision.approvalId),
+    },
+    approval: {
+      id: decision.approvalId,
+      status: approvalStatus || null,
+    },
+    outputValidation: {
+      status: status === 'denied' ? 'blocked' : status === 'completed' ? 'passed' : 'not_recorded',
+    },
+    correlationId: decision.correlationId,
+    createdAt: decision.createdAt,
+  };
+}
+
+function normalizeRunStatus(status: string): 'completed' | 'pending_approval' | 'denied' | 'degraded' | 'failed' {
+  if (status === 'executed') return 'completed';
+  if (status === 'pending_approval' || status === 'denied' || status === 'degraded' || status === 'failed') return status;
+  return 'failed';
+}
+
+function safeToolCalls(value: unknown): Array<{ name: string; outcome: string }> {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 20).flatMap((item) => {
+    if (!isRecord(item)) return [];
+    const name = safeIdentifier(item.name ?? item.tool ?? item.action);
+    const outcome = safeIdentifier(item.outcome ?? item.status ?? item.result);
+    return name ? [{ name, outcome: outcome || 'recorded' }] : [];
+  });
+}
+
+function safeEvidence(value: unknown): Array<{ type: string; sourceId: string }> {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 20).flatMap((item) => {
+    if (!isRecord(item)) return [];
+    const type = safeIdentifier(item.type);
+    const sourceId = safeIdentifier(item.sourceId ?? item.source_id ?? item.id);
+    return type && sourceId ? [{ type, sourceId }] : [];
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function safeIdentifier(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  if (!normalized || normalized.length > 160) return null;
+  return /^[A-Za-z0-9._:/-]+$/.test(normalized) ? normalized : null;
+}

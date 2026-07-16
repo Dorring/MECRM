@@ -172,8 +172,11 @@ class BaseAgent(ABC):
                     status="executed",
                     confidence=float(data["confidence"]) if data.get("confidence") is not None else None,
                     input_context={},
-                    reasoning={"factors": data.get("factors"), "reasoning": data.get("reasoning")},
-                    evidence=[{"type": "kafka_topic", "value": topic}, {"type": "event_id", "value": event["id"]}],
+                    reasoning={"factors": data.get("factors")},
+                    evidence=[
+                        {"type": "kafka_topic", "source_id": topic},
+                        {"type": "event_id", "source_id": event["id"]},
+                    ],
                     tool_calls=[],
                     approval_id=str(data.get("approvalId")) if data.get("approvalId") else None,
                     correlation_id=str(event.get("correlationid")) if event.get("correlationid") else None,

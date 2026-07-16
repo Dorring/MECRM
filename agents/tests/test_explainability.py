@@ -30,3 +30,22 @@ async def test_explainability_artifact_created_on_emit_event():
 
     assert len(engine.decisions) == 1
     assert engine.decisions[0].action_type == "crm.test.action"
+    assert engine.decisions[0].reasoning == {"factors": [{"name": "x"}]}
+
+
+def test_decision_redaction_removes_chain_of_thought_and_credentials():
+    from governance.explainability import _redact
+
+    redacted = _redact(
+        {
+            "reasoning": "private model rationale",
+            "prompt": "private user prompt",
+            "api_key": "secret-key",
+            "factors": [{"name": "policy_check", "status": "passed"}],
+        }
+    )
+
+    assert redacted["reasoning"] == "[redacted]"
+    assert redacted["prompt"] == "[redacted]"
+    assert redacted["api_key"] == "[redacted]"
+    assert redacted["factors"] == [{"name": "policy_check", "status": "passed"}]

@@ -164,7 +164,23 @@ def _redact(value: Any) -> Any:
         out: dict[str, Any] = {}
         for k, v in value.items():
             lk = str(k).lower()
-            if any(s in lk for s in ("token", "password", "secret", "authorization", "apikey", "api_key")):
+            if any(
+                s in lk
+                for s in (
+                    "token",
+                    "password",
+                    "secret",
+                    "authorization",
+                    "apikey",
+                    "api_key",
+                    "prompt",
+                    "chain_of_thought",
+                    "chain-of-thought",
+                    "reasoning",
+                    "thought",
+                    "raw_response",
+                )
+            ):
                 out[k] = "[redacted]"
             else:
                 out[k] = _redact(v)
