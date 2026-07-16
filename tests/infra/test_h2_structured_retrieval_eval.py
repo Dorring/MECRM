@@ -74,3 +74,19 @@ def test_ci_workflow_runs_real_db_baseline_and_uploads_report() -> None:
     assert "bash ./scripts/migrate.sh" in text
     assert "evals/run_structured_retrieval_eval.py" in text
     assert "ai-eval-structured-retrieval" in text
+
+
+def test_ci_workflow_supplies_all_required_compose_interpolation_values() -> None:
+    text = (ROOT / ".github" / "workflows" / "ai-evaluation-baseline.yml").read_text(
+        encoding="utf-8"
+    )
+
+    for required_name in (
+        "CRM_APP_PASSWORD",
+        "JWT_SECRET",
+        "KEYCLOAK_ADMIN_PASSWORD",
+        "GRAFANA_ADMIN_PASSWORD",
+    ):
+        assert f"  {required_name}:" in text
+    assert "if: ${{ success() }}" in text
+    assert "if: always()" not in text

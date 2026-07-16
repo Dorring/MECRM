@@ -31,6 +31,12 @@ env:
   ADMIN_DATABASE_URL: postgresql://crm_user:crm_password@localhost:5432/enterprise_crm
   DATABASE_URL: postgresql://crm_app:crm_password@localhost:5432/enterprise_crm
   CRM_APP_PASSWORD: crm_password
+  # Compose resolves every service before selecting postgres. These non-secret
+  # CI-only values satisfy required interpolation for services not started by
+  # this workflow; they are never deployed or uploaded.
+  JWT_SECRET: ci-evaluation-jwt-secret
+  KEYCLOAK_ADMIN_PASSWORD: ci-evaluation-keycloak-password
+  GRAFANA_ADMIN_PASSWORD: ci-evaluation-grafana-password
 
 jobs:
   structured-retrieval:
@@ -93,7 +99,7 @@ jobs:
             --output reports/ai-evals/structured-retrieval.json
 
       - name: Upload evaluation report
-        if: always()
+        if: ${{ success() }}
         uses: actions/upload-artifact@v7
         with:
           name: ai-eval-structured-retrieval
