@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 from dataclasses import dataclass
 
 from intelligence.providers import AsyncChatModel, create_chat_model

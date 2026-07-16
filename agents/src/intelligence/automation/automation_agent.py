@@ -7,8 +7,6 @@ import structlog
 from intelligence.providers import create_chat_model
 from opentelemetry import trace
 
-from orchestrator.config import settings
-
 from .graph import AutomationDeps, AutomationState, build_automation_graph
 
 
@@ -46,4 +44,3 @@ class AutomationAgent:
                 compiled=compiled,
                 warnings=warnings,
             ).__dict__
-
