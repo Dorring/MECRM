@@ -6,6 +6,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from pydantic import SecretStr
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -76,7 +77,7 @@ def test_nvidia_chat_and_embeddings_use_separate_model_settings(
         {
             "kind": "chat",
             "base_url": "https://integrate.api.nvidia.com/v1",
-            "api_key": "test-key-not-a-secret",
+            "api_key": SecretStr("test-key-not-a-secret"),
             "model": "nvidia/chat-model",
             "temperature": 0.2,
             "timeout": 17.0,
@@ -85,9 +86,9 @@ def test_nvidia_chat_and_embeddings_use_separate_model_settings(
         {
             "kind": "embedding",
             "base_url": "https://integrate.api.nvidia.com/v1",
-            "api_key": "test-key-not-a-secret",
+            "api_key": SecretStr("test-key-not-a-secret"),
             "model": "nvidia/embedding-model",
-            "request_timeout": 17.0,
+            "timeout": 17.0,
             "max_retries": 3,
         },
     ]

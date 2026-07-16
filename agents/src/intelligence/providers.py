@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from langchain_ollama import ChatOllama, OllamaEmbeddings
+from pydantic import SecretStr
 
 from orchestrator.config import settings
 
@@ -41,7 +42,7 @@ def create_chat_model(*, temperature: float = 0.0) -> AsyncChatModel:
 
         return ChatOpenAI(
             base_url=settings.NVIDIA_BASE_URL.rstrip("/"),
-            api_key=settings.NVIDIA_API_KEY,
+            api_key=SecretStr(settings.NVIDIA_API_KEY),
             model=settings.NVIDIA_CHAT_MODEL,
             temperature=temperature,
             timeout=settings.AI_REQUEST_TIMEOUT_SECONDS,
@@ -74,9 +75,9 @@ def create_embeddings(
 
         return OpenAIEmbeddings(
             base_url=settings.NVIDIA_BASE_URL.rstrip("/"),
-            api_key=settings.NVIDIA_API_KEY,
+            api_key=SecretStr(settings.NVIDIA_API_KEY),
             model=settings.NVIDIA_EMBED_MODEL,
-            request_timeout=settings.AI_REQUEST_TIMEOUT_SECONDS,
+            timeout=settings.AI_REQUEST_TIMEOUT_SECONDS,
             max_retries=settings.AI_MAX_RETRIES,
         )
     raise ProviderConfigurationError(
