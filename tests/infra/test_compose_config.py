@@ -286,6 +286,29 @@ class TestSecretsUseEnvVars(unittest.TestCase):
                     self.fail(f"JWT_SECRET hardcoded: {line.strip()!r}")
 
 
+class TestGatewayBrowserOriginConfiguration(unittest.TestCase):
+    """Compose must inject the browser-origin allowlist used by auth routes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.services = _load_compose().get("services", {})
+
+    def test_gateway_sets_a_local_origin_allowlist_default(self):
+        gateway = self.services.get("gateway")
+        self.assertIsNotNone(gateway, "gateway service missing")
+        env = _env_list(gateway)
+        self.assertIn(
+            "ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000}",
+            env,
+            "gateway must permit the local frontend-proxy Origin for browser auth",
+        )
+
+    def test_env_example_documents_the_local_origin_allowlist(self):
+        with open(".env.example", encoding="utf-8") as handle:
+            example = handle.read()
+        self.assertIn("ALLOWED_ORIGINS=http://localhost:3000", example)
+
+
 class TestAgentsCommand(unittest.TestCase):
     """P0-5: compose agents command must match the Dockerfile entrypoint."""
 

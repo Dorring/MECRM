@@ -64,6 +64,10 @@ services:
       - OPA_URL=${OPA_URL:-http://opa:8181}
       # JWT_SECRET must be provided via .env; missing secret fails startup (no default).
       - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required}
+      # Browser auth requests include Origin even when the frontend proxy keeps
+      # API traffic same-origin. Keep a local default while allowing deployments
+      # to supply an explicit comma-separated allowlist.
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000}
       - KEYCLOAK_URL=${KEYCLOAK_URL:-http://keycloak:8080}
       - REPLAY_SERVICE_URL=http://replay-service:5011
     volumes:
