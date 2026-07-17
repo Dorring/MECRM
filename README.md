@@ -34,8 +34,10 @@ This repository demonstrates that boundary:
 | If you want to... | Start with |
 |---|---|
 | Understand the architecture | [Architecture overview](docs/interview/architecture.md) |
+| Get the interview summary | [Project briefing](docs/interview/project-briefing.md) |
 | Run the application locally | [Quick start](#quick-start) |
 | See the intended interview demo | [Demo script](docs/interview/demo-script.md) |
+| Capture verified evidence | [Evidence capture map](docs/interview/evidence-capture-map.md) |
 | Review design decisions | [Engineering trade-offs](docs/interview/engineering-tradeoffs.md) |
 | Review current retrieval metrics | [AI evaluation baseline](evals/README.md) |
 | Configure remote AI inference | [NVIDIA NIM setup](docs/interview/nvidia-nim.md) |
@@ -146,9 +148,10 @@ the canonical demo before making local inference part of any required flow.
 - Image digest deployment paths, SBOM/provenance artifacts, Trivy scanning, and
   CodeQL/Dependabot governance.
 
-The next portfolio phases add deterministic demo fixtures, a run-level agent
-evidence screen, and a versioned AI evaluation suite. They are deliberately
-tracked as work in progress rather than represented as already complete.
+The project now includes a safe run-level agent evidence screen and versioned
+offline evaluation artifacts. A fully scripted, end-to-end support-copilot demo
+fixture and real screenshot/video package remain explicitly in progress; the
+evidence capture map prevents those future assets from being fabricated.
 
 ## Engineering evidence
 
@@ -206,7 +209,9 @@ checks.
 
 - [Interview readiness execution plan](docs/interview-readiness-execution-plan.md)
 - [Architecture overview](docs/interview/architecture.md)
+- [Project briefing](docs/interview/project-briefing.md)
 - [Demo script](docs/interview/demo-script.md)
+- [Evidence capture map](docs/interview/evidence-capture-map.md)
 - [AI evaluation baseline](evals/README.md)
 - [AI governance model](docs/ai-governance.md)
 - [Tenant isolation](docs/tenant-isolation.md)

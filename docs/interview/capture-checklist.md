@@ -1,6 +1,7 @@
 # Evidence Capture Checklist
 
-Capture only after H2-2 and later acceptance criteria are satisfied.
+Capture only after the local prerequisites in the
+[evidence capture map](evidence-capture-map.md) are satisfied.
 
 - [ ] Support Copilot structured result with tenant-safe evidence references.
 - [ ] Pending approval state.
