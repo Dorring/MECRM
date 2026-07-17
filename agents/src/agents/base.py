@@ -21,6 +21,7 @@ from governance.approval_service import approval_requestor_uuid
 from governance.approval_service import ApprovalService
 from governance.data_guard import DataGuard
 from governance.explainability import DecisionArtifact, ExplainabilityEngine
+from governance.evidence import is_valid_run_status
 from governance.agent_telemetry import inc_approval_required, inc_error, inc_policy_violation, inc_tool_call, observe_decision_latency
 
 logger = structlog.get_logger()
@@ -153,7 +154,7 @@ class BaseAgent(ABC):
         decision_evidence: Optional[list[Dict[str, str]]] = None,
     ):
         """Emit an event to Kafka."""
-        if decision_status not in {"completed", "pending_approval", "denied", "degraded", "failed"}:
+        if not is_valid_run_status(decision_status):
             raise ValueError(f"Unsupported decision status: {decision_status}")
 
         if self._data_guard and tenant_id:
