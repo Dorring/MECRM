@@ -19,6 +19,16 @@ PYTHONPATH=agents/src python evals/run_safety_contract_eval.py \
 The evaluation has hard gates for malformed contract output, unsafe execution,
 prompt-injection blocking, safe citation coverage, and safe tool-route coverage.
 
+## H2 offline evidence bundle
+
+The CI workflow combines the independently produced structured-retrieval and
+safety-contract reports into `ai-eval-h2-offline-evidence`. It keeps the two
+evidence types separate while presenting the interview-facing hard gates and
+report-only metrics in one artifact.
+
+This bundle has no network access and is not a NVIDIA NIM benchmark: it makes
+no live model call and contains no semantic-retrieval or answer-quality claim.
+
 ## H2 structured retrieval baseline
 
 `run_structured_retrieval_eval.py` seeds a temporary two-tenant corpus into the
