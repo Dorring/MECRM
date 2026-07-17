@@ -43,6 +43,8 @@ def test_interview_docs_cover_required_architecture_topics() -> None:
             "## Scaling path",
         ],
         "demo-script.md": ["## Five-minute primary demo", "## Required evidence"],
+        "project-briefing.md": ["## Problem", "## What is verified", "## Metrics and their boundaries"],
+        "evidence-capture-map.md": ["## Before capture", "## Capture map", "## Video walkthrough"],
         "engineering-tradeoffs.md": ["## Why agent workflows"],
         "limitations.md": ["# Current Limitations"],
         "interview-qa.md": ["# Interview Q&A"],
@@ -62,3 +64,19 @@ def test_governance_demo_has_no_screenshot_placeholders() -> None:
 
     assert "Screenshot placeholders:" not in text
     assert "capture-checklist.md" in text
+
+
+def test_interview_docs_do_not_claim_the_missing_demo_runner_exists() -> None:
+    demo_script = _text(INTERVIEW_DIR / "demo-script.md")
+    capture_map = _text(INTERVIEW_DIR / "evidence-capture-map.md")
+
+    assert "python scripts/interview_demo.py" not in demo_script
+    assert "not implemented yet" in demo_script
+    assert "Do not substitute an invented chat answer." in capture_map
+
+
+def test_readme_links_to_the_interview_briefing_and_capture_map() -> None:
+    text = _text(README)
+
+    assert "docs/interview/project-briefing.md" in text
+    assert "docs/interview/evidence-capture-map.md" in text

@@ -2,10 +2,11 @@
 
 ## Status
 
-The deterministic fixtures and one-command runner are intentionally deferred
-until H2-5, after the retrieval-quality baseline is established. This document
-defines the stable script before recording screenshots or video.
-Do not present placeholder images as evidence.
+Safe agent-run evidence and versioned offline evaluation artifacts are
+available. A one-command reset/seed/run/verify fixture for the end-to-end
+Support Copilot flow is not implemented yet. This script is therefore a
+walkthrough outline, not a claim that every state can be generated with a
+single command. Do not present placeholder images as evidence.
 
 ## Five-minute primary demo
 
@@ -47,20 +48,21 @@ trace. State which quality metrics are hard gates and which are report-only.
 
 ## Required evidence before recording
 
-- [ ] H2-2 seed/reset/run/verify commands pass twice in sequence.
 - [ ] The primary run has a visible tenant-scoped evidence record.
 - [ ] The approval result is present in the UI and audit data.
 - [ ] The denial scenario contains no foreign-tenant data.
 - [ ] The evaluation artifact identifies commit, dataset, provider, and result.
 - [ ] All screenshots originate from the current deterministic fixture.
 
-## Commands after H2-5
+## Verified local prerequisites
 
 ```powershell
-python scripts/interview_demo.py reset
-python scripts/interview_demo.py seed
-python scripts/interview_demo.py run --scenario support-copilot
-python scripts/interview_demo.py verify --scenario support-copilot
-python scripts/interview_demo.py run --scenario tenant-denial
-python scripts/interview_demo.py verify --scenario tenant-denial
+docker compose up -d --build --wait
+docker compose --profile migrate run --rm migrate
+docker compose --profile smoke-test run --rm smoke-test
+docker compose --profile ws-proxy-test run --rm ws-proxy-test
 ```
+
+Use the [evidence capture map](evidence-capture-map.md) for the UI states that
+are safe to record. Do not edit database rows manually to manufacture a run,
+approval, or denial result.
