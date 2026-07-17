@@ -74,12 +74,16 @@ class DataGuard:
     async def _ensure_customer_allowed(self, *, tenant_id: str, agent_id: str, customer_id: str) -> None:
         assert self._pool
         async with self._pool.acquire() as conn:
-            await conn.execute("SELECT set_config('app.tenant_id', $1, true)", tenant_id)
-            row = await conn.fetchrow(
-                "SELECT deletion_type, deleted_at FROM customers WHERE tenant_id=$1::uuid AND id=$2::uuid",
-                tenant_id,
-                customer_id,
-            )
+            # `is_local=true` scopes the RLS setting to this transaction.  Keep
+            # the query in the same transaction or PostgreSQL resets it to an
+            # empty value before the RLS policy evaluates it.
+            async with conn.transaction():
+                await conn.execute("SELECT set_config('app.tenant_id', $1, true)", tenant_id)
+                row = await conn.fetchrow(
+                    "SELECT deletion_type, deleted_at FROM customers WHERE tenant_id=$1::uuid AND id=$2::uuid",
+                    tenant_id,
+                    customer_id,
+                )
             if not row:
                 return
             deletion_type = row["deletion_type"]
@@ -112,12 +116,15 @@ class DataGuard:
     async def _ensure_user_allowed(self, *, tenant_id: str, agent_id: str, user_id: str) -> None:
         assert self._pool
         async with self._pool.acquire() as conn:
-            await conn.execute("SELECT set_config('app.tenant_id', $1, true)", tenant_id)
-            row = await conn.fetchrow(
-                "SELECT deletion_type, deleted_at FROM users WHERE tenant_id=$1::uuid AND id=$2::uuid",
-                tenant_id,
-                user_id,
-            )
+            # See _ensure_customer_allowed: RLS context and the guarded query
+            # must share one transaction when `set_config(..., true)` is used.
+            async with conn.transaction():
+                await conn.execute("SELECT set_config('app.tenant_id', $1, true)", tenant_id)
+                row = await conn.fetchrow(
+                    "SELECT deletion_type, deleted_at FROM users WHERE tenant_id=$1::uuid AND id=$2::uuid",
+                    tenant_id,
+                    user_id,
+                )
             if not row:
                 return
             deletion_type = row["deletion_type"]

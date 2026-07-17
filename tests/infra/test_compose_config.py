@@ -236,6 +236,22 @@ class TestGatewayPolicyMounts(unittest.TestCase):
             )
 
 
+class TestGatewayServiceDiscovery(unittest.TestCase):
+    """Gateway-to-Agents traffic must use Compose DNS, never container localhost."""
+
+    def test_gateway_uses_agents_service_name(self):
+        gateway = _load_compose().get("services", {}).get("gateway")
+        self.assertIsNotNone(gateway, "gateway service is missing")
+        env = _env_list(gateway)
+        agents_url = next((item for item in env if item.startswith("AGENTS_URL=")), "")
+        self.assertEqual(
+            agents_url,
+            "AGENTS_URL=${AGENTS_URL:-http://agents:5010}",
+            "gateway must reach Agents via the Compose service DNS name",
+        )
+        self.assertNotIn("localhost", agents_url)
+
+
 class TestSecretsUseEnvVars(unittest.TestCase):
     """Keycloak/Grafana/JWT must use env vars, not hardcoded admin/supersecret."""
 
