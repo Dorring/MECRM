@@ -336,8 +336,11 @@ function toSafeAgentRun(decision: DecisionRecord, approvalStatus?: string): Reco
   };
 }
 
-function normalizeRunStatus(status: string): 'completed' | 'pending_approval' | 'denied' | 'degraded' | 'failed' {
-  if (status === 'executed') return 'completed';
+export function normalizeRunStatus(status: string): 'completed' | 'pending_approval' | 'denied' | 'degraded' | 'failed' {
+  // Agent decisions produced by the asynchronous consumers use "completed",
+  // while older gateway-originated runs use "executed". Both are successful
+  // terminal states and must render identically in governance evidence.
+  if (status === 'executed' || status === 'completed') return 'completed';
   if (status === 'pending_approval' || status === 'denied' || status === 'degraded' || status === 'failed') return status;
   return 'failed';
 }
