@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 import structlog
 from intelligence.providers import create_chat_model
@@ -22,6 +22,51 @@ class AutomationParseResponse:
     warnings: list[str]
 
 
+def _serialize_graph_output(out: AutomationState | Mapping[str, Any]) -> AutomationParseResponse:
+    """Normalize LangGraph's mapping result before producing the HTTP response.
+
+    LangGraph returns a mapping for ``ainvoke`` even when the graph state is a
+    dataclass.  Keeping this conversion at the boundary makes the API stable
+    for both direct graph use and LangGraph's serialized return value.
+    """
+    if isinstance(out, Mapping):
+        workflow_value = out.get("workflow")
+        compiled_value = out.get("compiled")
+        warnings_value = out.get("warnings")
+    else:
+        workflow_value = out.workflow
+        compiled_value = out.compiled
+        warnings_value = out.warnings
+
+    workflow = (
+        workflow_value.model_dump()
+        if workflow_value is not None and hasattr(workflow_value, "model_dump")
+        else {"trigger": "customer_updated", "conditions": [], "actions": []}
+    )
+    compiled = (
+        compiled_value.to_dict()
+        if compiled_value is not None and hasattr(compiled_value, "to_dict")
+        else {
+            "trigger_type": "customer_updated",
+            "trigger_topics": [],
+            "conditions": [],
+            "actions": [],
+            "warnings": ["missing_compiled"],
+        }
+    )
+    warnings = list(warnings_value) if isinstance(warnings_value, list) else []
+    return AutomationParseResponse(
+        trigger_type=str(
+            compiled.get("trigger_type")
+            or workflow.get("trigger")
+            or "customer_updated"
+        ),
+        workflow=workflow,
+        compiled=compiled,
+        warnings=warnings,
+    )
+
+
 class AutomationAgent:
     def __init__(self):
         self._llm = create_chat_model(temperature=0)
@@ -34,13 +79,5 @@ class AutomationAgent:
             span.set_attribute("rule_len", len(nl_rule_text or ""))
 
             state = AutomationState(nl_rule_text=nl_rule_text)
-            out: Any = await self._graph.ainvoke(state)
-            workflow = out.workflow.model_dump() if out.workflow else {"trigger": "customer_updated", "conditions": [], "actions": []}
-            compiled = out.compiled.to_dict() if out.compiled else {"trigger_type": "customer_updated", "trigger_topics": [], "conditions": [], "actions": [], "warnings": ["missing_compiled"]}
-            warnings = out.warnings or []
-            return AutomationParseResponse(
-                trigger_type=str(compiled.get("trigger_type") or workflow.get("trigger") or "customer_updated"),
-                workflow=workflow,
-                compiled=compiled,
-                warnings=warnings,
-            ).__dict__
+            out: AutomationState | Mapping[str, Any] = await self._graph.ainvoke(state)
+            return _serialize_graph_output(out).__dict__

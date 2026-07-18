@@ -1,4 +1,5 @@
 from intelligence.automation.rule_parser import parse_rule
+from intelligence.automation.automation_agent import _serialize_graph_output
 from intelligence.automation.workflow_compiler import compile_workflow
 
 
@@ -17,3 +18,19 @@ def test_compile_enforces_allowlist():
     assert isinstance(compiled.trigger_topics, list)
     assert all(a.get("type") in ("notify", "create_task", "propose_followup") for a in compiled.actions)
 
+
+def test_serialize_graph_output_accepts_langgraph_mapping_result():
+    workflow, _ = parse_rule(
+        llm=None,
+        nl_rule_text="When invoice overdue by 7 days, notify finance and assign call task.",
+    )
+    compiled = compile_workflow(workflow)
+
+    result = _serialize_graph_output(
+        {"workflow": workflow, "compiled": compiled, "warnings": ["fallback_used"]}
+    )
+
+    assert result.trigger_type == "invoice_overdue"
+    assert result.workflow["trigger"] == "invoice_overdue"
+    assert result.compiled["trigger_type"] == "invoice_overdue"
+    assert result.warnings == ["fallback_used"]

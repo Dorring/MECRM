@@ -36,6 +36,29 @@ def _stringify_json(v: Any) -> str:
         return str(v)
 
 
+def _as_json_object(value: Any) -> dict[str, Any]:
+    """Return a JSON object for PostgreSQL JSON/JSONB values of either shape."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _as_json_value(value: Any) -> Any:
+    """Decode JSON strings returned by a database driver without changing JSON."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
 def _decision_text_blob(d: dict[str, Any]) -> str:
     parts = [
         f"agent={d.get('agent_id')}",
@@ -43,16 +66,16 @@ def _decision_text_blob(d: dict[str, Any]) -> str:
         f"risk={d.get('risk_level')}",
         f"status={d.get('status')}",
     ]
-    reasoning = d.get("reasoning") or {}
+    reasoning = _as_json_object(d.get("reasoning"))
     factors = reasoning.get("factors")
     if factors:
         parts.append("factors=" + _stringify_json(factors)[:2000])
     if reasoning:
         parts.append("reasoning=" + _stringify_json(reasoning)[:2000])
-    evidence = d.get("evidence")
+    evidence = _as_json_object(d.get("evidence"))
     if evidence:
         parts.append("evidence=" + _stringify_json(evidence)[:1500])
-    tool_calls = d.get("tool_calls")
+    tool_calls = _as_json_value(d.get("tool_calls"))
     if tool_calls:
         parts.append("tool_calls=" + _stringify_json(tool_calls)[:1500])
     return "\n".join(parts).strip()
@@ -236,4 +259,3 @@ def _env(key: str, default: str) -> str:
 
     val = os.getenv(key)
     return val.strip() if val and val.strip() else default
-
