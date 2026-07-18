@@ -236,6 +236,22 @@ class TestGatewayPolicyMounts(unittest.TestCase):
             )
 
 
+class TestGatewayServiceDiscovery(unittest.TestCase):
+    """Gateway-to-Agents traffic must use Compose DNS, never container localhost."""
+
+    def test_gateway_uses_agents_service_name(self):
+        gateway = _load_compose().get("services", {}).get("gateway")
+        self.assertIsNotNone(gateway, "gateway service is missing")
+        env = _env_list(gateway)
+        agents_url = next((item for item in env if item.startswith("AGENTS_URL=")), "")
+        self.assertEqual(
+            agents_url,
+            "AGENTS_URL=${AGENTS_URL:-http://agents:5010}",
+            "gateway must reach Agents via the Compose service DNS name",
+        )
+        self.assertNotIn("localhost", agents_url)
+
+
 class TestSecretsUseEnvVars(unittest.TestCase):
     """Keycloak/Grafana/JWT must use env vars, not hardcoded admin/supersecret."""
 
@@ -284,6 +300,29 @@ class TestSecretsUseEnvVars(unittest.TestCase):
                 rhs = line.split("=", 1)[1].strip().strip('"').strip("'")
                 if rhs and not rhs.startswith("${"):
                     self.fail(f"JWT_SECRET hardcoded: {line.strip()!r}")
+
+
+class TestGatewayBrowserOriginConfiguration(unittest.TestCase):
+    """Compose must inject the browser-origin allowlist used by auth routes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.services = _load_compose().get("services", {})
+
+    def test_gateway_sets_a_local_origin_allowlist_default(self):
+        gateway = self.services.get("gateway")
+        self.assertIsNotNone(gateway, "gateway service missing")
+        env = _env_list(gateway)
+        self.assertIn(
+            "ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000}",
+            env,
+            "gateway must permit the local frontend-proxy Origin for browser auth",
+        )
+
+    def test_env_example_documents_the_local_origin_allowlist(self):
+        with open(".env.example", encoding="utf-8") as handle:
+            example = handle.read()
+        self.assertIn("ALLOWED_ORIGINS=http://localhost:3000", example)
 
 
 class TestAgentsCommand(unittest.TestCase):

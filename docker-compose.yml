@@ -64,6 +64,13 @@ services:
       - OPA_URL=${OPA_URL:-http://opa:8181}
       # JWT_SECRET must be provided via .env; missing secret fails startup (no default).
       - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required}
+      # Browser auth requests include Origin even when the frontend proxy keeps
+      # API traffic same-origin. Keep a local default while allowing deployments
+      # to supply an explicit comma-separated allowlist.
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000}
+      # Service-to-service calls must use the Compose DNS name.  localhost in
+      # this container points back to the gateway, not to the Agents service.
+      - AGENTS_URL=${AGENTS_URL:-http://agents:5010}
       - KEYCLOAK_URL=${KEYCLOAK_URL:-http://keycloak:8080}
       - REPLAY_SERVICE_URL=http://replay-service:5011
     volumes:
