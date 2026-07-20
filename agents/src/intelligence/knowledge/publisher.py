@@ -7,7 +7,7 @@ from typing import Any, Optional
 import asyncpg
 import httpx
 import structlog
-from intelligence.providers import create_embeddings
+from intelligence.providers import create_embeddings, vector_collection_name
 
 from orchestrator.config import settings
 
@@ -19,7 +19,8 @@ class KnowledgePublisher:
     def __init__(self):
         self._pool: Optional[asyncpg.Pool] = None
         self._weaviate_url = settings.WEAVIATE_URL.rstrip("/")
-        self._embeddings = create_embeddings(ollama_url=settings.OLLAMA_URL, embedding_model=_env("OLLAMA_EMBED_MODEL", "nomic-embed-text"))
+        self._embeddings = create_embeddings(ollama_url=settings.OLLAMA_URL, embedding_model=settings.OLLAMA_EMBED_MODEL)
+        self._collection = vector_collection_name("KnowledgeBase")
 
     async def start(self) -> None:
         if self._pool:
@@ -60,7 +61,7 @@ class KnowledgePublisher:
         vector = await self._embeddings.aembed_query((title + "\n\n" + content)[:8000])
 
         obj = {
-            "class": "KnowledgeBase",
+            "class": self._collection,
             "id": article_id,
             "properties": {
                 "article_id": article_id,
@@ -78,7 +79,7 @@ class KnowledgePublisher:
 
     async def _ensure_schema(self) -> None:
         schema = {
-            "class": "KnowledgeBase",
+            "class": self._collection,
             "description": "Tenant-isolated knowledge base articles",
             "vectorizer": "none",
             "properties": [
@@ -92,7 +93,7 @@ class KnowledgePublisher:
         }
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:
-                existing = await client.get(f"{self._weaviate_url}/v1/schema/KnowledgeBase")
+                existing = await client.get(f"{self._weaviate_url}/v1/schema/{self._collection}")
                 if existing.status_code == 200:
                     return
                 if existing.status_code not in (404, 422):
@@ -108,10 +109,3 @@ def _as_iso(dt: Any) -> str:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.isoformat().replace("+00:00", "Z")
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _env(key: str, default: str) -> str:
-    import os
-
-    val = os.getenv(key)
-    return val.strip() if val and val.strip() else default

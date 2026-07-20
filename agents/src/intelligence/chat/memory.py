@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 import httpx
-from intelligence.providers import create_embeddings
+from intelligence.providers import create_embeddings, vector_collection_name
 
 
 Role = Literal["user", "assistant", "system"]
@@ -33,10 +33,11 @@ class WeaviateChatMemory:
         self._weaviate_url = weaviate_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
         self._embeddings = create_embeddings(ollama_url=ollama_url, embedding_model=embedding_model)
+        self._collection = vector_collection_name("ChatMemory")
 
     async def ensure_schema(self) -> None:
         body = {
-            "class": "ChatMemory",
+            "class": self._collection,
             "description": "Tenant-isolated conversational memory for CRM copilot",
             "vectorizer": "none",
             "properties": [
@@ -50,7 +51,7 @@ class WeaviateChatMemory:
         }
         try:
             async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
-                existing = await client.get(f"{self._weaviate_url}/v1/schema/ChatMemory")
+                existing = await client.get(f"{self._weaviate_url}/v1/schema/{self._collection}")
                 if existing.status_code == 200:
                     return
                 if existing.status_code not in (404, 422):
@@ -64,7 +65,7 @@ class WeaviateChatMemory:
             await self.ensure_schema()
             vector = await self._embeddings.aembed_query(item.message or "")
             obj = {
-                "class": "ChatMemory",
+                "class": self._collection,
                 "properties": {
                     "conversation_id": item.conversation_id,
                     "tenant_id": item.tenant_id,
@@ -82,28 +83,24 @@ class WeaviateChatMemory:
 
     async def load_window(self, *, tenant_id: str, conversation_id: str, limit: int) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit or 10), 50))
+        coll = self._collection
         query = {
-            "query": """
-            query ChatWindow($tenant:String!, $conv:String!, $limit:Int!) {
-              Get {
-                ChatMemory(
-                  where: { operator: And, operands: [
-                    { path: [\"tenant_id\"], operator: Equal, valueText: $tenant },
-                    { path: [\"conversation_id\"], operator: Equal, valueText: $conv }
-                  ]},
-                  limit: $limit,
-                  sort: [{ path: [\"timestamp\"], order: desc }]
-                ) {
-                  conversation_id
-                  tenant_id
-                  user_id
-                  role
-                  message
-                  timestamp
-                }
-              }
-            }
-            """,
+            "query": (
+                "query ChatWindow($tenant:String!, $conv:String!, $limit:Int!) {"
+                "  Get {"
+                f"    {coll}("
+                "      where: { operator: And, operands: ["
+                '        { path: ["tenant_id"], operator: Equal, valueText: $tenant },'
+                '        { path: ["conversation_id"], operator: Equal, valueText: $conv }'
+                "      ]},"
+                "      limit: $limit,"
+                '      sort: [{ path: ["timestamp"], order: desc }]'
+                "    ) {"
+                "      conversation_id tenant_id user_id role message timestamp"
+                "    }"
+                "  }"
+                "}"
+            ),
             "variables": {"tenant": tenant_id, "conv": conversation_id, "limit": limit},
         }
         try:
@@ -115,7 +112,7 @@ class WeaviateChatMemory:
         except Exception:
             return []
 
-        items = (((body.get("data") or {}).get("Get") or {}).get("ChatMemory")) or []
+        items = (((body.get("data") or {}).get("Get") or {}).get(coll)) or []
         if not isinstance(items, list):
             return []
         items = [x for x in items if isinstance(x, dict)]

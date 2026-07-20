@@ -40,7 +40,7 @@ class KnowledgeAgent(BaseAgent):
         self._chat_memory = WeaviateChatMemory(
             weaviate_url=settings.WEAVIATE_URL,
             ollama_url=settings.OLLAMA_URL,
-            embedding_model=_env("OLLAMA_EMBED_MODEL", "nomic-embed-text"),
+            embedding_model=settings.OLLAMA_EMBED_MODEL,
         )
         self._publisher = KnowledgePublisher()
 
@@ -274,11 +274,4 @@ class KnowledgeAgent(BaseAgent):
 
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _env(key: str, default: str) -> str:
-    import os
-
-    val = os.getenv(key)
-    return val.strip() if val and val.strip() else default
 

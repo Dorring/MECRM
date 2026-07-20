@@ -44,7 +44,7 @@ class ChatAgent:
             memory = WeaviateChatMemory(
                 weaviate_url=settings.WEAVIATE_URL,
                 ollama_url=settings.OLLAMA_URL,
-                embedding_model=_env("OLLAMA_EMBED_MODEL", "nomic-embed-text"),
+                embedding_model=settings.OLLAMA_EMBED_MODEL,
             )
         self._deps = ChatDeps(llm=self._llm, tool_executor=tool_executor, memory=memory, memory_window=12)
         self._graph = build_chat_graph(deps=self._deps)
@@ -192,13 +192,6 @@ class ChatAgent:
             inc_error(agent_id=self.agent_id, error_type="kafka_emit_failed")
             logger.warning("chat.emit_failed", topic=topic, error=str(e))
             return
-
-
-def _env(key: str, default: str) -> str:
-    import os
-
-    val = os.getenv(key)
-    return val.strip() if val and val.strip() else default
 
 
 def _topic(name: str) -> str:

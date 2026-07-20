@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 import asyncpg
 import httpx
-from intelligence.providers import create_embeddings
+from intelligence.providers import create_embeddings, vector_collection_name
 
 
 EntityType = Literal["lead", "deal", "ticket", "customer", "knowledge"]
@@ -47,6 +47,8 @@ class HybridRetriever:
         self._pool: asyncpg.Pool | None = None
         self._pool_lock = asyncio.Lock()
         self._embeddings = create_embeddings(ollama_url=ollama_url, embedding_model=embedding_model)
+        self._crm_collection = vector_collection_name("CrmEntity")
+        self._kb_collection = vector_collection_name("KnowledgeBase")
 
     async def start(self) -> None:
         async with self._pool_lock:
@@ -238,7 +240,7 @@ class HybridRetriever:
         except Exception:
             return []
 
-        class_name = "CrmEntity"
+        class_name = self._crm_collection
         where: dict[str, Any] = {
             "operator": "And",
             "operands": [
@@ -322,7 +324,7 @@ class HybridRetriever:
         except Exception:
             return []
 
-        class_name = "KnowledgeBase"
+        class_name = self._kb_collection
         where: dict[str, Any] = {
             "operator": "And",
             "operands": [
@@ -387,7 +389,7 @@ class HybridRetriever:
 
     async def ensure_weaviate_schema(self) -> None:
         crm_entity = {
-            "class": "CrmEntity",
+            "class": self._crm_collection,
             "description": "Tenant-isolated CRM entities for hybrid search",
             "vectorizer": "none",
             "properties": [
@@ -402,7 +404,7 @@ class HybridRetriever:
             ],
         }
         knowledge_base = {
-            "class": "KnowledgeBase",
+            "class": self._kb_collection,
             "description": "Tenant-isolated knowledge base articles",
             "vectorizer": "none",
             "properties": [
@@ -416,10 +418,10 @@ class HybridRetriever:
         }
         try:
             async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
-                existing = await client.get(f"{self._weaviate_url}/v1/schema/CrmEntity")
+                existing = await client.get(f"{self._weaviate_url}/v1/schema/{self._crm_collection}")
                 if existing.status_code in (404, 422):
                     await client.post(f"{self._weaviate_url}/v1/schema", json=crm_entity)
-                kb_existing = await client.get(f"{self._weaviate_url}/v1/schema/KnowledgeBase")
+                kb_existing = await client.get(f"{self._weaviate_url}/v1/schema/{self._kb_collection}")
                 if kb_existing.status_code in (404, 422):
                     await client.post(f"{self._weaviate_url}/v1/schema", json=knowledge_base)
         except Exception:
