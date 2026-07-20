@@ -20,6 +20,7 @@ pipeline so they are stable across processes and platforms.
 from __future__ import annotations
 
 from hmac import compare_digest
+from types import MappingProxyType
 from typing import Any, Literal, Mapping, Sequence
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
@@ -42,7 +43,7 @@ from multi_agent.serialization import canonicalize, stable_hash
 # Planner version — bumped whenever the planner algorithm changes.
 # ---------------------------------------------------------------------------
 
-PLANNER_VERSION = "ma-03.5.0"
+PLANNER_VERSION = "ma-03.6.0"
 
 #: R3 P1 — upper bound on the number of cartesian-product combinations
 #: the global multi-agent assignment search will evaluate before
@@ -80,13 +81,25 @@ CODE_APPROVAL_REQUEST_MISSING_PROPOSE = "approval_request_missing_propose_intent
 # never mutated.  The previous lazy ``_init_tool_authority_mapping()``
 # left the public mapping empty until first use, which made it unsafe
 # to read from external code.
+#
+# R6 P0-4 — wrapped in ``MappingProxyType`` so the public mapping is
+# **immutable**.  Previously it was a plain ``dict`` exported via
+# ``multi_agent.__init__``, so any caller (e.g. a misbehaving plugin or
+# a tampered test) could do
+# ``TOOL_TO_AGENT_AUTHORITY[ToolAuthority.PROPOSE] = AgentAuthority.READ``
+# and silently downgrade the authority boundary for the entire process.
+# ``MappingProxyType`` raises ``TypeError`` on mutation attempts, and
+# the type annotation ``Mapping[ToolAuthority, AgentAuthority]`` makes
+# the read-only contract explicit to type checkers.
 # ---------------------------------------------------------------------------
 
-TOOL_TO_AGENT_AUTHORITY: dict[Any, AgentAuthority] = {
-    ToolAuthority.READ: AgentAuthority.READ,
-    ToolAuthority.PROPOSE: AgentAuthority.PROPOSE,
-    ToolAuthority.EXECUTE: AgentAuthority.EXECUTE,
-}
+TOOL_TO_AGENT_AUTHORITY: Mapping[ToolAuthority, AgentAuthority] = MappingProxyType(
+    {
+        ToolAuthority.READ: AgentAuthority.READ,
+        ToolAuthority.PROPOSE: AgentAuthority.PROPOSE,
+        ToolAuthority.EXECUTE: AgentAuthority.EXECUTE,
+    }
+)
 
 _AUTHORITY_RANK: dict[Any, int] = {
     AgentAuthority.READ: 0,
@@ -945,8 +958,8 @@ def resolve_agent_assignment(
     * ``multi_agent`` with ``len(intents) >= 2``: deterministic
       cartesian-product search for a diverse, **deadline-feasible**
       assignment.  Composite sort key: total authority rank →
-      total cost class rank → total timeout → agent_id concat →
-      version concat.
+      total cost class rank → total timeout → (intent_id, agent_id,
+      version) tuple preserving the intent→agent mapping.
 
     R3 P1: the search is bounded by :data:`MAX_ASSIGNMENT_COMBINATIONS`.
     If the cartesian product exceeds this limit, the function fails
@@ -972,6 +985,16 @@ def resolve_agent_assignment(
     :class:`UnsupportedCapabilityError`.  R4 P0-2: if diverse
     assignments exist but none are deadline-feasible, the function
     fails closed with :class:`BudgetExceededPlanningError`.
+
+    R6 P0-2 — uses a **canonical intent order** (sorted by
+    ``intent_id``) for every step: candidate-list construction,
+    cartesian-product iteration, deadline estimation, and the final
+    tie-breaker.  The tie-breaker is now an ``intent_id → agent_id →
+    version`` tuple that preserves the intent→agent *mapping*;
+    previously two semantically-identical requests with permuted
+    ``requested_tasks`` could pick swapped agents because
+    ``sorted(agent_ids)`` and ``sorted(versions)`` lost the mapping
+    and produced the same key for different assignments.
     """
     from itertools import product
 
@@ -980,32 +1003,40 @@ def resolve_agent_assignment(
         UnsupportedCapabilityError,
     )
 
+    # R6 P0-2 — establish the canonical intent order once and use it
+    # everywhere below.  This makes the assignment invariant under
+    # list-order permutations of ``requested_tasks`` (the Request Hash
+    # is already order-invariant via canonical_request_payload; the
+    # assignment and Plan Hash must follow).
+    canonical_intents = sorted(intents, key=lambda i: i.intent_id)
+
     # R4 P0-2 — pre-check all structural budgets before searching.
     budget = request.budget
-    if len(intents) > budget.max_tasks:
+    if len(canonical_intents) > budget.max_tasks:
         raise BudgetExceededPlanningError(
-            f"intent count {len(intents)} > max_tasks {budget.max_tasks}"
+            f"intent count {len(canonical_intents)} > max_tasks {budget.max_tasks}"
         )
-    if len(intents) > budget.max_agent_calls:
+    if len(canonical_intents) > budget.max_agent_calls:
         raise BudgetExceededPlanningError(
-            f"intent count {len(intents)} > max_agent_calls {budget.max_agent_calls}"
+            f"intent count {len(canonical_intents)} > "
+            f"max_agent_calls {budget.max_agent_calls}"
         )
-    total_tool_calls = sum(i.estimated_tool_calls for i in intents)
+    total_tool_calls = sum(i.estimated_tool_calls for i in canonical_intents)
     if total_tool_calls > budget.max_tool_calls:
         raise BudgetExceededPlanningError(
             f"estimated_tool_calls {total_tool_calls} > "
             f"max_tool_calls {budget.max_tool_calls}"
         )
-    longest_path_nodes = _longest_path_node_count(intents)
+    longest_path_nodes = _longest_path_node_count(canonical_intents)
     if longest_path_nodes > budget.max_iterations:
         raise BudgetExceededPlanningError(
             f"intent DAG longest path {longest_path_nodes} nodes > "
             f"max_iterations {budget.max_iterations}"
         )
 
-    # Build per-intent candidate lists.
+    # Build per-intent candidate lists (in canonical order).
     intent_candidates: dict[str, list[Any]] = {}
-    for intent in intents:
+    for intent in canonical_intents:
         candidates = resolve_candidate_agents(intent, registry)
         if not candidates:
             raise UnsupportedCapabilityError(
@@ -1018,9 +1049,9 @@ def resolve_agent_assignment(
 
     # single_agent or fewer than 2 intents → greedy selection.
     # R4 P0-2: filter by per-intent deadline (timeout_ms <= deadline_ms).
-    if decision.route != "multi_agent" or len(intents) < 2:
+    if decision.route != "multi_agent" or len(canonical_intents) < 2:
         assignment: dict[str, Any] = {}
-        for intent in intents:
+        for intent in canonical_intents:
             candidates = intent_candidates[intent.intent_id]
             feasible = [c for c in candidates if c.timeout_ms <= budget.deadline_ms]
             if not feasible:
@@ -1033,8 +1064,8 @@ def resolve_agent_assignment(
         return assignment
 
     # multi_agent → search for a diverse, budget-feasible assignment.
-    lists = [intent_candidates[i.intent_id] for i in intents]
-    intent_ids = [i.intent_id for i in intents]
+    lists = [intent_candidates[i.intent_id] for i in canonical_intents]
+    intent_ids = [i.intent_id for i in canonical_intents]
 
     # R3 P1 — bound the search space.
     total_combinations = 1
@@ -1058,20 +1089,31 @@ def resolve_agent_assignment(
         any_diverse_found = True
         # R4 P0-2 — filter by DAG critical-path deadline.
         combo_assignment = dict(zip(intent_ids, combo))
-        combo_deadline = _estimate_assignment_deadline_ms(intents, combo_assignment)
+        combo_deadline = _estimate_assignment_deadline_ms(
+            canonical_intents, combo_assignment
+        )
         if combo_deadline > budget.deadline_ms:
             continue
         total_auth = sum(_AUTHORITY_RANK[c.authority] for c in combo)
         total_cost = sum(_COST_CLASS_RANK[c.estimated_cost_class] for c in combo)
         total_timeout = sum(c.timeout_ms for c in combo)
-        agent_ids_sorted = sorted(c.agent_id for c in combo)
-        versions_sorted = sorted(c.version for c in combo)
+        # R6 P0-2 — preserve intent→agent→version mapping in the
+        # tie-breaker.  Previously ``sorted(agent_ids)`` and
+        # ``sorted(versions)`` were independent lists that lost the
+        # mapping, so two semantically-identical requests with
+        # permuted requested_tasks could pick swapped agents (same
+        # total auth/cost/timeout, same sorted agent_ids, same sorted
+        # versions, but different intent→agent assignment) and produce
+        # different plan_hash despite identical request_hash.
+        assignment_key = tuple(
+            (intent.intent_id, cap.agent_id, cap.version)
+            for intent, cap in zip(canonical_intents, combo)
+        )
         key = (
             total_auth,
             total_cost,
             total_timeout,
-            agent_ids_sorted,
-            versions_sorted,
+            assignment_key,
         )
         if best_key is None or key < best_key:
             best_key = key
@@ -1134,12 +1176,21 @@ def build_expected_planned_tasks(
     * ``planning_metadata`` = ``dict(intent.metadata)``  (R4 P1-1 — enters
       Plan Hash and Canonical comparison so Phase 4 can recover template
       phase / context information)
+
+    R6 P0-2 — iterates over ``intents`` in **canonical intent order**
+    (sorted by ``intent_id``) so that two semantically-identical
+    requests with permuted ``requested_tasks`` produce identical
+    PlannedTask lists (same order, same content) and therefore the
+    same Plan Hash.
     """
     from multi_agent.contracts import AgentTask
 
+    # R6 P0-2 — canonical intent order, shared with resolve_agent_assignment.
+    canonical_intents = sorted(intents, key=lambda i: i.intent_id)
+
     # Build intent_id → task_id mapping first (for dependency resolution).
     intent_to_task_id: dict[str, str] = {}
-    for intent in intents:
+    for intent in canonical_intents:
         cap = assignment[intent.intent_id]
         task_id = _stable_task_id(
             run_id=request.run_id,
@@ -1150,7 +1201,7 @@ def build_expected_planned_tasks(
         intent_to_task_id[intent.intent_id] = task_id
 
     planned_tasks: list[PlannedTask] = []
-    for intent in intents:
+    for intent in canonical_intents:
         cap = assignment[intent.intent_id]
         task_id = intent_to_task_id[intent.intent_id]
         resolved_deps: frozenset[str] = frozenset(
@@ -1286,12 +1337,19 @@ def _canonical_tasks_payload(tasks: list[PlannedTask]) -> list[dict[str, Any]]:
       - ``task.created_at`` (wall-clock)
       - ``task.started_at`` (wall-clock, always None at plan time)
       - ``task.completed_at`` (wall-clock, always None at plan time)
+
+    R6 P0-1 — uses ``mode="python"`` so that ``frozenset`` fields
+    (``dependencies`` / ``required_tools`` / ``allowed_tools``) reach
+    the Canonicalizer's set/frozenset branch (which sorts) instead of
+    being converted to plain lists with process-random iteration order
+    that produced different ``plan_hash`` across ``PYTHONHASHSEED``
+    values.
     """
     sorted_tasks = sorted(tasks, key=lambda pt: pt.task.task_id)
     _exclude = {"created_at", "started_at", "completed_at"}
     out: list[dict[str, Any]] = []
     for pt in sorted_tasks:
-        data = pt.model_dump(mode="json")
+        data = pt.model_dump(mode="python")
         task_data = data.get("task", {})
         for k in _exclude:
             task_data.pop(k, None)
@@ -1322,8 +1380,17 @@ def canonical_request_payload(request: PlanningRequest) -> dict[str, Any]:
 
     Field values themselves (e.g. ``objective``, ``intent_id``) are
     NOT modified — only list ordering is normalized.
+
+    R6 P0-1 — uses ``mode="python"`` so that ``frozenset`` fields
+    (``domains`` / ``requested_task_types`` / ``required_tools``)
+    reach :func:`canonicalize`'s set/frozenset branch (which sorts)
+    instead of being converted to plain lists first.  Combined with
+    the explicit sort of ``requested_tasks`` by ``intent_id`` and
+    each task's ``dependencies``, this makes the Request Hash fully
+    invariant under list-order permutations *and* stable across
+    ``PYTHONHASHSEED`` values.
     """
-    signals_data = request.signals.model_dump(mode="json")
+    signals_data = request.signals.model_dump(mode="python")
 
     # Sort requested_tasks by intent_id; sort each task's dependencies.
     requested_tasks = signals_data.get("requested_tasks") or []
@@ -1337,7 +1404,10 @@ def canonical_request_payload(request: PlanningRequest) -> dict[str, Any]:
     )
     signals_data["requested_tasks"] = requested_tasks_sorted
 
-    # Sort set-like fields that model_dump emits as lists.
+    # frozenset fields (domains / requested_task_types / required_tools)
+    # are preserved by mode="python" and will be sorted by canonicalize().
+    # We still sort set-like values defensively in case any slipped
+    # through as plain lists (e.g. via Pydantic v2 edge cases).
     for set_field in ("domains", "requested_task_types"):
         v = signals_data.get(set_field)
         if isinstance(v, list):
@@ -1355,7 +1425,7 @@ def canonical_request_payload(request: PlanningRequest) -> dict[str, Any]:
         "actor_id": request.actor_id,
         "objective": request.objective,
         "signals": canonicalize(signals_data),
-        "budget": canonicalize(request.budget.model_dump(mode="json")),
+        "budget": canonicalize(request.budget.model_dump(mode="python")),
         "context_summary": request.context_summary,
         "registry_version": request.registry_version,
     }
@@ -1426,10 +1496,31 @@ def compute_plan_hash(
     Excludes ``summary``, ``warnings``, wall-clock times, and
     ``plan_hash`` itself.  Tasks are sorted by ``task_id`` so list
     reordering does not change the hash.
+
+    R6 P0-1 — uses ``mode="python"`` for ``complexity`` so that any
+    ``frozenset`` fields reach the Canonicalizer's set/frozenset branch
+    (which sorts) instead of being converted to plain lists with
+    process-random iteration order.
+
+    R6 P0-1 (follow-up) — ``ComplexityDecision.domains`` and
+    ``.reasons`` are typed as ``list[str]`` (not ``frozenset``), so
+    when a caller passes a ``frozenset`` Pydantic iterates it in
+    hash-randomized order and the list order leaks into the hash.
+    These fields are semantically sets (the Validator already compares
+    them via ``set(plan.complexity.domains) != set(expected.domains)``),
+    so we sort them explicitly here to make the hash stable across
+    ``PYTHONHASHSEED`` values.
     """
+    complexity_data = complexity.model_dump(mode="python")
+    # Sort list-typed fields that are semantically sets.
+    if isinstance(complexity_data.get("domains"), list):
+        complexity_data["domains"] = sorted(complexity_data["domains"])
+    if isinstance(complexity_data.get("reasons"), list):
+        complexity_data["reasons"] = sorted(complexity_data["reasons"])
+
     payload = {
         "request_hash": request_hash,
-        "complexity": canonicalize(complexity.model_dump(mode="json")),
+        "complexity": canonicalize(complexity_data),
         "tasks": _canonical_tasks_payload(tasks),
         "planner_version": planner_version,
     }
@@ -1502,6 +1593,39 @@ class PlanDraft(StrictContract):
         external mutation.
         """
         return PlanningRequest.model_validate(v.model_dump(mode="python"))
+
+    @field_validator("complexity")
+    @classmethod
+    def _complexity_deep_snapshot(cls, v: ComplexityDecision) -> ComplexityDecision:
+        """R6 P0-3 — force a deep copy of the caller's ComplexityDecision.
+
+        Without this guard, ``plan.complexity is original_complexity``
+        holds and mutating the caller's ``ComplexityDecision`` (e.g.
+        appending to ``domains`` or ``reasons``) corrupts the PlanDraft
+        and invalidates ``plan_hash``.  The snapshot must be independent
+        at construction time so the PlanDraft is a true deep snapshot
+        of (request, complexity, tasks), not just ``request``.
+        """
+        return ComplexityDecision.model_validate(v.model_dump(mode="python"))
+
+    @field_validator("tasks")
+    @classmethod
+    def _tasks_deep_snapshot(cls, v: list[PlannedTask]) -> list[PlannedTask]:
+        """R6 P0-3 — force a deep copy of each caller-provided PlannedTask.
+
+        ``PlannedTask`` itself is ``frozen=True``, but its nested
+        ``AgentTask`` and ``planning_metadata`` dict are still mutable.
+        Without this guard, ``plan.tasks[0] is original_planned_task``
+        and ``plan.tasks[0].task is original_task`` hold, so mutating
+        ``original_task.status`` or ``original_planning_metadata``
+        corrupts the PlanDraft and invalidates ``plan_hash``.
+
+        The snapshot must be independent at construction time so the
+        PlanDraft is a true deep snapshot.  ``build_execution_tasks()``
+        separately protects the Plan→Execution boundary; this validator
+        protects the Caller→Plan boundary.
+        """
+        return [PlannedTask.model_validate(pt.model_dump(mode="python")) for pt in v]
 
     @field_validator("request_hash")
     @classmethod

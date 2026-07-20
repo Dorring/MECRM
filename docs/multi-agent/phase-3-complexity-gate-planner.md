@@ -1,8 +1,8 @@
 # Phase 3: Complexity Gate + Planner + Plan Validator
 
-**Status:** Complete (R5)  
+**Status:** Complete (R6)  
 **Branch:** `feat/ma-03-complexity-gate-planner`  
-**Spec version:** ma-03.5.0
+**Spec version:** ma-03.6.0
 
 ---
 
@@ -316,7 +316,7 @@ if plan.planner_version != PLANNER_VERSION:
     issue(code="planner_version_mismatch", severity="error")
 ```
 
-当前 `PLANNER_VERSION = "ma-03.5.0"`。未来需要支持旧版本时，应使用显式版本 Registry `SUPPORTED_PLANNER_VERSIONS`，不接受任意非空字符串。
+当前 `PLANNER_VERSION = "ma-03.6.0"`。未来需要支持旧版本时，应使用显式版本 Registry `SUPPORTED_PLANNER_VERSIONS`，不接受任意非空字符串。
 
 ### 10.7 Intent Graph 校验（R4 P0-1）
 
@@ -339,11 +339,11 @@ R3 之前，`resolve_candidate_agents()` 保证 Agent 有权使用 Required Tool
 R4 新增共享纯函数 `validate_intent_tool_authority(intent, registry)`，在 Intent 解析后、Agent Assignment 前调用。规则：
 
 ```
-TOOL_TO_AGENT_AUTHORITY = {
+TOOL_TO_AGENT_AUTHORITY = MappingProxyType({
     ToolAuthority.READ    → AgentAuthority.READ
     ToolAuthority.PROPOSE → AgentAuthority.PROPOSE
     ToolAuthority.EXECUTE → AgentAuthority.EXECUTE  # Phase 3 直接拒绝
-}
+})  # R6 P0-4 — 不可变 Mapping，__setitem__/__delitem__ 抛 TypeError
 
 required_authority = max(
     TOOL_TO_AGENT_AUTHORITY[tool.authority]
@@ -355,6 +355,8 @@ if intent.preferred_authority < required_authority:
 ```
 
 **禁止静默提升 Preferred Authority** —— 调用方明确声明了权限边界，Validator 不得在 Planner 不知情的情况下修改它。违反时以 `PlanningInputError` Fail-Closed。Validator 在 `_check_canonical_plan` 的 Step 1c 调用同一函数；违反时返回稳定 Issue Code `tool_authority_mismatch`。
+
+**R6 P0-4 — Mapping 不可变**：`TOOL_TO_AGENT_AUTHORITY` 使用 `MappingProxyType` 包装，外部代码无法通过 `TOOL_TO_AGENT_AUTHORITY[ToolAuthority.PROPOSE] = AgentAuthority.READ` 降级权限边界。详见 §10.15。
 
 ### 10.9 Write / Approval Requirement 校验（R5 P0-1）
 
@@ -425,6 +427,143 @@ R5 新增 `canonical_request_payload(request) -> dict[str, Any]` 函数，规范
 
 依赖目标或任务语义真正变化
 → Hash 必须变化
+```
+
+### 10.12 Cross-process Hash Stability（R6 P0-1）
+
+R5 之前，共享 Canonicalizer 和 Registry Snapshot 在序列化 BaseModel 时使用 `model_dump(mode="json")`。该模式将 `frozenset` 字段（`AgentTask.dependencies`、`PlannedTask.required_tools`、`AgentCapability.domains` / `supported_tasks` / `allowed_tools`）转换为普通 `list`。由于 `frozenset` 的迭代顺序受 `PYTHONHASHSEED` 影响，转换后的 `list` 保留了进程随机的顺序。而 Canonicalizer 的 set/frozenset 分支会排序、list 分支保留原始顺序，导致同一份 Plan 在不同 `PYTHONHASHSEED` 的进程中产生不同的 `plan_hash` 和 `RegistrySnapshot.version`。
+
+R6 修复策略 — 全链路使用 `mode="python"`：
+
+| 位置 | 修改前 | 修改后 |
+|---|---|---|
+| `serialization._canonical_value` BaseModel 分支 | `model_dump(mode="json")` | `model_dump(mode="python")` |
+| `serialization.stable_hash` | `model_dump(mode="json")` | `model_dump(mode="python")` |
+| `planning._canonical_tasks_payload` | `model_dump(mode="json")` | `model_dump(mode="python")` |
+| `planning.canonical_request_payload` | `model_dump(mode="json")` | `model_dump(mode="python")` |
+| `planning.compute_plan_hash` | `model_dump(mode="json")` | `model_dump(mode="python")` |
+| `registry._copy_capability` | `model_dump(mode="json")` | `model_dump(mode="python")` |
+| `registry.snapshot` | `model_dump(mode="json")` | `model_dump(mode="python")` |
+
+`mode="python"` 保留 `frozenset` 类型，让 Canonicalizer 的 set/frozenset 分支排序，而不是看到 list 后保留进程随机顺序。
+
+**`ComplexityDecision.domains` / `.reasons` 显式排序**：这两个字段类型为 `list[str]`（不是 `frozenset`），但当 `DeterministicPlanner` 传入 `frozenset({"support", "sales"})` 时，Pydantic 按 `frozenset` 迭代顺序构造 `list`，迭代顺序受 `PYTHONHASHSEED` 影响。`compute_plan_hash` 在调用 Canonicalizer 前显式排序：
+
+```python
+complexity_data = complexity.model_dump(mode="python")
+if isinstance(complexity_data.get("domains"), list):
+    complexity_data["domains"] = sorted(complexity_data["domains"])
+if isinstance(complexity_data.get("reasons"), list):
+    complexity_data["reasons"] = sorted(complexity_data["reasons"])
+```
+
+**验证方式**：R6 新增真实 subprocess 测试（`test_phase3_r6_review.py::TestCrossProcessHashStability`），启动 4 个不同 `PYTHONHASHSEED`（`0` / `1` / `42` / `12345`）的独立 Python 进程，验证 `plan_hash` 和 `registry_version` 完全一致。不再在同一进程内重复计算。
+
+### 10.13 Canonical Intent Ordering（R6 P0-2）
+
+R5 通过 `canonical_request_payload` 让 `request_hash` 对 `requested_tasks` 列表顺序无关，但 `resolve_agent_assignment` 仍按传入 Intent 顺序构造候选列表和笛卡尔积。其 Tie-breaker 分别排序 `agent_ids` 和 `versions`，丢失了"哪个 Agent 分配给哪个 Intent"的对应关系。语义相同的两个请求（仅 `requested_tasks` 顺序不同）会产生不同的 `agent_assignment` 和 `plan_hash`。
+
+R6 修复策略 — 所有共享规划函数统一 Canonical Intent Order：
+
+```python
+canonical_intents = sorted(intents, key=lambda i: i.intent_id)
+```
+
+覆盖函数：
+
+| 函数 | 使用 canonical_intents 的位置 |
+|---|---|
+| `resolve_agent_assignment` | 候选列表构造、笛卡尔积、Tie-breaker、assignment 返回 |
+| `build_expected_planned_tasks` | PlannedTask 构造顺序、dependency task_id 映射 |
+| Validator Canonical Reconstruction | `resolve_expected_intents` 返回的 intents 已按模板顺序，但 `resolve_agent_assignment` / `build_expected_planned_tasks` 内部统一排序 |
+
+**Assignment Tie-breaker 保留映射**：
+
+```python
+assignment_key = tuple(
+    (intent.intent_id, capability.agent_id, capability.version)
+    for intent, capability in zip(canonical_intents, combo)
+)
+key = (total_auth, total_cost, total_timeout, assignment_key)
+```
+
+不再使用相互独立的 `sorted(agent_ids)` + `sorted(versions)`，避免丢失 Intent→Agent 映射。
+
+不变量：
+
+```
+同一组 RequestedTask，仅列表顺序不同
+→ 相同 canonical_intents
+→ 相同 agent_assignment
+→ 相同 plan_hash
+```
+
+### 10.14 Complete Plan Snapshot（R6 P0-3）
+
+R5 的深快照只覆盖 `PlanDraft.request`，`complexity` 和 `tasks` 没有防御性复制。`plan.complexity is original_complexity` 和 `plan.tasks[0] is original_planned_task` 成立，调用方修改原始对象会破坏 PlanDraft。
+
+R6 在 Contract 边界对全部三个字段强制深拷贝：
+
+```python
+@field_validator("complexity")
+@classmethod
+def _complexity_deep_snapshot(cls, v: ComplexityDecision) -> ComplexityDecision:
+    return ComplexityDecision.model_validate(v.model_dump(mode="python"))
+
+@field_validator("tasks")
+@classmethod
+def _tasks_deep_snapshot(cls, v: list[PlannedTask]) -> list[PlannedTask]:
+    return [
+        PlannedTask.model_validate(pt.model_dump(mode="python"))
+        for pt in v
+    ]
+```
+
+`PlannedTask` 内部的 `AgentTask` 和 `planning_metadata` 在重建 `PlannedTask` 时被 Pydantic 一并深拷贝。边界由 PlanDraft Contract 自身强制，手工构造也无法绕过。
+
+不变量：
+
+```
+plan.request is original_request       → False
+plan.complexity is original_complexity → False
+plan.tasks[0] is original_planned_task → False
+plan.tasks[0].task is original_task    → False
+plan.tasks[0].planning_metadata is original_metadata → False
+```
+
+`build_execution_tasks()` 的现有防御性复制保留不变。
+
+### 10.15 Immutable Authority Mapping（R6 P0-4）
+
+R5 将 `TOOL_TO_AGENT_AUTHORITY` 从延迟初始化改为模块级 `dict`，但仍是可变字典，且通过 `multi_agent.__init__` 公开导出。`TOOL_TO_AGENT_AUTHORITY[ToolAuthority.PROPOSE] = AgentAuthority.READ` 可全局降级权限边界。
+
+R6 使用 `MappingProxyType` 不可变 Mapping：
+
+```python
+from types import MappingProxyType
+from typing import Mapping
+
+TOOL_TO_AGENT_AUTHORITY: Mapping[ToolAuthority, AgentAuthority] = MappingProxyType(
+    {
+        ToolAuthority.READ: AgentAuthority.READ,
+        ToolAuthority.PROPOSE: AgentAuthority.PROPOSE,
+        ToolAuthority.EXECUTE: AgentAuthority.EXECUTE,
+    }
+)
+```
+
+- `__setitem__` / `__delitem__` 抛出 `TypeError`
+- 类型注解 `Mapping[ToolAuthority, AgentAuthority]` 让类型检查器明确只读契约
+- `validate_intent_tool_authority` 每次读取该 Mapping，无法被运行时篡改
+
+不变量：
+
+```
+TOOL_TO_AGENT_AUTHORITY[ToolAuthority.PROPOSE] = AgentAuthority.READ
+→ TypeError: 'mappingproxy' object does not support item assignment
+
+READ Intent + crm_writer.propose
+→ PlanningInputError (始终拒绝，无法绕过)
 ```
 
 ## 11. Budget 校验
@@ -543,23 +682,23 @@ Phase 4 Supervisor 将：
 6. **Authority 上限** — Phase 3 最高 `PROPOSE`，不选择 `EXECUTE` agent
 7. **Multi-agent 分配** — 使用有界笛卡尔积搜索（`MAX_ASSIGNMENT_COMBINATIONS=1,000,000`）+ R4 预算可行性过滤；不实现 Branch-and-Bound 或动态规划优化器（R3 P1 + R4 P0-2 更新）
 
-## 16. 共享纯函数（R3 + R4 + R5）
+## 16. 共享纯函数（R3 + R4 + R5 + R6）
 
-R3 将 Planner 的核心决策逻辑抽取为无副作用纯函数，位于 `multi_agent.planning` 模块。Planner 和 Validator **共同使用**这些函数，确保两边产生完全相同的 Canonical Plan。R4 新增 Intent Graph 校验和 Tool Authority 对齐两个共享纯函数。R5 新增 Write/Approval Requirement 校验和 Canonical Request Payload 两个共享纯函数：
+R3 将 Planner 的核心决策逻辑抽取为无副作用纯函数，位于 `multi_agent.planning` 模块。Planner 和 Validator **共同使用**这些函数，确保两边产生完全相同的 Canonical Plan。R4 新增 Intent Graph 校验和 Tool Authority 对齐两个共享纯函数。R5 新增 Write/Approval Requirement 校验和 Canonical Request Payload 两个共享纯函数。R6 将 `resolve_agent_assignment` 和 `build_expected_planned_tasks` 内部统一为 Canonical Intent Order，并保证跨进程 Hash 稳定性：
 
 | 函数 | 签名 | 用途 |
 |---|---|---|
 | `resolve_expected_intents` | `(request, decision) -> list[TaskIntent]` | 从 Request + ComplexityDecision 派生 Expected Intents（R2 已有） |
 | `resolve_candidate_agents` | `(intent, registry) -> list[AgentCapability]` | Tool-aware 候选筛选 + 稳定排序（R3 新增） |
-| `resolve_agent_assignment` | `(request, decision, intents, registry) -> dict[str, AgentCapability]` | 全局确定性 Agent 分配 + 有界搜索 + **预算预检 + DAG deadline 过滤** + Fail-Closed（R3 新增，R4 P0-2 升级为 budget-aware） |
-| `build_expected_planned_tasks` | `(request, intents, assignment) -> list[PlannedTask]` | 构建 Canonical PlannedTask（固定 timeout_ms / max_retries / priority / status / lifecycle 字段 + **planning_metadata**）（R3 新增，R4 P1-1 追加 metadata 复制） |
+| `resolve_agent_assignment` | `(request, decision, intents, registry) -> dict[str, AgentCapability]` | 全局确定性 Agent 分配 + 有界搜索 + **预算预检 + DAG deadline 过滤** + Fail-Closed（R3 新增，R4 P0-2 升级为 budget-aware，**R6 P0-2 内部使用 canonical_intents 排序 + assignment_key 保留 Intent→Agent 映射**） |
+| `build_expected_planned_tasks` | `(request, intents, assignment) -> list[PlannedTask]` | 构建 Canonical PlannedTask（固定 timeout_ms / max_retries / priority / status / lifecycle 字段 + **planning_metadata**）（R3 新增，R4 P1-1 追加 metadata 复制，**R6 P0-2 内部使用 canonical_intents 排序**） |
 | `_stable_task_id` | `(*, run_id, intent_id, task_type, agent_id) -> str` | 稳定 task_id 计算（R3 新增，Planner 和 Validator 共享） |
 | **`validate_intent_graph`** | `(intents) -> list[str]` | **R4 P0-1 新增**：Intent 依赖图校验（duplicate id / missing dep / cycle），返回稳定 Issue Code 列表 |
-| **`validate_intent_tool_authority`** | `(intent, registry) -> None` | **R4 P0-3 新增**：Intent preferred_authority 必须覆盖 required_tools 的最高 authority，违反抛 `PlanningInputError` |
+| **`validate_intent_tool_authority`** | `(intent, registry) -> None` | **R4 P0-3 新增**：Intent preferred_authority 必须覆盖 required_tools 的最高 authority，违反抛 `PlanningInputError`（**R6 P0-4 读取不可变 `TOOL_TO_AGENT_AUTHORITY` Mapping**） |
 | **`_estimate_assignment_deadline_ms`** | `(intents, assignment) -> int` | **R4 P0-2 内部辅助**：计算给定 assignment 的 DAG 关键路径 timeout 之和 |
 | **`_longest_path_node_count`** | `(intents) -> int` | **R4 P0-2 内部辅助**：计算 Intent DAG 最长路径节点数，用于 max_iterations 预检 |
 | **`validate_write_approval_requirements`** | `(request, intents) -> list[str]` | **R5 P0-1 新增**：requires_write / requires_approval 时至少一个 Intent 必须为 PROPOSE，返回稳定 Issue Code 列表 |
-| **`canonical_request_payload`** | `(request) -> dict[str, Any]` | **R5 P0-3 新增**：构建顺序无关的 Request Hash payload（requested_tasks / dependencies / set 字段全部排序），由 `compute_request_hash` 调用 |
+| **`canonical_request_payload`** | `(request) -> dict[str, Any]` | **R5 P0-3 新增**：构建顺序无关的 Request Hash payload（requested_tasks / dependencies / set 字段全部排序），由 `compute_request_hash` 调用（**R6 P0-1 使用 `mode="python"` 保留 frozenset**） |
 
 **设计约束**：
 
@@ -567,6 +706,8 @@ R3 将 Planner 的核心决策逻辑抽取为无副作用纯函数，位于 `mul
 - 所有纯函数无副作用，不修改 `request` / `registry` / `intent` / `capability`
 - 所有纯函数在相同输入下产生相同输出（确定性）
 - R4 起，Validator 在 Canonical Plan 重建前必须先调用 `validate_intent_graph` 和 `validate_intent_tool_authority`，确保非法 Request 不会让 `KeyError` / `IndexError` 在后续阶段逃逸
+- **R6 起，所有 BaseModel 序列化必须使用 `mode="python"` 保留 `frozenset` 类型**，让 Canonicalizer 的 set/frozenset 分支排序；`mode="json"` 会将 frozenset 转为 list 并保留进程随机迭代顺序，导致跨进程 Hash 漂移
+- **R6 起，`resolve_agent_assignment` 和 `build_expected_planned_tasks` 内部统一使用 `canonical_intents = sorted(intents, key=lambda i: i.intent_id)`**，确保 Planner 输出与 Intent 输入列表顺序无关
 
 ---
 
@@ -583,10 +724,11 @@ R3 将 Planner 的核心决策逻辑抽取为无副作用纯函数，位于 `mul
 | `test_phase3_r3_review.py` | 35 | R3 反例：Agent Assignment 篡改、Dependency/Required Evidence 绑定、Canonical Task 字段、Customer Recovery 输入互斥、Planner Version、分配搜索上限、共享纯函数一致性 |
 | `test_phase3_r4_review.py` | 15 | R4 反例：Intent Graph 校验、Budget-aware Assignment（deadline/工具/迭代预算预检 + 可行性过滤）、Intent/Tool Authority 对齐、PlannedTask.planning_metadata 篡改 |
 | `test_phase3_r5_review.py` | 16 | R5 反例：Write/Approval Requirement 共享校验、PlanDraft 深快照 + build_execution_tasks 防御性复制、Semantic Request Hash（顺序不变量 + 语义变化必变）、TOOL_TO_AGENT_AUTHORITY 静态化 |
-| **Phase 3 合计** | **196** | |
+| `test_phase3_r6_review.py` | 16 | R6 反例：Cross-process Hash Stability（subprocess + PYTHONHASHSEED）、Canonical Intent Ordering（permuted requested_tasks 不变量）、Complete Plan Snapshot（complexity + tasks 深快照）、Immutable Authority Mapping（MappingProxyType 不可变） |
+| **Phase 3 合计** | **212** | |
 | Phase 2 回归 | 168 | 全部通过 |
 | Phase 1 回归 | 76 | 全部通过 |
-| **总计** | **440** | |
+| **总计** | **456** | |
 
 ## 新增文件
 
@@ -601,10 +743,15 @@ agents/src/multi_agent/
 │                                # + validate_write_approval_requirements + canonical_request_payload (R5)
 │                                # + TOOL_TO_AGENT_AUTHORITY 静态化 (R5 P1-1)
 │                                # + PlanDraft.request 深拷贝 + build_execution_tasks 防御性复制 (R5 P0-2)
+│                                # + mode="python" 跨进程 Hash 稳定性 (R6 P0-1)
+│                                # + canonical_intents + assignment_key 保留映射 (R6 P0-2)
+│                                # + PlanDraft.complexity/tasks 深快照 (R6 P0-3)
+│                                # + TOOL_TO_AGENT_AUTHORITY MappingProxyType 不可变 (R6 P0-4)
+├── serialization.py            # _canonical_value + stable_hash 使用 mode="python" (R6 P0-1)
 ├── complexity_gate.py          # RuleBasedComplexityGate (含 Customer Recovery 互斥校验, R3)
 ├── planning_templates.py       # CustomerRecoveryTemplate
 ├── plan_validator.py           # PlanValidator (Canonical Plan Reconstruction + Intent Graph / Tool Authority / Write-Approval 校验)
-└── planner.py                  # DeterministicPlanner (调用共享纯函数, R3 + R4 + R5; 无 customer_recovery_template 注入, R4)
+└── planner.py                  # DeterministicPlanner (调用共享纯函数, R3 + R4 + R5 + R6; 无 customer_recovery_template 注入, R4)
 
 agents/tests/unit/multi_agent/
 ├── test_complexity_gate.py
@@ -615,7 +762,8 @@ agents/tests/unit/multi_agent/
 ├── test_phase3_r2_review.py    # R2 反例测试
 ├── test_phase3_r3_review.py    # R3 反例测试 (35 tests)
 ├── test_phase3_r4_review.py    # R4 反例测试 (15 tests)
-└── test_phase3_r5_review.py    # R5 反例测试 (16 tests)
+├── test_phase3_r5_review.py    # R5 反例测试 (16 tests)
+└── test_phase3_r6_review.py    # R6 反例测试 (16 tests, 含 subprocess 跨进程测试)
 
 docs/multi-agent/
 └── phase-3-complexity-gate-planner.md  (本文件)
@@ -624,8 +772,12 @@ docs/multi-agent/
 ## 修改文件
 
 - `agents/src/multi_agent/__init__.py` — 追加 Phase 3 导出 + `effective_domains` / `effective_task_types` / `resolve_expected_intents` / `MAX_ASSIGNMENT_COMBINATIONS` / `resolve_candidate_agents` / `resolve_agent_assignment` / `build_expected_planned_tasks`（R3）+ `validate_intent_graph` / `validate_intent_tool_authority` / `TOOL_TO_AGENT_AUTHORITY` / `CODE_INTENT_DUPLICATE_ID` / `CODE_INTENT_MISSING_DEPENDENCY` / `CODE_INTENT_CYCLE`（R4）
-- `agents/src/multi_agent/planning.py` — 升级 `resolve_agent_assignment` 为 budget-aware（R4 P0-2）；新增 `validate_intent_graph` / `validate_intent_tool_authority` / `TOOL_TO_AGENT_AUTHORITY` / `_estimate_assignment_deadline_ms` / `_longest_path_node_count`（R4）；`PlannedTask.planning_metadata` 新字段（R4 P1-1）；`PLANNER_VERSION = ma-03.4.0`（R4）
+- `agents/src/multi_agent/planning.py` — 升级 `resolve_agent_assignment` 为 budget-aware（R4 P0-2）；新增 `validate_intent_graph` / `validate_intent_tool_authority` / `TOOL_TO_AGENT_AUTHORITY` / `_estimate_assignment_deadline_ms` / `_longest_path_node_count`（R4）；`PlannedTask.planning_metadata` 新字段（R4 P1-1）；`PLANNER_VERSION = ma-03.6.0`（R4→R5→R6）；**R6 P0-1: `_canonical_tasks_payload` / `canonical_request_payload` / `compute_plan_hash` 改用 `mode="python"` + `ComplexityDecision.domains/reasons` 显式排序**；**R6 P0-2: `resolve_agent_assignment` / `build_expected_planned_tasks` 内部统一 `canonical_intents` 排序 + `assignment_key` 保留 Intent→Agent 映射**；**R6 P0-3: `PlanDraft` 新增 `complexity` / `tasks` 深快照 `field_validator`**；**R6 P0-4: `TOOL_TO_AGENT_AUTHORITY` 改为 `MappingProxyType` 不可变**
+- `agents/src/multi_agent/serialization.py` — **R6 P0-1: `_canonical_value` BaseModel 分支 + `stable_hash` 改用 `mode="python"` 保留 frozenset 类型，让 Canonicalizer 排序**
+- `agents/src/multi_agent/registry.py` — **R6 P0-1: `_copy_capability` + `snapshot()` 改用 `mode="python"`，保证 `RegistrySnapshot.version` 跨进程稳定**
 - `agents/src/multi_agent/plan_validator.py` — `_check_canonical_plan` 新增 Step 1b（`validate_intent_graph`）和 Step 1c（`validate_intent_tool_authority`）；`_compare_planned_task_fields` 比较 `planning_metadata`（R4 P1-1）；删除 `CODE_AGENT_VERSION_MISMATCH` 及 per-task version 检查块（R4 P1-3）；新增 `CODE_TOOL_AUTHORITY_MISMATCH`
 - `agents/src/multi_agent/planner.py` — 删除 `customer_recovery_template` 构造参数和 `self._recovery_template`（R4 P1-2）；`_validate_intents` 改为调用共享 `validate_intent_graph`（R4 P0-1）；新增 `_validate_tool_authority` 步骤调用 `validate_intent_tool_authority`（R4 P0-3）；`_HASH_CODES` 移除 `agent_version_mismatch`，新增 `missing_intent_dependency` / `tool_authority_mismatch`；`_CYCLE_CODES` 新增 `intent_cycle`
 - `agents/tests/unit/multi_agent/test_phase3_r4_review.py` — 新增 R4 反例测试（15 tests）
-- `docs/multi-agent/phase-3-complexity-gate-planner.md` — 文档更新至 R4
+- `agents/tests/unit/multi_agent/test_phase3_r5_review.py` — 新增 R5 反例测试（16 tests）
+- `agents/tests/unit/multi_agent/test_phase3_r6_review.py` — **R6 新增反例测试（16 tests，含 subprocess 跨进程测试）**
+- `docs/multi-agent/phase-3-complexity-gate-planner.md` — 文档更新至 R6

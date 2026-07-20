@@ -212,12 +212,19 @@ class AgentRegistry:
 
     @staticmethod
     def _copy_capability(capability: AgentCapability) -> AgentCapability:
-        """Return a deep copy of *capability* via JSON round-trip.
+        """Return a deep copy of *capability* via Python-mode round-trip.
 
         All public read APIs funnel through this helper so callers can never
         obtain a reference to the registry's internal object graph.
+
+        R6 P0-1 — uses ``mode="python"`` instead of ``mode="json"`` so
+        that ``frozenset`` fields (``domains`` / ``supported_tasks`` /
+        ``allowed_tools``) are preserved as ``frozenset`` and reach the
+        Canonicalizer's set/frozenset branch (which sorts) instead of
+        being converted to plain lists with process-random iteration
+        order.
         """
-        return AgentCapability.model_validate(capability.model_dump(mode="json"))
+        return AgentCapability.model_validate(capability.model_dump(mode="python"))
 
     # -- Resolution ---------------------------------------------------------
 
@@ -313,7 +320,12 @@ class AgentRegistry:
         raw: dict[str, Any] = {}
         for agent_id in sorted(self._agents):
             cap = self._agents[agent_id]
-            raw[agent_id] = cap.model_dump(mode="json")
+            # R6 P0-1 — mode="python" preserves frozenset fields as
+            # frozenset so content_hash/raw's canonicalization sorts
+            # them.  mode="json" emitted plain lists with process-random
+            # iteration order, producing different snapshot.version
+            # across PYTHONHASHSEED values.
+            raw[agent_id] = cap.model_dump(mode="python")
         version = content_hash(raw)
         # Return copies so mutation doesn't affect registry
         agents_copy = {
