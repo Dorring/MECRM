@@ -5,7 +5,7 @@ Produces a :class:`PlanDraft` from a :class:`PlanningRequest` and an
 calls an agent handler, never invokes a tool, never writes to the
 registry, and never opens a network connection.
 
-Flow (per Phase 3 spec §7, updated for R3):
+Flow (per Phase 3 spec §7, updated for R4):
 
 1. Verify Registry Snapshot version.
 2. Run Complexity Gate.
@@ -13,34 +13,52 @@ Flow (per Phase 3 spec §7, updated for R3):
 4. Build TaskIntents via the shared :func:`resolve_expected_intents`
    (R2 P0-1 — Planner and Validator share the same source of truth).
 5. Validate write/approval requirements (≥1 PROPOSE intent).
-6. Validate intent structure (unique IDs, dependencies exist, no cycle).
-7. Assign agents via the shared :func:`resolve_agent_assignment`
-   (R3 P0-2 — Planner and Validator share the same assignment logic).
-   This internally builds tool-aware candidate lists via
-   :func:`resolve_candidate_agents` (R2 P0-3) and performs a bounded
-   global search for multi-agent diversity (R2 P0-4 + R3 P1).
-8. Build canonical PlannedTasks via the shared
+6. Validate intent structure (unique IDs, dependencies exist, no cycle)
+   via the shared :func:`validate_intent_graph` (R4 P0-1 — Planner and
+   Validator share the same intent-graph validation).
+7. Validate Intent / Tool Authority alignment via the shared
+   :func:`validate_intent_tool_authority` (R4 P0-3 — a READ intent
+   cannot carry a PROPOSE/EXECUTE tool).
+8. Assign agents via the shared :func:`resolve_agent_assignment`
+   (R3 P0-2 + R4 P0-2 — budget-aware: structural pre-checks +
+   per-combo DAG deadline filtering before deterministic sort).
+9. Build canonical PlannedTasks via the shared
    :func:`build_expected_planned_tasks` (R3 P0-3 — Planner and
    Validator share the same Canonical Plan reconstruction).
-9. Assemble PlanDraft (hashes auto-computed).
-10. Run PlanValidator.
-11. If invalid → raise the appropriate specific error type.
+10. Assemble PlanDraft (hashes auto-computed).
+11. Run PlanValidator.
+12. If invalid → raise the appropriate specific error type.
 
-R3 changes:
+R4 changes:
 
-* The Planner no longer holds its own copy of the candidate filtering,
-  global assignment, or task-building logic.  All three now live in
-  :mod:`multi_agent.planning` as shared pure functions that the
-  Validator also calls.  This closes the "substitute a more privileged
-  agent" hole: even if a tampered plan is registry-supported, the
-  Validator recomputes the canonical assignment and rejects any
-  mismatch.
-* ``max_retries`` is now fixed at ``0`` (Phase 3 default) rather than
-  being read from the capability.  This makes the Canonical Plan
-  fully deterministic.
-* ``priority``, ``status``, ``input_data``, ``user_id``,
-  ``correlation_id``, ``started_at``, ``completed_at`` are now
-  canonical fixed values enforced at construction time.
+* Intent-graph validation is now a shared pure function
+  (:func:`validate_intent_graph`) so both Planner and Validator
+  reject ``duplicate_intent_id`` / ``missing_intent_dependency`` /
+  ``intent_cycle`` with stable issue codes instead of letting
+  ``KeyError`` escape during Canonical Plan reconstruction.
+* Intent ``preferred_authority`` must cover the highest authority
+  required by any of its ``required_tools`` (READ tool ≥ READ,
+  PROPOSE tool ≥ PROPOSE, EXECUTE tool rejected in Phase 3).  Silent
+  auto-elevation is forbidden — :class:`PlanningInputError` fails
+  closed via :func:`validate_intent_tool_authority`.
+* ``resolve_agent_assignment`` is now budget-aware: structural budgets
+  (``max_tasks`` / ``max_agent_calls`` / ``max_tool_calls`` /
+  ``max_iterations``) are pre-checked before searching, and each
+  candidate combination is filtered by DAG critical-path deadline
+  before the deterministic sort picks the cheapest feasible combo.
+* ``customer_recovery_template`` constructor parameter removed — the
+  parameter was silently ignored (R4 P1-2).  Phase 3 supports only
+  the default template; callers who need a custom template must wait
+  for a future phase that wires Planner + Validator to a shared
+  template context (id, version, content hash).
+* Per-task Agent Version check removed (R4 P1-3) — ``PlannedTask``
+  does not carry ``agent_version`` and both expected/actual
+  capabilities come from the same Registry Snapshot, so the
+  comparison was tautological.  Version drift is caught by the
+  plan-level ``registry_version`` check.
+* ``PlannedTask.planning_metadata`` is now copied verbatim from
+  ``TaskIntent.metadata`` (R4 P1-1) and enters Plan Hash + Canonical
+  Plan comparison so template/phase metadata tampering is detectable.
 """
 
 from __future__ import annotations
@@ -59,6 +77,8 @@ from multi_agent.planning import (
     compute_request_hash,
     resolve_agent_assignment,
     resolve_expected_intents,
+    validate_intent_graph,
+    validate_intent_tool_authority,
 )
 from multi_agent.planning_errors import (
     BudgetExceededPlanningError,
@@ -67,10 +87,6 @@ from multi_agent.planning_errors import (
     PlanValidationError,
     PlanningInputError,
     RegistryVersionMismatchError,
-)
-from multi_agent.planning_templates import (
-    DEFAULT_CUSTOMER_RECOVERY_TEMPLATE,
-    CustomerRecoveryTemplate,
 )
 from multi_agent.complexity_gate import RuleBasedComplexityGate
 
@@ -82,7 +98,7 @@ _BUDGET_CODES = {
     "iteration_budget_exceeded",
     "deadline_exceeded",
 }
-_CYCLE_CODES = {"cycle"}
+_CYCLE_CODES = {"cycle", "intent_cycle"}
 _HASH_CODES = {
     "plan_hash_mismatch",
     "request_hash_mismatch",
@@ -94,11 +110,13 @@ _HASH_CODES = {
     # R3 codes
     "planner_version_mismatch",
     "agent_assignment_mismatch",
-    "agent_version_mismatch",
     "dependency_mismatch",
     "required_evidence_mismatch",
     "task_lifecycle_violation",
     "task_field_mismatch",
+    # R4 codes
+    "missing_intent_dependency",
+    "tool_authority_mismatch",
 }
 
 
@@ -133,15 +151,11 @@ class DeterministicPlanner:
         self,
         *,
         gate: RuleBasedComplexityGate | None = None,
-        customer_recovery_template: CustomerRecoveryTemplate | None = None,
     ) -> None:
         from multi_agent.plan_validator import PlanValidator
 
         self._gate = gate or RuleBasedComplexityGate()
         self._validator = PlanValidator(gate=self._gate)
-        self._recovery_template = (
-            customer_recovery_template or DEFAULT_CUSTOMER_RECOVERY_TEMPLATE
-        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -173,18 +187,25 @@ class DeterministicPlanner:
         # Step 5 — Validate write/approval requirements.
         self._validate_write_approval_requirements(request, intents)
 
-        # Step 6 — Validate intent structure (unique IDs, deps exist, no cycle).
+        # Step 6 — Validate intent graph (R4 P0-1) via the shared pure
+        # function so Planner and Validator agree on what makes an
+        # intent graph invalid (duplicate id, missing dependency, cycle).
         self._validate_intents(intents)
 
-        # Step 7 — Assign agents via the shared pure function (R3 P0-2).
-        # This internally builds tool-aware candidate lists and performs
-        # a bounded global search for multi-agent diversity.
+        # Step 7 — Validate Intent / Tool Authority alignment (R4 P0-3).
+        # A READ intent cannot carry a PROPOSE/EXECUTE tool; silent
+        # auto-elevation is forbidden.
+        self._validate_tool_authority(intents, registry)
+
+        # Step 8 — Assign agents via the shared pure function (R3 P0-2
+        # + R4 P0-2 — budget-aware: structural pre-checks + per-combo
+        # DAG deadline filtering before deterministic sort).
         assignment = resolve_agent_assignment(request, decision, intents, registry)
 
-        # Step 8 — Build canonical PlannedTasks (R3 P0-3).
+        # Step 9 — Build canonical PlannedTasks (R3 P0-3).
         planned_tasks = build_expected_planned_tasks(request, intents, assignment)
 
-        # Step 9 — Assemble draft (hashes auto-computed by PlanDraft).
+        # Step 10 — Assemble draft (hashes auto-computed by PlanDraft).
         request_hash = compute_request_hash(request)
         draft = PlanDraft(
             request=request,
@@ -196,10 +217,10 @@ class DeterministicPlanner:
             warnings=[],
         )
 
-        # Step 10 — Validate.
+        # Step 11 — Validate.
         report = self._validator.validate(request, draft, registry)
         if not report.valid:
-            # Step 11 — Raise the appropriate specific error type.
+            # Step 12 — Raise the appropriate specific error type.
             self._raise_for_issues(report.issues)
 
         return draft
@@ -233,58 +254,56 @@ class DeterministicPlanner:
             )
 
     # ------------------------------------------------------------------
-    # Intent structure validation
+    # Intent structure validation (R4 P0-1 — shared with Validator)
     # ------------------------------------------------------------------
 
     @staticmethod
     def _validate_intents(intents: list[TaskIntent]) -> None:
         """Validate intent_id uniqueness, dependency existence, and cycles.
 
+        R4 P0-1: this is a thin wrapper around the shared
+        :func:`validate_intent_graph` pure function.  Planner and
+        Validator now share the exact same validation logic so a
+        tampered request that would cause Canonical Plan reconstruction
+        to raise ``KeyError`` is rejected by both sides with stable
+        issue codes (``duplicate_intent_id`` / ``missing_intent_dependency``
+        / ``intent_cycle``).
+
         Per Phase 3 review R1 P0-5: missing intent dependencies must
         Fail-Closed, not be silently dropped.
         """
-        if not intents:
+        issues = validate_intent_graph(intents)
+        if not issues:
             return
-
-        intent_ids: set[str] = set()
-        for intent in intents:
-            if intent.intent_id in intent_ids:
-                raise PlanningInputError(f"duplicate intent_id {intent.intent_id!r}")
-            intent_ids.add(intent.intent_id)
-
-        # All dependencies must reference existing intent_ids.
-        for intent in intents:
-            missing = set(intent.dependencies) - intent_ids
-            if missing:
-                raise PlanningInputError(
-                    f"Intent {intent.intent_id!r} has missing dependencies: "
-                    f"{sorted(missing)}"
-                )
-
-        # Cycle detection on intent_id graph.
-        graph: dict[str, set[str]] = {i.intent_id: set() for i in intents}
-        in_degree: dict[str, int] = {i.intent_id: 0 for i in intents}
-        for intent in intents:
-            for dep in intent.dependencies:
-                graph[dep].add(intent.intent_id)
-                in_degree[intent.intent_id] += 1
-        # Kahn's algorithm.
-        queue: list[str] = sorted(
-            i.intent_id for i in intents if in_degree[i.intent_id] == 0
-        )
-        visited: set[str] = set()
-        while queue:
-            node = queue.pop(0)
-            visited.add(node)
-            for neighbor in sorted(graph[node]):
-                in_degree[neighbor] -= 1
-                if in_degree[neighbor] == 0:
-                    queue.append(neighbor)
-        cycle_nodes = sorted(set(in_degree.keys()) - visited)
-        if cycle_nodes:
+        # Raise the most specific error type for the first detected issue.
+        first = issues[0]
+        if first == "intent_cycle":
             raise PlanCycleError(
-                f"Intent dependency graph contains a cycle involving {cycle_nodes!r}"
+                f"Intent dependency graph contains a cycle; issues={issues!r}"
             )
+        raise PlanningInputError(f"Intent graph validation failed; issues={issues!r}")
+
+    # ------------------------------------------------------------------
+    # Intent / Tool Authority alignment (R4 P0-3)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_tool_authority(
+        intents: list[TaskIntent], registry: AgentRegistry
+    ) -> None:
+        """Validate that each Intent's ``preferred_authority`` covers the
+        highest authority required by any of its ``required_tools``.
+
+        R4 P0-3: a READ intent cannot carry a PROPOSE/EXECUTE tool.
+        Silent auto-elevation is forbidden — the caller explicitly
+        declared the authority boundary, so we fail closed with
+        :class:`PlanningInputError` instead of bumping the authority.
+
+        EXECUTE tools are rejected outright by Phase 3 authority bounds
+        elsewhere; here we only enforce READ vs PROPOSE consistency.
+        """
+        for intent in intents:
+            validate_intent_tool_authority(intent, registry)
 
     # ------------------------------------------------------------------
     # Empty plan (deterministic_workflow)

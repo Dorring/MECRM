@@ -20,7 +20,7 @@ pipeline so they are stable across processes and platforms.
 from __future__ import annotations
 
 from hmac import compare_digest
-from typing import Any, Literal
+from typing import Any, Literal, Mapping, Sequence
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
@@ -41,7 +41,7 @@ from multi_agent.serialization import canonicalize, stable_hash
 # Planner version — bumped whenever the planner algorithm changes.
 # ---------------------------------------------------------------------------
 
-PLANNER_VERSION = "ma-03.3.0"
+PLANNER_VERSION = "ma-03.4.0"
 
 #: R3 P1 — upper bound on the number of cartesian-product combinations
 #: the global multi-agent assignment search will evaluate before
@@ -49,6 +49,52 @@ PLANNER_VERSION = "ma-03.3.0"
 #: ``max_tasks`` (default 16), but this guard prevents pathological
 #: registries from exhausting CPU during planning.
 MAX_ASSIGNMENT_COMBINATIONS = 1_000_000
+
+# ---------------------------------------------------------------------------
+# R4 P0-1 — stable Intent-graph validation issue codes (shared by Planner
+# and Validator so both sides agree on what makes an intent graph invalid).
+# ---------------------------------------------------------------------------
+
+CODE_INTENT_DUPLICATE_ID = "duplicate_intent_id"
+CODE_INTENT_MISSING_DEPENDENCY = "missing_intent_dependency"
+CODE_INTENT_CYCLE = "intent_cycle"
+
+# ---------------------------------------------------------------------------
+# R4 P0-3 — Tool Authority → Agent Authority mapping.  An Intent's
+# preferred_authority must cover the highest authority required by any
+# of its required_tools.  Silent auto-elevation is forbidden.
+# ---------------------------------------------------------------------------
+
+TOOL_TO_AGENT_AUTHORITY: dict[Any, AgentAuthority] = {
+    # Imported lazily below to avoid a circular import at module load; the
+    # mapping is filled in after ToolAuthority is importable.  See
+    # ``_init_tool_authority_mapping()``.
+}
+
+_AUTHORITY_RANK: dict[Any, int] = {
+    AgentAuthority.READ: 0,
+    AgentAuthority.PROPOSE: 1,
+    AgentAuthority.EXECUTE: 2,
+}
+
+_COST_CLASS_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
+
+
+def _init_tool_authority_mapping() -> None:
+    """Populate :data:`TOOL_TO_AGENT_AUTHORITY` lazily.
+
+    :class:`ToolAuthority` lives in :mod:`multi_agent.contracts`, which is
+    imported before this module.  The lazy init keeps the mapping
+    declaration close to its consumers without risking import-order issues
+    in test environments that monkeypatch the enum.
+    """
+    if TOOL_TO_AGENT_AUTHORITY:
+        return
+    from multi_agent.contracts import ToolAuthority
+
+    TOOL_TO_AGENT_AUTHORITY[ToolAuthority.READ] = AgentAuthority.READ
+    TOOL_TO_AGENT_AUTHORITY[ToolAuthority.PROPOSE] = AgentAuthority.PROPOSE
+    TOOL_TO_AGENT_AUTHORITY[ToolAuthority.EXECUTE] = AgentAuthority.EXECUTE
 
 
 # ---------------------------------------------------------------------------
@@ -584,17 +630,191 @@ def resolve_expected_intents(
 
 
 # ---------------------------------------------------------------------------
-# Shared pure functions for Planner + Validator (R3)
+# Shared pure functions for Planner + Validator (R3 + R4)
 # ---------------------------------------------------------------------------
 
-# Authority ordering — READ < PROPOSE < EXECUTE
-_AUTHORITY_RANK: dict[Any, int] = {
-    AgentAuthority.READ: 0,
-    AgentAuthority.PROPOSE: 1,
-    AgentAuthority.EXECUTE: 2,
-}
 
-_COST_CLASS_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
+def validate_intent_graph(intents: Sequence[TaskIntent]) -> list[str]:
+    """R4 P0-1 — validate the Intent dependency graph.
+
+    Shared between Planner and Validator so both sides agree on what
+    makes an intent graph valid *before* Agent Assignment or Canonical
+    Task construction.  This closes the ``KeyError`` hole: previously
+    only the Planner validated the graph, so a tampered request with
+    missing dependencies would crash the Validator's
+    :func:`build_expected_planned_tasks` via ``intent_to_task_id[dep]``.
+
+    Returns a list of stable issue code strings (empty == valid):
+
+    * :data:`CODE_INTENT_DUPLICATE_ID` — duplicate ``intent_id``.
+    * :data:`CODE_INTENT_MISSING_DEPENDENCY` — dependency references a
+      non-existent ``intent_id``.
+    * :data:`CODE_INTENT_CYCLE` — dependency graph contains a cycle.
+
+    Cycle detection is skipped when missing dependencies exist — they
+    would masquerade as roots and produce misleading cycle reports.
+    """
+    issues: list[str] = []
+    if not intents:
+        return issues
+
+    # Duplicate intent_id.
+    seen: set[str] = set()
+    for intent in intents:
+        if intent.intent_id in seen:
+            issues.append(CODE_INTENT_DUPLICATE_ID)
+        seen.add(intent.intent_id)
+
+    # Missing dependencies.
+    intent_ids = {i.intent_id for i in intents}
+    has_missing = False
+    for intent in intents:
+        missing = set(intent.dependencies) - intent_ids
+        if missing:
+            issues.append(CODE_INTENT_MISSING_DEPENDENCY)
+            has_missing = True
+
+    # Cycle detection — only when no missing deps (they'd mask as roots).
+    if not has_missing:
+        graph: dict[str, set[str]] = {i.intent_id: set() for i in intents}
+        in_degree: dict[str, int] = {i.intent_id: 0 for i in intents}
+        for intent in intents:
+            for dep in intent.dependencies:
+                graph[dep].add(intent.intent_id)
+                in_degree[intent.intent_id] += 1
+        queue: list[str] = sorted(iid for iid, deg in in_degree.items() if deg == 0)
+        visited: set[str] = set()
+        while queue:
+            node = queue.pop(0)
+            visited.add(node)
+            for neighbor in sorted(graph[node]):
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+        cycle_nodes = sorted(set(in_degree.keys()) - visited)
+        if cycle_nodes:
+            issues.append(CODE_INTENT_CYCLE)
+
+    return issues
+
+
+def validate_intent_tool_authority(intent: TaskIntent, registry: Any) -> None:
+    """R4 P0-3 — Intent ``preferred_authority`` must cover the highest
+    authority required by any of its ``required_tools``.
+
+    Mapping (:data:`TOOL_TO_AGENT_AUTHORITY`):
+
+    * READ Tool     → Intent Authority >= READ
+    * PROPOSE Tool  → Intent Authority >= PROPOSE
+    * EXECUTE Tool  → Phase 3 ceiling; rejected earlier by candidate filter
+
+    Does NOT auto-elevate — fails closed with :class:`PlanningInputError`
+    so the caller's explicitly declared authority boundary is preserved.
+
+    Shared between Planner and Validator.  The Planner calls it before
+    Agent Assignment so an invalid request fails fast.  The Validator
+    calls it before Canonical Plan reconstruction so an invalid request
+    produces a stable Issue instead of propagating an exception.
+    """
+    from multi_agent.contracts import ToolAuthority
+    from multi_agent.planning_errors import PlanningInputError
+
+    _init_tool_authority_mapping()
+
+    if not intent.required_tools:
+        return
+
+    for tool_name in intent.required_tools:
+        if not registry.tool_catalog.is_registered(tool_name):
+            # Unknown tool — handled by candidate filtering (returns []).
+            continue
+        tool = registry.tool_catalog.resolve(tool_name)
+        if tool.authority is ToolAuthority.EXECUTE:
+            # Phase 3 ceiling — handled by candidate filtering.
+            continue
+        required_authority = TOOL_TO_AGENT_AUTHORITY[tool.authority]
+        if (
+            _AUTHORITY_RANK[intent.preferred_authority]
+            < _AUTHORITY_RANK[required_authority]
+        ):
+            raise PlanningInputError(
+                f"Intent {intent.intent_id!r} preferred_authority="
+                f"{intent.preferred_authority.value} is lower than required "
+                f"tool {tool_name!r} authority={tool.authority.value}; "
+                f"intent authority must be >= {required_authority.value}"
+            )
+
+
+def _longest_path_node_count(intents: Sequence[TaskIntent]) -> int:
+    """R4 P0-2 — return the longest-path node count of the Intent DAG.
+
+    Used by :func:`resolve_agent_assignment` to pre-check the iteration
+    budget (``max_iterations``) before searching candidate combinations.
+    The iteration budget bounds the Supervisor graph depth, which equals
+    the longest path in the DAG (each node = one iteration).
+    """
+    if not intents:
+        return 0
+
+    graph: dict[str, set[str]] = {i.intent_id: set() for i in intents}
+    in_degree: dict[str, int] = {i.intent_id: 0 for i in intents}
+    for intent in intents:
+        for dep in intent.dependencies:
+            if dep in graph:
+                graph[dep].add(intent.intent_id)
+                in_degree[intent.intent_id] += 1
+
+    longest: dict[str, int] = {iid: 1 for iid in graph}
+    queue: list[str] = sorted(iid for iid, deg in in_degree.items() if deg == 0)
+    while queue:
+        node = queue.pop(0)
+        for neighbor in sorted(graph[node]):
+            if longest[neighbor] < longest[node] + 1:
+                longest[neighbor] = longest[node] + 1
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+    return max(longest.values()) if longest else 0
+
+
+def _estimate_assignment_deadline_ms(
+    intents: Sequence[TaskIntent],
+    assignment: Mapping[str, Any],
+) -> int:
+    """R4 P0-2 — compute the DAG critical-path deadline for *assignment*.
+
+    The critical path is the longest path through the Intent DAG,
+    summing the ``timeout_ms`` of each assigned capability.  This is the
+    same metric the Validator computes post-hoc on the PlanDraft; moving
+    it into the assignment search ensures the Planner only picks
+    deadline-feasible combinations instead of picking the cheapest
+    combination and letting the Validator reject it.
+    """
+    if not intents:
+        return 0
+
+    timeout_by_intent = {
+        i.intent_id: assignment[i.intent_id].timeout_ms for i in intents
+    }
+    graph: dict[str, set[str]] = {i.intent_id: set() for i in intents}
+    in_degree: dict[str, int] = {i.intent_id: 0 for i in intents}
+    for intent in intents:
+        for dep in intent.dependencies:
+            if dep in graph:
+                graph[dep].add(intent.intent_id)
+                in_degree[intent.intent_id] += 1
+
+    deadline: dict[str, int] = {iid: timeout_by_intent[iid] for iid in graph}
+    queue: list[str] = sorted(iid for iid, deg in in_degree.items() if deg == 0)
+    while queue:
+        node = queue.pop(0)
+        for neighbor in sorted(graph[node]):
+            if deadline[neighbor] < deadline[node] + timeout_by_intent[neighbor]:
+                deadline[neighbor] = deadline[node] + timeout_by_intent[neighbor]
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+    return max(deadline.values()) if deadline else 0
 
 
 def _stable_task_id(
@@ -726,10 +946,10 @@ def resolve_agent_assignment(
     Algorithm:
 
     * ``single_agent`` or ``len(intents) < 2``: greedy per-intent
-      selection (first candidate per intent).
+      selection (first deadline-feasible candidate per intent).
     * ``multi_agent`` with ``len(intents) >= 2``: deterministic
-      cartesian-product search for an assignment with at least two
-      distinct agents.  Composite sort key: total authority rank →
+      cartesian-product search for a diverse, **deadline-feasible**
+      assignment.  Composite sort key: total authority rank →
       total cost class rank → total timeout → agent_id concat →
       version concat.
 
@@ -737,15 +957,26 @@ def resolve_agent_assignment(
     If the cartesian product exceeds this limit, the function fails
     closed with :class:`UnsupportedCapabilityError`.
 
-    R3 P1: if no feasible diverse assignment exists for
-    ``multi_agent``, the function fails closed with
-    :class:`UnsupportedCapabilityError` instead of returning a greedy
-    assignment that the Validator would reject.
-
-    Pre-checks (R3 P1):
+    R4 P0-2: the search is **budget-aware**.  Pre-checks reject
+    infeasible requests before searching:
 
     * ``len(intents) <= budget.max_tasks``
     * ``len(intents) <= budget.max_agent_calls``
+    * ``sum(estimated_tool_calls) <= budget.max_tool_calls``
+    * ``longest_path_node_count(intents) <= budget.max_iterations``
+
+    Each candidate combination is filtered by
+    ``_estimate_assignment_deadline_ms(combo) <= budget.deadline_ms``.
+    Only deadline-feasible combinations enter the sort.  This ensures
+    the Planner picks the cheapest *feasible* combination, not the
+    cheapest combination overall (which might violate the deadline and
+    be rejected by the Validator).
+
+    R3 P1: if no feasible diverse assignment exists for
+    ``multi_agent``, the function fails closed with
+    :class:`UnsupportedCapabilityError`.  R4 P0-2: if diverse
+    assignments exist but none are deadline-feasible, the function
+    fails closed with :class:`BudgetExceededPlanningError`.
     """
     from itertools import product
 
@@ -754,7 +985,7 @@ def resolve_agent_assignment(
         UnsupportedCapabilityError,
     )
 
-    # R3 P1 — pre-check budgets before searching.
+    # R4 P0-2 — pre-check all structural budgets before searching.
     budget = request.budget
     if len(intents) > budget.max_tasks:
         raise BudgetExceededPlanningError(
@@ -763,6 +994,18 @@ def resolve_agent_assignment(
     if len(intents) > budget.max_agent_calls:
         raise BudgetExceededPlanningError(
             f"intent count {len(intents)} > max_agent_calls {budget.max_agent_calls}"
+        )
+    total_tool_calls = sum(i.estimated_tool_calls for i in intents)
+    if total_tool_calls > budget.max_tool_calls:
+        raise BudgetExceededPlanningError(
+            f"estimated_tool_calls {total_tool_calls} > "
+            f"max_tool_calls {budget.max_tool_calls}"
+        )
+    longest_path_nodes = _longest_path_node_count(intents)
+    if longest_path_nodes > budget.max_iterations:
+        raise BudgetExceededPlanningError(
+            f"intent DAG longest path {longest_path_nodes} nodes > "
+            f"max_iterations {budget.max_iterations}"
         )
 
     # Build per-intent candidate lists.
@@ -779,13 +1022,22 @@ def resolve_agent_assignment(
         intent_candidates[intent.intent_id] = candidates
 
     # single_agent or fewer than 2 intents → greedy selection.
+    # R4 P0-2: filter by per-intent deadline (timeout_ms <= deadline_ms).
     if decision.route != "multi_agent" or len(intents) < 2:
-        return {
-            intent.intent_id: intent_candidates[intent.intent_id][0]
-            for intent in intents
-        }
+        assignment: dict[str, Any] = {}
+        for intent in intents:
+            candidates = intent_candidates[intent.intent_id]
+            feasible = [c for c in candidates if c.timeout_ms <= budget.deadline_ms]
+            if not feasible:
+                raise BudgetExceededPlanningError(
+                    f"no deadline-feasible agent for intent "
+                    f"{intent.intent_id!r}; all {len(candidates)} candidate(s) "
+                    f"exceed deadline_ms={budget.deadline_ms}"
+                )
+            assignment[intent.intent_id] = feasible[0]
+        return assignment
 
-    # multi_agent → search for a diverse assignment.
+    # multi_agent → search for a diverse, budget-feasible assignment.
     lists = [intent_candidates[i.intent_id] for i in intents]
     intent_ids = [i.intent_id for i in intents]
 
@@ -802,10 +1054,17 @@ def resolve_agent_assignment(
 
     best_assignment: dict[str, Any] | None = None
     best_key: tuple[Any, ...] | None = None
+    any_diverse_found = False
 
     for combo in product(*lists):
         distinct_agents = {c.agent_id for c in combo}
         if len(distinct_agents) < 2:
+            continue
+        any_diverse_found = True
+        # R4 P0-2 — filter by DAG critical-path deadline.
+        combo_assignment = dict(zip(intent_ids, combo))
+        combo_deadline = _estimate_assignment_deadline_ms(intents, combo_assignment)
+        if combo_deadline > budget.deadline_ms:
             continue
         total_auth = sum(_AUTHORITY_RANK[c.authority] for c in combo)
         total_cost = sum(_COST_CLASS_RANK[c.estimated_cost_class] for c in combo)
@@ -821,14 +1080,21 @@ def resolve_agent_assignment(
         )
         if best_key is None or key < best_key:
             best_key = key
-            best_assignment = dict(zip(intent_ids, combo))
+            best_assignment = combo_assignment
 
     if best_assignment is None:
-        # R3 P1 — fail closed instead of returning a greedy assignment
-        # that the Validator would reject with multi_agent_too_few_agents.
-        raise UnsupportedCapabilityError(
-            "no feasible multi-agent assignment with >=2 distinct agents; "
-            "cannot satisfy multi_agent route diversity requirement"
+        if not any_diverse_found:
+            # R3 P1 — fail closed instead of returning a greedy assignment
+            # that the Validator would reject with multi_agent_too_few_agents.
+            raise UnsupportedCapabilityError(
+                "no feasible multi-agent assignment with >=2 distinct agents; "
+                "cannot satisfy multi_agent route diversity requirement"
+            )
+        # R4 P0-2 — diverse assignments exist but none are deadline-feasible.
+        raise BudgetExceededPlanningError(
+            f"no budget-feasible diverse assignment found; "
+            f"all {total_combinations} combination(s) exceed "
+            f"deadline_ms={budget.deadline_ms}"
         )
 
     return best_assignment
@@ -870,6 +1136,9 @@ def build_expected_planned_tasks(
     * ``correlation_id`` = ``None``  (R3 P0-3 — Plan-time invariant)
     * ``started_at`` = ``None``  (R3 P0-3 — Plan-time invariant)
     * ``completed_at`` = ``None``  (R3 P0-3 — Plan-time invariant)
+    * ``planning_metadata`` = ``dict(intent.metadata)``  (R4 P1-1 — enters
+      Plan Hash and Canonical comparison so Phase 4 can recover template
+      phase / context information)
     """
     from multi_agent.contracts import AgentTask
 
@@ -920,6 +1189,7 @@ def build_expected_planned_tasks(
                 required_tools=intent.required_tools,
                 estimated_tool_calls=intent.estimated_tool_calls,
                 required=intent.required,
+                planning_metadata=dict(intent.metadata),
                 task=task,
             )
         )
@@ -935,9 +1205,9 @@ class PlannedTask(StrictContract):
     """A :class:`TaskIntent` bound to a concrete :class:`AgentTask`.
 
     Carries the planning-side metadata (intent id, domain, preferred
-    authority, required tools, estimated tool-call count, required flag)
-    that the Validator needs *without* polluting :class:`AgentTask`
-    itself.
+    authority, required tools, estimated tool-call count, required flag,
+    and planning metadata) that the Validator needs *without* polluting
+    :class:`AgentTask` itself.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -948,6 +1218,13 @@ class PlannedTask(StrictContract):
     required_tools: frozenset[str] = Field(default_factory=frozenset)
     estimated_tool_calls: int = Field(default=0, ge=0)
     required: bool = True
+
+    # R4 P1-1 — planning_metadata is copied verbatim from
+    # TaskIntent.metadata by build_expected_planned_tasks.  It enters
+    # the Plan Hash and the Canonical Plan comparison so Phase 4 can
+    # recover template phase / context information, and so a tampered
+    # plan cannot silently drop or alter metadata.
+    planning_metadata: dict[str, JsonValue] = Field(default_factory=dict)
 
     task: AgentTask
 
@@ -982,6 +1259,14 @@ class PlannedTask(StrictContract):
                 raise ValueError("required_tools members must not be blank")
             cleaned.add(stripped)
         return frozenset(cleaned)
+
+    @field_validator("planning_metadata")
+    @classmethod
+    def _validate_planning_metadata(cls, v: dict[str, Any]) -> dict[str, Any]:
+        _reject_sensitive_keys(v, "PlannedTask.planning_metadata")
+        from multi_agent.serialization import validate_strict_json
+
+        return validate_strict_json(v)  # type: ignore[return-value]
 
     @model_validator(mode="after")
     def _task_no_self_dependency(self) -> "PlannedTask":
@@ -1252,6 +1537,9 @@ class PlanValidationReport(StrictContract):
 
 
 __all__ = [
+    "CODE_INTENT_CYCLE",
+    "CODE_INTENT_DUPLICATE_ID",
+    "CODE_INTENT_MISSING_DEPENDENCY",
     "MAX_ASSIGNMENT_COMBINATIONS",
     "PLANNER_VERSION",
     "PlanDraft",
@@ -1261,6 +1549,7 @@ __all__ = [
     "PlanningRequest",
     "PlanningSignals",
     "RequestedTask",
+    "TOOL_TO_AGENT_AUTHORITY",
     "TaskIntent",
     "build_expected_planned_tasks",
     "compute_plan_hash",
@@ -1271,4 +1560,6 @@ __all__ = [
     "resolve_candidate_agents",
     "resolve_expected_intents",
     "task_intent_from_requested_task",
+    "validate_intent_graph",
+    "validate_intent_tool_authority",
 ]

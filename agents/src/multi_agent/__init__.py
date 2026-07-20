@@ -71,6 +71,9 @@ from multi_agent.complexity_gate import (
     RuleBasedComplexityGate,
 )
 from multi_agent.planning import (
+    CODE_INTENT_CYCLE,
+    CODE_INTENT_DUPLICATE_ID,
+    CODE_INTENT_MISSING_DEPENDENCY,
     MAX_ASSIGNMENT_COMBINATIONS,
     PLANNER_VERSION,
     PlanDraft,
@@ -81,6 +84,7 @@ from multi_agent.planning import (
     PlanningSignals,
     RequestedTask,
     TaskIntent,
+    TOOL_TO_AGENT_AUTHORITY,
     build_expected_planned_tasks,
     compute_plan_hash,
     compute_request_hash,
@@ -90,6 +94,8 @@ from multi_agent.planning import (
     resolve_candidate_agents,
     resolve_expected_intents,
     task_intent_from_requested_task,
+    validate_intent_graph,
+    validate_intent_tool_authority,
 )
 from multi_agent.planning_errors import (
     AmbiguousAgentSelectionError,
@@ -180,6 +186,9 @@ __all__ = [
     "REASON_SINGLE_DOMAIN_SINGLE_TASK",
     "RuleBasedComplexityGate",
     # Phase 3 — Planning
+    "CODE_INTENT_CYCLE",
+    "CODE_INTENT_DUPLICATE_ID",
+    "CODE_INTENT_MISSING_DEPENDENCY",
     "MAX_ASSIGNMENT_COMBINATIONS",
     "PLANNER_VERSION",
     "PlanDraft",
@@ -190,6 +199,7 @@ __all__ = [
     "PlanningSignals",
     "RequestedTask",
     "TaskIntent",
+    "TOOL_TO_AGENT_AUTHORITY",
     "build_expected_planned_tasks",
     "compute_plan_hash",
     "compute_request_hash",
@@ -199,6 +209,8 @@ __all__ = [
     "resolve_candidate_agents",
     "resolve_expected_intents",
     "task_intent_from_requested_task",
+    "validate_intent_graph",
+    "validate_intent_tool_authority",
     # Phase 3 — Errors
     "AmbiguousAgentSelectionError",
     "BudgetExceededPlanningError",

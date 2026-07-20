@@ -37,12 +37,14 @@ from multi_agent.planning import (
     compute_request_hash,
     resolve_agent_assignment,
     resolve_expected_intents,
+    validate_intent_graph,
+    validate_intent_tool_authority,
 )
 from multi_agent.complexity_gate import (
     ComplexityGate,
     RuleBasedComplexityGate,
 )
-from multi_agent.planning_errors import PlanningError
+from multi_agent.planning_errors import PlanningError, PlanningInputError
 
 # ---------------------------------------------------------------------------
 # Issue codes (stable strings surfaced over HTTP / logs)
@@ -90,12 +92,14 @@ CODE_DUPLICATE_INTENT_ID = "duplicate_intent_id"
 # R3 — Canonical Plan reconstruction issue codes.
 CODE_PLANNER_VERSION_MISMATCH = "planner_version_mismatch"
 CODE_AGENT_ASSIGNMENT_MISMATCH = "agent_assignment_mismatch"
-CODE_AGENT_VERSION_MISMATCH = "agent_version_mismatch"
 CODE_DEPENDENCY_MISMATCH = "dependency_mismatch"
 CODE_REQUIRED_EVIDENCE_MISMATCH = "required_evidence_mismatch"
 CODE_TASK_LIFECYCLE_VIOLATION = "task_lifecycle_violation"
 CODE_TASK_FIELD_MISMATCH = "task_field_mismatch"
 CODE_CUSTOMER_RECOVERY_INPUT_CONFLICT = "customer_recovery_input_conflict"
+
+# R4 P0-3 — Tool / Intent Authority alignment issue code.
+CODE_TOOL_AUTHORITY_MISMATCH = "tool_authority_mismatch"
 
 
 # ---------------------------------------------------------------------------
@@ -472,9 +476,18 @@ class PlanValidator:
 
         1. :func:`resolve_expected_intents` — what intents the plan
            should contain.
-        2. :func:`resolve_agent_assignment` — which agent should be
+        2. :func:`validate_intent_graph` (R4 P0-1) — ensures the intent
+           dependency graph is valid (unique IDs, deps exist, no cycle)
+           *before* Canonical Task construction.  This closes the
+           ``KeyError`` hole: previously a tampered request with missing
+           dependencies would crash ``build_expected_planned_tasks`` via
+           ``intent_to_task_id[dep]``.
+        3. :func:`validate_intent_tool_authority` (R4 P0-3) — ensures
+           each intent's ``preferred_authority`` covers the highest
+           authority required by its ``required_tools``.
+        4. :func:`resolve_agent_assignment` — which agent should be
            selected for each intent.
-        3. :func:`build_expected_planned_tasks` — the canonical
+        5. :func:`build_expected_planned_tasks` — the canonical
            PlannedTask list.
 
         Then compares every field of every PlannedTask against the
@@ -511,6 +524,43 @@ class PlanValidator:
                         ),
                     )
                 )
+            return issues
+
+        # Step 1b (R4 P0-1) — validate the intent dependency graph.
+        # This must run BEFORE resolve_agent_assignment and
+        # build_expected_planned_tasks, both of which assume the graph
+        # is valid (otherwise KeyError / IndexError can escape).
+        graph_issues = validate_intent_graph(expected_intents)
+        for code in graph_issues:
+            issues.append(
+                PlanValidationIssue(
+                    code=code,
+                    severity="error",
+                    message=(
+                        f"intent graph validation failed: {code}; "
+                        f"canonical reconstruction aborted"
+                    ),
+                )
+            )
+        if graph_issues:
+            return issues
+
+        # Step 1c (R4 P0-3) — validate Intent / Tool Authority alignment.
+        # preferred_authority must cover the highest authority required
+        # by any required_tool.  Fails closed with a stable Issue instead
+        # of letting resolve_candidate_agents raise PlanningInputError.
+        for intent in expected_intents:
+            try:
+                validate_intent_tool_authority(intent, registry)
+            except PlanningInputError as exc:
+                issues.append(
+                    PlanValidationIssue(
+                        code=CODE_TOOL_AUTHORITY_MISMATCH,
+                        severity="error",
+                        message=str(exc),
+                    )
+                )
+        if any(i.code == CODE_TOOL_AUTHORITY_MISMATCH for i in issues):
             return issues
 
         # Duplicate intent_id check (kept from R2).
@@ -586,9 +636,7 @@ class PlanValidator:
 
             expected_cap = expected_assignment[pt.intent_id]
             issues.extend(
-                self._compare_planned_task_fields(
-                    pt, expected_pt, expected_cap, registry
-                )
+                self._compare_planned_task_fields(pt, expected_pt, expected_cap)
             )
 
         return issues
@@ -598,7 +646,6 @@ class PlanValidator:
         pt: PlannedTask,
         expected: PlannedTask,
         expected_cap: Any,
-        registry: AgentRegistry,
     ) -> list[PlanValidationIssue]:
         """Compare a single PlannedTask against its canonical form.
 
@@ -606,7 +653,10 @@ class PlanValidator:
 
         * Intent-level: domain, task_type, objective, preferred_authority,
           required_tools, estimated_tool_calls, required.
-        * Agent assignment: agent_id, agent version.
+        * Agent assignment: agent_id (R3 P0-2).  Agent version is NOT
+          compared per-task — version drift is caught by the plan-level
+          ``registry_version`` check, since the entire capability set
+          is bound to a single Registry Snapshot (R4 P1-3).
         * Task identity: task_id, idempotency_key.
         * Dependencies: frozenset equality (R3 P0-1).
         * Required evidence: list equality (R3 P0-1).
@@ -615,6 +665,8 @@ class PlanValidator:
           (R3 P0-3 — must be pending / None).
         * Fixed canonical: max_retries, priority, input_data,
           user_id, correlation_id (R3 P0-3).
+        * Planning metadata: dict equality (R4 P1-1 — enters Plan Hash
+          and Canonical comparison).
         """
         issues: list[PlanValidationIssue] = []
         intent_id = pt.intent_id
@@ -740,33 +792,12 @@ class PlanValidator:
                     task_id=task_id,
                 )
             )
-        else:
-            # R3 P0-2: agent version check.  Verify the capability
-            # currently in the registry has the same version as the
-            # capability that the deterministic assignment selected.
-            # In normal operation these always match (same registry),
-            # but this check exists for defense-in-depth: if the
-            # registry is mutated between planning and validation, the
-            # version drift is detected here.
-            try:
-                actual_cap = registry.resolve_capability(actual_task.agent_id)
-                if actual_cap.version != expected_cap.version:
-                    issues.append(
-                        PlanValidationIssue(
-                            code=CODE_AGENT_VERSION_MISMATCH,
-                            severity="error",
-                            message=(
-                                f"PlannedTask {intent_id!r} agent "
-                                f"{actual_task.agent_id!r} registry version "
-                                f"{actual_cap.version!r} != expected "
-                                f"{expected_cap.version!r}"
-                            ),
-                            task_id=task_id,
-                        )
-                    )
-            except Exception:  # noqa: BLE001
-                # Already reported by _check_tasks_against_registry.
-                pass
+        # R4 P1-3: agent version check removed.  PlannedTask does not
+        # carry agent_version, and both expected_cap and actual_cap
+        # come from the same Registry Snapshot — version drift is caught
+        # by the plan-level registry_version check.  Keeping a per-task
+        # version check that always passes (same registry) plus a broad
+        # ``except Exception: pass`` was misleading defensive code.
 
         # -- Task identity (R2, kept) ---------------------------------------
         # The canonical task_id is built by build_expected_planned_tasks
@@ -951,6 +982,25 @@ class PlanValidator:
                         f"PlannedTask {intent_id!r} correlation_id "
                         f"{actual_task.correlation_id!r} != expected "
                         f"{expected_task.correlation_id!r}"
+                    ),
+                    task_id=task_id,
+                )
+            )
+
+        # -- Planning metadata (R4 P1-1) -----------------------------------
+        # Metadata is copied verbatim from TaskIntent.metadata into
+        # PlannedTask.planning_metadata by build_expected_planned_tasks.
+        # It participates in Plan Hash and Canonical Plan comparison so
+        # that tampering with template/phase metadata is detectable.
+        if pt.planning_metadata != expected.planning_metadata:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_TASK_FIELD_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} planning_metadata "
+                        f"{pt.planning_metadata!r} != expected "
+                        f"{expected.planning_metadata!r}"
                     ),
                     task_id=task_id,
                 )
