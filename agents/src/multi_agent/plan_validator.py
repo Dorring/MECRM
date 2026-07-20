@@ -34,6 +34,8 @@ from multi_agent.planning import (
     PlanValidationIssue,
     PlanValidationReport,
     build_expected_planned_tasks,
+    canonical_complexity_payload,
+    canonical_request_payload,
     compute_request_hash,
     resolve_agent_assignment,
     resolve_expected_intents,
@@ -204,6 +206,17 @@ class PlanValidator:
     ) -> list[PlanValidationIssue]:
         """Verify plan.request matches the caller's request, and that
         plan.request_hash is consistent with both.
+
+        R7 P0-3 — the snapshot comparison uses
+        :func:`canonical_request_payload` instead of raw Pydantic
+        ``plan.request != request``.  The Phase 3 invariant is that
+        ``requested_tasks`` list order and ``dependencies`` list order
+        do not encode semantics (R5/R6 already made ``request_hash``
+        order-invariant).  Using raw object comparison reintroduced a
+        second, stricter definition of equality that rejected
+        semantically-identical requests with permuted task lists.
+        Canonical payload comparison aligns the snapshot check with the
+        hash check.
         """
         issues: list[PlanValidationIssue] = []
 
@@ -222,13 +235,21 @@ class PlanValidator:
                 )
             )
 
-        # plan.request must equal the caller's request.
-        if plan.request != request:
+        # R7 P0-3 — compare canonical payloads, not raw Pydantic objects.
+        # requested_tasks and dependencies are order-invariant by design;
+        # the raw ``plan.request != request`` comparison rejected
+        # semantically-equal requests that differed only in list order.
+        plan_payload = canonical_request_payload(plan.request)
+        caller_payload = canonical_request_payload(request)
+        if plan_payload != caller_payload:
             issues.append(
                 PlanValidationIssue(
                     code=CODE_REQUEST_SNAPSHOT_MISMATCH,
                     severity="error",
-                    message="plan.request snapshot does not match caller request",
+                    message=(
+                        "plan.request canonical payload does not match "
+                        "caller request canonical payload"
+                    ),
                 )
             )
 
@@ -300,7 +321,21 @@ class PlanValidator:
                 )
             )
             return issues
-        expected = plan.compute_plan_hash()
+        # R7 P0-1 — canonical_complexity_payload may raise ValueError
+        # if plan.complexity was tampered post-construction (duplicate
+        # domains/reasons or blank elements).  Catch and surface as a
+        # plan_hash_mismatch issue rather than crashing the Validator.
+        try:
+            expected = plan.compute_plan_hash()
+        except ValueError as exc:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_PLAN_HASH_MISMATCH,
+                    severity="error",
+                    message=(f"compute_plan_hash() raised ValueError: {exc}"),
+                )
+            )
+            return issues
         if plan.plan_hash != expected:
             issues.append(
                 PlanValidationIssue(
@@ -348,14 +383,23 @@ class PlanValidator:
     ) -> list[PlanValidationIssue]:
         """Re-run the gate and verify plan.complexity matches.
 
-        Compares route, domains (as sets), reasons (as sets), and
-        requires_human_review.  ``confidence`` is not compared because
-        it's a numeric hint, not a structural invariant.
+        R7 P0-1 — compares the **full** canonical payload (route,
+        domains, reasons, confidence, requires_human_review) using the
+        shared :func:`canonical_complexity_payload`.  Previously the
+        Validator compared ``set(domains)`` / ``set(reasons)`` and
+        skipped ``confidence``, which allowed a tampered
+        ``ComplexityDecision`` with duplicate domains/reasons or a
+        different ``confidence`` to pass validation.
 
-        R2 P1: only :class:`PlanningError` is caught.  Unknown
-        exceptions (programming bugs) are allowed to propagate so they
-        surface in tests, logs, and error monitoring rather than being
-        silently downgraded to a validation issue.
+        ``canonical_complexity_payload`` raises :class:`ValueError` on
+        duplicate or blank elements; the Validator catches this and
+        surfaces it as a ``complexity_decision_mismatch`` issue rather
+        than crashing.
+
+        R2 P1: only :class:`PlanningError` is caught from the gate.
+        Unknown exceptions (programming bugs) are allowed to propagate
+        so they surface in tests, logs, and error monitoring rather
+        than being silently downgraded to a validation issue.
         """
         issues: list[PlanValidationIssue] = []
         try:
@@ -370,48 +414,53 @@ class PlanValidator:
             )
             return issues
 
-        if plan.complexity.route != expected.route:
+        # R7 P0-1 — full canonical payload comparison.
+        try:
+            actual_payload = canonical_complexity_payload(plan.complexity)
+        except ValueError as exc:
             issues.append(
                 PlanValidationIssue(
                     code=CODE_COMPLEXITY_DECISION_MISMATCH,
                     severity="error",
-                    message=(
-                        f"plan.complexity.route={plan.complexity.route!r} != "
-                        f"gate route={expected.route!r}"
-                    ),
+                    message=(f"plan.complexity is non-canonical: {exc}"),
                 )
             )
-        if set(plan.complexity.domains) != set(expected.domains):
+            return issues
+        try:
+            expected_payload = canonical_complexity_payload(expected)
+        except ValueError as exc:
+            # Should never happen — the Gate produces clean values.
             issues.append(
                 PlanValidationIssue(
                     code=CODE_COMPLEXITY_DECISION_MISMATCH,
                     severity="error",
-                    message=(
-                        f"plan.complexity.domains={sorted(plan.complexity.domains)!r} != "
-                        f"gate domains={sorted(expected.domains)!r}"
-                    ),
+                    message=(f"gate.decide() returned non-canonical complexity: {exc}"),
                 )
             )
-        if set(plan.complexity.reasons) != set(expected.reasons):
+            return issues
+
+        if actual_payload != expected_payload:
+            # Identify the differing fields for a clearer message.
+            diffs: list[str] = []
+            for key in (
+                "route",
+                "domains",
+                "reasons",
+                "confidence",
+                "requires_human_review",
+            ):
+                if actual_payload.get(key) != expected_payload.get(key):
+                    diffs.append(
+                        f"{key}: plan={actual_payload.get(key)!r} != "
+                        f"gate={expected_payload.get(key)!r}"
+                    )
             issues.append(
                 PlanValidationIssue(
                     code=CODE_COMPLEXITY_DECISION_MISMATCH,
                     severity="error",
                     message=(
-                        f"plan.complexity.reasons={sorted(plan.complexity.reasons)!r} != "
-                        f"gate reasons={sorted(expected.reasons)!r}"
-                    ),
-                )
-            )
-        if plan.complexity.requires_human_review != expected.requires_human_review:
-            issues.append(
-                PlanValidationIssue(
-                    code=CODE_COMPLEXITY_DECISION_MISMATCH,
-                    severity="error",
-                    message=(
-                        f"plan.complexity.requires_human_review="
-                        f"{plan.complexity.requires_human_review} != "
-                        f"gate={expected.requires_human_review}"
+                        "plan.complexity canonical payload != gate canonical"
+                        f" payload ({'; '.join(diffs) if diffs else 'unknown'})"
                     ),
                 )
             )

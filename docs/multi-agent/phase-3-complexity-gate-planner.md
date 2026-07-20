@@ -1,8 +1,8 @@
 # Phase 3: Complexity Gate + Planner + Plan Validator
 
-**Status:** Complete (R6)  
+**Status:** Complete (R7)  
 **Branch:** `feat/ma-03-complexity-gate-planner`  
-**Spec version:** ma-03.6.0
+**Spec version:** ma-03.7.0
 
 ---
 
@@ -316,7 +316,7 @@ if plan.planner_version != PLANNER_VERSION:
     issue(code="planner_version_mismatch", severity="error")
 ```
 
-当前 `PLANNER_VERSION = "ma-03.6.0"`。未来需要支持旧版本时，应使用显式版本 Registry `SUPPORTED_PLANNER_VERSIONS`，不接受任意非空字符串。
+当前 `PLANNER_VERSION = "ma-03.7.0"`。未来需要支持旧版本时，应使用显式版本 Registry `SUPPORTED_PLANNER_VERSIONS`，不接受任意非空字符串。
 
 ### 10.7 Intent Graph 校验（R4 P0-1）
 
@@ -566,6 +566,114 @@ READ Intent + crm_writer.propose
 → PlanningInputError (始终拒绝，无法绕过)
 ```
 
+### 10.16 Canonical Complexity Payload（R7 P0-1）
+
+R6 之前，Validator 对 `ComplexityDecision` 只比较 `route`、`set(domains)`、`set(reasons)`、`requires_human_review`，明确跳过 `confidence`。`ComplexityDecision` 本身允许普通 `list[str]`，没有去重或非空校验。因此一个带重复 `domains` / `reasons` 或不同 `confidence` 的 Complexity 可以通过 Validator。
+
+R7 引入共享纯函数 `canonical_complexity_payload`，作为 Complexity 相等性的唯一定义：
+
+```python
+def canonical_complexity_payload(decision: ComplexityDecision) -> dict[str, Any]:
+    # domains → 去重、排序、拒绝空白
+    # reasons → 去重、排序、拒绝空白
+    # route → 原值
+    # confidence → 原值（R7 起进入比较）
+    # requires_human_review → 原值
+```
+
+`compute_plan_hash` 和 `PlanValidator._check_complexity_decision` 都使用该函数，确保只有一套比较规则。
+
+**Validator 策略**：
+- `canonical_complexity_payload(plan.complexity)` 抛出 `ValueError` → 返回 `complexity_decision_mismatch`
+- `plan.compute_plan_hash()` 抛出 `ValueError` → 返回 `plan_hash_mismatch`
+- Payload 不一致 → 返回 `complexity_decision_mismatch`，附带字段级差异诊断
+
+不变量：
+
+```
+ComplexityDecision(domains=["support", "support"])
+→ complexity_decision_mismatch
+
+ComplexityDecision(reasons=["", "reason"])
+→ complexity_decision_mismatch
+
+ComplexityDecision(confidence=0.5) vs Gate(confidence=1.0)
+→ complexity_decision_mismatch
+
+ComplexityDecision(domains=["sales", "support"])
+== ComplexityDecision(domains=["support", "sales"])
+→ canonical payload 相同
+```
+
+### 10.17 Immutable Default Template（R7 P0-2）
+
+`CustomerRecoveryTemplate` 之前只继承 `StrictContract`（`validate_assignment=True`），没有 `frozen=True`。全局 Singleton `DEFAULT_CUSTOMER_RECOVERY_TEMPLATE` 可被运行时修改：
+
+```python
+DEFAULT_CUSTOMER_RECOVERY_TEMPLATE.support_analysis_required = False  # 成功
+```
+
+R7 将模板设为真正不可变：
+
+```python
+class CustomerRecoveryTemplate(StrictContract):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+```
+
+`__setattr__` 抛出 `ValidationError`，所有字段（`name` / `version` / `customer_context_required` / `support_analysis_required` / `sales_risk_analysis_required` / `knowledge_recommendation_required` / `recovery_metrics_required`）均不可变。
+
+### 10.18 Template Version Binding（R7 P0-2）
+
+模板生成的每个 `TaskIntent.metadata` 现在包含 `template_version`：
+
+```python
+metadata={
+    "template": self.name,
+    "template_version": self.version,
+    "phase": "context",
+}
+```
+
+`build_expected_planned_tasks` 将 `intent.metadata` 复制到 `PlannedTask.planning_metadata`，后者进入 Plan Hash 和 Canonical Plan 比较。模板版本变化会被 Validator 检测到：
+
+```
+Plan A (template version = ma-03.1.0)
+Plan B (template version = ma-03.99.0)
+→ plan_hash 不同
+→ Canonical Reconstruction 检测到 planning_metadata 差异
+```
+
+### 10.19 Canonical Request Snapshot Comparison（R7 P0-3）
+
+R5/R6 让 `request_hash` 对 `requested_tasks` 和 `dependencies` 列表顺序无关，但 `_check_request_snapshot` 仍使用 Pydantic 原始对象比较 `plan.request != request`。两个语义相同的请求（仅列表顺序不同）会被 Validator 拒绝：
+
+```
+Request A: requested_tasks = [i1, i2]
+Request B: requested_tasks = [i2, i1]
+
+request_hash(A) == request_hash(B)
+plan_hash(A) == plan_hash(B)
+但 PlanValidator.validate(request=B, plan=Planner(A)).valid == False
+```
+
+R7 将 Request Snapshot 比较改为 Canonical Payload 比较：
+
+```python
+plan_payload = canonical_request_payload(plan.request)
+caller_payload = canonical_request_payload(request)
+
+if plan_payload != caller_payload:
+    request_snapshot_mismatch
+```
+
+不变量：
+
+```
+requested_tasks 排列不同但语义相同 → 接受
+dependencies 排列不同但语义相同 → 接受
+domain / task_type / objective / budget / actor 真正改变 → 拒绝
+```
+
 ## 11. Budget 校验
 
 ### 11.1 估算规则（修正 7）
@@ -698,7 +806,8 @@ R3 将 Planner 的核心决策逻辑抽取为无副作用纯函数，位于 `mul
 | **`_estimate_assignment_deadline_ms`** | `(intents, assignment) -> int` | **R4 P0-2 内部辅助**：计算给定 assignment 的 DAG 关键路径 timeout 之和 |
 | **`_longest_path_node_count`** | `(intents) -> int` | **R4 P0-2 内部辅助**：计算 Intent DAG 最长路径节点数，用于 max_iterations 预检 |
 | **`validate_write_approval_requirements`** | `(request, intents) -> list[str]` | **R5 P0-1 新增**：requires_write / requires_approval 时至少一个 Intent 必须为 PROPOSE，返回稳定 Issue Code 列表 |
-| **`canonical_request_payload`** | `(request) -> dict[str, Any]` | **R5 P0-3 新增**：构建顺序无关的 Request Hash payload（requested_tasks / dependencies / set 字段全部排序），由 `compute_request_hash` 调用（**R6 P0-1 使用 `mode="python"` 保留 frozenset**） |
+| **`canonical_request_payload`** | `(request) -> dict[str, Any]` | **R5 P0-3 新增**：构建顺序无关的 Request Hash payload（requested_tasks / dependencies / set 字段全部排序），由 `compute_request_hash` 调用（**R6 P0-1 使用 `mode="python"` 保留 frozenset**；**R7 P0-3 `_check_request_snapshot` 也使用该函数做 Canonical 比较**） |
+| **`canonical_complexity_payload`** | `(decision) -> dict[str, Any]` | **R7 P0-1 新增**：构建 Complexity 的 Canonical Payload（domains/reasons 去重、排序、拒绝空白；confidence 参与比较），由 `compute_plan_hash` 和 `PlanValidator._check_complexity_decision` 共同使用 |
 
 **设计约束**：
 
@@ -725,10 +834,11 @@ R3 将 Planner 的核心决策逻辑抽取为无副作用纯函数，位于 `mul
 | `test_phase3_r4_review.py` | 15 | R4 反例：Intent Graph 校验、Budget-aware Assignment（deadline/工具/迭代预算预检 + 可行性过滤）、Intent/Tool Authority 对齐、PlannedTask.planning_metadata 篡改 |
 | `test_phase3_r5_review.py` | 16 | R5 反例：Write/Approval Requirement 共享校验、PlanDraft 深快照 + build_execution_tasks 防御性复制、Semantic Request Hash（顺序不变量 + 语义变化必变）、TOOL_TO_AGENT_AUTHORITY 静态化 |
 | `test_phase3_r6_review.py` | 16 | R6 反例：Cross-process Hash Stability（subprocess + PYTHONHASHSEED）、Canonical Intent Ordering（permuted requested_tasks 不变量）、Complete Plan Snapshot（complexity + tasks 深快照）、Immutable Authority Mapping（MappingProxyType 不可变） |
-| **Phase 3 合计** | **212** | |
+| `test_phase3_r7_review.py` | 15 | R7 反例：Canonical Complexity Payload（confidence / 重复 / 空白 拒绝）、Immutable Customer Recovery Template（frozen=True + template_version 绑定 Plan Hash）、Canonical Request Snapshot Comparison（permuted requested_tasks / dependencies 接受，语义变化拒绝） |
+| **Phase 3 合计** | **227** | |
 | Phase 2 回归 | 168 | 全部通过 |
 | Phase 1 回归 | 76 | 全部通过 |
-| **总计** | **456** | |
+| **总计** | **471** | |
 
 ## 新增文件
 
@@ -763,7 +873,8 @@ agents/tests/unit/multi_agent/
 ├── test_phase3_r3_review.py    # R3 反例测试 (35 tests)
 ├── test_phase3_r4_review.py    # R4 反例测试 (15 tests)
 ├── test_phase3_r5_review.py    # R5 反例测试 (16 tests)
-└── test_phase3_r6_review.py    # R6 反例测试 (16 tests, 含 subprocess 跨进程测试)
+├── test_phase3_r6_review.py    # R6 反例测试 (16 tests, 含 subprocess 跨进程测试)
+└── test_phase3_r7_review.py    # R7 反例测试 (15 tests)
 
 docs/multi-agent/
 └── phase-3-complexity-gate-planner.md  (本文件)
@@ -772,12 +883,14 @@ docs/multi-agent/
 ## 修改文件
 
 - `agents/src/multi_agent/__init__.py` — 追加 Phase 3 导出 + `effective_domains` / `effective_task_types` / `resolve_expected_intents` / `MAX_ASSIGNMENT_COMBINATIONS` / `resolve_candidate_agents` / `resolve_agent_assignment` / `build_expected_planned_tasks`（R3）+ `validate_intent_graph` / `validate_intent_tool_authority` / `TOOL_TO_AGENT_AUTHORITY` / `CODE_INTENT_DUPLICATE_ID` / `CODE_INTENT_MISSING_DEPENDENCY` / `CODE_INTENT_CYCLE`（R4）
-- `agents/src/multi_agent/planning.py` — 升级 `resolve_agent_assignment` 为 budget-aware（R4 P0-2）；新增 `validate_intent_graph` / `validate_intent_tool_authority` / `TOOL_TO_AGENT_AUTHORITY` / `_estimate_assignment_deadline_ms` / `_longest_path_node_count`（R4）；`PlannedTask.planning_metadata` 新字段（R4 P1-1）；`PLANNER_VERSION = ma-03.6.0`（R4→R5→R6）；**R6 P0-1: `_canonical_tasks_payload` / `canonical_request_payload` / `compute_plan_hash` 改用 `mode="python"` + `ComplexityDecision.domains/reasons` 显式排序**；**R6 P0-2: `resolve_agent_assignment` / `build_expected_planned_tasks` 内部统一 `canonical_intents` 排序 + `assignment_key` 保留 Intent→Agent 映射**；**R6 P0-3: `PlanDraft` 新增 `complexity` / `tasks` 深快照 `field_validator`**；**R6 P0-4: `TOOL_TO_AGENT_AUTHORITY` 改为 `MappingProxyType` 不可变**
+- `agents/src/multi_agent/planning.py` — 升级 `resolve_agent_assignment` 为 budget-aware（R4 P0-2）；新增 `validate_intent_graph` / `validate_intent_tool_authority` / `TOOL_TO_AGENT_AUTHORITY` / `_estimate_assignment_deadline_ms` / `_longest_path_node_count`（R4）；`PlannedTask.planning_metadata` 新字段（R4 P1-1）；`PLANNER_VERSION = ma-03.7.0`（R4→R5→R6→R7）；**R6 P0-1: `_canonical_tasks_payload` / `canonical_request_payload` / `compute_plan_hash` 改用 `mode="python"` + `ComplexityDecision.domains/reasons` 显式排序**；**R6 P0-2: `resolve_agent_assignment` / `build_expected_planned_tasks` 内部统一 `canonical_intents` 排序 + `assignment_key` 保留 Intent→Agent 映射**；**R6 P0-3: `PlanDraft` 新增 `complexity` / `tasks` 深快照 `field_validator`**；**R6 P0-4: `TOOL_TO_AGENT_AUTHORITY` 改为 `MappingProxyType` 不可变**；**R7 P0-1: 新增 `canonical_complexity_payload` 共享纯函数，`compute_plan_hash` 委托该函数**
 - `agents/src/multi_agent/serialization.py` — **R6 P0-1: `_canonical_value` BaseModel 分支 + `stable_hash` 改用 `mode="python"` 保留 frozenset 类型，让 Canonicalizer 排序**
 - `agents/src/multi_agent/registry.py` — **R6 P0-1: `_copy_capability` + `snapshot()` 改用 `mode="python"`，保证 `RegistrySnapshot.version` 跨进程稳定**
-- `agents/src/multi_agent/plan_validator.py` — `_check_canonical_plan` 新增 Step 1b（`validate_intent_graph`）和 Step 1c（`validate_intent_tool_authority`）；`_compare_planned_task_fields` 比较 `planning_metadata`（R4 P1-1）；删除 `CODE_AGENT_VERSION_MISMATCH` 及 per-task version 检查块（R4 P1-3）；新增 `CODE_TOOL_AUTHORITY_MISMATCH`
+- `agents/src/multi_agent/planning_templates.py` — **R7 P0-2: `CustomerRecoveryTemplate` 新增 `frozen=True`；`build_intents` metadata 新增 `template_version` 字段**
+- `agents/src/multi_agent/plan_validator.py` — `_check_canonical_plan` 新增 Step 1b（`validate_intent_graph`）和 Step 1c（`validate_intent_tool_authority`）；`_compare_planned_task_fields` 比较 `planning_metadata`（R4 P1-1）；删除 `CODE_AGENT_VERSION_MISMATCH` 及 per-task version 检查块（R4 P1-3）；新增 `CODE_TOOL_AUTHORITY_MISMATCH`；**R7 P0-1: `_check_complexity_decision` 使用 `canonical_complexity_payload` 完整 Payload 比较（含 confidence，去重，排序，拒绝空白）**；**R7 P0-1: `_check_plan_hash` 捕获 `ValueError` 返回 `plan_hash_mismatch`**；**R7 P0-3: `_check_request_snapshot` 使用 `canonical_request_payload` 比较替代原始 Pydantic 对象比较**
 - `agents/src/multi_agent/planner.py` — 删除 `customer_recovery_template` 构造参数和 `self._recovery_template`（R4 P1-2）；`_validate_intents` 改为调用共享 `validate_intent_graph`（R4 P0-1）；新增 `_validate_tool_authority` 步骤调用 `validate_intent_tool_authority`（R4 P0-3）；`_HASH_CODES` 移除 `agent_version_mismatch`，新增 `missing_intent_dependency` / `tool_authority_mismatch`；`_CYCLE_CODES` 新增 `intent_cycle`
 - `agents/tests/unit/multi_agent/test_phase3_r4_review.py` — 新增 R4 反例测试（15 tests）
 - `agents/tests/unit/multi_agent/test_phase3_r5_review.py` — 新增 R5 反例测试（16 tests）
 - `agents/tests/unit/multi_agent/test_phase3_r6_review.py` — **R6 新增反例测试（16 tests，含 subprocess 跨进程测试）**
-- `docs/multi-agent/phase-3-complexity-gate-planner.md` — 文档更新至 R6
+- `agents/tests/unit/multi_agent/test_phase3_r7_review.py` — **R7 新增反例测试（15 tests）**
+- `docs/multi-agent/phase-3-complexity-gate-planner.md` — 文档更新至 R7

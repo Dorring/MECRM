@@ -22,7 +22,7 @@ available; the Planner still attempts to bind every intent.
 
 from __future__ import annotations
 
-from pydantic import field_validator
+from pydantic import ConfigDict, field_validator
 
 from multi_agent.contracts import AgentAuthority, StrictContract, _non_blank
 from multi_agent.planning import TaskIntent
@@ -59,7 +59,19 @@ class CustomerRecoveryTemplate(StrictContract):
     A frozen descriptor that emits 5 :class:`TaskIntent` objects.  The
     template never carries customer IDs, tenant IDs, or secrets — those
     are bound by the Planner from :class:`PlanningRequest`.
+
+    R7 P0-2 — the template is now truly immutable via ``frozen=True``.
+    Previously it only inherited ``validate_assignment=True`` from
+    :class:`StrictContract`, which allowed runtime mutation of the
+    global ``DEFAULT_CUSTOMER_RECOVERY_TEMPLATE`` singleton (e.g.
+    flipping ``support_analysis_required`` to ``False``) without
+    detection.  ``frozen=True`` makes every attribute assignment raise
+    :class:`ValidationError`, and ``template_version`` is now embedded
+    in every intent's ``planning_metadata`` so it enters Plan Hash and
+    Canonical Plan comparison.
     """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     name: str = "customer_recovery"
     version: str = "ma-03.1.0"
@@ -93,6 +105,13 @@ class CustomerRecoveryTemplate(StrictContract):
         intent-id order.  Callers should not rely on list position
         for dependency resolution — ``dependencies`` is the source of
         truth.
+
+        R7 P0-2 — each intent's ``metadata`` now includes
+        ``template_version`` so the template version enters
+        ``planning_metadata`` → Plan Hash → Canonical Plan comparison.
+        A runtime mutation of the template (which is now blocked by
+        ``frozen=True``) or a version bump will be detected by the
+        Validator.
         """
         root = INTENT_CUSTOMER_CONTEXT
         return [
@@ -107,7 +126,11 @@ class CustomerRecoveryTemplate(StrictContract):
                 preferred_authority=AgentAuthority.READ,
                 required_tools=frozenset({"crm_reader.get_customers"}),
                 estimated_tool_calls=1,
-                metadata={"template": self.name, "phase": "context"},
+                metadata={
+                    "template": self.name,
+                    "template_version": self.version,
+                    "phase": "context",
+                },
             ),
             TaskIntent(
                 intent_id=INTENT_SUPPORT_ANALYSIS,
@@ -120,7 +143,11 @@ class CustomerRecoveryTemplate(StrictContract):
                 preferred_authority=AgentAuthority.READ,
                 required_tools=frozenset({"crm_reader.get_tickets"}),
                 estimated_tool_calls=2,
-                metadata={"template": self.name, "phase": "support"},
+                metadata={
+                    "template": self.name,
+                    "template_version": self.version,
+                    "phase": "support",
+                },
             ),
             TaskIntent(
                 intent_id=INTENT_SALES_RISK_ANALYSIS,
@@ -133,7 +160,11 @@ class CustomerRecoveryTemplate(StrictContract):
                 preferred_authority=AgentAuthority.READ,
                 required_tools=frozenset({"crm_reader.get_deals"}),
                 estimated_tool_calls=2,
-                metadata={"template": self.name, "phase": "sales"},
+                metadata={
+                    "template": self.name,
+                    "template_version": self.version,
+                    "phase": "sales",
+                },
             ),
             TaskIntent(
                 intent_id=INTENT_KNOWLEDGE_RECOMMENDATION,
@@ -146,7 +177,11 @@ class CustomerRecoveryTemplate(StrictContract):
                 preferred_authority=AgentAuthority.READ,
                 required_tools=frozenset({"vector_search.search"}),
                 estimated_tool_calls=1,
-                metadata={"template": self.name, "phase": "knowledge"},
+                metadata={
+                    "template": self.name,
+                    "template_version": self.version,
+                    "phase": "knowledge",
+                },
             ),
             TaskIntent(
                 intent_id=INTENT_RECOVERY_METRICS,
@@ -159,7 +194,11 @@ class CustomerRecoveryTemplate(StrictContract):
                 preferred_authority=AgentAuthority.READ,
                 required_tools=frozenset({"crm_reader.get_customers"}),
                 estimated_tool_calls=1,
-                metadata={"template": self.name, "phase": "metrics"},
+                metadata={
+                    "template": self.name,
+                    "template_version": self.version,
+                    "phase": "metrics",
+                },
             ),
         ]
 

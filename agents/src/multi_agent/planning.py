@@ -1484,6 +1484,61 @@ def validate_write_approval_requirements(
     return issues
 
 
+def canonical_complexity_payload(
+    decision: ComplexityDecision,
+) -> dict[str, Any]:
+    """Build a canonical, order-invariant payload for a ComplexityDecision.
+
+    R7 P0-1 — shared between ``compute_plan_hash`` and
+    ``PlanValidator._check_complexity_decision`` so both sides use the
+    *same* definition of Complexity equality.
+
+    Canonical rules:
+
+    * ``domains`` — sorted; duplicates and blank elements are rejected;
+    * ``reasons`` — sorted; duplicates and blank elements are rejected;
+    * ``route`` — as-is;
+    * ``confidence`` — as-is (R7: now enters comparison, was ignored
+      before);
+    * ``requires_human_review`` — as-is.
+
+    Raises :class:`ValueError` on duplicate or blank elements so that
+    a tampered ``ComplexityDecision`` (e.g. ``domains=["support",
+    "support"]``) cannot produce a valid plan hash or pass Validator
+    comparison.  The Planner never produces such values — the Gate
+    emits clean, deduplicated domains/reasons — so this only triggers
+    on post-construction tampering.
+    """
+    domains = decision.domains
+    reasons = decision.reasons
+
+    # Reject blank elements.
+    for d in domains:
+        if not isinstance(d, str) or not d.strip():
+            raise ValueError(
+                f"ComplexityDecision.domains contains a blank element: {domains!r}"
+            )
+    for r in reasons:
+        if not isinstance(r, str) or not r.strip():
+            raise ValueError(
+                f"ComplexityDecision.reasons contains a blank element: {reasons!r}"
+            )
+
+    # Reject duplicates.
+    if len(set(domains)) != len(domains):
+        raise ValueError(f"ComplexityDecision.domains contains duplicates: {domains!r}")
+    if len(set(reasons)) != len(reasons):
+        raise ValueError(f"ComplexityDecision.reasons contains duplicates: {reasons!r}")
+
+    return {
+        "route": decision.route,
+        "domains": sorted(domains),
+        "reasons": sorted(reasons),
+        "confidence": decision.confidence,
+        "requires_human_review": decision.requires_human_review,
+    }
+
+
 def compute_plan_hash(
     *,
     request_hash: str,
@@ -1502,25 +1557,18 @@ def compute_plan_hash(
     (which sorts) instead of being converted to plain lists with
     process-random iteration order.
 
-    R6 P0-1 (follow-up) — ``ComplexityDecision.domains`` and
-    ``.reasons`` are typed as ``list[str]`` (not ``frozenset``), so
-    when a caller passes a ``frozenset`` Pydantic iterates it in
-    hash-randomized order and the list order leaks into the hash.
-    These fields are semantically sets (the Validator already compares
-    them via ``set(plan.complexity.domains) != set(expected.domains)``),
-    so we sort them explicitly here to make the hash stable across
-    ``PYTHONHASHSEED`` values.
+    R7 P0-1 — delegates complexity canonicalisation to
+    :func:`canonical_complexity_payload`, which sorts ``domains`` /
+    ``reasons``, rejects duplicates and blanks, and includes
+    ``confidence``.  Both ``compute_plan_hash`` and
+    ``PlanValidator._check_complexity_decision`` use the same function
+    so there is a single definition of Complexity equality.
     """
-    complexity_data = complexity.model_dump(mode="python")
-    # Sort list-typed fields that are semantically sets.
-    if isinstance(complexity_data.get("domains"), list):
-        complexity_data["domains"] = sorted(complexity_data["domains"])
-    if isinstance(complexity_data.get("reasons"), list):
-        complexity_data["reasons"] = sorted(complexity_data["reasons"])
+    complexity_payload = canonical_complexity_payload(complexity)
 
     payload = {
         "request_hash": request_hash,
-        "complexity": canonicalize(complexity_data),
+        "complexity": canonicalize(complexity_payload),
         "tasks": _canonical_tasks_payload(tasks),
         "planner_version": planner_version,
     }
@@ -1803,6 +1851,7 @@ __all__ = [
     "TOOL_TO_AGENT_AUTHORITY",
     "TaskIntent",
     "build_expected_planned_tasks",
+    "canonical_complexity_payload",
     "canonical_request_payload",
     "compute_plan_hash",
     "compute_request_hash",
