@@ -135,39 +135,39 @@ def merge_parallel_results(
 
     # -- Phase 2: resolve each group -----------------------------------------
     deduped_results: list[AgentResult] = []
-    for result_id, group in sorted(result_groups.items(), key=lambda x: x[0]):
-        hashes = {content_hash(r.model_dump(mode="json")) for r in group}
-        if len(hashes) == 1:
-            deduped_results.append(group[0])
+    for result_id, r_group in sorted(result_groups.items(), key=lambda x: x[0]):
+        r_hashes = {content_hash(r.model_dump(mode="json")) for r in r_group}
+        if len(r_hashes) == 1:
+            deduped_results.append(r_group[0])
         else:
             conflicts.append(
                 MergeConflict(
                     conflict_type="content_mismatch",
-                    detail=f"Result {result_id!r} has {len(hashes)} distinct content hashes; all excluded",
+                    detail=f"Result {result_id!r} has {len(r_hashes)} distinct content hashes; all excluded",
                     conflicting_ids=[result_id],
                 )
             )
 
     merged_evidence: list[Evidence] = []
-    for ev_id, group in sorted(evidence_groups.items(), key=lambda x: x[0]):
-        hashes = {content_hash(ev.model_dump(mode="json")) for ev in group}
-        if len(hashes) == 1:
-            merged_evidence.append(group[0])
+    for ev_id, ev_group in sorted(evidence_groups.items(), key=lambda x: x[0]):
+        ev_hashes = {content_hash(ev.model_dump(mode="json")) for ev in ev_group}
+        if len(ev_hashes) == 1:
+            merged_evidence.append(ev_group[0])
         else:
             conflicts.append(
                 MergeConflict(
                     conflict_type="content_mismatch",
-                    detail=f"Evidence {ev_id!r} has {len(hashes)} distinct content hashes; all excluded",
+                    detail=f"Evidence {ev_id!r} has {len(ev_hashes)} distinct content hashes; all excluded",
                     conflicting_ids=[ev_id],
                 )
             )
 
     merged_proposals: list[ActionProposal] = []
     seen_hashes: set[str] = set()
-    for prop_id, group in sorted(proposal_groups.items(), key=lambda x: x[0]):
-        hashes = {p.proposal_hash for p in group}
-        if len(hashes) == 1:
-            p = group[0]
+    for prop_id, p_group in sorted(proposal_groups.items(), key=lambda x: x[0]):
+        p_hashes = {p.proposal_hash for p in p_group}
+        if len(p_hashes) == 1:
+            p = p_group[0]
             if p.proposal_hash not in seen_hashes:
                 seen_hashes.add(p.proposal_hash)
                 merged_proposals.append(p)
@@ -176,7 +176,7 @@ def merge_parallel_results(
             conflicts.append(
                 MergeConflict(
                     conflict_type="content_mismatch",
-                    detail=f"Proposal {prop_id!r} has {len(hashes)} distinct content hashes; all excluded",
+                    detail=f"Proposal {prop_id!r} has {len(p_hashes)} distinct content hashes; all excluded",
                     conflicting_ids=[prop_id],
                 )
             )
