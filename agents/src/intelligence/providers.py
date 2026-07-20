@@ -371,16 +371,16 @@ async def provider_health_check() -> dict[str, Any]:
     if provider == AIProvider.NVIDIA_NIM:
         base["chat_model"] = settings.NVIDIA_CHAT_MODEL or "unset"
         base["embedding_model"] = settings.NVIDIA_EMBED_MODEL or "unset"
-        checks: dict[str, str] = {}
+        nim_checks: dict[str, str] = {}
         status = "ready"
 
         # Validate config
         try:
             _validate_nvidia("NVIDIA_CHAT_MODEL")
             _validate_nvidia("NVIDIA_EMBED_MODEL")
-            checks["nvidia_config"] = "valid"
+            nim_checks["nvidia_config"] = "valid"
         except ProviderConfigurationError as exc:
-            checks["nvidia_config"] = _safe_err(exc)
+            nim_checks["nvidia_config"] = _safe_err(exc)
             status = "degraded"
 
         # Probe endpoint if API key is set (single real request only)
@@ -392,25 +392,25 @@ async def provider_health_check() -> dict[str, Any]:
                         headers={"Authorization": f"Bearer {settings.NVIDIA_API_KEY}"},
                     )
                     if resp.status_code == 200:
-                        checks["nvidia_endpoint"] = "reachable"
+                        nim_checks["nvidia_endpoint"] = "reachable"
                     elif resp.status_code in (401, 403):
-                        checks["nvidia_endpoint"] = f"auth_failed_{resp.status_code}"
+                        nim_checks["nvidia_endpoint"] = f"auth_failed_{resp.status_code}"
                         status = "degraded"
                     elif resp.status_code == 404:
-                        checks["nvidia_endpoint"] = "endpoint_not_found"
+                        nim_checks["nvidia_endpoint"] = "endpoint_not_found"
                         status = "degraded"
                     elif resp.status_code >= 500:
-                        checks["nvidia_endpoint"] = f"server_error_{resp.status_code}"
+                        nim_checks["nvidia_endpoint"] = f"server_error_{resp.status_code}"
                         status = "degraded"
                     else:
-                        checks["nvidia_endpoint"] = f"http_{resp.status_code}"
+                        nim_checks["nvidia_endpoint"] = f"http_{resp.status_code}"
                         status = "degraded"
             except Exception as exc:
-                checks["nvidia_endpoint"] = _safe_err(exc)
+                nim_checks["nvidia_endpoint"] = _safe_err(exc)
                 status = "degraded"
 
         base["status"] = status
-        base["checks"] = checks
+        base["checks"] = nim_checks
         return base
 
     # fallback (should be unreachable)
@@ -455,7 +455,7 @@ def vector_collection_name(base_name: str) -> str:
     else:
         ident = "unknown"
 
-    provider_str = provider.value
+    provider_str = provider.value if provider is not None else "unknown"
     model_hash = hashlib.sha256(ident.encode()).hexdigest()[:8]
     safe_name = _sanitise_weaviate_name(base_name)
     ident_str = f"{provider_str}_{model_hash}"
