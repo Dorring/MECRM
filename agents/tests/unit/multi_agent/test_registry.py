@@ -295,3 +295,40 @@ class TestCapabilityFrozen:
         snap = reg.snapshot()
         snap.agents.clear()
         assert reg.is_registered("a1")
+
+
+# ============================================================================
+# R6: Registry deep copy — metadata mutation does not leak
+# ============================================================================
+
+
+class TestRegistryDeepCopy:
+    def test_original_capability_mutation_does_not_change_registry(self):
+        """Mutating the original capability after register doesn't affect registry."""
+        reg = AgentRegistry()
+        cap = _make_capability(agent_id="aa", metadata={"key": "original"})
+        reg.register(cap, object())
+        cap.metadata["key"] = "mutated"  # mutate original
+        resolved = reg.resolve_capability("aa")
+        assert resolved.metadata["key"] == "original"
+
+    def test_resolved_metadata_mutation_does_not_change_registry(self):
+        """Mutating a resolved capability doesn't affect the registry."""
+        reg = AgentRegistry()
+        reg.register(
+            _make_capability(agent_id="aa", metadata={"key": "original"}), object()
+        )
+        resolved1 = reg.resolve_capability("aa")
+        resolved1.metadata["key"] = "mutated"
+        resolved2 = reg.resolve_capability("aa")
+        assert resolved2.metadata["key"] == "original"
+
+    def test_metadata_mutation_does_not_change_snapshot_version(self):
+        """Snapshot version is stable even if resolved capability metadata is mutated."""
+        reg = AgentRegistry()
+        reg.register(_make_capability(agent_id="aa", metadata={"key": "v1"}), object())
+        v1 = reg.snapshot().version
+        resolved = reg.resolve_capability("aa")
+        resolved.metadata["key"] = "v2"
+        v2 = reg.snapshot().version
+        assert v1 == v2

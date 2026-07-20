@@ -28,6 +28,33 @@ from multi_agent.serialization import validate_strict_json
 
 JsonValue = Any
 
+# Sensitive keys rejected from all metadata fields
+_SECRET_KEY_PATTERNS = frozenset(
+    {
+        "authorization",
+        "api_key",
+        "apikey",
+        "access_token",
+        "refresh_token",
+        "client_secret",
+        "password",
+        "secret",
+        "cookie",
+    }
+)
+
+
+def _reject_sensitive_keys(metadata: dict[str, Any], field_name: str) -> None:
+    """Reject sensitive keys in metadata dicts (recursive scan)."""
+    for k, v in metadata.items():
+        low = str(k).lower().replace("_", "").replace("-", "")
+        for pattern in _SECRET_KEY_PATTERNS:
+            if pattern in low:
+                raise ValueError(f"{field_name} must not contain sensitive key {k!r}")
+        if isinstance(v, dict):
+            _reject_sensitive_keys(v, f"{field_name}.{k}")
+
+
 # ---------------------------------------------------------------------------
 # Strict base contract
 # ---------------------------------------------------------------------------
@@ -145,6 +172,7 @@ class AgentCapability(StrictContract):
     @field_validator("metadata")
     @classmethod
     def _validate_cap_metadata(cls, v: dict[str, Any]) -> dict[str, Any]:
+        _reject_sensitive_keys(v, "AgentCapability.metadata")
         return validate_strict_json(v)  # type: ignore[return-value]
 
     @field_validator("timeout_ms")
@@ -223,6 +251,7 @@ class Evidence(StrictContract):
         cls, v: dict[str, Any] | None
     ) -> dict[str, Any] | None:
         if v is not None:
+            _reject_sensitive_keys(v, "Evidence.metadata")
             validate_strict_json(v)
         return v
 
@@ -274,6 +303,7 @@ class AgentError(StrictContract):
         cls, v: dict[str, Any] | None
     ) -> dict[str, Any] | None:
         if v is not None:
+            _reject_sensitive_keys(v, "AgentError.details")
             validate_strict_json(v)
         return v
 
@@ -475,9 +505,17 @@ class AgentTask(StrictContract):
     def _validate_input_data(cls, v: dict[str, Any]) -> dict[str, Any]:
         return validate_strict_json(v)  # type: ignore[return-value]
 
+    @field_validator("objective")
+    @classmethod
+    def _objective_non_blank_task(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("objective must not be blank")
+        return v
+
     @field_validator("timeout_ms")
     @classmethod
-    def _timeout_positive(cls, v: int) -> int:
+    def _timeout_positive_task(cls, v: int) -> int:
         if v <= 0:
             raise ValueError("timeout_ms must be > 0")
         return v
@@ -599,6 +637,15 @@ class AgentResult(StrictContract):
                     f"ActionProposal {p.proposal_id!r} created_by_agent "
                     f"{p.created_by_agent!r} != result agent_id {self.agent_id!r}"
                 )
+        # Verify proposal evidence_ids reference actual evidence
+        known_evidence_ids = {ev.evidence_id for ev in self.evidence}
+        for p in self.action_proposals:
+            missing = [eid for eid in p.evidence_ids if eid not in known_evidence_ids]
+            if missing:
+                raise ValueError(
+                    f"ActionProposal {p.proposal_id!r} references unknown evidence: {missing}"
+                )
+        return self
         return self
 
 
@@ -627,11 +674,13 @@ class AgentExecutionContext(StrictContract):
     @field_validator("policy_context")
     @classmethod
     def _validate_policy_context(cls, v: dict[str, Any]) -> dict[str, Any]:
+        _reject_sensitive_keys(v, "AgentExecutionContext.policy_context")
         return validate_strict_json(v)  # type: ignore[return-value]
 
     @field_validator("run_metadata")
     @classmethod
     def _validate_run_metadata(cls, v: dict[str, Any]) -> dict[str, Any]:
+        _reject_sensitive_keys(v, "AgentExecutionContext.run_metadata")
         return validate_strict_json(v)  # type: ignore[return-value]
 
 
@@ -710,10 +759,18 @@ class MultiAgentState(StrictContract):
 
     @field_validator("tenant_id")
     @classmethod
-    def _tenant_required(cls, v: str) -> str:
+    def _tenant_required_state(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("MultiAgentState must have a tenant_id")
         return v.strip()
+
+    @field_validator("actor_id", "objective")
+    @classmethod
+    def _non_blank_state(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("actor_id and objective must not be blank")
+        return v
 
     @field_validator("created_at", "updated_at")
     @classmethod

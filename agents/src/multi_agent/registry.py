@@ -190,7 +190,9 @@ class AgentRegistry:
                 f"Agent {agent_id!r} is already registered; use replace() to overwrite"
             )
         self._validate_tool_authority(capability)
-        self._agents[agent_id] = capability
+        # Store a deep copy so external mutation cannot change registry state
+        stored = AgentCapability.model_validate(capability.model_dump(mode="json"))
+        self._agents[agent_id] = stored
         self._handlers[agent_id] = handler
 
     def replace(self, capability: AgentCapability, handler: AgentHandler) -> None:
@@ -200,7 +202,8 @@ class AgentRegistry:
                 f"Agent {agent_id!r} is not registered; use register() for new agents"
             )
         self._validate_tool_authority(capability)
-        self._agents[agent_id] = capability
+        stored = AgentCapability.model_validate(capability.model_dump(mode="json"))
+        self._agents[agent_id] = stored
         self._handlers[agent_id] = handler
 
     def unregister(self, agent_id: str) -> None:
@@ -215,11 +218,14 @@ class AgentRegistry:
             raise UnknownAgentError(f"Agent {agent_id!r} is not registered")
         if not cap.enabled:
             raise DisabledAgentError(f"Agent {agent_id!r} is disabled")
-        return cap, self._handlers[agent_id]
+        # Return a deep copy so callers cannot mutate registry internals
+        safe = AgentCapability.model_validate(cap.model_dump(mode="json"))
+        return safe, self._handlers[agent_id]
 
     def resolve_capability(self, agent_id: str) -> AgentCapability:
         cap, _ = self.resolve(agent_id)
-        # Capability is frozen (immutable) — safe to return directly
+        # Already a deep copy from resolve()
+        return cap
         return cap
 
     def is_registered(self, agent_id: str) -> bool:

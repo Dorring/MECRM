@@ -781,3 +781,177 @@ class TestStrictJsonRejection:
                 tenant_id="t-1",
                 run_metadata={"timestamp": _utc_now()},
             )
+
+
+# ============================================================================
+# R6: Blank string rejection
+# ============================================================================
+
+
+class TestBlankStringRejection:
+    def test_multi_agent_state_rejects_blank_actor_id(self):
+        with pytest.raises(ValidationError):
+            MultiAgentState(
+                run_id="r1",
+                tenant_id="t-1",
+                objective="Test",
+                actor_id="   ",
+            )
+
+    def test_multi_agent_state_rejects_blank_objective(self):
+        with pytest.raises(ValidationError):
+            MultiAgentState(
+                run_id="r1",
+                tenant_id="t-1",
+                objective="   ",
+                actor_id="test",
+            )
+
+    def test_agent_task_rejects_blank_objective(self):
+        with pytest.raises(ValidationError):
+            AgentTask(
+                objective="   ",
+                task_id="t1",
+                agent_id="a1",
+                task_type="t",
+                input_data={},
+                tenant_id="t-1",
+                timeout_ms=60_000,
+                idempotency_key="ik-1",
+            )
+
+
+# ============================================================================
+# R6: Secret key rejection in metadata
+# ============================================================================
+
+
+class TestMetadataSecretKeyRejection:
+    def test_api_key_in_metadata_rejected(self):
+        with pytest.raises(ValidationError):
+            AgentCapability(
+                agent_id="test_agent",
+                version="1.0.0",
+                description="Test",
+                domains=frozenset({"test"}),
+                supported_tasks=frozenset({"t"}),
+                allowed_tools=frozenset({"crm_reader.get_leads"}),
+                authority=AgentAuthority.READ,
+                input_contract="in",
+                output_contract="out",
+                timeout_ms=30_000,
+                max_retries=2,
+                estimated_cost_class="low",
+                metadata={"api_key": "secret123"},
+            )
+
+    def test_authorization_in_run_metadata_rejected(self):
+        with pytest.raises(ValidationError):
+            AgentExecutionContext(
+                tenant_id="t-1",
+                run_metadata={"authorization": "Bearer xyz"},
+            )
+
+    def test_password_in_evidence_metadata_rejected(self):
+        with pytest.raises(ValidationError):
+            Evidence(
+                evidence_id="ev-1",
+                evidence_type=EvidenceType.TOOL_RESULT,
+                tenant_id="t-1",
+                source_agent="a",
+                metadata={"password": "1234"},
+            )
+
+
+# ============================================================================
+# R6: Evidence reference validation
+# ============================================================================
+
+
+class TestEvidenceReferenceValidation:
+    def test_high_risk_proposal_with_missing_evidence_rejected(self):
+        with pytest.raises(ValidationError):
+            AgentResult(
+                result_id="r-1",
+                task_id="t-1",
+                agent_id="agent_a",
+                tenant_id="t-1",
+                status="completed",
+                evidence=[],  # empty!
+                action_proposals=[
+                    ActionProposal.create(
+                        proposal_id="p-1",
+                        tenant_id="t-1",
+                        created_by_agent="agent_a",
+                        action_type="delete",
+                        target_entity="customer",
+                        target_id="c1",
+                        risk_level=ActionRiskLevel.HIGH,
+                        evidence_ids=["ev-missing"],
+                        requires_approval=True,
+                        idempotency_key="ik-1",
+                    )
+                ],
+                completed_at=_utc_now(),
+            )
+
+    def test_high_risk_proposal_with_valid_evidence_ok(self):
+        p = ActionProposal.create(
+            proposal_id="p-1",
+            tenant_id="t-1",
+            created_by_agent="agent_a",
+            action_type="delete",
+            target_entity="customer",
+            target_id="c1",
+            risk_level=ActionRiskLevel.HIGH,
+            evidence_ids=["ev-1"],
+            requires_approval=True,
+            idempotency_key="ik-1",
+        )
+        result = AgentResult(
+            result_id="r-1",
+            task_id="t-1",
+            agent_id="agent_a",
+            tenant_id="t-1",
+            status="completed",
+            evidence=[
+                Evidence(
+                    evidence_id="ev-1",
+                    evidence_type=EvidenceType.TOOL_RESULT,
+                    tenant_id="t-1",
+                    source_agent="agent_a",
+                ),
+            ],
+            action_proposals=[p],
+            completed_at=_utc_now(),
+        )
+        assert result.status == "completed"
+
+    def test_merge_excludes_proposal_with_missing_evidence(self):
+        """AgentResult construction catches missing evidence references;
+        the merge inherits this safety via MergedState validation."""
+        # This is caught at AgentResult construction time
+        with pytest.raises(ValidationError):
+            AgentResult(
+                result_id="r-1",
+                task_id="t-1",
+                agent_id="agent_a",
+                tenant_id="t-001",
+                status="completed",
+                evidence=[],
+                action_proposals=[
+                    ActionProposal.create(
+                        proposal_id="p-1",
+                        tenant_id="t-001",
+                        created_by_agent="agent_a",
+                        action_type="delete",
+                        target_entity="customer",
+                        target_id="c1",
+                        risk_level=ActionRiskLevel.HIGH,
+                        evidence_ids=["ev-missing"],
+                        requires_approval=True,
+                        idempotency_key="ik-1",
+                    )
+                ],
+                completed_at=_utc_now(),
+            )
