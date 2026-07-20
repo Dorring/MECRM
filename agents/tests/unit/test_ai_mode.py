@@ -15,7 +15,8 @@ import pytest
 import sys
 from pathlib import Path
 
-SRC = Path(__file__).resolve().parents[3] / "src"
+# tests/unit/test_ai_mode.py -> parents[2] = agents/
+SRC = Path(__file__).resolve().parents[2] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
@@ -801,6 +802,70 @@ class TestEmbeddingCollectionIsolation:
         assert "disabled" in name_disabled.lower()
 
 
+class TestEmbeddingModelIsolationSubprocess:
+    """Real embedding model change → different collection name.
+
+    Uses subprocess so each Settings instantiation sees its own env vars.
+    """
+
+    def _run_collection_name(self, **env_vars) -> str:
+        import subprocess
+        src_dir = str(SRC)
+        env = os.environ.copy()
+        env["PYTHONPATH"] = src_dir
+        env.update(env_vars)
+        result = subprocess.run(
+            [
+                sys.executable, "-c",
+                "from intelligence.providers import vector_collection_name; "
+                "print(vector_collection_name('KnowledgeBase'))",
+            ],
+            capture_output=True, text=True, timeout=30,
+            env=env, cwd=src_dir,
+        )
+        err = result.stderr.strip()
+        assert result.returncode == 0, (
+            f"Subprocess failed (rc={result.returncode}):\nstderr: {err}"
+        )
+        return result.stdout.strip()
+
+    def test_ollama_embedding_model_change_changes_collection(self):
+        """Switching OLLAMA_EMBED_MODEL changes the collection name."""
+        name1 = self._run_collection_name(
+            AI_MODE="live", AI_PROVIDER="ollama",
+            OLLAMA_EMBED_MODEL="nomic-embed-text",
+        )
+        name2 = self._run_collection_name(
+            AI_MODE="live", AI_PROVIDER="ollama",
+            OLLAMA_EMBED_MODEL="all-minilm-l6-v2",
+        )
+        assert name1 != name2, (
+            f"Different OLLAMA_EMBED_MODEL must produce different names:\n"
+            f"  nomic-embed-text → {name1}\n"
+            f"  all-minilm-l6-v2 → {name2}"
+        )
+
+    def test_nvidia_embedding_model_change_changes_collection(self):
+        """Switching NVIDIA_EMBED_MODEL changes the collection name."""
+        name1 = self._run_collection_name(
+            AI_MODE="live", AI_PROVIDER="nvidia_nim",
+            NVIDIA_API_KEY="sk-test",
+            NVIDIA_CHAT_MODEL="meta/llama3-70b",
+            NVIDIA_EMBED_MODEL="nvidia/nv-embedqa-4b",
+        )
+        name2 = self._run_collection_name(
+            AI_MODE="live", AI_PROVIDER="nvidia_nim",
+            NVIDIA_API_KEY="sk-test",
+            NVIDIA_CHAT_MODEL="meta/llama3-70b",
+            NVIDIA_EMBED_MODEL="nvidia/nv-embed-v3",
+        )
+        assert name1 != name2, (
+            f"Different NVIDIA_EMBED_MODEL must produce different names:\n"
+            f"  nv-embedqa-4b → {name1}\n"
+            f"  nv-embed-v3   → {name2}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Chat Graph integration tests (Fix 3)
 # ---------------------------------------------------------------------------
@@ -977,47 +1042,82 @@ class TestReadyEndpoint:
 
 
 class TestNvidiaHealthCheck:
-    """NVIDIA provider_health_check makes exactly 1 HTTP call."""
+    """NVIDIA provider_health_check makes exactly 1 HTTP call.
 
-    @pytest.mark.asyncio
-    async def test_nvidia_makes_exactly_one_http_get(self):
-        import httpx
-        from unittest import mock as umock
-        call_count = 0
+    Patches httpx.AsyncClient via monkeypatch so the test is immune
+    to ordering effects from other tests.
+    """
 
-        class _MockClient:
-            def __init__(self, **kwargs):
-                pass
+    def test_nvidia_makes_exactly_one_http_get(self):
+        """Exactly 1 HTTP GET, no duplicate requests, 401 → degraded.
 
-            async def __aenter__(self):
-                return self
+        Uses subprocess for complete isolation from other tests' monkeypatch
+        state.  The subprocess sets AI_MODE=live + AI_PROVIDER=nvidia_nim,
+        starts a dummy HTTP server that returns 401, and asserts exactly
+        one request was received by the server.
+        """
+        import subprocess
+        import json
 
-            async def __aexit__(self, *args):
-                pass
-
-            async def get(self, url, **kwargs):
-                nonlocal call_count
-                call_count += 1
-                headers = kwargs.get("headers", {})
-                auth = headers.get("Authorization", "")
-                if "Bearer sk-test" in auth:
-                    return httpx.Response(401)
-                return httpx.Response(200)
-
-        _set_env(AI_MODE="live", AI_PROVIDER="nvidia_nim",
-                  NVIDIA_API_KEY="sk-test",
-                  NVIDIA_CHAT_MODEL="meta/llama3-70b",
-                  NVIDIA_EMBED_MODEL="nvidia/nv-embedqa")
-        try:
-            with umock.patch.object(httpx, "AsyncClient", _MockClient):
-                from intelligence.providers import provider_health_check
-                await provider_health_check()
-            assert call_count == 1, (
-                f"Expected exactly 1 HTTP GET, got {call_count}"
-            )
-        finally:
-            _del_env("AI_MODE", "AI_PROVIDER", "NVIDIA_API_KEY",
-                     "NVIDIA_CHAT_MODEL", "NVIDIA_EMBED_MODEL")
+        src_dir = str(SRC)
+        env = os.environ.copy()
+        env["PYTHONPATH"] = src_dir
+        env.update({
+            "AI_MODE": "live",
+            "AI_PROVIDER": "nvidia_nim",
+            "NVIDIA_API_KEY": "sk-test",
+            "NVIDIA_CHAT_MODEL": "meta/llama3-70b",
+            "NVIDIA_EMBED_MODEL": "nvidia/nv-embedqa",
+        })
+        # Run a script that starts a mock HTTP server, sets the env var
+        # BEFORE importing anything from the project, then calls
+        # provider_health_check and prints the call count as JSON.
+        script = (
+            "import asyncio, json, threading, time, os\n"
+            "from http.server import HTTPServer, BaseHTTPRequestHandler\n"
+            "\n"
+            "call_count = 0\n"
+            "class H(BaseHTTPRequestHandler):\n"
+            "    def do_GET(self):\n"
+            "        global call_count\n"
+            "        call_count += 1\n"
+            "        self.send_response(401)\n"
+            "        self.end_headers()\n"
+            "    def do_POST(self):\n"
+            "        global call_count\n"
+            "        call_count += 1\n"
+            "        self.send_response(200)\n"
+            "        self.end_headers()\n"
+            "        self.wfile.write(b'{}')\n"
+            "    def log_message(self, *a): pass\n"
+            "srv = HTTPServer(('127.0.0.1', 0), H)\n"
+            "port = srv.server_address[1]\n"
+            "# IMPORTANT: override env var BEFORE importing any project module\n"
+            "os.environ['NVIDIA_BASE_URL'] = f'http://127.0.0.1:{port}/v1'\n"
+            "t = threading.Thread(target=srv.serve_forever, daemon=True)\n"
+            "t.start()\n"
+            "time.sleep(0.1)\n"
+            "from intelligence.providers import provider_health_check\n"
+            "result = asyncio.run(provider_health_check())\n"
+            "srv.shutdown()\n"
+            "print(json.dumps({'call_count': call_count, 'status': result['status']}))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=30,
+            env=env, cwd=src_dir,
+        )
+        err = result.stderr.strip()
+        assert result.returncode == 0, (
+            f"Subprocess failed (rc={result.returncode}):\nstderr: {err}"
+        )
+        out = result.stdout.strip()
+        assert out, f"No output from subprocess. stderr: {err}"
+        data = json.loads(out)
+        assert data["call_count"] == 1, (
+            f"Expected exactly 1 HTTP GET, got {data['call_count']}"
+        )
+        assert data["status"] == "degraded"
 
 
 # ---------------------------------------------------------------------------
@@ -1142,44 +1242,62 @@ class TestVoiceApiStatus:
 
 
 class TestSettingsFromDotenv:
-    """Settings singleton picks up values from .env file."""
+    """Settings singleton picks up values from environment.
+
+    Uses subprocess to avoid importlib.reload side effects that
+    corrupt other tests' module state (test-order dependency).
+    """
 
     def test_settings_loads_all_ai_vars_from_env(self):
-        """Verify all AI-related Settings keys are loadable from env vars."""
-        _set_env(
-            AI_MODE="live",
-            AI_PROVIDER="ollama",
-            OLLAMA_URL="http://ollama:9999",
-            OLLAMA_MODEL="test-model-42b",
-            OLLAMA_EMBED_MODEL="test-embed-v2",
-            NVIDIA_BASE_URL="https://test.nvidia.example.com/v1",
-            NVIDIA_CHAT_MODEL="test/chat-model",
-            NVIDIA_EMBED_MODEL="test/embed-model",
-        )
-        try:
-            # Reload the settings module to pick up new env vars
-            import importlib
-            import orchestrator.config
-            importlib.reload(orchestrator.config)
-            from orchestrator.config import settings
+        """All 7 AI-related Settings keys load from env vars."""
+        import subprocess
 
-            assert settings.AI_MODE == "live"
-            assert settings.AI_PROVIDER == "ollama"
-            assert settings.OLLAMA_URL == "http://ollama:9999"
-            assert settings.OLLAMA_MODEL == "test-model-42b"
-            assert settings.OLLAMA_EMBED_MODEL == "test-embed-v2"
-            assert settings.NVIDIA_BASE_URL == "https://test.nvidia.example.com/v1"
-            assert settings.NVIDIA_CHAT_MODEL == "test/chat-model"
-            assert settings.NVIDIA_EMBED_MODEL == "test/embed-model"
-        finally:
-            _del_env(
-                "AI_MODE", "AI_PROVIDER", "OLLAMA_URL", "OLLAMA_MODEL",
-                "OLLAMA_EMBED_MODEL", "NVIDIA_BASE_URL", "NVIDIA_CHAT_MODEL",
-                "NVIDIA_EMBED_MODEL",
-            )
-            # Reload again to restore defaults
-            import orchestrator.config
-            importlib.reload(orchestrator.config)
+        src_dir = str(SRC)
+        env = os.environ.copy()
+        env.update({
+            "PYTHONPATH": src_dir,
+            "AI_MODE": "live",
+            "AI_PROVIDER": "ollama",
+            "OLLAMA_URL": "http://ollama:9999",
+            "OLLAMA_MODEL": "test-model-42b",
+            "OLLAMA_EMBED_MODEL": "test-embed-v2",
+            "NVIDIA_BASE_URL": "https://test.nvidia.example.com/v1",
+            "NVIDIA_CHAT_MODEL": "test/chat-model",
+            "NVIDIA_EMBED_MODEL": "test/embed-model",
+        })
+        result = subprocess.run(
+            [
+                sys.executable, "-c",
+                "from orchestrator.config import settings; "
+                "print(settings.AI_MODE); "
+                "print(settings.AI_PROVIDER); "
+                "print(settings.OLLAMA_URL); "
+                "print(settings.OLLAMA_MODEL); "
+                "print(settings.OLLAMA_EMBED_MODEL); "
+                "print(settings.NVIDIA_BASE_URL); "
+                "print(settings.NVIDIA_CHAT_MODEL); "
+                "print(settings.NVIDIA_EMBED_MODEL)",
+            ],
+            capture_output=True, text=True, timeout=30,
+            env=env, cwd=src_dir,
+        )
+        err = result.stderr.strip()
+        assert result.returncode == 0, (
+            f"Subprocess failed (rc={result.returncode}):\nstderr: {err}"
+        )
+        lines = [l.strip() for l in result.stdout.strip().splitlines()]
+        assert len(lines) == 8, (
+            f"Expected 8 lines, got {len(lines)}. "
+            f"stdout={lines!r} stderr={err!r}"
+        )
+        assert lines[0] == "live"
+        assert lines[1] == "ollama"
+        assert lines[2] == "http://ollama:9999"
+        assert lines[3] == "test-model-42b"
+        assert lines[4] == "test-embed-v2"
+        assert lines[5] == "https://test.nvidia.example.com/v1"
+        assert lines[6] == "test/chat-model"
+        assert lines[7] == "test/embed-model"
 
 
 # ---------------------------------------------------------------------------
