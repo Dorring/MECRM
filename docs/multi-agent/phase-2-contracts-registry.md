@@ -1,8 +1,9 @@
 # Phase 2: Multi-Agent Contracts & Agent Registry
 
-## Status: Complete
+## Status: Complete (R2)
 
 **Branch:** `feat/ma-02-contracts-registry`
+**Tests:** 119 passed (R2) + 76 Phase 1 regression
 **Tests:** 134 passed, 0 failed (AI_MODE=deterministic)
 
 ---

@@ -1,8 +1,10 @@
-"""Serialization helpers for multi-agent contracts.
+"""Deterministic serialization for multi-agent contracts.
 
-All helpers produce deterministic output: sorted keys, stable separators,
-and explicit UTC formatting.  Two calls with the same Pydantic model always
-produce the same JSON bytes.
+The central function is :func:`canonicalize` — a recursive converter that
+produces sort-key-ordered, UTC-normalised JSON from any Phase 2 contract
+(and nested dicts / lists / sets / Enums / Decimals / datetimes).
+Every consumer that needs a stable hash or snapshot version MUST go through
+this single canonicalizer.
 """
 
 from __future__ import annotations
@@ -10,86 +12,118 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
+from decimal import Decimal
 from enum import Enum
-from typing import Any, TypeVar
+from typing import Any
 
 from pydantic import BaseModel
 
-T = TypeVar("T", bound=BaseModel)
 
+def _canonical_value(obj: Any) -> Any:
+    """Recursively convert *obj* into a JSON-native, deterministic representation.
 
-# ---------------------------------------------------------------------------
-# JSON
-# ---------------------------------------------------------------------------
+    Rules (in priority order):
+    1. ``None`` → ``None``
+    2. ``bool`` → ``bool`` (MUST come before int — bool is a subclass)
+    3. ``int`` / ``float`` / ``str`` → as-is, but ``float('nan')`` / ``inf`` are rejected
+    4. ``Decimal`` → string with 2 decimal places for cost, full precision otherwise
+    5. ``datetime`` → UTC-normalised ISO-8601 with ``Z`` suffix
+    6. ``Enum`` → ``.value``
+    7. ``set`` / ``frozenset`` → sorted list (sorted by canonical string key)
+    8. ``bytes`` → hex string
+    9. ``BaseModel`` → canonicalize(model_dump(mode="json"))
+    10. ``dict`` → sorted-by-key dict of canonicalized values
+    11. ``list`` / ``tuple`` → list of canonicalized values
+    12. anything else → ``TypeError``
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, int):
+        return obj
+    if isinstance(obj, float):
+        import math
 
-
-def _default_encoder(obj: Any) -> Any:
-    """Convert non-JSON-native types to serializable values."""
+        if math.isnan(obj) or math.isinf(obj):
+            raise ValueError(f"float value {obj!r} is not JSON-serializable")
+        return obj
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, Decimal):
+        # Preserve full precision as a JSON number string
+        return str(obj)
     if isinstance(obj, datetime):
         if obj.tzinfo is None:
             obj = obj.replace(tzinfo=timezone.utc)
-        return obj.isoformat().replace("+00:00", "Z")
+        return obj.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     if isinstance(obj, Enum):
         return obj.value
-    if isinstance(obj, set):
-        return sorted(obj)
+    if isinstance(obj, (set, frozenset)):
+        return sorted(
+            (_canonical_value(v) for v in obj),
+            key=lambda x: str(x),
+        )
     if isinstance(obj, bytes):
         return obj.hex()
-    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+    if isinstance(obj, BaseModel):
+        return _canonical_value(obj.model_dump(mode="json"))
+    if isinstance(obj, dict):
+        return {
+            str(k): _canonical_value(v)
+            for k, v in sorted(obj.items(), key=lambda kv: str(kv[0]))
+        }
+    if isinstance(obj, (list, tuple)):
+        return [_canonical_value(v) for v in obj]
+    raise TypeError(f"Cannot canonicalize type {type(obj).__name__}: {obj!r}")
+
+
+def canonicalize(obj: Any) -> Any:
+    """Return a fully canonical (JSON-native, sorted, UTC) representation of *obj*."""
+    return _canonical_value(obj)
+
+
+# ---------------------------------------------------------------------------
+# High-level helpers
+# ---------------------------------------------------------------------------
 
 
 def serialize_contract(obj: BaseModel) -> str:
-    """Serialize a contract model to a deterministic JSON string.
-
-    Keys are sorted, separators are compact, and datetime / enum / set types
-    are handled transparently.
-    """
-    return json.dumps(
-        obj.model_dump(mode="json"),
-        sort_keys=True,
-        separators=(",", ":"),
-        default=_default_encoder,
-        ensure_ascii=False,
-    )
+    """Serialize a contract model to a deterministic JSON string."""
+    data = canonicalize(obj)
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def deserialize_contract(raw: str, model_cls: type[T]) -> T:
+def deserialize_contract(raw: str, model_cls: type[BaseModel]) -> Any:
     """Deserialize a JSON string back into a contract model."""
     data = json.loads(raw)
     return model_cls.model_validate(data)
 
 
-# ---------------------------------------------------------------------------
-# Stable hash
-# ---------------------------------------------------------------------------
+def stable_hash(obj: Any, *, exclude: set[str] | None = None) -> str:
+    """Return a SHA-256 hex digest of *obj*'s canonical form.
 
-
-def stable_hash(obj: BaseModel, *, exclude: set[str] | None = None) -> str:
-    """Return a SHA-256 hex digest of *obj*'s canonical JSON.
-
-    The *exclude* set names fields to drop before hashing (e.g.
-    ``created_at`` or ``proposal_hash``).  The hash is deterministic as long
-    as the model's content is unchanged.
+    When *obj* is a BaseModel its fields named in *exclude* are dropped first.
     """
-    data = obj.model_dump(mode="json")
-    if exclude:
-        for key in exclude:
-            data.pop(key, None)
-    canonical = json.dumps(
-        data,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=_default_encoder,
-        ensure_ascii=False,
+    if isinstance(obj, BaseModel):
+        data = obj.model_dump(mode="json")
+        if exclude:
+            for key in exclude:
+                data.pop(key, None)
+        canonical_data = canonicalize(data)
+    else:
+        canonical_data = canonicalize(obj)
+    canonical_json = json.dumps(
+        canonical_data, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-# ---------------------------------------------------------------------------
-# Set helper
-# ---------------------------------------------------------------------------
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
 
 def serialize_set_for_json(value: set[Any]) -> list[Any]:
     """Return a sorted list suitable for JSON serialization."""
     return sorted(value, key=lambda x: str(x) if not isinstance(x, str) else x)
+
+
+def content_hash(obj: Any) -> str:
+    """Return a stable SHA-256 hash of *obj*'s canonical form (full content hash)."""
+    return stable_hash(obj)

@@ -1,21 +1,22 @@
-"""Multi-agent contracts, registry, state merge, and serialization.
-
-This package is the foundation for Phase 3+ (Complexity Gate, Planner,
-Supervisor).  It does NOT modify any existing agent, route, or Kafka
-consumer — it only provides the data contracts and registry that future
-phases will consume.
-"""
+"""Multi-agent contracts, registry, state merge, and serialization."""
 
 from multi_agent.contracts import (
     ActionProposal,
+    ActionRiskLevel,
     AgentAuthority,
     AgentCapability,
     AgentError,
+    AgentErrorCategory,
     AgentExecutionContext,
     AgentResult,
     AgentTask,
+    ComplexityDecision,
     Evidence,
+    EvidenceType,
+    ExecutionBudget,
+    MultiAgentState,
     ProviderMetadata,
+    StrictContract,
     TokenUsage,
     ToolAuthority,
     ToolCallRecord,
@@ -24,6 +25,7 @@ from multi_agent.contracts import (
     from_productivity_proposal,
 )
 from multi_agent.errors import (
+    BudgetExceededError,
     CapabilityValidationError,
     DisabledAgentError,
     DuplicateAgentError,
@@ -31,29 +33,50 @@ from multi_agent.errors import (
     MergeConflictError,
     MultiAgentError,
     ProposalHashMismatchError,
+    SerializationError,
     UnauthorizedToolError,
     UnknownAgentError,
+    UnknownToolError,
 )
-from multi_agent.registry import AgentHandler, AgentRegistry, RegistrySnapshot
+from multi_agent.registry import (
+    AgentHandler,
+    AgentRegistry,
+    RegistrySnapshot,
+    ToolCatalog,
+    ToolDescriptor,
+)
 from multi_agent.serialization import (
+    canonicalize,
+    content_hash,
     deserialize_contract,
     serialize_contract,
     serialize_set_for_json,
     stable_hash,
 )
-from multi_agent.state import MergeConflict, MergedState, merge_parallel_results
+from multi_agent.state import (
+    MergeConflict,
+    MergedState,
+    merge_parallel_results,
+)
 
 __all__ = [
     # Contracts
     "ActionProposal",
+    "ActionRiskLevel",
     "AgentAuthority",
     "AgentCapability",
     "AgentError",
+    "AgentErrorCategory",
     "AgentExecutionContext",
     "AgentResult",
     "AgentTask",
+    "ComplexityDecision",
     "Evidence",
+    "EvidenceType",
+    "ExecutionBudget",
+    "MultiAgentState",
     "ProviderMetadata",
+    "StrictContract",
     "TokenUsage",
     "ToolAuthority",
     "ToolCallRecord",
@@ -61,6 +84,7 @@ __all__ = [
     "from_crm_writer_proposal",
     "from_productivity_proposal",
     # Errors
+    "BudgetExceededError",
     "CapabilityValidationError",
     "DisabledAgentError",
     "DuplicateAgentError",
@@ -68,13 +92,19 @@ __all__ = [
     "MergeConflictError",
     "MultiAgentError",
     "ProposalHashMismatchError",
+    "SerializationError",
     "UnauthorizedToolError",
     "UnknownAgentError",
+    "UnknownToolError",
     # Registry
     "AgentHandler",
     "AgentRegistry",
     "RegistrySnapshot",
+    "ToolCatalog",
+    "ToolDescriptor",
     # Serialization
+    "canonicalize",
+    "content_hash",
     "deserialize_contract",
     "serialize_contract",
     "serialize_set_for_json",

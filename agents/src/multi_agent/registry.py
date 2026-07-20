@@ -1,25 +1,24 @@
-"""Single AgentRegistry for the MECRM multi-agent system.
+"""Single AgentRegistry with mandatory ToolCatalog.
 
-There must be exactly ONE registry per process.  The registry owns the
-mapping from ``agent_id`` → (``AgentCapability``, ``AgentHandler``) and
-enforces all Phase 2 authority / tool rules.
+The registry owns agent_id → (AgentCapability, AgentHandler) and enforces
+tool permissions against an injected ToolCatalog.  There must be exactly
+ONE registry per process.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from multi_agent.contracts import (
     AgentAuthority,
     AgentCapability,
+    AgentExecutionContext,
     AgentResult,
     AgentTask,
-    AgentExecutionContext,
+    StrictContract,
     ToolAuthority,
 )
 from multi_agent.errors import (
@@ -27,7 +26,125 @@ from multi_agent.errors import (
     DuplicateAgentError,
     UnauthorizedToolError,
     UnknownAgentError,
+    UnknownToolError,
 )
+from multi_agent.serialization import content_hash
+
+# ---------------------------------------------------------------------------
+# Tool Catalog
+# ---------------------------------------------------------------------------
+
+
+class ToolDescriptor(StrictContract):
+    """Describes a single tool's authority, contract, and metadata."""
+
+    tool_name: str
+    authority: ToolAuthority
+    description: str = ""
+    input_contract: str = ""
+    output_contract: str = ""
+
+
+class ToolCatalog:
+    """Single source of truth for tool → authority mapping.
+
+    The catalog is injected into AgentRegistry at construction time.
+    Unknown tools are rejected by default (fail-closed).
+    """
+
+    def __init__(self, tools: list[ToolDescriptor] | None = None) -> None:
+        self._tools: dict[str, ToolDescriptor] = {}
+        for t in tools or []:
+            self.register(t)
+
+    def register(self, tool: ToolDescriptor) -> None:
+        if tool.tool_name in self._tools:
+            raise DuplicateAgentError(f"Tool {tool.tool_name!r} is already registered")
+        self._tools[tool.tool_name] = tool
+
+    def resolve(self, tool_name: str) -> ToolDescriptor:
+        try:
+            return self._tools[tool_name]
+        except KeyError:
+            raise UnknownToolError(f"Tool {tool_name!r} is not in the catalog")
+
+    def is_registered(self, tool_name: str) -> bool:
+        return tool_name in self._tools
+
+    def snapshot(self) -> list[ToolDescriptor]:
+        return sorted(self._tools.values(), key=lambda t: t.tool_name)
+
+    @classmethod
+    def default_catalog(cls) -> "ToolCatalog":
+        """Factory for the built-in Phase 2 tool catalog."""
+        return cls(
+            tools=[
+                # Read tools
+                ToolDescriptor(
+                    tool_name="crm_reader.get_leads",
+                    authority=ToolAuthority.READ,
+                    description="Read leads",
+                ),
+                ToolDescriptor(
+                    tool_name="crm_reader.get_deals",
+                    authority=ToolAuthority.READ,
+                    description="Read deals",
+                ),
+                ToolDescriptor(
+                    tool_name="crm_reader.get_tickets",
+                    authority=ToolAuthority.READ,
+                    description="Read tickets",
+                ),
+                ToolDescriptor(
+                    tool_name="crm_reader.get_customers",
+                    authority=ToolAuthority.READ,
+                    description="Read customers",
+                ),
+                ToolDescriptor(
+                    tool_name="crm_reader.get_tasks",
+                    authority=ToolAuthority.READ,
+                    description="Read tasks",
+                ),
+                ToolDescriptor(
+                    tool_name="crm_reader.get_invoices",
+                    authority=ToolAuthority.READ,
+                    description="Read invoices",
+                ),
+                ToolDescriptor(
+                    tool_name="vector_search.search",
+                    authority=ToolAuthority.READ,
+                    description="Vector semantic search",
+                ),
+                ToolDescriptor(
+                    tool_name="search_adapter.search",
+                    authority=ToolAuthority.READ,
+                    description="Keyword / full-text search",
+                ),
+                # Propose tools
+                ToolDescriptor(
+                    tool_name="crm_writer.propose",
+                    authority=ToolAuthority.PROPOSE,
+                    description="Propose a CRM write",
+                ),
+                # Execute tools
+                ToolDescriptor(
+                    tool_name="automation_executor.execute",
+                    authority=ToolAuthority.EXECUTE,
+                    description="Execute an automation workflow",
+                ),
+                ToolDescriptor(
+                    tool_name="kafka.emit_event",
+                    authority=ToolAuthority.EXECUTE,
+                    description="Emit a Kafka event",
+                ),
+                ToolDescriptor(
+                    tool_name="governance.approve",
+                    authority=ToolAuthority.EXECUTE,
+                    description="Approve a governance decision",
+                ),
+            ]
+        )
+
 
 # ---------------------------------------------------------------------------
 # Handler protocol
@@ -35,11 +152,6 @@ from multi_agent.errors import (
 
 
 class AgentHandler(Protocol):
-    """A callable that executes an AgentTask and returns an AgentResult.
-
-    In Phase 2 the handler is a test Fake; real agents are wired in Phase 5+.
-    """
-
     async def run(
         self,
         task: AgentTask,
@@ -48,46 +160,36 @@ class AgentHandler(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Registry
+# Registry Snapshot
 # ---------------------------------------------------------------------------
 
 
-class RegistrySnapshot(BaseModel):
-    """A point-in-time snapshot of the registry state.
-
-    Contains agent capabilities only — NO handler references, NO Python
-    memory addresses, NO sensitive config.
-    """
-
-    agents: dict[str, AgentCapability] = Field(default_factory=dict)
+class RegistrySnapshot(StrictContract):
+    agents: dict[str, AgentCapability] = {}
     version: str = ""
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+# ---------------------------------------------------------------------------
+# Agent Registry
+# ---------------------------------------------------------------------------
+
+
 class AgentRegistry:
-    """The single registry of agent capabilities and handlers.
+    """Single registry of agent capabilities and handlers."""
 
-    Rules (all enforced):
-      - Agent IDs are unique; duplicate register → DuplicateAgentError
-      - Replace overwrites; must be explicit
-      - Disabled agents are excluded from resolve() but visible in snapshot()
-      - resolve() validates tool authority against AgentAuthority
-      - No LLM-driven registration
-      - No dynamic code loading
-    """
-
-    def __init__(self) -> None:
+    def __init__(self, tool_catalog: ToolCatalog | None = None) -> None:
+        self._tool_catalog = tool_catalog or ToolCatalog.default_catalog()
         self._agents: dict[str, AgentCapability] = {}
         self._handlers: dict[str, AgentHandler] = {}
 
-    # ------------------------------------------------------------------
-    # Registration
-    # ------------------------------------------------------------------
+    @property
+    def tool_catalog(self) -> ToolCatalog:
+        return self._tool_catalog
+
+    # -- Registration -------------------------------------------------------
 
     def register(self, capability: AgentCapability, handler: AgentHandler) -> None:
-        """Register a new agent.  Raises DuplicateAgentError if *capability.agent_id*
-        is already known — use ``replace()`` for explicit overwrites.
-        """
         agent_id = capability.agent_id
         if agent_id in self._agents:
             raise DuplicateAgentError(
@@ -98,132 +200,144 @@ class AgentRegistry:
         self._handlers[agent_id] = handler
 
     def replace(self, capability: AgentCapability, handler: AgentHandler) -> None:
-        """Replace an existing agent's capability and handler.
-
-        No-op if the agent_id is unknown (matches explicit-replace semantics:
-        replacing something that does not exist yet is a caller bug, but for
-        idempotency we allow it without raising).
-        """
         agent_id = capability.agent_id
+        if agent_id not in self._agents:
+            raise UnknownAgentError(
+                f"Agent {agent_id!r} is not registered; use register() for new agents"
+            )
         self._validate_tool_authority(capability)
         self._agents[agent_id] = capability
         self._handlers[agent_id] = handler
 
     def unregister(self, agent_id: str) -> None:
-        """Remove an agent from the registry.  Idempotent."""
         self._agents.pop(agent_id, None)
         self._handlers.pop(agent_id, None)
 
-    # ------------------------------------------------------------------
-    # Resolution
-    # ------------------------------------------------------------------
+    # -- Resolution ---------------------------------------------------------
 
     def resolve(self, agent_id: str) -> tuple[AgentCapability, AgentHandler]:
-        """Return the capability and handler for *agent_id*.
-
-        Raises:
-            UnknownAgentError: agent_id is not registered.
-            DisabledAgentError: agent is registered but disabled.
-        """
-        capability = self._agents.get(agent_id)
-        if capability is None:
+        cap = self._agents.get(agent_id)
+        if cap is None:
             raise UnknownAgentError(f"Agent {agent_id!r} is not registered")
-        if not capability.enabled:
+        if not cap.enabled:
             raise DisabledAgentError(f"Agent {agent_id!r} is disabled")
-        handler = self._handlers[agent_id]
-        return capability, handler
+        return cap, self._handlers[agent_id]
 
     def resolve_capability(self, agent_id: str) -> AgentCapability:
-        """Return only the capability (no handler).  Same rules as ``resolve()``."""
-        capability = self._agents.get(agent_id)
-        if capability is None:
-            raise UnknownAgentError(f"Agent {agent_id!r} is not registered")
-        if not capability.enabled:
-            raise DisabledAgentError(f"Agent {agent_id!r} is disabled")
-        return capability
+        cap, _ = self.resolve(agent_id)
+        return cap
 
     def is_registered(self, agent_id: str) -> bool:
-        """Return True if *agent_id* is known (regardless of enabled state)."""
         return agent_id in self._agents
 
-    # ------------------------------------------------------------------
-    # Queries
-    # ------------------------------------------------------------------
+    # -- Validation ---------------------------------------------------------
+
+    def validate_task(self, task: AgentTask) -> AgentCapability:
+        """Validate that *task* can be dispatched to its target agent.
+
+        Returns the resolved AgentCapability on success.
+        """
+        cap = self.resolve_capability(task.agent_id)
+        if task.task_type not in cap.supported_tasks:
+            raise UnauthorizedToolError(
+                f"Agent {task.agent_id!r} does not support task type {task.task_type!r}"
+            )
+        if task.timeout_ms > cap.timeout_ms:
+            raise UnauthorizedToolError(
+                f"Task timeout {task.timeout_ms}ms exceeds agent capability {cap.timeout_ms}ms"
+            )
+        # Authority check: a task requiring execute must go to an execute agent.
+        # We infer the required authority from task_type naming convention for now;
+        # Phase 3+ can formalize this.
+        return cap
+
+    def validate_tool_access(
+        self,
+        agent_id: str,
+        tool_name: str,
+    ) -> ToolDescriptor:
+        """Validate that *agent_id* is authorised to use *tool_name*.
+
+        Returns the ToolDescriptor on success.
+        """
+        cap = self.resolve_capability(agent_id)
+        tool = self._tool_catalog.resolve(tool_name)
+
+        if tool_name not in cap.allowed_tools:
+            raise UnauthorizedToolError(
+                f"Agent {agent_id!r} is not allowed to use tool {tool_name!r}"
+            )
+
+        # Authority hierarchy check
+        if (
+            cap.authority == AgentAuthority.READ
+            and tool.authority != ToolAuthority.READ
+        ):
+            raise UnauthorizedToolError(
+                f"READ agent {agent_id!r} cannot use {tool.authority.value}-level tool {tool_name!r}"
+            )
+        if (
+            cap.authority == AgentAuthority.PROPOSE
+            and tool.authority == ToolAuthority.EXECUTE
+        ):
+            raise UnauthorizedToolError(
+                f"PROPOSE agent {agent_id!r} cannot use execute-level tool {tool_name!r}"
+            )
+        return tool
+
+    # -- Queries (sorted by agent_id for determinism) -----------------------
 
     def list_by_domain(self, domain: str) -> list[AgentCapability]:
-        """Return enabled agents whose ``domains`` include *domain*."""
-        return [c for c in self._agents.values() if c.enabled and domain in c.domains]
+        return sorted(
+            (c for c in self._agents.values() if c.enabled and domain in c.domains),
+            key=lambda c: c.agent_id,
+        )
 
     def list_by_task(self, task_type: str) -> list[AgentCapability]:
-        """Return enabled agents whose ``supported_tasks`` include *task_type*."""
-        return [
-            c
-            for c in self._agents.values()
-            if c.enabled and task_type in c.supported_tasks
-        ]
+        return sorted(
+            (
+                c
+                for c in self._agents.values()
+                if c.enabled and task_type in c.supported_tasks
+            ),
+            key=lambda c: c.agent_id,
+        )
 
-    # ------------------------------------------------------------------
-    # Snapshot
-    # ------------------------------------------------------------------
+    def list_all(self) -> list[AgentCapability]:
+        return sorted(self._agents.values(), key=lambda c: c.agent_id)
+
+    # -- Snapshot -----------------------------------------------------------
 
     def snapshot(self) -> RegistrySnapshot:
-        """Return a deterministic, JSON-safe snapshot of the registry.
-
-        The snapshot includes ALL agents (including disabled) and a version
-        hash computed from sorted capability data.  No handler references,
-        memory addresses, or secrets are included.
-        """
         raw: dict[str, Any] = {}
         for agent_id in sorted(self._agents):
             cap = self._agents[agent_id]
-            raw[agent_id] = json.loads(cap.model_dump_json(exclude_defaults=False))
-
-        canonical = json.dumps(
-            raw,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        )
-        version = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
+            raw[agent_id] = cap.model_dump(mode="json")
+        version = content_hash(raw)
         return RegistrySnapshot(
             agents=dict(sorted(self._agents.items(), key=lambda kv: kv[0])),
             version=version,
             created_at=datetime.now(timezone.utc),
         )
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    # -- Internal -----------------------------------------------------------
 
-    @staticmethod
-    def _tool_authorities() -> dict[str, ToolAuthority]:
-        """Return the built-in tool→authority mapping (delegates to contracts)."""
-        return AgentCapability._tool_authorities()
-
-    @classmethod
-    def _validate_tool_authority(cls, capability: AgentCapability) -> None:
-        """Raise UnauthorizedToolError if any allowed_tool exceeds the agent's
-        authority level.
-        """
-        tool_map = cls._tool_authorities()
-        for tool in capability.allowed_tools:
-            tool_auth = tool_map.get(tool)
-            if tool_auth is None:
-                # Unknown tool — allow registration but warn in telemetry.
-                # Phase 3+ can add strict mode.
-                continue
-
-            if capability.authority == AgentAuthority.READ:
-                if tool_auth != ToolAuthority.READ:
-                    raise UnauthorizedToolError(
-                        f"READ agent {capability.agent_id!r} cannot use "
-                        f"{tool_auth.value}-level tool {tool!r}"
-                    )
-            elif capability.authority == AgentAuthority.PROPOSE:
-                if tool_auth == ToolAuthority.EXECUTE:
-                    raise UnauthorizedToolError(
-                        f"PROPOSE agent {capability.agent_id!r} cannot use "
-                        f"execute-level tool {tool!r}"
-                    )
-            # EXECUTE agents can use any tool level
+    def _validate_tool_authority(self, capability: AgentCapability) -> None:
+        for tool_name in capability.allowed_tools:
+            tool = self._tool_catalog.resolve(tool_name)  # raises UnknownToolError
+            if (
+                capability.authority == AgentAuthority.READ
+                and tool.authority != ToolAuthority.READ
+            ):
+                raise UnauthorizedToolError(
+                    f"READ agent {capability.agent_id!r} cannot use "
+                    f"{tool.authority.value}-level tool {tool_name!r}"
+                )
+            if (
+                capability.authority == AgentAuthority.PROPOSE
+                and tool.authority == ToolAuthority.EXECUTE
+            ):
+                raise UnauthorizedToolError(
+                    f"PROPOSE agent {capability.agent_id!r} cannot use "
+                    f"execute-level tool {tool_name!r}"
+                )

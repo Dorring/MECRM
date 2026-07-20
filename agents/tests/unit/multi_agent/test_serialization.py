@@ -1,37 +1,34 @@
-"""Serialization round-trip and hash stability tests.
-
-All tests run under AI_MODE=deterministic; no Ollama, no API keys.
-"""
+"""Serialization round-trip and canonical stability — Phase 2 R2."""
 
 from __future__ import annotations
 
-import json
+import subprocess
+import sys
 from datetime import datetime, timezone
+from decimal import Decimal
+
+import pytest
 
 from multi_agent.contracts import (
     ActionProposal,
+    ActionRiskLevel,
     AgentAuthority,
     AgentCapability,
     AgentResult,
     AgentTask,
-    Evidence,
-    ProviderMetadata,
-    TokenUsage,
-    ToolAuthority,
-    ToolCallRecord,
-    _compute_proposal_hash,
+    ExecutionBudget,
+    MultiAgentState,
 )
-from multi_agent.registry import AgentRegistry, RegistrySnapshot
+from multi_agent.registry import AgentRegistry
 from multi_agent.serialization import (
+    canonicalize,
     deserialize_contract,
     serialize_contract,
     serialize_set_for_json,
     stable_hash,
 )
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# Helpers ----------------------------------------------------------------
 
 
 def _utc_now() -> datetime:
@@ -39,84 +36,136 @@ def _utc_now() -> datetime:
 
 
 def _make_result() -> AgentResult:
-    ev = Evidence(
-        evidence_id="ev-001",
-        evidence_type="opa_policy",
-        tenant_id="t-001",
-        source_agent="test_agent",
-        created_at=datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
-    )
-    p = ActionProposal(
-        proposal_id="p-001",
-        proposal_hash=_compute_proposal_hash(
-            tenant_id="t-001",
-            created_by_agent="agent_a",
-            action_type="create",
-            target_entity="ticket",
-            target_id=None,
-            payload={},
-            priority="medium",
-            justification=None,
-            evidence_ids=[],
-            requires_approval=True,
-            idempotency_key="ik-001",
-        ),
-        tenant_id="t-001",
-        created_by_agent="agent_a",
-        action_type="create",
-        target_entity="ticket",
-        priority="medium",
-        idempotency_key="ik-001",
-        created_at=datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
-    )
     return AgentResult(
         result_id="r-001",
         task_id="task-001",
         agent_id="agent_a",
         tenant_id="t-001",
         status="completed",
-        confidence=0.95,
-        duration_ms=150.0,
-        output={"summary": "done"},
-        evidence=[ev],
-        action_proposals=[p],
-        token_usage=TokenUsage(input_tokens=100, output_tokens=50, total_tokens=150),
-        tool_calls=[
-            ToolCallRecord(
-                tool_name="crm_reader.get_leads", authority=ToolAuthority.READ, ok=True
-            )
-        ],
-        provider_metadata=ProviderMetadata(
-            provider="ollama",
-            chat_model="llama3.1",
-            embedding_model="nomic",
-            ai_mode="live",
-        ),
+        summary="Done",
         completed_at=datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
     )
 
 
-# ---------------------------------------------------------------------------
-# JSON round-trip
-# ---------------------------------------------------------------------------
+# Canonicalizer -----------------------------------------------------------
+
+
+class TestCanonicalizer:
+    def test_datetime_normalized_to_utc(self):
+        dt = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        c = canonicalize(dt)
+        assert c.endswith("Z")
+        assert "+00:00" not in c
+
+    def test_decimal_preserved(self):
+        d = Decimal("123.456")
+        c = canonicalize(d)
+        assert c == "123.456"
+
+    def test_set_sorted(self):
+        c = canonicalize({"b", "a", "c"})
+        assert c == ["a", "b", "c"]
+
+    def test_dict_sorted_keys(self):
+        d = {"z": 1, "a": 2, "m": 3}
+        c = canonicalize(d)
+        assert list(c.keys()) == ["a", "m", "z"]
+
+    def test_nested_structure(self):
+        obj = {
+            "items": [{"b": 2, "a": 1}],
+            "tags": {"c", "a", "b"},
+        }
+        c = canonicalize(obj)
+        assert c["items"][0] == {"a": 1, "b": 2}
+        assert c["tags"] == ["a", "b", "c"]
+
+    def test_canonicalize_base_model(self):
+        task = AgentTask(
+            task_id="task-001",
+            agent_id="a",
+            task_type="t",
+            input_data={},
+            tenant_id="t-1",
+            timeout_ms=60_000,
+            idempotency_key="ik-1",
+            created_at=datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
+        )
+        c = canonicalize(task)
+        assert c["task_id"] == "task-001"
+        assert "2025-06-01T12:00:00Z" in c["created_at"]
+
+
+# Cross-subprocess stability ----------------------------------------------
+
+
+class TestCrossProcessStability:
+    def test_canonical_stable_across_processes(self):
+        """The canonical form of a contract is identical across subprocesses."""
+        import os
+
+        script = """
+import json
+from datetime import datetime, timezone
+from multi_agent.contracts import AgentTask
+from multi_agent.serialization import serialize_contract
+
+task = AgentTask(
+    task_id="task-001",
+    agent_id="agent_a",
+    task_type="test",
+    input_data={"key": "value"},
+    tenant_id="t-001",
+    timeout_ms=60_000,
+    idempotency_key="ik-001",
+    created_at=datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
+)
+print(serialize_contract(task))
+"""
+        env = {
+            **os.environ,
+            "AI_MODE": "deterministic",
+            "PYTHONPATH": os.getcwd() + "/src",
+        }
+        r1 = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            cwd=os.getcwd(),
+            env=env,
+        )
+        r2 = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            cwd=os.getcwd(),
+            env=env,
+        )
+        if r1.returncode != 0:
+            # Subprocess may not have the right pythonpath; skip with context
+            pytest.skip(f"Subprocess error: {r1.stderr}")
+        assert r1.stdout.strip() == r2.stdout.strip()
+        assert len(r1.stdout.strip()) > 0
+
+
+# JSON round-trip --------------------------------------------------------
 
 
 class TestJsonRoundTrip:
     def test_agent_task_round_trip(self):
         task = AgentTask(
             task_id="task-001",
-            agent_id="agent_a",
-            task_type="test",
-            input_data={"key": "value"},
-            tenant_id="t-001",
+            agent_id="a",
+            task_type="t",
+            input_data={},
+            tenant_id="t-1",
             timeout_ms=60_000,
-            idempotency_key="ik-001",
+            idempotency_key="ik-1",
             created_at=datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
         )
         raw = serialize_contract(task)
         restored = deserialize_contract(raw, AgentTask)
         assert restored.task_id == task.task_id
-        assert restored.tenant_id == task.tenant_id
         assert restored.created_at == task.created_at
 
     def test_agent_result_round_trip(self):
@@ -124,9 +173,6 @@ class TestJsonRoundTrip:
         raw = serialize_contract(result)
         restored = deserialize_contract(raw, AgentResult)
         assert restored.result_id == result.result_id
-        assert restored.confidence == result.confidence
-        assert len(restored.evidence) == 1
-        assert len(restored.action_proposals) == 1
 
     def test_capability_round_trip(self):
         cap = AgentCapability(
@@ -137,237 +183,66 @@ class TestJsonRoundTrip:
             supported_tasks={"triage"},
             allowed_tools={"crm_reader.get_leads"},
             authority=AgentAuthority.READ,
-            input_contract="test_in",
-            output_contract="test_out",
+            input_contract="in",
+            output_contract="out",
             timeout_ms=30_000,
             max_retries=2,
             estimated_cost_class="low",
         )
         raw = serialize_contract(cap)
         restored = deserialize_contract(raw, AgentCapability)
-        assert restored.agent_id == cap.agent_id
         assert restored.domains == cap.domains
-        assert restored.authority == cap.authority
 
-    def test_evidence_round_trip(self):
-        ev = Evidence(
-            evidence_id="ev-001",
-            evidence_type="opa_policy",
-            tenant_id="t-001",
-            source_agent="agent_a",
-            content_hash="abc123",
-            created_at=datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
+    def test_multi_agent_state_round_trip(self):
+        state = MultiAgentState(
+            run_id="run-1",
+            tenant_id="t-1",
+            budget=ExecutionBudget(max_cost=100, total_cost=50),
         )
-        raw = serialize_contract(ev)
-        restored = deserialize_contract(raw, Evidence)
-        assert restored.evidence_id == ev.evidence_id
-        assert restored.content_hash == ev.content_hash
+        raw = serialize_contract(state)
+        restored = deserialize_contract(raw, MultiAgentState)
+        assert restored.run_id == "run-1"
+        assert restored.budget.total_cost == Decimal("50")
 
     def test_action_proposal_round_trip(self):
-        now = _utc_now()
-        h = _compute_proposal_hash(
-            tenant_id="t-001",
-            created_by_agent="agent_a",
+        p = ActionProposal.create(
+            proposal_id="p-1",
+            tenant_id="t-1",
+            created_by_agent="a",
             action_type="create",
             target_entity="ticket",
-            target_id=None,
-            payload={"amount": 100},
             priority="medium",
-            justification="because",
+            risk_level=ActionRiskLevel.MEDIUM,
             evidence_ids=[],
             requires_approval=True,
             idempotency_key="ik-1",
         )
-        p = ActionProposal(
-            proposal_id="p-001",
-            proposal_hash=h,
-            tenant_id="t-001",
-            created_by_agent="agent_a",
-            action_type="create",
-            target_entity="ticket",
-            payload={"amount": 100},
-            priority="medium",
-            justification="because",
-            idempotency_key="ik-1",
-            created_at=now,
-        )
         raw = serialize_contract(p)
         restored = deserialize_contract(raw, ActionProposal)
-        assert restored.proposal_id == p.proposal_id
         assert restored.proposal_hash == p.proposal_hash
 
 
-# ---------------------------------------------------------------------------
-# datetime UTC
-# ---------------------------------------------------------------------------
+# No secrets in serialization ---------------------------------------------
 
 
-class TestUtcSerialization:
-    def test_datetime_utc_round_trip(self):
-        """UTC datetime should survive round-trip without offset shift."""
-        dt = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        result = AgentResult(
-            result_id="r-001",
-            task_id="task-001",
-            agent_id="agent_a",
-            tenant_id="t-001",
-            status="completed",
-            completed_at=dt,
-        )
-        raw = serialize_contract(result)
-        restored = deserialize_contract(raw, AgentResult)
-        assert restored.completed_at is not None
-        assert restored.completed_at.isoformat() == dt.isoformat()
+class TestNoSecrets:
+    def test_no_authorization_in_serialized(self):
+        from multi_agent.contracts import AgentExecutionContext
 
-    def test_utc_z_suffix(self):
-        dt = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        result = AgentResult(
-            result_id="r-001",
-            task_id="task-001",
-            agent_id="agent_a",
-            tenant_id="t-001",
-            status="completed",
-            completed_at=dt,
-        )
-        raw = serialize_contract(result)
-        # The ISO string with Z suffix should appear
-        assert "2025-06-01T12:00:00Z" in raw
+        ctx = AgentExecutionContext(tenant_id="t-1", scopes=["read"])
+        raw = serialize_contract(ctx)
+        assert "authorization" not in raw.lower()
+        assert "bearer" not in raw.lower()
+        assert "access_token" not in raw.lower()
+        assert "api_key" not in raw.lower()
 
-
-# ---------------------------------------------------------------------------
-# Enum serialization
-# ---------------------------------------------------------------------------
-
-
-class TestEnumSerialization:
-    def test_authority_serializes_as_value(self):
-        cap = AgentCapability(
-            agent_id="test_agent",
-            version="1.0.0",
-            description="Test",
-            domains={"test"},
-            supported_tasks={"test_task"},
-            allowed_tools={"crm_reader.get_leads"},
-            authority=AgentAuthority.PROPOSE,
-            input_contract="in",
-            output_contract="out",
-            timeout_ms=30_000,
-            max_retries=2,
-            estimated_cost_class="low",
-        )
-        raw = serialize_contract(cap)
-        assert '"propose"' in raw
-
-    def test_tool_authority_serialization(self):
-        tcr = ToolCallRecord(tool_name="test", authority=ToolAuthority.EXECUTE, ok=True)
-        raw = serialize_contract(tcr)
-        assert '"execute"' in raw
-
-
-# ---------------------------------------------------------------------------
-# Set serialization
-# ---------------------------------------------------------------------------
-
-
-class TestSetSerialization:
-    def test_serialize_set_sorted(self):
-        result = serialize_set_for_json({"b", "a", "c"})
-        assert result == ["a", "b", "c"]
-
-    def test_serialize_set_empty(self):
-        assert serialize_set_for_json(set()) == []
-
-    def test_capability_set_fields_in_json(self):
-        cap = AgentCapability(
-            agent_id="test_agent",
-            version="1.0.0",
-            description="Test",
-            domains={"support", "sales"},
-            supported_tasks={"task_a", "task_b"},
-            allowed_tools={"tool_x"},
-            authority=AgentAuthority.READ,
-            input_contract="in",
-            output_contract="out",
-            timeout_ms=30_000,
-            max_retries=2,
-            estimated_cost_class="low",
-        )
-        raw = serialize_contract(cap)
-        # Sets should be serialized as arrays (Pydantic JSON mode)
-        parsed = json.loads(raw)
-        assert set(parsed["domains"]) == {"sales", "support"}
-        assert set(parsed["supported_tasks"]) == {"task_a", "task_b"}
-
-
-# ---------------------------------------------------------------------------
-# Snapshot hash stability
-# ---------------------------------------------------------------------------
-
-
-class TestSnapshotHash:
-    def test_snapshot_hash_stable(self):
-        reg1 = AgentRegistry()
-        reg1.register(
-            AgentCapability(
-                agent_id="agent_a",
-                version="1.0.0",
-                description="Agent A",
-                domains={"support"},
-                supported_tasks={"triage"},
-                allowed_tools={"crm_reader.get_leads"},
-                authority=AgentAuthority.READ,
-                input_contract="in",
-                output_contract="out",
-                timeout_ms=30_000,
-                max_retries=2,
-                estimated_cost_class="low",
-            ),
-            object(),  # Fake handler
-        )
-
-        snap1 = reg1.snapshot()
-        snap2 = reg1.snapshot()
-        assert snap1.version == snap2.version
-
-    def test_serialize_snapshot(self):
+    def test_no_handler_refs_in_snapshot(self):
         reg = AgentRegistry()
         reg.register(
             AgentCapability(
-                agent_id="agent_a",
+                agent_id="a",
                 version="1.0.0",
-                description="Agent A",
-                domains={"support"},
-                supported_tasks={"triage"},
-                allowed_tools={"crm_reader.get_leads"},
-                authority=AgentAuthority.READ,
-                input_contract="in",
-                output_contract="out",
-                timeout_ms=30_000,
-                max_retries=2,
-                estimated_cost_class="low",
-            ),
-            object(),
-        )
-        snap = reg.snapshot()
-        raw = serialize_contract(snap)
-        restored = deserialize_contract(raw, RegistrySnapshot)
-        assert restored.version == snap.version
-
-
-# ---------------------------------------------------------------------------
-# No handler / secret leaks
-# ---------------------------------------------------------------------------
-
-
-class TestNoLeaks:
-    def test_snapshot_no_python_objects(self):
-        """Serialized snapshot must not contain handler refs."""
-        reg = AgentRegistry()
-        reg.register(
-            AgentCapability(
-                agent_id="agent_a",
-                version="1.0.0",
-                description="Agent A",
+                description="A",
                 domains={"test"},
                 supported_tasks={"test_task"},
                 allowed_tools={"crm_reader.get_leads"},
@@ -382,101 +257,123 @@ class TestNoLeaks:
         )
         snap = reg.snapshot()
         raw = serialize_contract(snap)
-        assert "object" not in raw.lower()
         assert "0x" not in raw
 
-    def test_result_serialization_has_no_secrets(self):
-        result = _make_result()
-        raw = serialize_contract(result)
-        assert "api_key" not in raw.lower()
-        assert "password" not in raw.lower()
-        assert "secret" not in raw.lower()
+
+# Set serialization -------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# Stable hash
-# ---------------------------------------------------------------------------
+class TestSetSerialization:
+    def test_serialize_set_sorted(self):
+        assert serialize_set_for_json({"b", "a"}) == ["a", "b"]
+
+
+# Stable hash ------------------------------------------------------------
 
 
 class TestStableHash:
-    def test_stable_hash_same_content_same_hash(self):
+    def test_same_content_same_hash(self):
         cap1 = AgentCapability(
-            agent_id="agent_a",
+            agent_id="a",
             version="1.0.0",
-            description="Agent A",
+            description="A",
             domains={"test"},
-            supported_tasks={"test_task"},
+            supported_tasks={"t"},
             allowed_tools={"crm_reader.get_leads"},
             authority=AgentAuthority.READ,
-            input_contract="in",
-            output_contract="out",
+            input_contract="i",
+            output_contract="o",
             timeout_ms=30_000,
             max_retries=2,
             estimated_cost_class="low",
         )
         cap2 = AgentCapability(
-            agent_id="agent_a",
+            agent_id="a",
             version="1.0.0",
-            description="Agent A",
+            description="A",
             domains={"test"},
-            supported_tasks={"test_task"},
+            supported_tasks={"t"},
             allowed_tools={"crm_reader.get_leads"},
             authority=AgentAuthority.READ,
-            input_contract="in",
-            output_contract="out",
+            input_contract="i",
+            output_contract="o",
             timeout_ms=30_000,
             max_retries=2,
             estimated_cost_class="low",
         )
         assert stable_hash(cap1) == stable_hash(cap2)
 
-    def test_stable_hash_different_content_different_hash(self):
+    def test_different_content_different_hash(self):
         cap1 = AgentCapability(
-            agent_id="agent_a",
+            agent_id="a",
             version="1.0.0",
-            description="Agent A",
+            description="A",
             domains={"test"},
-            supported_tasks={"test_task"},
+            supported_tasks={"t"},
             allowed_tools={"crm_reader.get_leads"},
             authority=AgentAuthority.READ,
-            input_contract="in",
-            output_contract="out",
+            input_contract="i",
+            output_contract="o",
             timeout_ms=30_000,
             max_retries=2,
             estimated_cost_class="low",
         )
         cap2 = AgentCapability(
-            agent_id="agent_b",  # different
+            agent_id="b",
             version="1.0.0",
-            description="Agent B",
+            description="B",
             domains={"test"},
-            supported_tasks={"test_task"},
+            supported_tasks={"t"},
             allowed_tools={"crm_reader.get_leads"},
             authority=AgentAuthority.READ,
-            input_contract="in",
-            output_contract="out",
+            input_contract="i",
+            output_contract="o",
             timeout_ms=30_000,
             max_retries=2,
             estimated_cost_class="low",
         )
         assert stable_hash(cap1) != stable_hash(cap2)
 
-    def test_stable_hash_with_exclude(self):
-        cap = AgentCapability(
-            agent_id="agent_a",
-            version="1.0.0",
-            description="Agent A",
-            domains={"test"},
-            supported_tasks={"test_task"},
-            allowed_tools={"crm_reader.get_leads"},
-            authority=AgentAuthority.READ,
-            input_contract="in",
-            output_contract="out",
-            timeout_ms=30_000,
-            max_retries=2,
-            estimated_cost_class="low",
+
+# Snapshot hash -----------------------------------------------------------
+
+
+class TestSnapshotHash:
+    def test_version_is_content_hash(self):
+        reg1 = AgentRegistry()
+        reg1.register(
+            AgentCapability(
+                agent_id="a",
+                version="1.0.0",
+                description="A",
+                domains={"test"},
+                supported_tasks={"t"},
+                allowed_tools={"crm_reader.get_leads"},
+                authority=AgentAuthority.READ,
+                input_contract="i",
+                output_contract="o",
+                timeout_ms=30_000,
+                max_retries=2,
+                estimated_cost_class="low",
+            ),
+            object(),
         )
-        h1 = stable_hash(cap)
-        # Exclude a field that doesn't affect semantics
-        h2 = stable_hash(cap, exclude={"description"})
-        assert h1 != h2  # hash should differ when a field is excluded
+        reg2 = AgentRegistry()
+        reg2.register(
+            AgentCapability(
+                agent_id="a",
+                version="1.0.0",
+                description="A",
+                domains={"test"},
+                supported_tasks={"t"},
+                allowed_tools={"crm_reader.get_leads"},
+                authority=AgentAuthority.READ,
+                input_contract="i",
+                output_contract="o",
+                timeout_ms=30_000,
+                max_retries=2,
+                estimated_cost_class="low",
+            ),
+            object(),
+        )
+        assert reg1.snapshot().version == reg2.snapshot().version

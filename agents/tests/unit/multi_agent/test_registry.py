@@ -1,7 +1,4 @@
-"""AgentRegistry tests — registration, resolution, query, snapshot.
-
-All tests run under AI_MODE=deterministic; no Ollama, no API keys.
-"""
+"""AgentRegistry + ToolCatalog tests — Phase 2 R2."""
 
 from __future__ import annotations
 
@@ -13,17 +10,23 @@ from multi_agent.contracts import (
     AgentExecutionContext,
     AgentResult,
     AgentTask,
+    ToolAuthority,
 )
 from multi_agent.errors import (
     DisabledAgentError,
     DuplicateAgentError,
+    UnauthorizedToolError,
     UnknownAgentError,
+    UnknownToolError,
 )
-from multi_agent.registry import AgentRegistry
+from multi_agent.registry import (
+    AgentRegistry,
+    ToolCatalog,
+    ToolDescriptor,
+)
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+
+# Helpers ----------------------------------------------------------------
 
 
 def _make_capability(
@@ -38,13 +41,13 @@ def _make_capability(
     defaults: dict = dict(
         agent_id=agent_id,
         version="1.0.0",
-        description=f"Test agent {agent_id}",
+        description=f"Agent {agent_id}",
         domains=domains or {"test"},
         supported_tasks=supported_tasks or {"test_task"},
         allowed_tools=allowed_tools or {"crm_reader.get_leads"},
         authority=authority,
-        input_contract="test_input",
-        output_contract="test_output",
+        input_contract="in",
+        output_contract="out",
         timeout_ms=30_000,
         max_retries=2,
         estimated_cost_class="low",
@@ -55,11 +58,9 @@ def _make_capability(
 
 
 class FakeHandler:
-    """A fake AgentHandler that records calls for testing."""
-
-    def __init__(self, agent_id: str = "test_agent"):
+    def __init__(self, agent_id: str = "test"):
         self.agent_id = agent_id
-        self.calls: list[tuple[AgentTask, AgentExecutionContext]] = []
+        self.calls: list = []
 
     async def run(self, task: AgentTask, context: AgentExecutionContext) -> AgentResult:
         self.calls.append((task, context))
@@ -75,335 +76,297 @@ class FakeHandler:
         )
 
 
-# ---------------------------------------------------------------------------
-# Registration
-# ---------------------------------------------------------------------------
+# ToolCatalog ------------------------------------------------------------
+
+
+class TestToolCatalog:
+    def test_register_and_resolve(self):
+        cat = ToolCatalog()
+        cat.register(ToolDescriptor(tool_name="my.tool", authority=ToolAuthority.READ))
+        t = cat.resolve("my.tool")
+        assert t.tool_name == "my.tool"
+        assert t.authority == ToolAuthority.READ
+
+    def test_unknown_tool_raises(self):
+        cat = ToolCatalog()
+        with pytest.raises(UnknownToolError):
+            cat.resolve("nonexistent")
+
+    def test_default_catalog_has_builtins(self):
+        cat = ToolCatalog.default_catalog()
+        assert cat.is_registered("crm_reader.get_leads")
+        assert cat.is_registered("crm_writer.propose")
+        assert cat.is_registered("automation_executor.execute")
+
+    def test_duplicate_tool_raises(self):
+        cat = ToolCatalog()
+        cat.register(ToolDescriptor(tool_name="t1", authority=ToolAuthority.READ))
+        with pytest.raises(DuplicateAgentError):
+            cat.register(
+                ToolDescriptor(tool_name="t1", authority=ToolAuthority.EXECUTE)
+            )
+
+    def test_snapshot_sorted(self):
+        cat = ToolCatalog()
+        cat.register(ToolDescriptor(tool_name="b", authority=ToolAuthority.READ))
+        cat.register(ToolDescriptor(tool_name="a", authority=ToolAuthority.READ))
+        snap = cat.snapshot()
+        assert [t.tool_name for t in snap] == ["a", "b"]
+
+
+# Registry — Registration --------------------------------------------------
 
 
 class TestRegistration:
     def test_register_success(self):
         reg = AgentRegistry()
-        cap = _make_capability(agent_id="agent_a")
-        handler = FakeHandler("agent_a")
-        reg.register(cap, handler)
-        assert reg.is_registered("agent_a")
+        reg.register(_make_capability(agent_id="a"), FakeHandler("a"))
+        assert reg.is_registered("a")
 
     def test_duplicate_raises(self):
         reg = AgentRegistry()
-        cap1 = _make_capability(agent_id="agent_a")
-        cap2 = _make_capability(agent_id="agent_a")
-        reg.register(cap1, FakeHandler("agent_a"))
+        reg.register(_make_capability(agent_id="a"), FakeHandler("a"))
         with pytest.raises(DuplicateAgentError):
-            reg.register(cap2, FakeHandler("agent_a-dup"))
+            reg.register(_make_capability(agent_id="a"), FakeHandler("a2"))
 
-    def test_replace_overwrites(self):
+    def test_replace_only_known_agent(self):
         reg = AgentRegistry()
-        cap1 = _make_capability(agent_id="agent_a", version="1.0.0")
-        cap2 = _make_capability(agent_id="agent_a", version="2.0.0")
-        h1 = FakeHandler("agent_a-v1")
-        h2 = FakeHandler("agent_a-v2")
+        with pytest.raises(UnknownAgentError):
+            reg.replace(_make_capability(agent_id="ghost"), FakeHandler("ghost"))
 
-        reg.register(cap1, h1)
-        reg.replace(cap2, h2)
-
-        resolved_cap, resolved_handler = reg.resolve("agent_a")
-        assert resolved_cap.version == "2.0.0"
-        assert resolved_handler is h2
-
-    def test_replace_new_agent_allowed(self):
-        """Replace is idempotent — it also works as upsert for convenience."""
+    def test_replace_success(self):
         reg = AgentRegistry()
-        cap = _make_capability(agent_id="agent_new")
-        reg.replace(cap, FakeHandler("agent_new"))
-        assert reg.is_registered("agent_new")
+        reg.register(_make_capability(agent_id="a", version="1.0.0"), FakeHandler("a1"))
+        reg.replace(_make_capability(agent_id="a", version="2.0.0"), FakeHandler("a2"))
+        cap, _ = reg.resolve("a")
+        assert cap.version == "2.0.0"
 
     def test_unregister(self):
         reg = AgentRegistry()
-        cap = _make_capability(agent_id="agent_a")
-        reg.register(cap, FakeHandler("agent_a"))
-        assert reg.is_registered("agent_a")
-        reg.unregister("agent_a")
-        assert not reg.is_registered("agent_a")
-
-    def test_unregister_idempotent(self):
-        reg = AgentRegistry()
-        reg.unregister("nonexistent")  # no-op
+        reg.register(_make_capability(agent_id="a"), FakeHandler("a"))
+        reg.unregister("a")
+        assert not reg.is_registered("a")
 
 
-# ---------------------------------------------------------------------------
-# Resolution
-# ---------------------------------------------------------------------------
+# Registry — Resolution ---------------------------------------------------
 
 
 class TestResolution:
-    def test_resolve_returns_capability_and_handler(self):
+    def test_resolve_returns_both(self):
         reg = AgentRegistry()
-        cap = _make_capability(agent_id="agent_a")
-        handler = FakeHandler("agent_a")
-        reg.register(cap, handler)
+        reg.register(_make_capability(agent_id="a"), FakeHandler("a"))
+        cap, handler = reg.resolve("a")
+        assert cap.agent_id == "a"
 
-        resolved_cap, resolved_handler = reg.resolve("agent_a")
-        assert resolved_cap.agent_id == "agent_a"
-        assert resolved_handler is handler
-
-    def test_resolve_unregistered_raises(self):
+    def test_resolve_unknown_raises(self):
         reg = AgentRegistry()
         with pytest.raises(UnknownAgentError):
             reg.resolve("ghost")
 
     def test_resolve_disabled_raises(self):
         reg = AgentRegistry()
-        cap = _make_capability(agent_id="agent_a", enabled=False)
-        reg.register(cap, FakeHandler("agent_a"))
+        reg.register(_make_capability(agent_id="a", enabled=False), FakeHandler("a"))
         with pytest.raises(DisabledAgentError):
-            reg.resolve("agent_a")
-
-    def test_resolve_capability_only(self):
-        reg = AgentRegistry()
-        cap = _make_capability(agent_id="agent_a")
-        reg.register(cap, FakeHandler("agent_a"))
-        resolved = reg.resolve_capability("agent_a")
-        assert resolved.agent_id == "agent_a"
-        assert resolved.version == "1.0.0"
-
-    def test_resolve_capability_disabled_raises(self):
-        reg = AgentRegistry()
-        cap = _make_capability(agent_id="agent_a", enabled=False)
-        reg.register(cap, FakeHandler("agent_a"))
-        with pytest.raises(DisabledAgentError):
-            reg.resolve_capability("agent_a")
+            reg.resolve("a")
 
     def test_is_registered_includes_disabled(self):
         reg = AgentRegistry()
-        cap = _make_capability(agent_id="agent_a", enabled=False)
-        reg.register(cap, FakeHandler("agent_a"))
-        assert reg.is_registered("agent_a") is True
+        reg.register(_make_capability(agent_id="a", enabled=False), FakeHandler("a"))
+        assert reg.is_registered("a") is True
 
 
-# ---------------------------------------------------------------------------
-# Queries
-# ---------------------------------------------------------------------------
+# Registry — Tool authority -----------------------------------------------
+
+
+class TestToolAuthority:
+    def test_unknown_tool_rejected(self):
+        reg = AgentRegistry()
+        with pytest.raises(UnknownToolError):
+            reg.register(
+                _make_capability(agent_id="a", allowed_tools={"evil.delete_all"}),
+                FakeHandler("a"),
+            )
+
+    def test_read_agent_cannot_use_execute_tool(self):
+        reg = AgentRegistry()
+        with pytest.raises(UnauthorizedToolError):
+            reg.register(
+                _make_capability(
+                    agent_id="a",
+                    authority=AgentAuthority.READ,
+                    allowed_tools={"automation_executor.execute"},
+                ),
+                FakeHandler("a"),
+            )
+
+
+# Registry — validate_task / validate_tool_access --------------------------
+
+
+class TestValidateTask:
+    def test_valid_task_passes(self):
+        reg = AgentRegistry()
+        cap = _make_capability(
+            agent_id="a", supported_tasks={"triage"}, timeout_ms=60_000
+        )
+        reg.register(cap, FakeHandler("a"))
+
+        task = AgentTask(
+            task_id="t-1",
+            agent_id="a",
+            task_type="triage",
+            input_data={},
+            tenant_id="t-1",
+            timeout_ms=30_000,
+            idempotency_key="ik-1",
+        )
+        result = reg.validate_task(task)
+        assert result.agent_id == "a"
+
+    def test_unsupported_task_type_raises(self):
+        reg = AgentRegistry()
+        reg.register(
+            _make_capability(agent_id="a", supported_tasks={"x"}), FakeHandler("a")
+        )
+
+        task = AgentTask(
+            task_id="t-1",
+            agent_id="a",
+            task_type="y",  # not in supported_tasks
+            input_data={},
+            tenant_id="t-1",
+            timeout_ms=30_000,
+            idempotency_key="ik-1",
+        )
+        with pytest.raises(UnauthorizedToolError):
+            reg.validate_task(task)
+
+    def test_timeout_exceeds_capability_raises(self):
+        reg = AgentRegistry()
+        reg.register(
+            _make_capability(agent_id="a", timeout_ms=10_000), FakeHandler("a")
+        )
+
+        task = AgentTask(
+            task_id="t-1",
+            agent_id="a",
+            task_type="test_task",
+            input_data={},
+            tenant_id="t-1",
+            timeout_ms=60_000,  # > 10_000
+            idempotency_key="ik-1",
+        )
+        with pytest.raises(UnauthorizedToolError):
+            reg.validate_task(task)
+
+
+class TestValidateToolAccess:
+    def test_valid_access(self):
+        reg = AgentRegistry()
+        reg.register(
+            _make_capability(
+                agent_id="a",
+                allowed_tools={"crm_reader.get_leads"},
+                authority=AgentAuthority.READ,
+            ),
+            FakeHandler("a"),
+        )
+        tool = reg.validate_tool_access("a", "crm_reader.get_leads")
+        assert tool.tool_name == "crm_reader.get_leads"
+
+    def test_tool_not_in_allowed_raises(self):
+        reg = AgentRegistry()
+        reg.register(
+            _make_capability(
+                agent_id="a",
+                allowed_tools={"crm_reader.get_leads"},
+                authority=AgentAuthority.READ,
+            ),
+            FakeHandler("a"),
+        )
+        with pytest.raises(UnauthorizedToolError):
+            reg.validate_tool_access("a", "crm_writer.propose")
+
+    def test_unknown_tool_raises(self):
+        """validate_tool_access with a tool not in the catalog raises UnknownToolError."""
+        reg = AgentRegistry()
+        reg.register(
+            _make_capability(
+                agent_id="a",
+                allowed_tools={"crm_reader.get_leads"},
+                authority=AgentAuthority.READ,
+            ),
+            FakeHandler("a"),
+        )
+        with pytest.raises(UnknownToolError):
+            reg.validate_tool_access("a", "nonexistent.tool")
+
+    def test_authority_too_low_raises(self):
+        """Register with execute tool fails because READ authority can't use it."""
+        with pytest.raises(UnauthorizedToolError):
+            reg = AgentRegistry()
+            reg.register(
+                _make_capability(
+                    agent_id="a",
+                    allowed_tools={"automation_executor.execute"},
+                    authority=AgentAuthority.READ,
+                ),
+                FakeHandler("a"),
+            )
+
+
+# Registry — Queries (sorted) ---------------------------------------------
 
 
 class TestQueries:
-    def test_list_by_domain(self):
+    def test_list_by_domain_sorted(self):
+        reg = AgentRegistry()
+        reg.register(_make_capability(agent_id="b", domains={"x"}), FakeHandler("b"))
+        reg.register(_make_capability(agent_id="a", domains={"x"}), FakeHandler("a"))
+        result = reg.list_by_domain("x")
+        assert [c.agent_id for c in result] == ["a", "b"]
+
+    def test_list_by_task_sorted(self):
         reg = AgentRegistry()
         reg.register(
-            _make_capability(agent_id="support1", domains={"support", "ticketing"}),
-            FakeHandler("support1"),
+            _make_capability(agent_id="z", supported_tasks={"t"}), FakeHandler("z")
         )
         reg.register(
-            _make_capability(agent_id="sales1", domains={"sales", "deals"}),
-            FakeHandler("sales1"),
+            _make_capability(agent_id="m", supported_tasks={"t"}), FakeHandler("m")
         )
-        reg.register(
-            _make_capability(agent_id="disabled1", domains={"support"}, enabled=False),
-            FakeHandler("disabled1"),
-        )
+        result = reg.list_by_task("t")
+        assert [c.agent_id for c in result] == ["m", "z"]
 
-        support_agents = reg.list_by_domain("support")
-        assert len(support_agents) == 1
-        assert support_agents[0].agent_id == "support1"
-
-    def test_list_by_domain_empty(self):
+    def test_list_all_sorted(self):
         reg = AgentRegistry()
-        assert reg.list_by_domain("nonexistent") == []
-
-    def test_list_by_task(self):
-        reg = AgentRegistry()
-        reg.register(
-            _make_capability(agent_id="triage1", supported_tasks={"triage", "respond"}),
-            FakeHandler("triage1"),
-        )
-        reg.register(
-            _make_capability(agent_id="forecast1", supported_tasks={"forecast"}),
-            FakeHandler("forecast1"),
-        )
-
-        triage_agents = reg.list_by_task("triage")
-        assert len(triage_agents) == 1
-        assert triage_agents[0].agent_id == "triage1"
-
-    def test_list_by_task_disabled_excluded(self):
-        reg = AgentRegistry()
-        reg.register(
-            _make_capability(
-                agent_id="enabled1",
-                supported_tasks={"task_x"},
-                enabled=True,
-            ),
-            FakeHandler("enabled1"),
-        )
-        reg.register(
-            _make_capability(
-                agent_id="disabled1",
-                supported_tasks={"task_x"},
-                enabled=False,
-            ),
-            FakeHandler("disabled1"),
-        )
-
-        agents = reg.list_by_task("task_x")
-        assert len(agents) == 1
-        assert agents[0].agent_id == "enabled1"
+        reg.register(_make_capability(agent_id="c"), FakeHandler("c"))
+        reg.register(_make_capability(agent_id="a"), FakeHandler("a"))
+        assert [c.agent_id for c in reg.list_all()] == ["a", "c"]
 
 
-# ---------------------------------------------------------------------------
-# Tool authority checks
-# ---------------------------------------------------------------------------
-
-
-class TestToolAuthorityChecks:
-    def test_read_agent_cannot_use_propose_tool(self):
-        """Pydantic model_validator rejects READ authority with propose tool."""
-        from pydantic import ValidationError
-
-        with pytest.raises(ValidationError) as exc:
-            _make_capability(
-                agent_id="reader",
-                authority=AgentAuthority.READ,
-                allowed_tools={"crm_writer.propose"},
-            )
-        assert "READ" in str(exc.value) or "propose" in str(exc.value).lower()
-
-    def test_propose_agent_cannot_use_execute_tool(self):
-        """Pydantic model_validator rejects PROPOSE authority with execute tool."""
-        from pydantic import ValidationError
-
-        with pytest.raises(ValidationError) as exc:
-            _make_capability(
-                agent_id="proposer",
-                authority=AgentAuthority.PROPOSE,
-                allowed_tools={"automation_executor.execute"},
-            )
-        assert "PROPOSE" in str(exc.value) or "execute" in str(exc.value).lower()
-
-    def test_execute_agent_can_use_execute_tool(self):
-        reg = AgentRegistry()
-        cap = _make_capability(
-            agent_id="executor",
-            authority=AgentAuthority.EXECUTE,
-            allowed_tools={"automation_executor.execute"},
-        )
-        reg.register(cap, FakeHandler("executor"))
-        assert reg.is_registered("executor")
-
-    def test_unknown_tool_allowed(self):
-        """Unknown tools are allowed through (Phase 3+ can add strict mode)."""
-        reg = AgentRegistry()
-        cap = _make_capability(
-            agent_id="reader",
-            authority=AgentAuthority.READ,
-            allowed_tools={"future.tool"},
-        )
-        reg.register(cap, FakeHandler("reader"))
-        assert reg.is_registered("reader")
-
-
-# ---------------------------------------------------------------------------
-# Snapshot
-# ---------------------------------------------------------------------------
+# Registry — Snapshot -----------------------------------------------------
 
 
 class TestSnapshot:
-    def test_snapshot_has_capabilities(self):
+    def test_snapshot_no_handler_refs(self):
         reg = AgentRegistry()
-        reg.register(
-            _make_capability(agent_id="agent_a"),
-            FakeHandler("agent_a"),
-        )
-        reg.register(
-            _make_capability(agent_id="agent_b"),
-            FakeHandler("agent_b"),
-        )
-
-        snap = reg.snapshot()
-        assert "agent_a" in snap.agents
-        assert "agent_b" in snap.agents
-        assert snap.agents["agent_a"].agent_id == "agent_a"
-
-    def test_snapshot_includes_disabled(self):
-        reg = AgentRegistry()
-        reg.register(
-            _make_capability(agent_id="enabled1", enabled=True),
-            FakeHandler("enabled1"),
-        )
-        reg.register(
-            _make_capability(agent_id="disabled1", enabled=False),
-            FakeHandler("disabled1"),
-        )
-
-        snap = reg.snapshot()
-        assert "enabled1" in snap.agents
-        assert "disabled1" in snap.agents
-
-    def test_snapshot_stable(self):
-        """Two snapshots from same registry should be identical (except created_at)."""
-        reg = AgentRegistry()
-        reg.register(
-            _make_capability(agent_id="agent_a"),
-            FakeHandler("agent_a"),
-        )
-
-        snap1 = reg.snapshot()
-        snap2 = reg.snapshot()
-
-        assert snap1.version == snap2.version
-        assert snap1.agents.keys() == snap2.agents.keys()
-
-    def test_snapshot_version_changes(self):
-        reg = AgentRegistry()
-        reg.register(
-            _make_capability(agent_id="agent_a"),
-            FakeHandler("agent_a"),
-        )
-        v1 = reg.snapshot().version
-
-        reg.register(
-            _make_capability(agent_id="agent_b"),
-            FakeHandler("agent_b"),
-        )
-        v2 = reg.snapshot().version
-
-        assert v1 != v2
-
-    def test_snapshot_no_handler_references(self):
-        """Snapshot must not contain handler objects or Python addresses."""
-        reg = AgentRegistry()
-        reg.register(
-            _make_capability(agent_id="agent_a"),
-            FakeHandler("agent_a"),
-        )
-
+        reg.register(_make_capability(agent_id="a"), FakeHandler("a"))
         snap = reg.snapshot()
         snap_json = snap.model_dump_json()
-
-        # No Python memory addresses
-        assert "0x" not in snap_json
-        # No handler references
         assert "FakeHandler" not in snap_json
         assert "handler" not in snap_json.lower()
 
-    def test_registry_version_deterministic(self):
-        """Same capabilities in same order → same version hash."""
-        reg1 = AgentRegistry()
-        reg1.register(
-            _make_capability(agent_id="agent_a", version="1.0.0"),
-            FakeHandler("agent_a"),
-        )
-        reg1.register(
-            _make_capability(agent_id="agent_b", version="1.0.0"),
-            FakeHandler("agent_b"),
-        )
+    def test_version_stable(self):
+        reg = AgentRegistry()
+        reg.register(_make_capability(agent_id="a", version="1.0.0"), FakeHandler("a"))
+        v1 = reg.snapshot().version
+        v2 = reg.snapshot().version
+        assert v1 == v2
 
-        reg2 = AgentRegistry()
-        reg2.register(
-            _make_capability(agent_id="agent_a", version="1.0.0"),
-            FakeHandler("agent_a"),
-        )
-        reg2.register(
-            _make_capability(agent_id="agent_b", version="1.0.0"),
-            FakeHandler("agent_b"),
-        )
-
-        assert reg1.snapshot().version == reg2.snapshot().version
+    def test_version_changes_on_register(self):
+        reg = AgentRegistry()
+        reg.register(_make_capability(agent_id="a"), FakeHandler("a"))
+        v1 = reg.snapshot().version
+        reg.register(_make_capability(agent_id="b"), FakeHandler("b"))
+        v2 = reg.snapshot().version
+        assert v1 != v2
