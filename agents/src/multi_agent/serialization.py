@@ -31,7 +31,12 @@ def _canonical_value(obj: Any) -> Any:
     6. ``Enum`` → ``.value``
     7. ``set`` / ``frozenset`` → sorted list (sorted by canonical string key)
     8. ``bytes`` → hex string
-    9. ``BaseModel`` → canonicalize(model_dump(mode="json"))
+    9. ``BaseModel`` → canonicalize(model_dump(mode="python")) — R6 P0-1:
+       MUST use ``mode="python"`` so that ``frozenset`` fields stay as
+       ``frozenset`` and reach the ``set/frozenset`` branch above.  Using
+       ``mode="json"`` converted them to plain ``list`` first, which
+       preserved the (process-random) iteration order and produced
+       different hashes on different ``PYTHONHASHSEED`` values.
     10. ``dict`` → sorted-by-key dict of canonicalized values
     11. ``list`` / ``tuple`` → list of canonicalized values
     12. anything else → ``TypeError``
@@ -67,7 +72,12 @@ def _canonical_value(obj: Any) -> Any:
     if isinstance(obj, bytes):
         return obj.hex()
     if isinstance(obj, BaseModel):
-        return _canonical_value(obj.model_dump(mode="json"))
+        # R6 P0-1 — use mode="python" so frozenset fields reach the
+        # set/frozenset branch above and get sorted.  mode="json"
+        # converted them to plain lists first, preserving process-random
+        # iteration order and producing different hashes across
+        # PYTHONHASHSEED values.
+        return _canonical_value(obj.model_dump(mode="python"))
     if isinstance(obj, dict):
         return {
             str(k): _canonical_value(v)
@@ -104,9 +114,15 @@ def stable_hash(obj: Any, *, exclude: set[str] | None = None) -> str:
     """Return a SHA-256 hex digest of *obj*'s canonical form.
 
     When *obj* is a BaseModel its fields named in *exclude* are dropped first.
+
+    R6 P0-1 — uses ``mode="python"`` so that ``frozenset`` fields reach
+    :func:`_canonical_value`'s ``set/frozenset`` branch (which sorts)
+    instead of being converted to plain lists first (which preserved
+    process-random iteration order and produced different hashes across
+    ``PYTHONHASHSEED`` values).
     """
     if isinstance(obj, BaseModel):
-        data = obj.model_dump(mode="json")
+        data = obj.model_dump(mode="python")
         if exclude:
             for key in exclude:
                 data.pop(key, None)
