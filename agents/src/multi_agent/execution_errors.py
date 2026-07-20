@@ -50,6 +50,23 @@ class InvalidAgentResultError(SupervisorError):
     """
 
 
+class InvalidInvocationReceiptError(SupervisorError):
+    """R1 P0-4: An :class:`AgentInvocationReceipt` failed consistency
+    validation.
+
+    The receipt reported a ``tool_calls`` count that does not equal
+    ``len(result.tool_calls)``, or a ``tokens_used`` value that does
+    not match ``result.token_usage.total_tokens`` when
+    ``provider_metadata`` is present.
+
+    A mismatched receipt is treated as a *non-retryable* Task failure:
+    the Task is marked ``failed``, the result does not enter Merge,
+    and the error_code is ``invalid_receipt``.  This prevents a custom
+    AgentInvoker from under-reporting usage to bypass budget
+    enforcement.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Budget
 # ---------------------------------------------------------------------------
@@ -91,6 +108,7 @@ class RunAlreadyInProgressError(SupervisorError):
 __all__ = [
     "ExecutionUsageUnavailableError",
     "InvalidAgentResultError",
+    "InvalidInvocationReceiptError",
     "RetryableAgentError",
     "RunAlreadyInProgressError",
     "RunPlanConflictError",

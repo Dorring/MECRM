@@ -30,6 +30,7 @@ from multi_agent.contracts import (
     AgentTask,
     StrictContract,
 )
+from multi_agent.execution_errors import InvalidInvocationReceiptError
 from multi_agent.registry import AgentHandler, AgentRegistry
 
 
@@ -191,9 +192,60 @@ class DeterministicFakeInvoker:
         )
 
 
+# ---------------------------------------------------------------------------
+# R1 P0-4: Receipt consistency validation
+# ---------------------------------------------------------------------------
+
+
+def validate_invocation_receipt(receipt: AgentInvocationReceipt) -> None:
+    """Validate that *receipt* is internally consistent.
+
+    Phase 4 budget enforcement trusts ``receipt.tool_calls`` and
+    (when configured) ``receipt.tokens_used`` to charge against the
+    Run budget.  A custom AgentInvoker that under-reports usage would
+    silently bypass ``max_tool_calls`` / ``token_budget``.
+
+    Checks:
+
+    * ``receipt.tool_calls == len(receipt.result.tool_calls)`` — the
+      receipt must report exactly the number of :class:`ToolCallRecord`
+      entries the Handler returned.
+    * When ``receipt.result.provider_metadata is not None`` and the
+      receipt reports ``tokens_used`` — the value must equal
+      ``receipt.result.token_usage.total_tokens``.  This prevents a
+      custom Invoker from under-reporting tokens while the Result
+      carries authoritative provider usage.
+
+    Cost is intentionally **not** validated here because
+    :class:`AgentResult` does not carry a cost field; cost trust is
+    solely a property of the chosen Invoker (RegistryAgentInvoker
+    reports ``None``, future trusted Invokers may report real cost).
+
+    Raises :class:`InvalidInvocationReceiptError` on any mismatch.
+    """
+    result = receipt.result
+    actual_tool_calls = len(result.tool_calls)
+    if receipt.tool_calls != actual_tool_calls:
+        raise InvalidInvocationReceiptError(
+            f"receipt.tool_calls={receipt.tool_calls} does not match "
+            f"len(result.tool_calls)={actual_tool_calls}"
+        )
+
+    if result.provider_metadata is not None and receipt.tokens_used is not None:
+        actual_tokens = result.token_usage.total_tokens
+        if receipt.tokens_used != actual_tokens:
+            raise InvalidInvocationReceiptError(
+                f"receipt.tokens_used={receipt.tokens_used} does not "
+                f"match result.token_usage.total_tokens={actual_tokens} "
+                f"(provider_metadata is present, so token usage is "
+                f"authoritative)"
+            )
+
+
 __all__ = [
     "AgentInvocationReceipt",
     "AgentInvoker",
     "DeterministicFakeInvoker",
     "RegistryAgentInvoker",
+    "validate_invocation_receipt",
 ]

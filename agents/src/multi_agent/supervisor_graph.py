@@ -60,7 +60,7 @@ class SupervisorGraphState:
     invoker: AgentInvoker | None = None
     run_store: RunStore | None = None
     result: SupervisorRunResult | None = None
-    error: BaseException | None = None
+    error: Exception | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +77,7 @@ class FakeSupervisorRuntime:
     """
 
     result: SupervisorRunResult | None = None
-    error: BaseException | None = None
+    error: Exception | None = None
     calls: list[tuple[PlanDraft, AgentRegistry]] = field(default_factory=list)
 
     async def execute(
@@ -136,9 +136,14 @@ def build_supervisor_graph(runtime: _SupervisorLike):
                 config=state.config,
                 cancellation=state.cancellation,
             )
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             # Capture so ``finalize_run`` can re-raise cleanly
             # rather than aborting LangGraph's executor.
+            #
+            # R1 P1: only catch ``Exception`` — let
+            # ``asyncio.CancelledError``, ``KeyboardInterrupt`` and
+            # ``SystemExit`` propagate to the caller so task
+            # cancellation works correctly.
             return {"error": exc}
         return {"result": result}
 

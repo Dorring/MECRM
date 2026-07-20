@@ -8,7 +8,9 @@ Contract
 --------
 
 ``begin(run_id, plan_hash) -> RunLease``
-    Called by :class:`SupervisorRuntime` *before* any Handler runs.
+    Called by :class:`SupervisorRuntime` *after* all side-effect-free
+    pre-flight checks (plan integrity, registry version, PlanValidator,
+    handler resolution) have passed.
 
     * If ``run_id`` is unknown → mark it in-progress and return a
       :class:`RunLease` whose ``cached_result is None``.
@@ -25,6 +27,14 @@ Contract
     Called by the Supervisor after the run reaches a terminal status.
     Stores a deep copy of *result* so later callers receive an
     independent object graph.
+
+``abort(run_id, plan_hash, *, error_code) -> None``
+    R1 P0-1: Called by the Supervisor when a run fails *after* the
+    lease was acquired but before ``complete`` is reached (exception
+    during execution, cancellation, etc.).  Drops the in-progress
+    entry so a later ``begin`` with the same ``run_id`` can proceed.
+    If the run was already completed, ``abort`` is a no-op (the stored
+    result wins).
 
 The store is intentionally simple — no TTL, no eviction.  Phase 5
 will add a Postgres-backed implementation with the same Protocol.
@@ -92,6 +102,14 @@ class RunStore(Protocol):
         result: SupervisorRunResult,
     ) -> None: ...
 
+    async def abort(
+        self,
+        run_id: str,
+        plan_hash: str,
+        *,
+        error_code: str,
+    ) -> None: ...
+
 
 # ---------------------------------------------------------------------------
 # In-memory implementation
@@ -145,6 +163,7 @@ class InMemoryRunStore:
 
     def __init__(self) -> None:
         self._entries: dict[str, _RunEntry] = {}
+        self._aborts: dict[str, str] = {}
 
     # -- introspection (test helpers) -------------------------------------
 
@@ -159,9 +178,17 @@ class InMemoryRunStore:
         entry = self._entries.get(run_id)
         return entry is not None and not entry.in_progress and entry.result is not None
 
+    def last_error_code(self, run_id: str) -> str | None:
+        """Return the ``error_code`` recorded by the most recent
+        ``abort()`` for *run_id*, or ``None`` if no abort happened.
+        Test-only introspection helper.
+        """
+        return self._aborts.get(run_id)
+
     def clear(self) -> None:
         """Drop all stored entries.  Test-only."""
         self._entries.clear()
+        self._aborts.clear()
 
     # -- Protocol ---------------------------------------------------------
 
@@ -232,6 +259,37 @@ class InMemoryRunStore:
             in_progress=False,
             result=stored,
         )
+
+    async def abort(
+        self,
+        run_id: str,
+        plan_hash: str,
+        *,
+        error_code: str,
+    ) -> None:
+        """R1 P0-1: Release an in-progress lease.
+
+        Behaviour:
+
+        * If the run is unknown or already completed → no-op (a
+          cached result wins; aborting cannot revoke a completed run).
+        * If the run is in-progress → drop the entry entirely so a
+          later ``begin(run_id, ...)`` succeeds.  Record ``error_code``
+          for test introspection.
+        * ``plan_hash`` is informational — the Supervisor always passes
+          the plan it actually tried to execute.  We do not enforce a
+          match here because the abort path is reached after a failure
+          and the entry may already have been tampered with in tests.
+        """
+        entry = self._entries.get(run_id)
+        if entry is None or not entry.in_progress:
+            # No-op: nothing to release.
+            self._aborts[run_id] = error_code
+            return
+        # Drop the in-progress entry.  A subsequent begin() with the
+        # same run_id will create a fresh lease.
+        del self._entries[run_id]
+        self._aborts[run_id] = error_code
 
 
 # ---------------------------------------------------------------------------

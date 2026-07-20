@@ -308,19 +308,19 @@ class TestCancellation:
 
 
 # ---------------------------------------------------------------------------
-# Wave callback
+# Wave callbacks (R1 P0-2: split into started / completed / skipped)
 # ---------------------------------------------------------------------------
 
 
-class TestWaveCallback:
+class TestWaveCallbacks:
     @pytest.mark.asyncio
-    async def test_wave_callback_invoked_with_terminal_records(self):
+    async def test_wave_completed_invoked_with_terminal_records(self):
         async def run_task(task: AgentTask) -> Any:
             return _outcome(task.task_id, task.agent_id)
 
         waves: list[list[str]] = []
 
-        def on_wave_complete(records: list[TaskExecutionRecord]) -> None:
+        def on_wave_completed(records: list[TaskExecutionRecord]) -> None:
             waves.append([r.task_id for r in records])
 
         tasks = [
@@ -329,9 +329,85 @@ class TestWaveCallback:
         ]
 
         scheduler = DagScheduler(SupervisorConfig(max_concurrency=1))
-        await scheduler.execute(tasks, run_task, on_wave_complete=on_wave_complete)
+        await scheduler.execute(tasks, run_task, on_wave_completed=on_wave_completed)
 
         # Two waves: root, then child.
         assert len(waves) == 2
         assert waves[0] == ["task_root"]
         assert waves[1] == ["task_child"]
+
+    @pytest.mark.asyncio
+    async def test_wave_started_invoked_before_dispatch(self):
+        """R1 P0-2: ``on_wave_started`` fires *before* the wave runs,
+        with the AgentTasks about to be dispatched."""
+
+        async def run_task(task: AgentTask) -> Any:
+            return _outcome(task.task_id, task.agent_id)
+
+        started_waves: list[list[str]] = []
+        dispatch_order: list[str] = []
+
+        def on_wave_started(ready_tasks: list[AgentTask]) -> None:
+            started_waves.append([t.task_id for t in ready_tasks])
+
+        async def tracking_run_task(task: AgentTask) -> Any:
+            dispatch_order.append(task.task_id)
+            return _outcome(task.task_id, task.agent_id)
+
+        tasks = [
+            _task("task_root"),
+            _task("task_child", dependencies=frozenset({"task_root"})),
+        ]
+
+        scheduler = DagScheduler(SupervisorConfig(max_concurrency=1))
+        await scheduler.execute(
+            tasks,
+            tracking_run_task,
+            on_wave_started=on_wave_started,
+        )
+
+        assert len(started_waves) == 2
+        assert started_waves[0] == ["task_root"]
+        assert started_waves[1] == ["task_child"]
+        # The callback fires before the run_task is invoked.
+        assert dispatch_order == ["task_root", "task_child"]
+
+    @pytest.mark.asyncio
+    async def test_skipped_tasks_invoke_on_tasks_skipped_not_on_wave_completed(self):
+        """R1 P0-2: dependency-failure propagation must call
+        ``on_tasks_skipped``, NOT ``on_wave_completed``.  Skip
+        propagation does NOT consume an iteration."""
+
+        async def run_task(task: AgentTask) -> Any:
+            if task.task_id == "task_root":
+                return _outcome(task.task_id, task.agent_id, status="failed")
+            return _outcome(task.task_id, task.agent_id)
+
+        completed_waves: list[list[str]] = []
+        skipped_records: list[list[str]] = []
+
+        def on_wave_completed(records: list[TaskExecutionRecord]) -> None:
+            completed_waves.append([r.task_id for r in records])
+
+        def on_tasks_skipped(records: list[TaskExecutionRecord]) -> None:
+            skipped_records.append([r.task_id for r in records])
+
+        tasks = [
+            _task("task_root"),
+            _task("task_child", dependencies=frozenset({"task_root"})),
+        ]
+
+        scheduler = DagScheduler(SupervisorConfig())
+        await scheduler.execute(
+            tasks,
+            run_task,
+            on_wave_completed=on_wave_completed,
+            on_tasks_skipped=on_tasks_skipped,
+        )
+
+        # ``on_wave_completed`` only sees the root wave (the failed
+        # root); ``on_tasks_skipped`` sees the skipped child.
+        assert len(completed_waves) == 1
+        assert completed_waves[0] == ["task_root"]
+        assert len(skipped_records) == 1
+        assert skipped_records[0] == ["task_child"]

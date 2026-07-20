@@ -20,6 +20,20 @@ Contract
   ``completed`` is marked ``skipped``.  Independent branches continue.
 * No mutation: the Scheduler never mutates the input tasks or the
   :class:`PlanDraft`.  All state lives in :class:`TaskExecutionRecord`.
+
+R1 P0-2 callback split
+----------------------
+
+The Scheduler exposes three distinct callbacks so the Supervisor can
+distinguish *real* Ready-Task waves (which consume an iteration slot)
+from *state propagation* (which must not):
+
+* ``on_wave_started(ready_tasks)`` — called *before* a wave of Ready
+  Tasks is dispatched.  The Supervisor reserves an iteration here.
+* ``on_wave_completed(records)`` — called *after* a wave of Ready
+  Tasks reaches a terminal status.  No-op for accounting.
+* ``on_tasks_skipped(records)`` — called when tasks are skipped due
+  to dependency failure propagation.  Does NOT consume an iteration.
 """
 
 from __future__ import annotations
@@ -51,6 +65,7 @@ class TaskOutcome(TaskExecutionRecord):
 TaskRunner = Callable[[AgentTask], Awaitable[TaskOutcome]]
 ShouldStop = Callable[[], bool]
 WaveCallback = Callable[[list[TaskExecutionRecord]], None]
+WaveStartedCallback = Callable[[list[AgentTask]], None]
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +138,9 @@ class DagScheduler:
         run_task: TaskRunner,
         *,
         should_stop: ShouldStop | None = None,
-        on_wave_complete: WaveCallback | None = None,
+        on_wave_started: WaveStartedCallback | None = None,
+        on_wave_completed: WaveCallback | None = None,
+        on_tasks_skipped: WaveCallback | None = None,
     ) -> list[TaskExecutionRecord]:
         """Execute *tasks* in dependency order.
 
@@ -140,10 +157,21 @@ class DagScheduler:
             Sync callable checked before every wave.  When it returns
             ``True`` the Scheduler stops dispatching new tasks; every
             still-pending task is marked ``cancelled``.
-        on_wave_complete
-            Sync callback invoked after each wave with the records of
-            the tasks that reached a terminal status in that wave.
-            Used by the Supervisor to trigger a parallel-result merge.
+        on_wave_started
+            R1 P0-2: sync callback invoked *before* a wave of Ready
+            Tasks is dispatched.  The Supervisor reserves an iteration
+            slot here.  Receives the list of :class:`AgentTask` about
+            to run.  Not invoked for skip propagation or cancellation
+            cleanup.
+        on_wave_completed
+            Sync callback invoked *after* a wave of Ready Tasks
+            reaches a terminal status.  Receives the records of tasks
+            that ran in this wave.  Used by the Supervisor to emit
+            per-wave trace events.
+        on_tasks_skipped
+            R1 P0-2: sync callback invoked when tasks are skipped due
+            to dependency failure propagation.  Does NOT consume an
+            iteration — state propagation is not execution.
         """
         # Build the initial records map.  We never mutate the input
         # tasks; all state lives in records.
@@ -158,24 +186,15 @@ class DagScheduler:
         pending_ids: set[str] = set(records.keys())
 
         while pending_ids:
-            # 1. Cancellation / budget stop check.
-            if should_stop is not None and should_stop():
-                for tid in sorted(pending_ids):
-                    rec = records[tid]
-                    records[tid] = TaskExecutionRecord(
-                        task_id=rec.task_id,
-                        agent_id=rec.agent_id,
-                        status="cancelled",
-                        attempts=rec.attempts,
-                        result=rec.result,
-                        skip_reason="run stopped before dispatch",
-                    )
-                pending_ids.clear()
-                break
-
-            # 2. Resolve failure propagation: any pending task whose
-            #    dependencies are all terminal but not all completed
-            #    is skipped immediately (independent branches continue).
+            # 1. Resolve failure propagation FIRST: any pending task
+            #    whose dependencies are all terminal but not all
+            #    completed is skipped immediately (independent branches
+            #    continue).  R1 P0-2: this is state propagation, NOT a
+            #    real wave — invoke on_tasks_skipped rather than
+            #    on_wave_completed.  Moving this before the should_stop
+            #    check ensures that dependency-failed descendants are
+            #    marked as ``skipped`` (not ``cancelled``) even when the
+            #    iteration budget is exhausted.
             newly_skipped: list[str] = []
             for tid in sorted(pending_ids):
                 task = self._find_task(tasks, tid)
@@ -200,10 +219,25 @@ class DagScheduler:
             for tid in newly_skipped:
                 pending_ids.discard(tid)
 
-            if newly_skipped and on_wave_complete is not None:
-                on_wave_complete([records[tid] for tid in newly_skipped])
+            if newly_skipped and on_tasks_skipped is not None:
+                on_tasks_skipped([records[tid] for tid in newly_skipped])
 
             if not pending_ids:
+                break
+
+            # 2. Cancellation / budget stop check.
+            if should_stop is not None and should_stop():
+                for tid in sorted(pending_ids):
+                    rec = records[tid]
+                    records[tid] = TaskExecutionRecord(
+                        task_id=rec.task_id,
+                        agent_id=rec.agent_id,
+                        status="cancelled",
+                        attempts=rec.attempts,
+                        result=rec.result,
+                        skip_reason="run stopped before dispatch",
+                    )
+                pending_ids.clear()
                 break
 
             # 3. Find ready tasks: pending + dependencies all completed.
@@ -222,13 +256,19 @@ class DagScheduler:
                 # it does we break to avoid a busy loop.
                 break
 
-            # 4. Execute the wave with bounded concurrency.
+            # 4. R1 P0-2: notify the Supervisor that a real Ready-Task
+            #    wave is about to be dispatched.  This is where the
+            #    iteration budget is reserved.
+            if on_wave_started is not None:
+                on_wave_started(ready)
+
+            # 5. Execute the wave with bounded concurrency.
             semaphore = asyncio.Semaphore(self._config.max_concurrency)
             outcomes = await asyncio.gather(
                 *(self._run_with_semaphore(semaphore, run_task, task) for task in ready)
             )
 
-            # 5. Commit outcomes in task_id order so the wave callback
+            # 6. Commit outcomes in task_id order so the wave callback
             #    sees a stable sequence.
             wave_terminal: list[TaskExecutionRecord] = []
             for task in ready:
@@ -237,8 +277,8 @@ class DagScheduler:
                 pending_ids.discard(task.task_id)
                 wave_terminal.append(outcome)
 
-            if on_wave_complete is not None and wave_terminal:
-                on_wave_complete(wave_terminal)
+            if on_wave_completed is not None and wave_terminal:
+                on_wave_completed(wave_terminal)
 
         # Return records in stable task_id order.
         return [records[t.task_id] for t in tasks if t.task_id in records]
@@ -265,5 +305,6 @@ __all__ = [
     "TaskOutcome",
     "TaskRunner",
     "WaveCallback",
+    "WaveStartedCallback",
     "ShouldStop",
 ]

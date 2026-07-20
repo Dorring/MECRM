@@ -236,15 +236,20 @@ class SupervisorRunResult(StrictContract):
 class SupervisorConfig(StrictContract):
     """Runtime knobs.
 
-    Defaults are deterministic-friendly: ``retry_backoff_ms=0`` and
-    ``deterministic_mode=True`` so the same plan + fake handler
-    produces a repeatable trace.
+    Defaults are deterministic-friendly: ``retry_backoff_ms=0`` so the
+    same plan + fake handler produces a repeatable trace.
+
+    R1 P1: the previous ``continue_independent_branches`` and
+    ``deterministic_mode`` fields were removed because they were never
+    read by the Scheduler or Supervisor.  ``continue_independent_branches``
+    in particular would conflict with the Scheduler's documented
+    contract ("independent branches continue" is the *only* supported
+    behaviour — see :class:`DagScheduler`).  Passing either keyword
+    now raises ``ValidationError`` thanks to ``extra='forbid'``.
     """
 
     max_concurrency: int = Field(default=4, ge=1, le=32)
     retry_backoff_ms: int = Field(default=0, ge=0)
-    continue_independent_branches: bool = True
-    deterministic_mode: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +367,15 @@ def validate_agent_result(
     tampered or buggy handler cannot slip a foreign-tenant result past
     the Supervisor.
 
+    R1 P0-5: the check also re-verifies that every
+    ``action_proposals[*].evidence_ids`` references an evidence_id
+    that still exists in ``result.evidence``.  ``AgentResult`` validates
+    this at construction, but list fields can be mutated in place
+    after construction (e.g. ``result.evidence.clear()``); without
+    re-validation a tampered result with dangling evidence_ids would
+    pass the Supervisor boundary and only be excluded later by
+    Phase 2 Merge, leaving the Task marked ``completed``.
+
     Checks:
 
     * ``result.task_id == task.task_id``
@@ -371,6 +385,8 @@ def validate_agent_result(
     * every ``action_proposals[*].proposal_hash`` verifies
     * every ``action_proposals[*].created_by_agent == task.agent_id``
     * every ``action_proposals[*].tenant_id == plan.tenant_id``
+    * every ``action_proposals[*].evidence_ids`` references an
+      evidence_id present in ``result.evidence``
     * every ``evidence[*].tenant_id == plan.tenant_id``
     """
     if result.task_id != task.task_id:
@@ -390,6 +406,8 @@ def validate_agent_result(
             f"result.status={result.status!r} is not an allowed value"
         )
 
+    known_evidence_ids = {ev.evidence_id for ev in result.evidence}
+
     for proposal in result.action_proposals:
         if proposal.created_by_agent != task.agent_id:
             raise InvalidAgentResultError(
@@ -400,6 +418,18 @@ def validate_agent_result(
             raise InvalidAgentResultError(
                 f"proposal {proposal.proposal_id!r} tenant_id="
                 f"{proposal.tenant_id!r} != plan.tenant_id={plan.tenant_id!r}"
+            )
+        # R1 P0-5: re-validate evidence_ids against the current
+        # ``result.evidence`` set.  ``AgentResult.__init__`` validates
+        # this once at construction but the list can be mutated
+        # afterward.
+        missing_evidence = [
+            eid for eid in proposal.evidence_ids if eid not in known_evidence_ids
+        ]
+        if missing_evidence:
+            raise InvalidAgentResultError(
+                f"proposal {proposal.proposal_id!r} references missing "
+                f"evidence_ids={missing_evidence!r}"
             )
         try:
             proposal.verify_integrity()

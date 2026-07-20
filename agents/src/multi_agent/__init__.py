@@ -159,6 +159,7 @@ from multi_agent.execution import (
 from multi_agent.execution_errors import (
     ExecutionUsageUnavailableError,
     InvalidAgentResultError,
+    InvalidInvocationReceiptError,
     RetryableAgentError,
     RunAlreadyInProgressError,
     RunPlanConflictError,
@@ -169,6 +170,7 @@ from multi_agent.invocation import (
     AgentInvoker,
     DeterministicFakeInvoker,
     RegistryAgentInvoker,
+    validate_invocation_receipt,
 )
 from multi_agent.run_store import (
     InMemoryRunStore,
@@ -176,7 +178,12 @@ from multi_agent.run_store import (
     RunStore,
     defensive_copy_result,
 )
-from multi_agent.scheduler import DagScheduler, TaskOutcome
+from multi_agent.scheduler import (
+    DagScheduler,
+    TaskOutcome,
+    WaveCallback,
+    WaveStartedCallback,
+)
 from multi_agent.supervisor import SupervisorRuntime
 from multi_agent.supervisor_graph import (
     FakeSupervisorRuntime,
@@ -304,6 +311,7 @@ __all__ = [
     # Phase 4 — Execution Errors
     "ExecutionUsageUnavailableError",
     "InvalidAgentResultError",
+    "InvalidInvocationReceiptError",
     "RetryableAgentError",
     "RunAlreadyInProgressError",
     "RunPlanConflictError",
@@ -313,6 +321,7 @@ __all__ = [
     "AgentInvoker",
     "DeterministicFakeInvoker",
     "RegistryAgentInvoker",
+    "validate_invocation_receipt",
     # Phase 4 — Execution Contracts
     "ExecutionCancellation",
     "ExecutionTraceEvent",
@@ -348,6 +357,8 @@ __all__ = [
     # Phase 4 — Scheduler & Supervisor
     "DagScheduler",
     "TaskOutcome",
+    "WaveCallback",
+    "WaveStartedCallback",
     "SupervisorRuntime",
     # Phase 4 — LangGraph Adapter
     "FakeSupervisorRuntime",

@@ -238,8 +238,21 @@ class TestSupervisorConfig:
         cfg = SupervisorConfig()
         assert cfg.max_concurrency == 4
         assert cfg.retry_backoff_ms == 0
-        assert cfg.continue_independent_branches is True
-        assert cfg.deterministic_mode is True
+
+    def test_removed_config_fields_are_rejected(self):
+        """R1 P1: ``continue_independent_branches`` and
+        ``deterministic_mode`` were removed because they were never
+        read.  ``extra='forbid'`` must reject them so callers do not
+        silently pass no-op configuration."""
+        from multi_agent.contracts import StrictContract
+
+        # StrictContract sets extra='forbid' — any unknown kwarg raises.
+        with pytest.raises(Exception):
+            SupervisorConfig(continue_independent_branches=False)  # type: ignore[call-arg]
+        with pytest.raises(Exception):
+            SupervisorConfig(deterministic_mode=False)  # type: ignore[call-arg]
+        # Sanity-check the base config.
+        assert issubclass(SupervisorConfig, StrictContract)
 
     def test_max_concurrency_lower_bound(self):
         with pytest.raises(Exception):
@@ -590,15 +603,21 @@ class TestBudgetEnforcement:
         assert "max_tool_calls" in (acc.exceeded_reason or "")
 
     def test_max_iterations_exceeded(self):
+        """R1 P0-2: ``reserve_iteration`` is the new API.  The budget
+        is checked *before* the wave is dispatched, so a violated
+        budget stops new work immediately."""
         from multi_agent.supervisor import _BudgetAccountant
 
         budget = ExecutionBudget(max_iterations=2)
         acc = _BudgetAccountant(budget, start_monotonic=0.0)
-        acc.increment_iteration()
-        acc.increment_iteration()
+        acc.reserve_iteration()
+        acc.reserve_iteration()
         assert not acc.exceeded  # 2 == max_iterations — still OK.
-        acc.increment_iteration()
+        # Third wave would exceed — ``can_start_iteration`` returns
+        # False and marks the accountant as exceeded.
+        assert not acc.can_start_iteration()
         assert acc.exceeded
+        assert "max_iterations" in (acc.exceeded_reason or "")
 
     def test_deadline_uses_monotonic_clock(self):
         from multi_agent.supervisor import _BudgetAccountant
