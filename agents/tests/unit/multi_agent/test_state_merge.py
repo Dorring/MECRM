@@ -1,4 +1,4 @@
-"""State merge tests — Phase 2 R3 with two-phase order-independent merge."""
+"""State merge tests — two-phase order-independent merge."""
 
 from __future__ import annotations
 
@@ -17,9 +17,13 @@ from multi_agent.state import merge_parallel_results
 
 # Helpers ----------------------------------------------------------------
 
+# Fixed timestamp so that two objects with the same logical content
+# produce identical content hashes regardless of wall-clock drift.
+_FIXED_TS = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
 
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return _FIXED_TS
 
 
 def _make_result(
@@ -44,7 +48,7 @@ def _make_result(
         evidence=evidence or [],
         action_proposals=proposals or [],
         token_usage=TokenUsage(),
-        completed_at=_utc_now(),
+        completed_at=_FIXED_TS,
     )
     defaults.update(overrides)
     return AgentResult(**defaults)
@@ -56,7 +60,7 @@ def _make_evidence(evidence_id: str = "ev-001", tenant_id: str = "t-001") -> Evi
         evidence_type=EvidenceType.TOOL_RESULT,
         tenant_id=tenant_id,
         source_agent="test_agent",
-        created_at=_utc_now(),
+        created_at=_FIXED_TS,
     )
 
 
@@ -493,3 +497,206 @@ class TestExcludedProposalScrubbedFromResults:
             ids = {prop.proposal_id for prop in result.action_proposals}
             assert "p-good" in ids
             assert "p-bad" not in ids
+
+
+# ============================================================================
+# R9: Proposal-ID-level Fail-Closed — any bad copy excludes ALL copies
+# ============================================================================
+
+
+class TestProposalIdFailClosed:
+    """If ANY copy of a proposal_id is judged invalid, ALL copies of that
+    id must be removed from merged_proposals and results[*].action_proposals."""
+
+    def test_valid_and_tampered_same_proposal_id_excludes_all(self):
+        """One valid + one tampered proposal with the SAME proposal_id:
+        the tampered copy adds the id to excluded_proposal_ids, and the
+        valid copy must also be excluded (Fail-Closed)."""
+        p_good = _make_proposal(proposal_id="p-same")
+        p_bad = _make_proposal(proposal_id="p-same")
+
+        r1 = _make_result(result_id="r-001", proposals=[p_good])
+        r2 = _make_result(result_id="r-002", proposals=[p_bad])
+        # Tamper the bad copy's hash AFTER both result and proposal are
+        # constructed, so AgentResult validation doesn't catch it — merge
+        # must detect it via verify_integrity().
+        object.__setattr__(p_bad, "proposal_hash", "deadbeef")
+
+        merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
+
+        # No copy of p-same should survive anywhere
+        assert not any(p.proposal_id == "p-same" for p in merged.merged_proposals)
+        for result in merged.results:
+            assert not any(p.proposal_id == "p-same" for p in result.action_proposals)
+        # Integrity failure was recorded
+        assert any(
+            c.conflict_type == "proposal_integrity_failure"
+            and "p-same" in c.conflicting_ids
+            for c in merged.conflicts
+        )
+
+    def test_foreign_and_local_same_proposal_id_excludes_all(self):
+        """One foreign-tenant proposal + one local proposal with the SAME
+        proposal_id, both inside LOCAL results: the foreign proposal adds
+        the id to excluded_proposal_ids, and the local copy must also be
+        excluded (Fail-Closed).
+
+        Because AgentResult validates tenant homogeneity at construction,
+        we tamper the proposal's tenant_id AFTER construction so the
+        result is still buildable."""
+        p_foreign = _make_proposal(proposal_id="p-same", tenant_id="t-001")
+        p_local = _make_proposal(proposal_id="p-same", tenant_id="t-001")
+
+        r1 = _make_result(
+            result_id="r-001",
+            tenant_id="t-001",
+            proposals=[p_foreign],
+        )
+        r2 = _make_result(
+            result_id="r-002",
+            tenant_id="t-001",
+            proposals=[p_local],
+        )
+        # Tamper p_foreign's tenant_id AFTER construction so the result
+        # was buildable, but merge will catch the foreign proposal.
+        object.__setattr__(p_foreign, "tenant_id", "t-other")
+
+        merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
+
+        # p-same must not survive anywhere — Fail-Closed
+        assert not any(p.proposal_id == "p-same" for p in merged.merged_proposals)
+        for result in merged.results:
+            assert not any(p.proposal_id == "p-same" for p in result.action_proposals)
+
+    def test_excluded_proposal_id_absent_from_all_merged_views(self):
+        """End-to-end: an excluded proposal_id must not appear in
+        merged_proposals, results[*].action_proposals, or any nested
+        structure reachable from MergedState."""
+        p1 = _make_proposal(proposal_id="p-dup", payload={"v": 1})
+        p2 = _make_proposal(proposal_id="p-dup", payload={"v": 2})
+        r1 = _make_result(result_id="r-001", proposals=[p1])
+        r2 = _make_result(result_id="r-002", proposals=[p2])
+
+        merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
+
+        # p-dup had content_mismatch → excluded
+        assert not any(p.proposal_id == "p-dup" for p in merged.merged_proposals)
+        for result in merged.results:
+            assert not any(p.proposal_id == "p-dup" for p in result.action_proposals)
+
+
+# ============================================================================
+# R9: Conflicting Result's children must not survive
+# ============================================================================
+
+
+class TestConflictingResultChildrenExcluded:
+    """When a Result is excluded due to content_mismatch, its Evidence
+    and Proposals must NOT participate in the merge."""
+
+    def test_conflicting_result_proposals_are_excluded(self):
+        """Two results with same result_id but different content:
+        both are excluded, and their proposals must not appear in
+        merged_proposals."""
+        p_a = _make_proposal(proposal_id="p-from-a")
+        p_b = _make_proposal(proposal_id="p-from-b")
+        r1 = _make_result(
+            result_id="r-conflict",
+            proposals=[p_a],
+            confidence=0.9,
+        )
+        r2 = _make_result(
+            result_id="r-conflict",
+            proposals=[p_b],
+            confidence=0.5,
+        )
+
+        merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
+
+        # Results excluded
+        assert len(merged.results) == 0
+        assert any(
+            c.conflict_type == "content_mismatch" and "r-conflict" in c.conflicting_ids
+            for c in merged.conflicts
+        )
+        # Proposals from the conflicting results must NOT survive
+        proposal_ids = {p.proposal_id for p in merged.merged_proposals}
+        assert "p-from-a" not in proposal_ids
+        assert "p-from-b" not in proposal_ids
+
+    def test_conflicting_result_evidence_is_excluded(self):
+        """Two results with same result_id but different content:
+        their evidence must not appear in merged_evidence."""
+        ev_a = _make_evidence(evidence_id="ev-from-a")
+        ev_b = _make_evidence(evidence_id="ev-from-b")
+        r1 = _make_result(
+            result_id="r-conflict",
+            evidence=[ev_a],
+            confidence=0.9,
+        )
+        r2 = _make_result(
+            result_id="r-conflict",
+            evidence=[ev_b],
+            confidence=0.5,
+        )
+
+        merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
+
+        assert len(merged.results) == 0
+        evidence_ids = {e.evidence_id for e in merged.merged_evidence}
+        assert "ev-from-a" not in evidence_ids
+        assert "ev-from-b" not in evidence_ids
+
+    def test_conflicting_result_children_unreachable_from_merged_state(self):
+        """End-to-end: conflicting result's children must not be reachable
+        from any path in MergedState."""
+        ev = _make_evidence(evidence_id="ev-orphan")
+        p = _make_proposal(
+            proposal_id="p-orphan",
+            evidence_ids=["ev-orphan"],
+            risk_level=ActionRiskLevel.HIGH,
+        )
+        r1 = _make_result(
+            result_id="r-conflict",
+            evidence=[ev],
+            proposals=[p],
+            confidence=0.9,
+        )
+        r2 = _make_result(
+            result_id="r-conflict",
+            confidence=0.5,
+        )
+
+        merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
+
+        # Nothing from r1 should survive
+        assert len(merged.results) == 0
+        assert len(merged.merged_evidence) == 0
+        assert len(merged.merged_proposals) == 0
+
+    def test_duplicate_identical_result_children_merged_once(self):
+        """Two identical results (same id + same content): result is
+        deduped to 1, and its children are merged once (not duplicated)."""
+        ev = _make_evidence(evidence_id="ev-shared")
+        p = _make_proposal(proposal_id="p-shared")
+        r1 = _make_result(
+            result_id="r-dup",
+            evidence=[ev],
+            proposals=[p],
+        )
+        r2 = _make_result(
+            result_id="r-dup",
+            evidence=[ev],
+            proposals=[p],
+        )
+
+        merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
+
+        # Result deduped to 1
+        assert len(merged.results) == 1
+        # Evidence merged once (not duplicated)
+        assert len(merged.merged_evidence) == 1
+        assert merged.merged_evidence[0].evidence_id == "ev-shared"
+        # Proposal merged once
+        assert len(merged.merged_proposals) == 1
+        assert merged.merged_proposals[0].proposal_id == "p-shared"

@@ -1,15 +1,26 @@
 """Parallel agent result merge.
 
 Two-phase merge: group by ID, compare content hashes.
-Same ID + single content hash → keep one.
-Same ID + multiple content hashes → ALL excluded (content_mismatch).
+Same ID + single content hash -> keep one.
+Same ID + multiple content hashes -> ALL excluded (content_mismatch).
 No first/last preference.
 
-Invalid proposals (integrity failure, content mismatch, foreign tenant,
-missing evidence) are tracked in a single ``excluded_proposal_ids`` set
-and removed from BOTH ``merged_proposals`` AND every
-``results[*].action_proposals`` so that no executable path can reach a
-known-bad proposal.
+Processing order (R9):
+
+1. Filter foreign-tenant results.
+2. Group by result_id; resolve result dedup / content_mismatch.
+3. Collect Evidence and ActionProposal ONLY from surviving results.
+4. Resolve evidence dedup / content_mismatch.
+5. Resolve proposal integrity, content_mismatch, foreign tenant.
+6. Verify evidence references; exclude dangling proposals.
+7. Filter merged_proposals by excluded_proposal_ids (Fail-Closed).
+8. Scrub excluded proposals from results[*].action_proposals.
+9. Construct MergedState.
+
+``excluded_proposal_ids`` is a proposal-ID-level Fail-Closed set: if ANY
+copy of a proposal_id is judged invalid, ALL copies of that id are
+removed from both ``merged_proposals`` and every
+``results[*].action_proposals``.
 """
 
 from __future__ import annotations
@@ -68,30 +79,60 @@ def merge_parallel_results(
     sorted_results = sorted(results, key=lambda r: r.result_id)
     conflicts: list[MergeConflict] = []
     # Unified set of proposal IDs that must not survive into MergedState.
-    # Populated by every exclusion path and used to scrub results at the end.
+    # Populated by every exclusion path and used to scrub both
+    # merged_proposals and results[*].action_proposals at the end.
     excluded_proposal_ids: set[str] = set()
 
-    # -- Filter foreign tenants ----------------------------------------------
+    # ------------------------------------------------------------------
+    # Step 1: filter foreign-tenant results
+    # ------------------------------------------------------------------
     local_results: list[AgentResult] = []
     for r in sorted_results:
         if r.tenant_id != expected_tenant_id:
             conflicts.append(
                 MergeConflict(
                     conflict_type="foreign_tenant",
-                    detail=f"Result {r.result_id!r} tenant {r.tenant_id!r} != expected {expected_tenant_id!r}",
+                    detail=(
+                        f"Result {r.result_id!r} tenant {r.tenant_id!r}"
+                        f" != expected {expected_tenant_id!r}"
+                    ),
                     conflicting_ids=[r.result_id],
                 )
             )
         else:
             local_results.append(r)
 
-    # -- Phase 1: group by ID ------------------------------------------------
+    # ------------------------------------------------------------------
+    # Step 2: group by result_id and resolve dedup / content_mismatch
+    # ------------------------------------------------------------------
     result_groups: dict[str, list[AgentResult]] = defaultdict(list)
+    for r in local_results:
+        result_groups[r.result_id].append(r)
+
+    deduped_results: list[AgentResult] = []
+    for result_id, r_group in sorted(result_groups.items(), key=lambda x: x[0]):
+        r_hashes = {content_hash(r.model_dump(mode="json")) for r in r_group}
+        if len(r_hashes) == 1:
+            deduped_results.append(r_group[0])
+        else:
+            conflicts.append(
+                MergeConflict(
+                    conflict_type="content_mismatch",
+                    detail=(
+                        f"Result {result_id!r} has {len(r_hashes)} distinct"
+                        f" content hashes; all excluded"
+                    ),
+                    conflicting_ids=[result_id],
+                )
+            )
+
+    # ------------------------------------------------------------------
+    # Step 3: collect Evidence and Proposals ONLY from surviving results
+    # ------------------------------------------------------------------
     evidence_groups: dict[str, list[Evidence]] = defaultdict(list)
     proposal_groups: dict[str, list[ActionProposal]] = defaultdict(list)
 
-    for r in local_results:
-        result_groups[r.result_id].append(r)
+    for r in deduped_results:
         for ev in r.evidence:
             if ev.tenant_id == expected_tenant_id:
                 evidence_groups[ev.evidence_id].append(ev)
@@ -99,7 +140,11 @@ def merge_parallel_results(
                 conflicts.append(
                     MergeConflict(
                         conflict_type="foreign_tenant",
-                        detail=f"Evidence {ev.evidence_id!r} tenant {ev.tenant_id!r} != expected {expected_tenant_id!r}",
+                        detail=(
+                            f"Evidence {ev.evidence_id!r} tenant"
+                            f" {ev.tenant_id!r} != expected"
+                            f" {expected_tenant_id!r}"
+                        ),
                         conflicting_ids=[ev.evidence_id],
                     )
                 )
@@ -109,7 +154,11 @@ def merge_parallel_results(
                 conflicts.append(
                     MergeConflict(
                         conflict_type="foreign_tenant",
-                        detail=f"Proposal {p.proposal_id!r} tenant {p.tenant_id!r} != expected {expected_tenant_id!r}",
+                        detail=(
+                            f"Proposal {p.proposal_id!r} tenant"
+                            f" {p.tenant_id!r} != expected"
+                            f" {expected_tenant_id!r}"
+                        ),
                         conflicting_ids=[p.proposal_id],
                     )
                 )
@@ -126,28 +175,19 @@ def merge_parallel_results(
                 conflicts.append(
                     MergeConflict(
                         conflict_type="proposal_integrity_failure",
-                        detail=f"Proposal {p.proposal_id!r} failed integrity check; excluded",
+                        detail=(
+                            f"Proposal {p.proposal_id!r} failed integrity"
+                            f" check; excluded"
+                        ),
                         conflicting_ids=[p.proposal_id],
                     )
                 )
                 continue
             proposal_groups[p.proposal_id].append(p)
 
-    # -- Phase 2: resolve each group -----------------------------------------
-    deduped_results: list[AgentResult] = []
-    for result_id, r_group in sorted(result_groups.items(), key=lambda x: x[0]):
-        r_hashes = {content_hash(r.model_dump(mode="json")) for r in r_group}
-        if len(r_hashes) == 1:
-            deduped_results.append(r_group[0])
-        else:
-            conflicts.append(
-                MergeConflict(
-                    conflict_type="content_mismatch",
-                    detail=f"Result {result_id!r} has {len(r_hashes)} distinct content hashes; all excluded",
-                    conflicting_ids=[result_id],
-                )
-            )
-
+    # ------------------------------------------------------------------
+    # Step 4: resolve evidence dedup / content_mismatch
+    # ------------------------------------------------------------------
     merged_evidence: list[Evidence] = []
     for ev_id, ev_group in sorted(evidence_groups.items(), key=lambda x: x[0]):
         ev_hashes = {content_hash(ev.model_dump(mode="json")) for ev in ev_group}
@@ -157,11 +197,17 @@ def merge_parallel_results(
             conflicts.append(
                 MergeConflict(
                     conflict_type="content_mismatch",
-                    detail=f"Evidence {ev_id!r} has {len(ev_hashes)} distinct content hashes; all excluded",
+                    detail=(
+                        f"Evidence {ev_id!r} has {len(ev_hashes)} distinct"
+                        f" content hashes; all excluded"
+                    ),
                     conflicting_ids=[ev_id],
                 )
             )
 
+    # ------------------------------------------------------------------
+    # Step 5: resolve proposal dedup / content_mismatch
+    # ------------------------------------------------------------------
     merged_proposals: list[ActionProposal] = []
     seen_hashes: set[str] = set()
     for prop_id, p_group in sorted(proposal_groups.items(), key=lambda x: x[0]):
@@ -176,19 +222,19 @@ def merge_parallel_results(
             conflicts.append(
                 MergeConflict(
                     conflict_type="content_mismatch",
-                    detail=f"Proposal {prop_id!r} has {len(p_hashes)} distinct content hashes; all excluded",
+                    detail=(
+                        f"Proposal {prop_id!r} has {len(p_hashes)} distinct"
+                        f" content hashes; all excluded"
+                    ),
                     conflicting_ids=[prop_id],
                 )
             )
 
-    # -- Evidence reference integrity ----------------------------------------
-    # Proposals that reference evidence IDs which are not present in the
-    # final merged_evidence set (e.g. because the evidence was excluded by
-    # a content_mismatch conflict) must also be excluded.  This runs after
-    # all evidence and proposal conflict resolution so that the available
-    # evidence set reflects the surviving objects only.
+    # ------------------------------------------------------------------
+    # Step 6: verify evidence references — exclude dangling proposals
+    # ------------------------------------------------------------------
     available_evidence_ids = {ev.evidence_id for ev in merged_evidence}
-    final_proposals: list[ActionProposal] = []
+    ref_checked_proposals: list[ActionProposal] = []
     for p in merged_proposals:
         missing = sorted(set(p.evidence_ids) - available_evidence_ids)
         if missing:
@@ -197,21 +243,26 @@ def merge_parallel_results(
                 MergeConflict(
                     conflict_type="proposal_missing_evidence",
                     detail=(
-                        f"Proposal {p.proposal_id!r} references "
-                        f"missing evidence {missing!r}"
+                        f"Proposal {p.proposal_id!r} references"
+                        f" missing evidence {missing!r}"
                     ),
                     conflicting_ids=[p.proposal_id, *missing],
                 )
             )
             continue
-        final_proposals.append(p)
-    merged_proposals = final_proposals
+        ref_checked_proposals.append(p)
 
-    # -- Scrub excluded proposals from deduped_results ----------------------
-    # Invalid proposals must not be reachable from any executable path in
-    # MergedState.  We remove them from each surviving result's
-    # action_proposals using model_copy(update=...) which does NOT re-run
-    # validators, so the already-validated AgentResult stays intact.
+    # ------------------------------------------------------------------
+    # Step 7: Fail-Closed filter — any excluded proposal_id is removed
+    # from merged_proposals even if another copy passed earlier checks.
+    # ------------------------------------------------------------------
+    merged_proposals = [
+        p for p in ref_checked_proposals if p.proposal_id not in excluded_proposal_ids
+    ]
+
+    # ------------------------------------------------------------------
+    # Step 8: scrub excluded proposals from results[*].action_proposals
+    # ------------------------------------------------------------------
     if excluded_proposal_ids:
         cleaned_results: list[AgentResult] = []
         for r in deduped_results:
