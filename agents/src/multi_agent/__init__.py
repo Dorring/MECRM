@@ -1,4 +1,4 @@
-"""Multi-agent contracts, registry, state merge, and serialization."""
+"""Multi-agent contracts, registry, state merge, serialization, and planning."""
 
 from multi_agent.contracts import (
     ActionProposal,
@@ -58,7 +58,57 @@ from multi_agent.serialization import (
 )
 from multi_agent.state import MergeConflict, MergedState, merge_parallel_results
 
+# Phase 3 — planning
+from multi_agent.complexity_gate import (
+    DETERMINISTIC_EVENT_TYPES,
+    KAFKA_TOPIC_TO_EVENT_TYPE,
+    REASON_CONFLICTING_SIGNALS,
+    REASON_CROSS_DOMAIN_OBJECTIVE,
+    REASON_CUSTOMER_RECOVERY_TEMPLATE,
+    REASON_FIXED_EVENT_ALLOWLIST,
+    REASON_MULTIPLE_TASK_TYPES,
+    REASON_SINGLE_DOMAIN_SINGLE_TASK,
+    RuleBasedComplexityGate,
+)
+from multi_agent.planning import (
+    PLANNER_VERSION,
+    PlanDraft,
+    PlanValidationIssue,
+    PlanValidationReport,
+    PlannedTask,
+    PlanningRequest,
+    PlanningSignals,
+    TaskIntent,
+    compute_plan_hash,
+    compute_request_hash,
+)
+from multi_agent.planning_errors import (
+    AmbiguousAgentSelectionError,
+    BudgetExceededPlanningError,
+    InsufficientContextError,
+    PlanCycleError,
+    PlanIntegrityError,
+    PlanValidationError,
+    PlanningError,
+    PlanningInputError,
+    RegistryVersionMismatchError,
+    UnsupportedCapabilityError,
+)
+from multi_agent.planning_templates import (
+    CUSTOMER_RECOVERY_DOMAIN,
+    DEFAULT_CUSTOMER_RECOVERY_TEMPLATE,
+    CustomerRecoveryTemplate,
+    INTENT_CUSTOMER_CONTEXT,
+    INTENT_KNOWLEDGE_RECOMMENDATION,
+    INTENT_RECOVERY_METRICS,
+    INTENT_SALES_RISK_ANALYSIS,
+    INTENT_SUPPORT_ANALYSIS,
+)
+from multi_agent.plan_validator import PlanValidator
+from multi_agent.planner import DeterministicPlanner
+
 __all__ = [
+    # Phase 2
     "ActionProposal",
     "ActionRiskLevel",
     "AgentAuthority",
@@ -110,4 +160,48 @@ __all__ = [
     "serialize_set_for_json",
     "stable_hash",
     "validate_strict_json",
+    # Phase 3 — Complexity Gate
+    "DETERMINISTIC_EVENT_TYPES",
+    "KAFKA_TOPIC_TO_EVENT_TYPE",
+    "REASON_CONFLICTING_SIGNALS",
+    "REASON_CROSS_DOMAIN_OBJECTIVE",
+    "REASON_CUSTOMER_RECOVERY_TEMPLATE",
+    "REASON_FIXED_EVENT_ALLOWLIST",
+    "REASON_MULTIPLE_TASK_TYPES",
+    "REASON_SINGLE_DOMAIN_SINGLE_TASK",
+    "RuleBasedComplexityGate",
+    # Phase 3 — Planning
+    "PLANNER_VERSION",
+    "PlanDraft",
+    "PlanValidationIssue",
+    "PlanValidationReport",
+    "PlannedTask",
+    "PlanningRequest",
+    "PlanningSignals",
+    "TaskIntent",
+    "compute_plan_hash",
+    "compute_request_hash",
+    # Phase 3 — Errors
+    "AmbiguousAgentSelectionError",
+    "BudgetExceededPlanningError",
+    "InsufficientContextError",
+    "PlanCycleError",
+    "PlanIntegrityError",
+    "PlanValidationError",
+    "PlanningError",
+    "PlanningInputError",
+    "RegistryVersionMismatchError",
+    "UnsupportedCapabilityError",
+    # Phase 3 — Templates
+    "CUSTOMER_RECOVERY_DOMAIN",
+    "DEFAULT_CUSTOMER_RECOVERY_TEMPLATE",
+    "CustomerRecoveryTemplate",
+    "INTENT_CUSTOMER_CONTEXT",
+    "INTENT_KNOWLEDGE_RECOMMENDATION",
+    "INTENT_RECOVERY_METRICS",
+    "INTENT_SALES_RISK_ANALYSIS",
+    "INTENT_SUPPORT_ANALYSIS",
+    # Phase 3 — Validator & Planner
+    "PlanValidator",
+    "DeterministicPlanner",
 ]
