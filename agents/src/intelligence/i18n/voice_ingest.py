@@ -120,9 +120,7 @@ class WhisperSTT:
         model: str = "whisper",
         timeout: float = 30.0,
     ):
-        self._whisper_url = whisper_url or os.environ.get(
-            "WHISPER_URL", ""
-        )
+        self._whisper_url = whisper_url or os.environ.get("WHISPER_URL", "")
         if not self._whisper_url:
             raise RuntimeError(
                 "WHISPER_URL must be set when AI_MODE=live "
@@ -130,7 +128,7 @@ class WhisperSTT:
             )
         self._model = model
         self._timeout = timeout
-    
+
     async def transcribe(
         self,
         audio_bytes: bytes,
@@ -161,18 +159,22 @@ class WhisperSTT:
                 error="Empty audio input",
                 error_code="voice_transcription_failed",
             )
-        
+
         try:
             # Try Ollama-style API first
-            result = await self._transcribe_ollama(audio_bytes, audio_format, language_hint)
+            result = await self._transcribe_ollama(
+                audio_bytes, audio_format, language_hint
+            )
             if result.success:
                 return result
 
             # Fallback to OpenAI Whisper API style
-            result = await self._transcribe_openai_style(audio_bytes, audio_format, language_hint)
+            result = await self._transcribe_openai_style(
+                audio_bytes, audio_format, language_hint
+            )
             return result
 
-        except Exception as e:
+        except Exception:
             logger.exception("Transcription failed")
             return TranscriptResult(
                 text="",
@@ -184,7 +186,7 @@ class WhisperSTT:
                 error="Transcription service error",
                 error_code="voice_transcription_failed",
             )
-    
+
     async def _transcribe_ollama(
         self,
         audio_bytes: bytes,
@@ -193,15 +195,15 @@ class WhisperSTT:
     ) -> TranscriptResult:
         """Transcribe using Ollama multimodal endpoint."""
         start_time = time.time()
-        
+
         try:
             # Encode audio as base64 for Ollama
             audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-            
+
             prompt = "Transcribe this audio exactly as spoken. Return only the transcription, no additional text."
             if language_hint:
                 prompt = f"Transcribe this audio in {language_hint}. Return only the transcription, no additional text."
-            
+
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 response = await client.post(
                     f"{self._whisper_url}/api/generate",
@@ -212,7 +214,7 @@ class WhisperSTT:
                         "stream": False,
                     },
                 )
-                
+
                 if response.status_code != 200:
                     return TranscriptResult(
                         text="",
@@ -224,10 +226,10 @@ class WhisperSTT:
                         error="Transcription service error",
                         error_code="voice_transcription_failed",
                     )
-                
+
                 data = response.json()
                 text = data.get("response", "").strip()
-                
+
                 return TranscriptResult(
                     text=text,
                     language=language_hint,
@@ -236,7 +238,7 @@ class WhisperSTT:
                     processing_time_ms=(time.time() - start_time) * 1000,
                     model_used=self._model,
                 )
-                
+
         except Exception:
             logger.exception("Ollama transcription failed")
             return TranscriptResult(
@@ -249,7 +251,7 @@ class WhisperSTT:
                 error="Transcription service error",
                 error_code="voice_transcription_failed",
             )
-    
+
     async def _transcribe_openai_style(
         self,
         audio_bytes: bytes,
@@ -258,27 +260,35 @@ class WhisperSTT:
     ) -> TranscriptResult:
         """Transcribe using OpenAI Whisper API style endpoint."""
         start_time = time.time()
-        
+
         try:
             # Write to temp file for multipart upload
-            with tempfile.NamedTemporaryFile(suffix=f".{audio_format}", delete=False) as f:
+            with tempfile.NamedTemporaryFile(
+                suffix=f".{audio_format}", delete=False
+            ) as f:
                 f.write(audio_bytes)
                 temp_path = f.name
-            
+
             try:
                 async with httpx.AsyncClient(timeout=self._timeout) as client:
                     with open(temp_path, "rb") as audio_file:
-                        files = {"file": (f"audio.{audio_format}", audio_file, f"audio/{audio_format}")}
+                        files = {
+                            "file": (
+                                f"audio.{audio_format}",
+                                audio_file,
+                                f"audio/{audio_format}",
+                            )
+                        }
                         data = {"model": "whisper-1"}
                         if language_hint:
                             data["language"] = language_hint
-                        
+
                         response = await client.post(
                             f"{self._whisper_url}/v1/audio/transcriptions",
                             files=files,
                             data=data,
                         )
-                        
+
                         if response.status_code != 200:
                             return TranscriptResult(
                                 text="",
@@ -290,15 +300,17 @@ class WhisperSTT:
                                 error="Transcription service error",
                                 error_code="voice_transcription_failed",
                             )
-                        
+
                         result = response.json()
                         text = result.get("text", "").strip()
-                        
+
                         return TranscriptResult(
                             text=text,
                             language=result.get("language", language_hint),
                             confidence=0.9 if text else 0.0,
-                            duration_seconds=result.get("duration", len(audio_bytes) / 16000 / 2),
+                            duration_seconds=result.get(
+                                "duration", len(audio_bytes) / 16000 / 2
+                            ),
                             processing_time_ms=(time.time() - start_time) * 1000,
                             model_used="whisper-1",
                         )
@@ -308,7 +320,7 @@ class WhisperSTT:
                     os.unlink(temp_path)
                 except Exception:
                     pass
-                    
+
         except Exception:
             logger.exception("OpenAI-style transcription failed")
             return TranscriptResult(
@@ -324,9 +336,7 @@ class WhisperSTT:
 
 
 # Default STT instance (AI_MODE-aware)
-_default_stt: WhisperSTT | DisabledWhisperSTT | DeterministicWhisperSTT | None = (
-    None
-)
+_default_stt: WhisperSTT | DisabledWhisperSTT | DeterministicWhisperSTT | None = None
 
 
 def get_stt() -> WhisperSTT | DisabledWhisperSTT | DeterministicWhisperSTT:
@@ -373,4 +383,6 @@ async def transcribe_audio(
             error_code="voice_transcription_failed",
         )
     stt = get_stt()
-    return await stt.transcribe(audio_bytes, audio_format=audio_format, language_hint=language_hint)
+    return await stt.transcribe(
+        audio_bytes, audio_format=audio_format, language_hint=language_hint
+    )

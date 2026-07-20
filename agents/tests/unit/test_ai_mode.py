@@ -7,9 +7,7 @@ Network isolation tests use Mock HTTP Client — cross-platform, no skip needed.
 
 from __future__ import annotations
 
-import io
 import os
-from unittest import mock
 
 import pytest
 
@@ -49,6 +47,7 @@ class TestAIModeResolution:
         _set_env(AI_MODE="disabled")
         try:
             from orchestrator.ai_mode import resolve_ai_mode, AIMode
+
             assert resolve_ai_mode() is AIMode.DISABLED
         finally:
             _del_env("AI_MODE")
@@ -57,6 +56,7 @@ class TestAIModeResolution:
         _set_env(AI_MODE="deterministic")
         try:
             from orchestrator.ai_mode import resolve_ai_mode, AIMode
+
             assert resolve_ai_mode() is AIMode.DETERMINISTIC
         finally:
             _del_env("AI_MODE")
@@ -65,6 +65,7 @@ class TestAIModeResolution:
         _set_env(AI_MODE="live")
         try:
             from orchestrator.ai_mode import resolve_ai_mode, AIMode
+
             assert resolve_ai_mode() is AIMode.LIVE
         finally:
             _del_env("AI_MODE")
@@ -72,12 +73,14 @@ class TestAIModeResolution:
     def test_default_is_deterministic_when_unset(self):
         _del_env("AI_MODE")
         from orchestrator.ai_mode import resolve_ai_mode, AIMode
+
         assert resolve_ai_mode() is AIMode.DETERMINISTIC
 
     def test_empty_string_defaults_to_deterministic(self):
         _set_env(AI_MODE="")
         try:
             from orchestrator.ai_mode import resolve_ai_mode, AIMode
+
             assert resolve_ai_mode() is AIMode.DETERMINISTIC
         finally:
             _del_env("AI_MODE")
@@ -87,6 +90,7 @@ class TestAIModeResolution:
         _set_env(AI_MODE="garbage")
         try:
             from orchestrator.ai_mode import resolve_ai_mode, AIConfigurationError
+
             with pytest.raises(AIConfigurationError, match="AI_MODE"):
                 resolve_ai_mode()
         finally:
@@ -96,7 +100,13 @@ class TestAIModeResolution:
         """AI_MODE=live without AI_PROVIDER → AIConfigurationError."""
         _set_env(AI_MODE="live", AI_PROVIDER="")
         try:
-            from orchestrator.ai_mode import resolve_ai_provider, resolve_ai_mode, AIMode, AIConfigurationError
+            from orchestrator.ai_mode import (
+                resolve_ai_provider,
+                resolve_ai_mode,
+                AIMode,
+                AIConfigurationError,
+            )
+
             mode = resolve_ai_mode()
             assert mode is AIMode.LIVE
             with pytest.raises(AIConfigurationError, match="live requires AI_PROVIDER"):
@@ -108,7 +118,12 @@ class TestAIModeResolution:
         """Invalid non-empty AI_PROVIDER in live mode → AIConfigurationError."""
         _set_env(AI_MODE="live", AI_PROVIDER="garbage_provider")
         try:
-            from orchestrator.ai_mode import resolve_ai_provider, resolve_ai_mode, AIMode, AIConfigurationError
+            from orchestrator.ai_mode import (
+                resolve_ai_provider,
+                resolve_ai_mode,
+                AIConfigurationError,
+            )
+
             mode = resolve_ai_mode()
             with pytest.raises(AIConfigurationError, match="AI_PROVIDER"):
                 resolve_ai_provider(mode)
@@ -119,7 +134,12 @@ class TestAIModeResolution:
         """AI_MODE=live + AI_PROVIDER=ollama → OLLAMA provider."""
         _set_env(AI_MODE="live", AI_PROVIDER="ollama")
         try:
-            from orchestrator.ai_mode import resolve_ai_provider, resolve_ai_mode, AIMode, AIProvider
+            from orchestrator.ai_mode import (
+                resolve_ai_provider,
+                resolve_ai_mode,
+                AIProvider,
+            )
+
             mode = resolve_ai_mode()
             p = resolve_ai_provider(mode)
             assert p is AIProvider.OLLAMA
@@ -130,7 +150,12 @@ class TestAIModeResolution:
         """AI_MODE=live + AI_PROVIDER=nvidia_nim → NVIDIA_NIM provider."""
         _set_env(AI_MODE="live", AI_PROVIDER="nvidia_nim")
         try:
-            from orchestrator.ai_mode import resolve_ai_provider, resolve_ai_mode, AIMode, AIProvider
+            from orchestrator.ai_mode import (
+                resolve_ai_provider,
+                resolve_ai_mode,
+                AIProvider,
+            )
+
             mode = resolve_ai_mode()
             p = resolve_ai_provider(mode)
             assert p is AIProvider.NVIDIA_NIM
@@ -142,9 +167,11 @@ class TestAIModeResolution:
         env_file = tmp_path / ".env"
         env_file.write_text("AI_MODE=disabled\nAI_PROVIDER=\n")
         import dotenv
+
         dotenv.load_dotenv(env_file)
         try:
             from orchestrator.ai_mode import resolve_ai_mode, AIMode
+
             assert resolve_ai_mode() is AIMode.DISABLED
         finally:
             _del_env("AI_MODE", "AI_PROVIDER")
@@ -162,6 +189,7 @@ class TestProviderFactory:
         _set_env(AI_MODE="disabled")
         try:
             from intelligence.providers import create_chat_model, DisabledChatProvider
+
             provider = create_chat_model(temperature=0)
             assert isinstance(provider, DisabledChatProvider)
         finally:
@@ -170,7 +198,11 @@ class TestProviderFactory:
     def test_disabled_returns_disabled_embeddings_provider(self):
         _set_env(AI_MODE="disabled")
         try:
-            from intelligence.providers import create_embeddings, DisabledEmbeddingsProvider
+            from intelligence.providers import (
+                create_embeddings,
+                DisabledEmbeddingsProvider,
+            )
+
             provider = create_embeddings()
             assert isinstance(provider, DisabledEmbeddingsProvider)
         finally:
@@ -181,6 +213,7 @@ class TestProviderFactory:
         try:
             from intelligence.providers import create_chat_model
             from intelligence.deterministic_provider import DeterministicChatProvider
+
             provider = create_chat_model(temperature=0)
             assert isinstance(provider, DeterministicChatProvider)
         finally:
@@ -190,7 +223,10 @@ class TestProviderFactory:
         _set_env(AI_MODE="deterministic")
         try:
             from intelligence.providers import create_embeddings
-            from intelligence.deterministic_provider import DeterministicEmbeddingsProvider
+            from intelligence.deterministic_provider import (
+                DeterministicEmbeddingsProvider,
+            )
+
             provider = create_embeddings()
             assert isinstance(provider, DeterministicEmbeddingsProvider)
         finally:
@@ -201,6 +237,7 @@ class TestProviderFactory:
         try:
             from intelligence.providers import create_chat_model
             from orchestrator.ai_mode import AIConfigurationError
+
             with pytest.raises(AIConfigurationError):
                 create_chat_model(temperature=0)
         finally:
@@ -211,6 +248,7 @@ class TestProviderFactory:
         try:
             from intelligence.providers import create_chat_model
             from orchestrator.ai_mode import AIConfigurationError
+
             with pytest.raises(AIConfigurationError):
                 create_chat_model(temperature=0)
         finally:
@@ -221,6 +259,7 @@ class TestProviderFactory:
         try:
             from intelligence.providers import create_chat_model
             from intelligence.deterministic_provider import DeterministicChatProvider
+
             provider = create_chat_model(temperature=0)
             assert isinstance(provider, DeterministicChatProvider)
         finally:
@@ -238,6 +277,7 @@ class TestNetworkIsolation:
     @pytest.mark.asyncio
     async def test_disabled_chat_does_not_make_http_call(self, monkeypatch):
         import httpx
+
         calls: list[str] = []
 
         async def _tracking_get(url, **kwargs):
@@ -253,6 +293,7 @@ class TestNetworkIsolation:
         _set_env(AI_MODE="disabled")
         try:
             from intelligence.providers import create_chat_model, DisabledChatProvider
+
             provider = create_chat_model(temperature=0)
             assert isinstance(provider, DisabledChatProvider)
             # No HTTP calls should have been made
@@ -263,6 +304,7 @@ class TestNetworkIsolation:
     @pytest.mark.asyncio
     async def test_deterministic_chat_does_not_make_http_call(self, monkeypatch):
         import httpx
+
         calls: list[str] = []
 
         async def _tracking_get(url, **kwargs):
@@ -277,6 +319,7 @@ class TestNetworkIsolation:
         try:
             from intelligence.providers import create_chat_model
             from intelligence.deterministic_provider import DeterministicChatProvider
+
             provider = create_chat_model(temperature=0)
             assert isinstance(provider, DeterministicChatProvider)
             assert len(calls) == 0, f"Expected 0 HTTP calls, got {len(calls)}: {calls}"
@@ -286,6 +329,7 @@ class TestNetworkIsolation:
     @pytest.mark.asyncio
     async def test_default_config_does_not_make_http_call(self, monkeypatch):
         import httpx
+
         calls: list[str] = []
 
         async def _tracking_get(url, **kwargs):
@@ -299,6 +343,7 @@ class TestNetworkIsolation:
         _del_env("AI_MODE", "AI_PROVIDER")
         try:
             from intelligence.providers import create_chat_model
+
             create_chat_model(temperature=0)
             assert len(calls) == 0, f"Expected 0 HTTP calls, got {len(calls)}: {calls}"
         finally:
@@ -316,6 +361,7 @@ class TestVoiceIsolation:
     @pytest.mark.asyncio
     async def test_voice_disabled_no_network(self, monkeypatch):
         import httpx
+
         calls: list[str] = []
 
         async def _tracking_get(url, **kwargs):
@@ -330,9 +376,11 @@ class TestVoiceIsolation:
         try:
             # Reset the cached STT instance
             import intelligence.i18n.voice_ingest as vi
+
             vi._default_stt = None
 
             from intelligence.i18n.voice_ingest import DisabledWhisperSTT, get_stt
+
             stt = get_stt()
             assert isinstance(stt, DisabledWhisperSTT)
             result = await stt.transcribe(b"fake audio", audio_format="webm")
@@ -345,6 +393,7 @@ class TestVoiceIsolation:
     @pytest.mark.asyncio
     async def test_voice_deterministic_no_network(self, monkeypatch):
         import httpx
+
         calls: list[str] = []
 
         async def _tracking_get(url, **kwargs):
@@ -359,14 +408,19 @@ class TestVoiceIsolation:
         try:
             # Reset the cached STT instance
             import intelligence.i18n.voice_ingest as vi
+
             vi._default_stt = None
 
             from intelligence.i18n.voice_ingest import DeterministicWhisperSTT, get_stt
+
             stt = get_stt()
             assert isinstance(stt, DeterministicWhisperSTT)
             result = await stt.transcribe(b"fake audio", audio_format="webm")
             assert result.success
-            assert "deterministic" in result.text.lower() or "testing" in result.text.lower()
+            assert (
+                "deterministic" in result.text.lower()
+                or "testing" in result.text.lower()
+            )
             assert len(calls) == 0, f"Expected 0 HTTP calls, got {len(calls)}: {calls}"
         finally:
             _del_env("AI_MODE")
@@ -620,6 +674,7 @@ class TestProviderHealthCheck:
         _set_env(AI_MODE="disabled")
         try:
             from intelligence.providers import provider_health_check
+
             result = await provider_health_check()
             assert result["status"] == "ready"
             assert result["chat_model"] == "disabled"
@@ -634,6 +689,7 @@ class TestProviderHealthCheck:
         _set_env(AI_MODE="deterministic")
         try:
             from intelligence.providers import provider_health_check
+
             result = await provider_health_check()
             assert result["status"] == "ready"
             assert result["checks"]["chat_model"] == "available"
@@ -650,6 +706,7 @@ class TestProviderHealthCheck:
         _set_env(AI_MODE="live", AI_PROVIDER="")
         try:
             from intelligence.providers import provider_health_check
+
             result = await provider_health_check()
             assert result["status"] == "unavailable"
             assert "error" in result
@@ -662,6 +719,7 @@ class TestProviderHealthCheck:
         _set_env(AI_MODE="live", AI_PROVIDER="")
         try:
             from intelligence.providers import provider_health_check
+
             result = await provider_health_check()
             assert result["status"] == "unavailable"
         finally:
@@ -669,54 +727,93 @@ class TestProviderHealthCheck:
 
     @pytest.mark.asyncio
     async def test_health_check_does_not_leak_api_key(self):
-        _set_env(AI_MODE="live", AI_PROVIDER="nvidia_nim",
-                  NVIDIA_API_KEY="sk-1234567890",
-                  NVIDIA_CHAT_MODEL="meta/llama3-70b",
-                  NVIDIA_EMBED_MODEL="nvidia/nv-embedqa")
+        _set_env(
+            AI_MODE="live",
+            AI_PROVIDER="nvidia_nim",
+            NVIDIA_API_KEY="sk-1234567890",
+            NVIDIA_CHAT_MODEL="meta/llama3-70b",
+            NVIDIA_EMBED_MODEL="nvidia/nv-embedqa",
+        )
         try:
             from intelligence.providers import provider_health_check
+
             result = await provider_health_check()
             result_str = str(result)
             assert "sk-1234567890" not in result_str
         finally:
-            _del_env("AI_MODE", "AI_PROVIDER", "NVIDIA_API_KEY",
-                     "NVIDIA_CHAT_MODEL", "NVIDIA_EMBED_MODEL")
+            _del_env(
+                "AI_MODE",
+                "AI_PROVIDER",
+                "NVIDIA_API_KEY",
+                "NVIDIA_CHAT_MODEL",
+                "NVIDIA_EMBED_MODEL",
+            )
 
-    @pytest.mark.asyncio
-    async def test_nim_unauthorized_is_not_ready(self, monkeypatch):
-        """NIM 401/403 → degraded status. Also test no secrets leak."""
-        import httpx
+    def test_nim_unauthorized_is_not_ready(self):
+        """NIM 401/403 → degraded status. Subprocess for isolation."""
+        import json
+        import subprocess
 
-        async def _mock_get(self_arg, url, **kwargs):
-            headers = kwargs.get("headers", {})
-            auth = headers.get("Authorization", "")
-            if "Bearer sk-test" in auth:
-                return httpx.Response(401)
-            return httpx.Response(200)
-
-        monkeypatch.setattr(httpx.AsyncClient, "get", _mock_get)
-        _set_env(AI_MODE="live", AI_PROVIDER="nvidia_nim",
-                  NVIDIA_API_KEY="sk-test",
-                  NVIDIA_CHAT_MODEL="meta/llama3-70b",
-                  NVIDIA_EMBED_MODEL="nvidia/nv-embedqa")
-        try:
-            from intelligence.providers import provider_health_check
-            result = await provider_health_check()
-            # With valid config but 401 from API → degraded
-            assert result["status"] == "degraded"
-            # The nvidia_endpoint check should show auth_failed
-            endpoint = result["checks"].get("nvidia_endpoint", "")
-            assert "auth_failed" in endpoint or result["checks"].get("nvidia_config") != "valid"
-            # No API key leak
-            result_str = str(result)
-            assert "sk-test" not in result_str
-        finally:
-            _del_env("AI_MODE", "AI_PROVIDER", "NVIDIA_API_KEY",
-                     "NVIDIA_CHAT_MODEL", "NVIDIA_EMBED_MODEL")
+        script = (
+            "import asyncio, json, threading, time, os\n"
+            "from http.server import HTTPServer, BaseHTTPRequestHandler\n"
+            "call_count = 0\n"
+            "class H(BaseHTTPRequestHandler):\n"
+            "    def do_GET(self):\n"
+            "        global call_count\n"
+            "        call_count += 1\n"
+            "        self.send_response(401)\n"
+            "        self.end_headers()\n"
+            "    def do_POST(self):\n"
+            "        global call_count\n"
+            "        call_count += 1\n"
+            "        self.send_response(200)\n"
+            "        self.end_headers()\n"
+            "        self.wfile.write(b'{}')\n"
+            "    def log_message(self, *a): pass\n"
+            "srv = HTTPServer(('127.0.0.1', 0), H)\n"
+            "port = srv.server_address[1]\n"
+            "os.environ['NVIDIA_BASE_URL'] = f'http://127.0.0.1:{port}/v1'\n"
+            "t = threading.Thread(target=srv.serve_forever, daemon=True)\n"
+            "t.start()\n"
+            "time.sleep(0.1)\n"
+            "from intelligence.providers import provider_health_check\n"
+            "result = asyncio.run(provider_health_check())\n"
+            "srv.shutdown()\n"
+            "print(json.dumps({'status': result['status'], "
+            "'endpoint': result['checks'].get('nvidia_endpoint', ''), "
+            "'api_key_leaked': 'sk-test' in str(result)}))\n"
+        )
+        src_dir = str(SRC)
+        env = os.environ.copy()
+        env["PYTHONPATH"] = src_dir
+        env.update(
+            {
+                "AI_MODE": "live",
+                "AI_PROVIDER": "nvidia_nim",
+                "NVIDIA_API_KEY": "sk-test",
+                "NVIDIA_CHAT_MODEL": "meta/llama3-70b",
+                "NVIDIA_EMBED_MODEL": "nvidia/nv-embedqa",
+            }
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+            cwd=src_dir,
+        )
+        assert result.returncode == 0, f"Subprocess failed: {result.stderr}"
+        data = json.loads(result.stdout.strip())
+        assert data["status"] == "degraded"
+        assert "auth_failed" in data["endpoint"]
+        assert data["api_key_leaked"] is False
 
     @pytest.mark.asyncio
     async def test_disabled_does_not_probe_ollama(self, monkeypatch):
         import httpx
+
         calls: list[str] = []
 
         async def _tracking_get(url, **kwargs):
@@ -730,8 +827,11 @@ class TestProviderHealthCheck:
         _set_env(AI_MODE="disabled", AI_PROVIDER="ollama")
         try:
             from intelligence.providers import provider_health_check
+
             await provider_health_check()
-            assert len(calls) == 0, f"Expected 0 HTTP calls in disabled mode, got {len(calls)}: {calls}"
+            assert len(calls) == 0, (
+                f"Expected 0 HTTP calls in disabled mode, got {len(calls)}: {calls}"
+            )
         finally:
             _del_env("AI_MODE", "AI_PROVIDER")
 
@@ -749,6 +849,7 @@ class TestEmbeddingCollectionIsolation:
         _set_env(AI_MODE="deterministic")
         try:
             from intelligence.providers import vector_collection_name
+
             name = vector_collection_name("KnowledgeBase")
             assert name.startswith("KnowledgeBase_")
             assert "deterministic" in name.lower()
@@ -760,6 +861,7 @@ class TestEmbeddingCollectionIsolation:
         _set_env(AI_MODE="deterministic")
         try:
             from intelligence.providers import vector_collection_name
+
             name_det = vector_collection_name("TestBase")
             assert "deterministic" in name_det.lower()
         finally:
@@ -774,6 +876,7 @@ class TestEmbeddingCollectionIsolation:
         _set_env(AI_MODE="live", AI_PROVIDER="ollama")
         try:
             from intelligence.providers import vector_collection_name
+
             name = vector_collection_name("TestBase")
             # Name should contain base, provider, and a hash segment
             assert "TestBase" in name
@@ -788,6 +891,7 @@ class TestEmbeddingCollectionIsolation:
         _set_env(AI_MODE="disabled")
         try:
             from intelligence.providers import vector_collection_name
+
             name_disabled = vector_collection_name("TestBase")
         finally:
             _del_env("AI_MODE")
@@ -795,6 +899,7 @@ class TestEmbeddingCollectionIsolation:
         _set_env(AI_MODE="deterministic")
         try:
             from intelligence.providers import vector_collection_name
+
             name_det = vector_collection_name("TestBase")
         finally:
             _del_env("AI_MODE")
@@ -811,18 +916,23 @@ class TestEmbeddingModelIsolationSubprocess:
 
     def _run_collection_name(self, **env_vars) -> str:
         import subprocess
+
         src_dir = str(SRC)
         env = os.environ.copy()
         env["PYTHONPATH"] = src_dir
         env.update(env_vars)
         result = subprocess.run(
             [
-                sys.executable, "-c",
+                sys.executable,
+                "-c",
                 "from intelligence.providers import vector_collection_name; "
                 "print(vector_collection_name('KnowledgeBase'))",
             ],
-            capture_output=True, text=True, timeout=30,
-            env=env, cwd=src_dir,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+            cwd=src_dir,
         )
         err = result.stderr.strip()
         assert result.returncode == 0, (
@@ -833,11 +943,13 @@ class TestEmbeddingModelIsolationSubprocess:
     def test_ollama_embedding_model_change_changes_collection(self):
         """Switching OLLAMA_EMBED_MODEL changes the collection name."""
         name1 = self._run_collection_name(
-            AI_MODE="live", AI_PROVIDER="ollama",
+            AI_MODE="live",
+            AI_PROVIDER="ollama",
             OLLAMA_EMBED_MODEL="nomic-embed-text",
         )
         name2 = self._run_collection_name(
-            AI_MODE="live", AI_PROVIDER="ollama",
+            AI_MODE="live",
+            AI_PROVIDER="ollama",
             OLLAMA_EMBED_MODEL="all-minilm-l6-v2",
         )
         assert name1 != name2, (
@@ -849,13 +961,15 @@ class TestEmbeddingModelIsolationSubprocess:
     def test_nvidia_embedding_model_change_changes_collection(self):
         """Switching NVIDIA_EMBED_MODEL changes the collection name."""
         name1 = self._run_collection_name(
-            AI_MODE="live", AI_PROVIDER="nvidia_nim",
+            AI_MODE="live",
+            AI_PROVIDER="nvidia_nim",
             NVIDIA_API_KEY="sk-test",
             NVIDIA_CHAT_MODEL="meta/llama3-70b",
             NVIDIA_EMBED_MODEL="nvidia/nv-embedqa-4b",
         )
         name2 = self._run_collection_name(
-            AI_MODE="live", AI_PROVIDER="nvidia_nim",
+            AI_MODE="live",
+            AI_PROVIDER="nvidia_nim",
             NVIDIA_API_KEY="sk-test",
             NVIDIA_CHAT_MODEL="meta/llama3-70b",
             NVIDIA_EMBED_MODEL="nvidia/nv-embed-v3",
@@ -892,9 +1006,14 @@ class TestDeterministicChatGraphIntegration:
         )
         try:
             llm = DeterministicChatProvider()
-            graph = build_chat_graph(deps=ChatDeps(
-                llm=llm, tool_executor=_NoopToolExecutor(), memory=None, memory_window=8,
-            ))
+            graph = build_chat_graph(
+                deps=ChatDeps(
+                    llm=llm,
+                    tool_executor=_NoopToolExecutor(),
+                    memory=None,
+                    memory_window=8,
+                )
+            )
             state = ChatState(
                 query="Show my open tickets",
                 tenant_id="tenant-1",
@@ -927,9 +1046,14 @@ class TestDeterministicChatGraphIntegration:
         )
         try:
             llm = DeterministicChatProvider()
-            graph = build_chat_graph(deps=ChatDeps(
-                llm=llm, tool_executor=_NoopToolExecutor(), memory=None, memory_window=8,
-            ))
+            graph = build_chat_graph(
+                deps=ChatDeps(
+                    llm=llm,
+                    tool_executor=_NoopToolExecutor(),
+                    memory=None,
+                    memory_window=8,
+                )
+            )
             state = ChatState(
                 query="Create a follow-up task",
                 tenant_id="tenant-1",
@@ -962,9 +1086,14 @@ class TestDeterministicChatGraphIntegration:
         )
         try:
             llm = DeterministicChatProvider()
-            graph = build_chat_graph(deps=ChatDeps(
-                llm=llm, tool_executor=_NoopToolExecutor(), memory=None, memory_window=8,
-            ))
+            graph = build_chat_graph(
+                deps=ChatDeps(
+                    llm=llm,
+                    tool_executor=_NoopToolExecutor(),
+                    memory=None,
+                    memory_window=8,
+                )
+            )
             state = ChatState(
                 query="Explain the renewal policy",
                 tenant_id="tenant-1",
@@ -983,9 +1112,13 @@ class TestDeterministicChatGraphIntegration:
 
 class _NoopToolExecutor:
     """ToolExecutor that returns ok for any tool call."""
+
     async def execute(self, **kwargs):
         from intelligence.chat.graph import ToolResult
-        return ToolResult(tool=kwargs.get("call").tool if kwargs.get("call") else "none", ok=True)
+
+        return ToolResult(
+            tool=kwargs.get("call").tool if kwargs.get("call") else "none", ok=True
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1002,10 +1135,12 @@ class TestReadyEndpoint:
         try:
             from aiohttp.test_utils import make_mocked_request
             from orchestrator.main import ready_handler
+
             req = make_mocked_request("GET", "/ready")
             resp = await ready_handler(req)
             assert resp.status == 200
             import json
+
             data = json.loads(resp.body)
             assert data["status"] == "ready"
             assert data["provider"] == "deterministic"
@@ -1018,6 +1153,7 @@ class TestReadyEndpoint:
         try:
             from aiohttp.test_utils import make_mocked_request
             from orchestrator.main import ready_handler
+
             req = make_mocked_request("GET", "/ready")
             resp = await ready_handler(req)
             assert resp.status == 503
@@ -1030,6 +1166,7 @@ class TestReadyEndpoint:
         try:
             from aiohttp.test_utils import make_mocked_request
             from orchestrator.main import ready_handler
+
             req = make_mocked_request("GET", "/ready")
             resp = await ready_handler(req)
             assert resp.status == 503
@@ -1063,13 +1200,15 @@ class TestNvidiaHealthCheck:
         src_dir = str(SRC)
         env = os.environ.copy()
         env["PYTHONPATH"] = src_dir
-        env.update({
-            "AI_MODE": "live",
-            "AI_PROVIDER": "nvidia_nim",
-            "NVIDIA_API_KEY": "sk-test",
-            "NVIDIA_CHAT_MODEL": "meta/llama3-70b",
-            "NVIDIA_EMBED_MODEL": "nvidia/nv-embedqa",
-        })
+        env.update(
+            {
+                "AI_MODE": "live",
+                "AI_PROVIDER": "nvidia_nim",
+                "NVIDIA_API_KEY": "sk-test",
+                "NVIDIA_CHAT_MODEL": "meta/llama3-70b",
+                "NVIDIA_EMBED_MODEL": "nvidia/nv-embedqa",
+            }
+        )
         # Run a script that starts a mock HTTP server, sets the env var
         # BEFORE importing anything from the project, then calls
         # provider_health_check and prints the call count as JSON.
@@ -1105,8 +1244,11 @@ class TestNvidiaHealthCheck:
         )
         result = subprocess.run(
             [sys.executable, "-c", script],
-            capture_output=True, text=True, timeout=30,
-            env=env, cwd=src_dir,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+            cwd=src_dir,
         )
         err = result.stderr.strip()
         assert result.returncode == 0, (
@@ -1133,6 +1275,7 @@ class TestProviderMetadata:
         _set_env(AI_MODE="disabled")
         try:
             from intelligence.providers import provider_metadata
+
             meta = provider_metadata()
             assert meta["ai_mode"] == "disabled"
             assert meta["provider"] == "disabled"
@@ -1145,6 +1288,7 @@ class TestProviderMetadata:
         _set_env(AI_MODE="deterministic")
         try:
             from intelligence.providers import provider_metadata
+
             meta = provider_metadata()
             assert meta["ai_mode"] == "deterministic"
             assert meta["provider"] == "deterministic"
@@ -1159,6 +1303,7 @@ class TestProviderMetadata:
         _set_env(AI_MODE="live", AI_PROVIDER="ollama")
         try:
             from intelligence.providers import provider_metadata
+
             meta = provider_metadata()
             assert meta["ai_mode"] == "live"
             assert meta["provider"] == "ollama"
@@ -1177,6 +1322,7 @@ class TestVoiceApiStatus:
     @pytest.mark.asyncio
     async def test_disabled_voice_returns_unavailable_status(self, monkeypatch):
         import httpx
+
         calls: list[str] = []
 
         async def _tracking_get(url, **kwargs):
@@ -1190,8 +1336,10 @@ class TestVoiceApiStatus:
         _set_env(AI_MODE="disabled")
         try:
             import intelligence.i18n.voice_ingest as vi
+
             vi._default_stt = None
             from intelligence.i18n.voice_ingest import transcribe_audio
+
             result = await transcribe_audio(b"test audio")
             assert not result.success
             assert "disabled" in (result.error or "").lower()
@@ -1202,6 +1350,7 @@ class TestVoiceApiStatus:
     @pytest.mark.asyncio
     async def test_deterministic_voice_returns_fixed_transcript(self, monkeypatch):
         import httpx
+
         calls: list[str] = []
 
         async def _tracking_get(url, **kwargs):
@@ -1215,8 +1364,10 @@ class TestVoiceApiStatus:
         _set_env(AI_MODE="deterministic")
         try:
             import intelligence.i18n.voice_ingest as vi
+
             vi._default_stt = None
             from intelligence.i18n.voice_ingest import transcribe_audio
+
             result = await transcribe_audio(b"test audio")
             assert result.success
             assert result.model_used == "deterministic-stt-v1"
@@ -1229,8 +1380,10 @@ class TestVoiceApiStatus:
         _set_env(AI_MODE="live", AI_PROVIDER="ollama")
         try:
             import intelligence.i18n.voice_ingest as vi
+
             vi._default_stt = None
             from intelligence.i18n.voice_ingest import WhisperSTT
+
             with pytest.raises(RuntimeError, match="WHISPER_URL"):
                 WhisperSTT()
         finally:
@@ -1249,25 +1402,38 @@ class TestVoiceHandlerHttpSemantics:
     async def test_voice_handler_disabled_returns_503(self, monkeypatch):
         import httpx
         from unittest import mock as umock
+
         calls: list[str] = []
-        async def _track(method, url, **kw): calls.append(f"{method} {url}")
+
+        async def _track(method, url, **kw):
+            calls.append(f"{method} {url}")
+
         monkeypatch.setattr(httpx.AsyncClient, "get", _track)
         monkeypatch.setattr(httpx.AsyncClient, "post", _track)
         _set_env(AI_MODE="disabled")
         try:
             import intelligence.i18n.voice_ingest as vi
+
             vi._default_stt = None
             from aiohttp.test_utils import make_mocked_request
-            req = make_mocked_request("POST", "/api/v1/intelligence/voice",
-                                      headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"})
+
+            req = make_mocked_request(
+                "POST",
+                "/api/v1/intelligence/voice",
+                headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"},
+            )
+
             # Mock request.read() to return audio bytes
             async def _read():
                 return b"fake audio bytes for testing"
+
             with umock.patch.object(req, "read", _read):
                 from orchestrator.main import voice_handler
+
                 resp = await voice_handler(req)
             assert resp.status == 503
             import json
+
             body = json.loads(resp.body)
             assert body == {"error": "voice_ai_disabled"}
             assert "details" not in body
@@ -1279,24 +1445,37 @@ class TestVoiceHandlerHttpSemantics:
     async def test_voice_handler_deterministic_returns_200(self, monkeypatch):
         import httpx
         from unittest import mock as umock
+
         calls: list[str] = []
-        async def _track(method, url, **kw): calls.append(f"{method} {url}")
+
+        async def _track(method, url, **kw):
+            calls.append(f"{method} {url}")
+
         monkeypatch.setattr(httpx.AsyncClient, "get", _track)
         monkeypatch.setattr(httpx.AsyncClient, "post", _track)
         _set_env(AI_MODE="deterministic")
         try:
             import intelligence.i18n.voice_ingest as vi
+
             vi._default_stt = None
             from aiohttp.test_utils import make_mocked_request
-            req = make_mocked_request("POST", "/api/v1/intelligence/voice",
-                                      headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"})
+
+            req = make_mocked_request(
+                "POST",
+                "/api/v1/intelligence/voice",
+                headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"},
+            )
+
             async def _read():
                 return b"fake audio bytes for testing"
+
             with umock.patch.object(req, "read", _read):
                 from orchestrator.main import voice_handler
+
                 resp = await voice_handler(req)
             assert resp.status == 200
             import json
+
             body = json.loads(resp.body)
             assert body["transcript"]["text"] != ""
             assert "error" not in body
@@ -1307,20 +1486,30 @@ class TestVoiceHandlerHttpSemantics:
     @pytest.mark.asyncio
     async def test_voice_handler_live_without_whisper_returns_503(self):
         from unittest import mock as umock
+
         _set_env(AI_MODE="live", AI_PROVIDER="ollama")
         try:
             import intelligence.i18n.voice_ingest as vi
+
             vi._default_stt = None
             from aiohttp.test_utils import make_mocked_request
-            req = make_mocked_request("POST", "/api/v1/intelligence/voice",
-                                      headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"})
+
+            req = make_mocked_request(
+                "POST",
+                "/api/v1/intelligence/voice",
+                headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"},
+            )
+
             async def _read():
                 return b"fake audio bytes for testing"
+
             with umock.patch.object(req, "read", _read):
                 from orchestrator.main import voice_handler
+
                 resp = await voice_handler(req)
             assert resp.status == 503
             import json
+
             body = json.loads(resp.body)
             assert body == {"error": "voice_provider_unavailable"}
             assert "details" not in body
@@ -1331,23 +1520,34 @@ class TestVoiceHandlerHttpSemantics:
     async def test_voice_handler_does_not_expose_internal_exception(self, monkeypatch):
         """Internal errors return 500 with no details/stacktrace."""
         from unittest import mock as umock
+
         async def _failing_stt(*args, **kwargs):
             raise ValueError("secret internal error XYZ123")
+
         # Patch inside orchestrator.main where the function is imported
         import orchestrator.main as _main
+
         monkeypatch.setattr(_main, "process_multilingual_input", _failing_stt)
         _set_env(AI_MODE="deterministic")
         try:
             from aiohttp.test_utils import make_mocked_request
-            req = make_mocked_request("POST", "/api/v1/intelligence/voice",
-                                      headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"})
+
+            req = make_mocked_request(
+                "POST",
+                "/api/v1/intelligence/voice",
+                headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"},
+            )
+
             async def _read():
                 return b"fake audio"
+
             with umock.patch.object(req, "read", _read):
                 from orchestrator.main import voice_handler
+
                 resp = await voice_handler(req)
             assert resp.status == 500
             import json
+
             body = json.loads(resp.body)
             assert body == {"error": "transcription_failed"}
             assert "details" not in body
@@ -1356,32 +1556,49 @@ class TestVoiceHandlerHttpSemantics:
             _del_env("AI_MODE")
 
     @pytest.mark.asyncio
-    async def test_voice_query_handler_does_not_expose_internal_exception(self, monkeypatch):
+    async def test_voice_query_handler_does_not_expose_internal_exception(
+        self, monkeypatch
+    ):
         """voice_query_handler internal errors return 500, no details."""
         from unittest import mock as umock
+
         async def _failing_stt(*args, **kwargs):
             raise ValueError("secret internal error ABC789")
+
         import orchestrator.main as _main
+
         monkeypatch.setattr(_main, "process_multilingual_input", _failing_stt)
         _set_env(AI_MODE="deterministic")
         try:
             from aiohttp import web
+
             app = web.Application()
+
             # The handler accesses app["search_agent"] — provide a minimal stub
             class _FakeSearch:
-                async def search(self, **kw): return {}
+                async def search(self, **kw):
+                    return {}
+
             app["search_agent"] = _FakeSearch()
             from aiohttp.test_utils import make_mocked_request
-            req = make_mocked_request("POST", "/api/v1/intelligence/voice/query",
-                                      headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"},
-                                      app=app)
+
+            req = make_mocked_request(
+                "POST",
+                "/api/v1/intelligence/voice/query",
+                headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"},
+                app=app,
+            )
+
             async def _read():
                 return b"fake audio"
+
             with umock.patch.object(req, "read", _read):
                 from orchestrator.main import voice_query_handler
+
                 resp = await voice_query_handler(req)
             assert resp.status == 500
             import json
+
             body = json.loads(resp.body)
             assert body == {"error": "voice_query_failed"}
             assert "details" not in body
@@ -1408,20 +1625,23 @@ class TestSettingsFromDotenv:
 
         src_dir = str(SRC)
         env = os.environ.copy()
-        env.update({
-            "PYTHONPATH": src_dir,
-            "AI_MODE": "live",
-            "AI_PROVIDER": "ollama",
-            "OLLAMA_URL": "http://ollama:9999",
-            "OLLAMA_MODEL": "test-model-42b",
-            "OLLAMA_EMBED_MODEL": "test-embed-v2",
-            "NVIDIA_BASE_URL": "https://test.nvidia.example.com/v1",
-            "NVIDIA_CHAT_MODEL": "test/chat-model",
-            "NVIDIA_EMBED_MODEL": "test/embed-model",
-        })
+        env.update(
+            {
+                "PYTHONPATH": src_dir,
+                "AI_MODE": "live",
+                "AI_PROVIDER": "ollama",
+                "OLLAMA_URL": "http://ollama:9999",
+                "OLLAMA_MODEL": "test-model-42b",
+                "OLLAMA_EMBED_MODEL": "test-embed-v2",
+                "NVIDIA_BASE_URL": "https://test.nvidia.example.com/v1",
+                "NVIDIA_CHAT_MODEL": "test/chat-model",
+                "NVIDIA_EMBED_MODEL": "test/embed-model",
+            }
+        )
         result = subprocess.run(
             [
-                sys.executable, "-c",
+                sys.executable,
+                "-c",
                 "from orchestrator.config import settings; "
                 "print(settings.AI_MODE); "
                 "print(settings.AI_PROVIDER); "
@@ -1432,17 +1652,19 @@ class TestSettingsFromDotenv:
                 "print(settings.NVIDIA_CHAT_MODEL); "
                 "print(settings.NVIDIA_EMBED_MODEL)",
             ],
-            capture_output=True, text=True, timeout=30,
-            env=env, cwd=src_dir,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+            cwd=src_dir,
         )
         err = result.stderr.strip()
         assert result.returncode == 0, (
             f"Subprocess failed (rc={result.returncode}):\nstderr: {err}"
         )
-        lines = [l.strip() for l in result.stdout.strip().splitlines()]
+        lines = [line.strip() for line in result.stdout.strip().splitlines()]
         assert len(lines) == 8, (
-            f"Expected 8 lines, got {len(lines)}. "
-            f"stdout={lines!r} stderr={err!r}"
+            f"Expected 8 lines, got {len(lines)}. stdout={lines!r} stderr={err!r}"
         )
         assert lines[0] == "live"
         assert lines[1] == "ollama"
@@ -1472,7 +1694,10 @@ class TestDisabledProviderBehavior:
 
     @pytest.mark.asyncio
     async def test_disabled_embeddings_raises_on_query(self):
-        from intelligence.providers import DisabledEmbeddingsProvider, AIModeDisabledError
+        from intelligence.providers import (
+            DisabledEmbeddingsProvider,
+            AIModeDisabledError,
+        )
 
         provider = DisabledEmbeddingsProvider()
         with pytest.raises(AIModeDisabledError, match="disabled"):
@@ -1480,7 +1705,10 @@ class TestDisabledProviderBehavior:
 
     @pytest.mark.asyncio
     async def test_disabled_embeddings_raises_on_documents(self):
-        from intelligence.providers import DisabledEmbeddingsProvider, AIModeDisabledError
+        from intelligence.providers import (
+            DisabledEmbeddingsProvider,
+            AIModeDisabledError,
+        )
 
         provider = DisabledEmbeddingsProvider()
         with pytest.raises(AIModeDisabledError, match="disabled"):

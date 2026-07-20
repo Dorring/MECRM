@@ -254,11 +254,13 @@ class DeterministicChatProvider:
             if sid.startswith(FAULT_MALFORMED):
                 return "{not valid json [}"
             if sid.startswith(FAULT_LOW_CONFIDENCE):
-                return json.dumps({
-                    "confidence": 0.12,
-                    "summary": "Uncertain response from deterministic provider",
-                    "status": "low_confidence",
-                })
+                return json.dumps(
+                    {
+                        "confidence": 0.12,
+                        "summary": "Uncertain response from deterministic provider",
+                        "status": "low_confidence",
+                    }
+                )
             if sid.startswith(FAULT_PROVIDER_ERROR):
                 raise DeterministicProviderError(
                     f"Deterministic provider error injected for scenario={sid}"
@@ -266,16 +268,18 @@ class DeterministicChatProvider:
 
         # 4. Default: stable structured response (valid JSON, but generic)
         h = _stable_hash(messages_text, 16)
-        return json.dumps({
-            "analysis": (
-                f"Deterministic analysis based on input hash {h}. "
-                f"This is a stable, repeatable response for CI and testing."
-            ),
-            "confidence": 0.85,
-            "status": "completed",
-            "input_hash": h,
-            "provider": self.PROVIDER,
-        })
+        return json.dumps(
+            {
+                "analysis": (
+                    f"Deterministic analysis based on input hash {h}. "
+                    f"This is a stable, repeatable response for CI and testing."
+                ),
+                "confidence": 0.85,
+                "status": "completed",
+                "input_hash": h,
+                "provider": self.PROVIDER,
+            }
+        )
 
     async def ainvoke(
         self,

@@ -18,8 +18,11 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 from pydantic import SecretStr
 
 from orchestrator.ai_mode import (
-    AIMode, AIProvider, AIConfigurationError,
-    resolve_ai_mode, resolve_ai_provider,
+    AIMode,
+    AIProvider,
+    AIConfigurationError,
+    resolve_ai_mode,
+    resolve_ai_provider,
 )
 from orchestrator.config import settings
 
@@ -52,8 +55,7 @@ class DisabledChatProvider:
 
     async def ainvoke(self, input: Any, **kwargs: Any) -> Any:
         raise AIModeDisabledError(
-            "AI is disabled (AI_MODE=disabled). "
-            "Chat model inference is not available."
+            "AI is disabled (AI_MODE=disabled). Chat model inference is not available."
         )
 
 
@@ -62,14 +64,12 @@ class DisabledEmbeddingsProvider:
 
     async def aembed_query(self, text: str) -> list[float]:
         raise AIModeDisabledError(
-            "AI is disabled (AI_MODE=disabled). "
-            "Embeddings are not available."
+            "AI is disabled (AI_MODE=disabled). Embeddings are not available."
         )
 
     async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
         raise AIModeDisabledError(
-            "AI is disabled (AI_MODE=disabled). "
-            "Embeddings are not available."
+            "AI is disabled (AI_MODE=disabled). Embeddings are not available."
         )
 
 
@@ -88,6 +88,7 @@ def create_chat_model(*, temperature: float = 0.0) -> AsyncChatModel:
 
     if mode == AIMode.DETERMINISTIC:
         from intelligence.deterministic_provider import DeterministicChatProvider
+
         return DeterministicChatProvider()  # type: ignore[return-value]
 
     # AI_MODE=live — real provider
@@ -152,6 +153,7 @@ def create_embeddings(
 
     if mode == AIMode.DETERMINISTIC:
         from intelligence.deterministic_provider import DeterministicEmbeddingsProvider
+
         return DeterministicEmbeddingsProvider()  # type: ignore[return-value]
 
     # AI_MODE=live — real provider
@@ -197,6 +199,7 @@ def provider_metadata() -> dict[str, str | bool]:
             DeterministicChatProvider,
             DeterministicEmbeddingsProvider,
         )
+
         chat_model = DeterministicChatProvider.MODEL
         embedding_model = DeterministicEmbeddingsProvider.MODEL
     elif provider == AIProvider.NVIDIA_NIM:
@@ -272,9 +275,13 @@ async def provider_health_check() -> dict[str, Any]:
                 DeterministicChatProvider,
                 DeterministicEmbeddingsProvider,
             )
+
             chat = DeterministicChatProvider()
             embed = DeterministicEmbeddingsProvider()
+            chat_result = await chat.ainvoke("health-check")
             test_vec = await embed.aembed_query("health-check")
+            if not chat_result or not test_vec:
+                raise RuntimeError("Deterministic provider returned empty result")
             base["status"] = "ready"
             base["chat_model"] = DeterministicChatProvider.MODEL
             base["embedding_model"] = DeterministicEmbeddingsProvider.MODEL
@@ -297,8 +304,7 @@ async def provider_health_check() -> dict[str, Any]:
         base["chat_model"] = "unset"
         base["embedding_model"] = "unset"
         base["error"] = (
-            "AI_MODE=live requires AI_PROVIDER to be set to "
-            "'ollama' or 'nvidia_nim'"
+            "AI_MODE=live requires AI_PROVIDER to be set to 'ollama' or 'nvidia_nim'"
         )
         return base
 
@@ -433,6 +439,7 @@ def vector_collection_name(base_name: str) -> str:
     # -- deterministic ------------------------------------------------------
     if mode == AIMode.DETERMINISTIC:
         from intelligence.deterministic_provider import DeterministicEmbeddingsProvider
+
         ident = DeterministicEmbeddingsProvider.MODEL
         safe_name = _sanitise_weaviate_name(base_name)
         safe_ident = _sanitise_weaviate_name(ident)
@@ -478,9 +485,15 @@ def _validate_nvidia(required_model_env: str) -> None:
     missing: list[str] = []
     if not settings.NVIDIA_API_KEY.strip():
         missing.append("NVIDIA_API_KEY")
-    if required_model_env == "NVIDIA_CHAT_MODEL" and not settings.NVIDIA_CHAT_MODEL.strip():
+    if (
+        required_model_env == "NVIDIA_CHAT_MODEL"
+        and not settings.NVIDIA_CHAT_MODEL.strip()
+    ):
         missing.append("NVIDIA_CHAT_MODEL")
-    if required_model_env == "NVIDIA_EMBED_MODEL" and not settings.NVIDIA_EMBED_MODEL.strip():
+    if (
+        required_model_env == "NVIDIA_EMBED_MODEL"
+        and not settings.NVIDIA_EMBED_MODEL.strip()
+    ):
         missing.append("NVIDIA_EMBED_MODEL")
     if missing:
         raise ProviderConfigurationError(
