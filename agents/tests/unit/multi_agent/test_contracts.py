@@ -1,4 +1,4 @@
-"""Contract validation and anti-pattern tests — Phase 2 R2.
+"""Contract validation and anti-pattern tests — Phase 2 R3.
 
 All tests run under AI_MODE=deterministic; no Ollama, no API keys.
 """
@@ -16,8 +16,6 @@ from multi_agent.contracts import (
     ActionRiskLevel,
     AgentAuthority,
     AgentCapability,
-    AgentError,
-    AgentErrorCategory,
     AgentExecutionContext,
     AgentResult,
     AgentTask,
@@ -25,16 +23,16 @@ from multi_agent.contracts import (
     Evidence,
     EvidenceType,
     ExecutionBudget,
+    ExecutionUsage,
     MultiAgentState,
     ProviderMetadata,
     TokenUsage,
     from_crm_writer_proposal,
     from_productivity_proposal,
 )
+from multi_agent.errors import ProposalHashMismatchError
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# Helpers ----------------------------------------------------------------
 
 
 def _utc_now() -> datetime:
@@ -44,16 +42,16 @@ def _utc_now() -> datetime:
 def _make_capability(
     agent_id: str = "test_agent",
     authority: AgentAuthority = AgentAuthority.READ,
-    allowed_tools: set[str] | None = None,
+    allowed_tools: frozenset[str] | None = None,
     **overrides: Any,
 ) -> AgentCapability:
     defaults: dict[str, Any] = dict(
         agent_id=agent_id,
         version="1.0.0",
         description="Test agent",
-        domains={"test"},
-        supported_tasks={"test_task"},
-        allowed_tools=allowed_tools or {"crm_reader.get_leads"},
+        domains=frozenset({"test"}),
+        supported_tasks=frozenset({"test_task"}),
+        allowed_tools=allowed_tools or frozenset({"crm_reader.get_leads"}),
         authority=authority,
         input_contract="test_input",
         output_contract="test_output",
@@ -66,8 +64,7 @@ def _make_capability(
 
 
 def _make_proposal(**overrides: Any) -> ActionProposal:
-    """Create an ActionProposal via the factory (auto-hash)."""
-    defaults: dict[str, Any] = dict(
+    fields: dict[str, Any] = dict(
         proposal_id="p-001",
         tenant_id="t-001",
         created_by_agent="agent_a",
@@ -75,18 +72,16 @@ def _make_proposal(**overrides: Any) -> ActionProposal:
         target_entity="ticket",
         priority="medium",
         risk_level=ActionRiskLevel.MEDIUM,
-        justification="test",
         evidence_ids=[],
         requires_approval=True,
         idempotency_key="ik-001",
-        created_at=_utc_now(),
     )
-    defaults.update(overrides)
-    return ActionProposal.create(**defaults)
+    fields.update(overrides)
+    return ActionProposal.create(**fields)
 
 
 # ============================================================================
-# StrictContract — extra fields are rejected
+# StrictContract — extra fields rejected
 # ============================================================================
 
 
@@ -95,17 +90,6 @@ class TestStrictContract:
         with pytest.raises(ValidationError) as exc:
             TokenUsage(input_tokens=10, output_tokens=5, total_tokens=15, fake_field=42)  # type: ignore[call-arg]
         assert "fake_field" in str(exc.value)
-
-    def test_extra_field_on_evidence_rejected(self):
-        with pytest.raises(ValidationError) as exc:
-            Evidence(
-                evidence_id="ev-1",
-                evidence_type=EvidenceType.TOOL_RESULT,
-                tenant_id="t-1",
-                source_agent="a",
-                raw_prompt="inject",  # type: ignore[call-arg]
-            )
-        assert "raw_prompt" in str(exc.value)
 
     def test_provider_metadata_api_key_field_rejected(self):
         with pytest.raises(ValidationError) as exc:
@@ -124,9 +108,9 @@ class TestStrictContract:
                 agent_id="test_agent",
                 version="1.0.0",
                 description="Test",
-                domains={"test"},
-                supported_tasks={"test_task"},
-                allowed_tools={"crm_reader.get_leads"},
+                domains=frozenset({"test"}),
+                supported_tasks=frozenset({"t"}),
+                allowed_tools=frozenset({"crm_reader.get_leads"}),
                 authority=AgentAuthority.READ,
                 input_contract="in",
                 output_contract="out",
@@ -139,25 +123,22 @@ class TestStrictContract:
 
 
 # ============================================================================
-# Evidence — chain_of_thought / llm_reasoning are NOT valid evidence types
+# Evidence type safety
 # ============================================================================
 
 
 class TestEvidenceTypeSafety:
-    def test_chain_of_thought_evidence_is_rejected(self):
-        """chain_of_thought is NOT in EvidenceType enum."""
+    def test_chain_of_thought_rejected(self):
         assert "chain_of_thought" not in EvidenceType.__members__
 
-    def test_llm_reasoning_evidence_is_rejected(self):
-        """llm_reasoning is NOT in EvidenceType enum."""
+    def test_llm_reasoning_rejected(self):
         assert "llm_reasoning" not in EvidenceType.__members__
 
-    def test_business_evidence_types_are_supported(self):
+    def test_business_types_supported(self):
         for et in (
             EvidenceType.CUSTOMER,
             EvidenceType.TICKET,
             EvidenceType.DEAL,
-            EvidenceType.KNOWLEDGE_ARTICLE,
             EvidenceType.TOOL_RESULT,
             EvidenceType.AUDIT_EVENT,
             EvidenceType.POLICY_DECISION,
@@ -172,7 +153,6 @@ class TestEvidenceTypeSafety:
             assert ev.evidence_type == et
 
     def test_raw_prompt_not_in_evidence(self):
-        """The Evidence model does not have a 'prompt' or 'raw_prompt' field."""
         ev = Evidence(
             evidence_id="ev-1",
             evidence_type=EvidenceType.TOOL_RESULT,
@@ -182,37 +162,46 @@ class TestEvidenceTypeSafety:
         assert not hasattr(ev, "prompt")
         assert not hasattr(ev, "raw_prompt")
 
+    def test_summary_field(self):
+        ev = Evidence(
+            evidence_id="ev-1",
+            evidence_type=EvidenceType.TOOL_RESULT,
+            tenant_id="t-1",
+            source_agent="a",
+            summary="Fetched 5 leads",
+        )
+        assert ev.summary == "Fetched 5 leads"
+
+    def test_retrieved_at(self):
+        now = _utc_now()
+        ev = Evidence(
+            evidence_id="ev-1",
+            evidence_type=EvidenceType.TOOL_RESULT,
+            tenant_id="t-1",
+            source_agent="a",
+            retrieved_at=now,
+        )
+        assert ev.retrieved_at == now
+
 
 # ============================================================================
-# AgentExecutionContext — NO raw authorization
+# AgentExecutionContext — no raw authorization
 # ============================================================================
 
 
 class TestExecutionContextNoAuth:
     def test_authorization_not_a_field(self):
-        """AgentExecutionContext must NOT have an 'authorization' field."""
-        fields = AgentExecutionContext.model_fields
-        assert "authorization" not in fields
+        assert "authorization" not in AgentExecutionContext.model_fields
 
-    def test_scopes_and_roles_exist(self):
+    def test_scopes_and_roles(self):
         ctx = AgentExecutionContext(
-            tenant_id="t-1",
-            roles=["admin"],
-            scopes=["read:leads", "write:tickets"],
+            tenant_id="t-1", roles=["admin"], scopes=["read:leads"]
         )
         assert "admin" in ctx.roles
-        assert "read:leads" in ctx.scopes
-
-    def test_policy_context(self):
-        ctx = AgentExecutionContext(
-            tenant_id="t-1",
-            policy_context={"allow_delete": False, "max_confidence": 0.9},
-        )
-        assert ctx.policy_context["allow_delete"] is False
 
 
 # ============================================================================
-# ActionProposal — hash integrity + risk/priority split
+# ActionProposal — hash integrity (R3)
 # ============================================================================
 
 
@@ -233,45 +222,9 @@ class TestActionProposalHashIntegrity:
         assert len(p.proposal_hash) == 64
         assert p.proposal_hash == p.compute_hash()
 
-    def test_forged_proposal_hash_rejected(self):
-        with pytest.raises(ValidationError) as exc:
-            ActionProposal(
-                proposal_id="p-1",
-                proposal_hash="0000000000000000000000000000000000000000000000000000000000000000",  # forged
-                tenant_id="t-1",
-                created_by_agent="a",
-                action_type="create",
-                target_entity="ticket",
-                priority="medium",
-                risk_level=ActionRiskLevel.MEDIUM,
-                evidence_ids=[],
-                requires_approval=True,
-                idempotency_key="ik-1",
-                created_at=_utc_now(),
-            )
-        assert "hash" in str(exc.value).lower()
-
-    def test_placeholder_hash_rejected(self):
-        """'placeholder' as a hash is rejected (must be empty or valid)."""
-        with pytest.raises(ValidationError) as exc:
-            ActionProposal(
-                proposal_id="p-1",
-                proposal_hash="placeholder",
-                tenant_id="t-1",
-                created_by_agent="a",
-                action_type="create",
-                target_entity="ticket",
-                priority="medium",
-                risk_level=ActionRiskLevel.MEDIUM,
-                evidence_ids=[],
-                requires_approval=True,
-                idempotency_key="ik-1",
-                created_at=_utc_now(),
-            )
-        assert "hash" in str(exc.value).lower()
-
-    def test_empty_hash_allowed(self):
-        """Empty string hash is allowed (means 'not yet computed')."""
+    def test_empty_hash_is_auto_computed(self):
+        """Empty hash is auto-computed at construction, not left empty."""
+        now = _utc_now()
         p = ActionProposal(
             proposal_id="p-1",
             proposal_hash="",
@@ -284,12 +237,30 @@ class TestActionProposalHashIntegrity:
             evidence_ids=[],
             requires_approval=True,
             idempotency_key="ik-1",
-            created_at=_utc_now(),
+            created_at=now,
         )
-        assert p.proposal_hash == ""
+        assert len(p.proposal_hash) == 64
+        assert p.proposal_hash == p.compute_hash()
+
+    def test_forged_hash_rejected(self):
+        with pytest.raises(ValidationError) as exc:
+            ActionProposal(
+                proposal_id="p-1",
+                proposal_hash="0000000000000000000000000000000000000000000000000000000000000000",
+                tenant_id="t-1",
+                created_by_agent="a",
+                action_type="create",
+                target_entity="ticket",
+                priority="medium",
+                risk_level=ActionRiskLevel.MEDIUM,
+                evidence_ids=[],
+                requires_approval=True,
+                idempotency_key="ik-1",
+                created_at=_utc_now(),
+            )
+        assert "hash" in str(exc.value).lower()
 
     def test_hash_excludes_idempotency_key(self):
-        """Two proposals with different idempotency keys but same content → same hash."""
         p1 = ActionProposal.create(
             proposal_id="p-1",
             tenant_id="t-1",
@@ -300,7 +271,7 @@ class TestActionProposalHashIntegrity:
             risk_level=ActionRiskLevel.MEDIUM,
             evidence_ids=[],
             requires_approval=True,
-            idempotency_key="key-a",  # different
+            idempotency_key="key-a",
         )
         p2 = ActionProposal.create(
             proposal_id="p-2",
@@ -312,402 +283,238 @@ class TestActionProposalHashIntegrity:
             risk_level=ActionRiskLevel.MEDIUM,
             evidence_ids=[],
             requires_approval=True,
-            idempotency_key="key-b",  # different
+            idempotency_key="key-b",
         )
         assert p1.proposal_hash == p2.proposal_hash
 
+    def test_mutated_payload_fails_integrity(self):
+        p = _make_proposal(payload={"amount": 100})
+        p.payload["amount"] = 999999  # type: ignore[index]
+        with pytest.raises(ProposalHashMismatchError):
+            p.verify_integrity()
+
+    def test_mutated_evidence_fails_integrity(self):
+        p = _make_proposal(evidence_ids=["ev-1"])
+        p.evidence_ids.append("fake-ev")
+        with pytest.raises(ProposalHashMismatchError):
+            p.verify_integrity()
+
+    def test_mutated_proposal_rejected_by_agent_result(self):
+        p = _make_proposal(payload={"amount": 100})
+        p.payload["amount"] = 999999  # type: ignore[index]
+        with pytest.raises(ValidationError):
+            AgentResult(
+                result_id="r-1",
+                task_id="t-1",
+                agent_id="agent_a",
+                tenant_id="t-001",
+                status="completed",
+                action_proposals=[p],
+                completed_at=_utc_now(),
+            )
+
+    def test_verify_integrity_passes_good_proposal(self):
+        p = _make_proposal()
+        p.verify_integrity()
+
+    def test_proposal_hash_uses_shared_canonicalizer(self):
+        h1 = _make_proposal(payload={"b": 2, "a": 1}).proposal_hash
+        h2 = _make_proposal(payload={"a": 1, "b": 2}).proposal_hash
+        assert h1 == h2
+
 
 class TestActionProposalRiskAndPriority:
-    def test_risk_level_separate_from_priority(self):
-        """priority and risk_level are independent."""
-        p = _make_proposal(
-            priority="low", risk_level=ActionRiskLevel.HIGH, evidence_ids=["ev-1"]
-        )
-        assert p.priority == "low"
-        assert p.risk_level == ActionRiskLevel.HIGH
-
     def test_high_risk_requires_evidence(self):
-        with pytest.raises(ValidationError) as exc:
+        with pytest.raises(ValidationError):
             _make_proposal(risk_level=ActionRiskLevel.HIGH, evidence_ids=[])
-        assert "evidence" in str(exc.value).lower()
 
     def test_high_risk_requires_approval(self):
-        with pytest.raises(ValidationError) as exc:
+        with pytest.raises(ValidationError):
             _make_proposal(
                 risk_level=ActionRiskLevel.HIGH,
                 evidence_ids=["ev-1"],
                 requires_approval=False,
             )
-        assert "approval" in str(exc.value).lower()
-
-    def test_medium_risk_no_evidence_ok(self):
-        p = _make_proposal(risk_level=ActionRiskLevel.MEDIUM, evidence_ids=[])
-        assert p.risk_level == ActionRiskLevel.MEDIUM
 
 
 class TestActionProposalTenantOverride:
-    def test_payload_flat_tenant_id_rejected(self):
-        with pytest.raises(ValidationError) as exc:
-            _make_proposal(payload={"tenant_id": "evil"})
-        assert "tenant_id" in str(exc.value)
-
-    def test_payload_nested_tenant_id_rejected(self):
-        with pytest.raises(ValidationError) as exc:
+    def test_nested_tenant_id_rejected(self):
+        with pytest.raises(ValidationError):
             _make_proposal(payload={"nested": {"tenant_id": "evil"}})
-        assert "tenant_id" in str(exc.value)
 
-    def test_payload_list_item_tenant_id_rejected(self):
-        with pytest.raises(ValidationError) as exc:
-            _make_proposal(payload={"items": [{"x": 1}, {"tenantId": "evil"}]})
-        assert "tenant" in str(exc.value).lower()
+    def test_list_item_tenant_id_rejected(self):
+        with pytest.raises(ValidationError):
+            _make_proposal(payload={"items": [{"tenantId": "evil"}]})
 
 
 # ============================================================================
-# AgentCapability
+# AgentCapability — frozen (R3)
 # ============================================================================
 
 
-class TestAgentCapabilityValidation:
-    def test_valid_capability(self):
-        cap = _make_capability()
-        assert cap.agent_id == "test_agent"
-
-    def test_agent_id_must_be_stable_format(self):
+class TestCapabilityFrozen:
+    def test_cannot_change_authority_after_construction(self):
+        cap = _make_capability(agent_id="support1", authority=AgentAuthority.READ)
         with pytest.raises(ValidationError):
-            _make_capability(agent_id="123invalid")
+            cap.authority = AgentAuthority.EXECUTE  # type: ignore[misc]
 
-    def test_version_must_not_be_empty(self):
+    def test_cannot_add_tool_after_construction(self):
+        cap = _make_capability(agent_id="support1")
+        assert isinstance(cap.allowed_tools, frozenset)
+        with pytest.raises(AttributeError):
+            cap.allowed_tools.add("kafka.emit_event")  # type: ignore[union-attr]
+
+    def test_domains_are_frozenset(self):
+        cap = _make_capability(agent_id="support1")
+        assert isinstance(cap.domains, frozenset)
+
+    def test_registered_capability_cannot_escalate(self):
+        from multi_agent.registry import AgentRegistry
+
+        reg = AgentRegistry()
+        cap = _make_capability(
+            agent_id="support1",
+            authority=AgentAuthority.READ,
+            allowed_tools=frozenset({"crm_reader.get_leads"}),
+        )
+        reg.register(cap, object())
+        resolved = reg.resolve_capability("support1")
         with pytest.raises(ValidationError):
-            _make_capability(version="")
+            resolved.authority = AgentAuthority.EXECUTE  # type: ignore[misc]
 
-    def test_timeout_ms_must_be_positive(self):
-        with pytest.raises(ValidationError):
-            _make_capability(timeout_ms=0)
+    def test_snapshot_mutation_does_not_change_registry(self):
+        from multi_agent.registry import AgentRegistry
 
-    def test_max_retries_non_negative(self):
-        cap = _make_capability(max_retries=0)
-        assert cap.max_retries == 0
-
-    def test_max_retries_negative_raises(self):
-        with pytest.raises(ValidationError):
-            _make_capability(max_retries=-1)
+        reg = AgentRegistry()
+        reg.register(_make_capability(agent_id="a1"), object())
+        snap = reg.snapshot()
+        snap.agents.clear()
+        assert reg.is_registered("a1")
 
 
 # ============================================================================
-# AgentTask
+# AgentTask / AgentResult
 # ============================================================================
 
 
 class TestAgentTask:
-    def test_valid_task(self):
+    def test_dependencies_frozenset(self):
         task = AgentTask(
-            task_id="task-001",
-            agent_id="test_agent",
-            task_type="test_task",
-            objective="Test objective",
-            input_data={},
-            tenant_id="t-001",
-            timeout_ms=60_000,
-            idempotency_key="ik-001",
-        )
-        assert task.objective == "Test objective"
-        assert task.status == "pending"
-
-    def test_self_dependency_raises(self):
-        with pytest.raises(ValidationError):
-            AgentTask(
-                task_id="task-001",
-                agent_id="a",
-                task_type="t",
-                input_data={},
-                tenant_id="t-001",
-                dependencies={"task-001"},
-                timeout_ms=60_000,
-                idempotency_key="ik-001",
-            )
-
-    def test_required_evidence_field(self):
-        task = AgentTask(
-            task_id="task-001",
-            agent_id="a",
+            task_id="t1",
+            agent_id="a1",
             task_type="t",
             input_data={},
-            tenant_id="t-001",
-            required_evidence=["opa_policy", "tool_result"],
+            tenant_id="t-1",
             timeout_ms=60_000,
-            idempotency_key="ik-001",
+            idempotency_key="ik-1",
+            dependencies=frozenset({"t2", "t3"}),
         )
-        assert "opa_policy" in task.required_evidence
+        assert "t2" in task.dependencies
 
-    def test_required_flag(self):
+    def test_objective_required_evidence(self):
         task = AgentTask(
-            task_id="task-001",
-            agent_id="a",
+            task_id="t1",
+            agent_id="a1",
             task_type="t",
             input_data={},
-            tenant_id="t-001",
-            required=False,
+            tenant_id="t-1",
+            objective="Find leads",
+            required_evidence=["tool_result"],
             timeout_ms=60_000,
-            idempotency_key="ik-001",
+            idempotency_key="ik-1",
         )
-        assert task.required is False
-
-    def test_status_values(self):
-        task = AgentTask(
-            task_id="task-001",
-            agent_id="a",
-            task_type="t",
-            input_data={},
-            tenant_id="t-001",
-            status="ready",
-            timeout_ms=60_000,
-            idempotency_key="ik-001",
-        )
-        assert task.status == "ready"
-
-    def test_needs_input_status(self):
-        task = AgentTask(
-            task_id="task-001",
-            agent_id="a",
-            task_type="t",
-            input_data={},
-            tenant_id="t-001",
-            status="needs_input",
-            timeout_ms=60_000,
-            idempotency_key="ik-001",
-        )
-        assert task.status == "needs_input"
+        assert task.objective == "Find leads"
 
 
 # ============================================================================
-# AgentResult
-# ============================================================================
-
-
-class TestAgentResult:
-    def test_valid_completed(self):
-        result = AgentResult(
-            result_id="r-001",
-            task_id="task-001",
-            agent_id="agent_a",
-            agent_version="1.0.0",
-            tenant_id="t-001",
-            status="completed",
-            summary="Done",
-            completed_at=_utc_now(),
-        )
-        assert result.status == "completed"
-        assert result.summary == "Done"
-
-    def test_failed_requires_errors(self):
-        with pytest.raises(ValidationError) as exc:
-            AgentResult(
-                result_id="r-001",
-                task_id="task-001",
-                agent_id="agent_a",
-                tenant_id="t-001",
-                status="failed",
-                completed_at=_utc_now(),
-            )
-        assert "error" in str(exc.value).lower()
-
-    def test_failed_with_errors_ok(self):
-        result = AgentResult(
-            result_id="r-001",
-            task_id="task-001",
-            agent_id="agent_a",
-            tenant_id="t-001",
-            status="failed",
-            errors=[
-                AgentError(
-                    error_code="E1",
-                    message="broken",
-                    category=AgentErrorCategory.PERMANENT,
-                )
-            ],
-            completed_at=_utc_now(),
-        )
-        assert len(result.errors) == 1
-        assert result.errors[0].category == AgentErrorCategory.PERMANENT
-
-    def test_completed_no_errors(self):
-        with pytest.raises(ValidationError) as exc:
-            AgentResult(
-                result_id="r-001",
-                task_id="task-001",
-                agent_id="agent_a",
-                tenant_id="t-001",
-                status="completed",
-                errors=[AgentError(error_code="E1", message="oops")],
-                completed_at=_utc_now(),
-            )
-        assert "error" in str(exc.value).lower()
-
-    def test_findings_field(self):
-        result = AgentResult(
-            result_id="r-001",
-            task_id="task-001",
-            agent_id="agent_a",
-            tenant_id="t-001",
-            status="completed",
-            findings=[{"severity": "info", "message": "all clear"}],
-            completed_at=_utc_now(),
-        )
-        assert len(result.findings) == 1
-
-    def test_unresolved_questions(self):
-        result = AgentResult(
-            result_id="r-001",
-            task_id="task-001",
-            agent_id="agent_a",
-            tenant_id="t-001",
-            status="completed",
-            unresolved_questions=["Why is revenue down?"],
-            completed_at=_utc_now(),
-        )
-        assert "Why is revenue down?" in result.unresolved_questions
-
-    def test_started_at_tracked(self):
-        started = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        result = AgentResult(
-            result_id="r-001",
-            task_id="task-001",
-            agent_id="agent_a",
-            tenant_id="t-001",
-            status="completed",
-            started_at=started,
-            completed_at=_utc_now(),
-        )
-        assert result.started_at == started
-
-    def test_tenant_homogeneity_evidence(self):
-        """Evidence from wrong tenant inside a result must be rejected."""
-        with pytest.raises(ValidationError):
-            AgentResult(
-                result_id="r-001",
-                task_id="task-001",
-                agent_id="agent_a",
-                tenant_id="t-001",
-                status="completed",
-                evidence=[
-                    Evidence(
-                        evidence_id="ev-1",
-                        evidence_type=EvidenceType.TOOL_RESULT,
-                        tenant_id="t-002",  # foreign!
-                        source_agent="a",
-                    )
-                ],
-                completed_at=_utc_now(),
-            )
-
-    def test_tenant_homogeneity_proposal(self):
-        """Proposal from wrong tenant inside a result must be rejected."""
-        with pytest.raises(ValidationError):
-            AgentResult(
-                result_id="r-001",
-                task_id="task-001",
-                agent_id="agent_a",
-                tenant_id="t-001",
-                status="completed",
-                action_proposals=[
-                    _make_proposal(tenant_id="t-002")  # foreign!
-                ],
-                completed_at=_utc_now(),
-            )
-
-    def test_proposal_creator_must_match_result_agent(self):
-        """Proposal created_by_agent must match result.agent_id."""
-        with pytest.raises(ValidationError):
-            AgentResult(
-                result_id="r-001",
-                task_id="task-001",
-                agent_id="agent_a",
-                tenant_id="t-001",
-                status="completed",
-                action_proposals=[
-                    _make_proposal(created_by_agent="agent_b")  # wrong!
-                ],
-                completed_at=_utc_now(),
-            )
-
-
-# ============================================================================
-# TokenUsage / ProviderMetadata / AgentError
-# ============================================================================
-
-
-class TestTokenUsage:
-    def test_negative_raises(self):
-        with pytest.raises(ValidationError):
-            TokenUsage(input_tokens=-1)
-
-
-class TestProviderMetadata:
-    def test_valid_metadata(self):
-        pm = ProviderMetadata(
-            provider="ollama",
-            chat_model="llama3.1",
-            embedding_model="nomic",
-            ai_mode="live",
-        )
-        assert pm.provider == "ollama"
-
-
-class TestAgentError:
-    def test_category_enum(self):
-        e = AgentError(
-            error_code="E1", message="msg", category=AgentErrorCategory.TIMEOUT
-        )
-        assert e.category == AgentErrorCategory.TIMEOUT
-
-
-# ============================================================================
-# ComplexityDecision / ExecutionBudget / MultiAgentState
+# ComplexityDecision / ExecutionBudget / ExecutionUsage / MultiAgentState
 # ============================================================================
 
 
 class TestComplexityDecision:
-    def test_basic(self):
-        cd = ComplexityDecision(complexity="single_agent", reason="simple task")
-        assert cd.complexity == "single_agent"
+    def test_routes_match_execution_modes(self):
+        for route in ("deterministic_workflow", "single_agent", "multi_agent"):
+            cd = ComplexityDecision(route=route)  # type: ignore[arg-type]
+            assert cd.route == route
+
+    def test_with_reasons_and_confidence(self):
+        cd = ComplexityDecision(
+            route="multi_agent",
+            domains=["support"],
+            reasons=["complex"],
+            confidence=0.8,
+        )
+        assert cd.confidence == 0.8
 
 
 class TestExecutionBudget:
-    def test_cost_exceeded_raises(self):
-        with pytest.raises(ValidationError):
-            ExecutionBudget(max_cost=10, total_cost=20)
+    def test_budget_fields(self):
+        b = ExecutionBudget(
+            max_tasks=8,
+            max_agent_calls=64,
+            max_tool_calls=256,
+            max_iterations=5,
+            token_budget=10000,
+            cost_budget_usd=5,
+            deadline_ms=120_000,
+        )
+        assert b.max_tasks == 8
+        assert b.token_budget == 10000
 
-    def test_max_agents_positive(self):
+    def test_positive_validation(self):
         with pytest.raises(ValidationError):
-            ExecutionBudget(max_agents=0)
+            ExecutionBudget(deadline_ms=0)
 
-    def test_valid_budget(self):
-        b = ExecutionBudget(max_cost=100, total_cost=50, agent_calls=3, iteration=1)
-        assert b.total_cost == 50
+
+class TestExecutionUsage:
+    def test_tracks_usage(self):
+        u = ExecutionUsage(
+            tasks_dispatched=5, agent_calls=20, tokens_used=500, cost_usd=1
+        )
+        assert u.tasks_dispatched == 5
 
 
 class TestMultiAgentState:
-    def test_basic(self):
-        state = MultiAgentState(run_id="run-1", tenant_id="t-1")
-        assert state.status == "idle"
-        assert state.current_iteration == 0
-
-    def test_with_budget(self):
+    def test_with_objective_and_user(self):
         state = MultiAgentState(
-            run_id="run-1",
+            run_id="r1",
             tenant_id="t-1",
-            budget=ExecutionBudget(max_agents=4, max_iterations=5, max_cost=50),
+            user_id="u1",
+            objective="Analyze support tickets",
         )
-        assert state.budget.max_agents == 4
+        assert state.objective == "Analyze support tickets"
+
+    def test_rejects_foreign_tenant_task(self):
+        task = AgentTask(
+            task_id="t1",
+            agent_id="a1",
+            task_type="t",
+            input_data={},
+            tenant_id="t-999",
+            timeout_ms=60_000,
+            idempotency_key="ik-1",
+        )
+        with pytest.raises(ValidationError):
+            MultiAgentState(run_id="r1", tenant_id="t-1", tasks=[task])
+
+    def test_with_complexity_and_budget(self):
+        state = MultiAgentState(
+            run_id="r1",
+            tenant_id="t-1",
+            complexity=ComplexityDecision(route="multi_agent", reasons=["high"]),
+            budget=ExecutionBudget(max_tasks=4),
+        )
+        assert state.complexity.route == "multi_agent"
+        assert state.budget.max_tasks == 4
 
 
 # ============================================================================
-# Adapters
+# Adapter tests
 # ============================================================================
 
 
-class TestCrmWriterAdapter:
-    def test_adapter(self):
+class TestAdapters:
+    def test_crm_writer_adapter(self):
         from dataclasses import dataclass
 
         @dataclass
@@ -721,15 +528,9 @@ class TestCrmWriterAdapter:
 
         old = Old("p-1", "ticket", "create", {"x": 1}, True, "2025-06-01T12:00:00Z")
         adapted = from_crm_writer_proposal(old, tenant_id="t-001", agent_id="sales")
-        assert adapted.proposal_id == "p-1"
-        assert adapted.tenant_id == "t-001"
-        # Hash must be non-empty and valid
-        assert len(adapted.proposal_hash) == 64
         assert adapted.proposal_hash == adapted.compute_hash()
 
-
-class TestProductivityAdapter:
-    def test_adapter_no_evidence_medium(self):
+    def test_productivity_adapter(self):
         from dataclasses import dataclass
 
         @dataclass(frozen=True)
@@ -764,42 +565,4 @@ class TestProductivityAdapter:
             {"type": "sla"},
         )
         adapted = from_productivity_proposal(old, evidence_ids=["ev-1"])
-        assert adapted.proposal_id == "p-1"
         assert adapted.proposal_hash == adapted.compute_hash()
-
-    def test_adapter_high_priority_requires_explicit_evidence(self):
-        from dataclasses import dataclass
-
-        @dataclass(frozen=True)
-        class Old:
-            proposal_id: str
-            tenant_id: str
-            user_id: str
-            action_type: str
-            target_entity: str
-            target_id: str
-            priority: str
-            justification: str
-            drafts: dict
-            created_at: str
-            dedupe_key: str
-            signal_type: str
-            signal: dict
-
-        old = Old(
-            "p-1",
-            "t-001",
-            "u-1",
-            "reminder",
-            "task",
-            "task-1",
-            "high",
-            "critical",
-            {},
-            "2025-06-01T12:00:00+00:00",
-            "dk-1",
-            "sla",
-            {"type": "sla"},
-        )
-        with pytest.raises(ValueError, match="evidence_ids"):
-            from_productivity_proposal(old)

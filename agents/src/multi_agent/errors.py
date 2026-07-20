@@ -14,16 +14,20 @@ class DuplicateAgentError(MultiAgentError):
     """Registering an agent_id that already exists."""
 
 
+class DuplicateToolError(MultiAgentError):
+    """Registering a tool_name that already exists in the ToolCatalog."""
+
+
 class UnknownAgentError(MultiAgentError):
     """Resolving an agent_id that is not registered."""
 
 
-class DisabledAgentError(MultiAgentError):
-    """Resolving a disabled agent."""
-
-
 class UnknownToolError(MultiAgentError):
     """A tool name is not in the ToolCatalog."""
+
+
+class DisabledAgentError(MultiAgentError):
+    """Resolving a disabled agent."""
 
 
 class UnauthorizedToolError(MultiAgentError):
@@ -31,7 +35,7 @@ class UnauthorizedToolError(MultiAgentError):
 
 
 class CapabilityValidationError(MultiAgentError):
-    """AgentCapability fails structural validation."""
+    """Task type or timeout exceeds agent capability."""
 
 
 # Contracts --------------------------------------------------------------
@@ -56,7 +60,7 @@ class MergeConflictError(MultiAgentError):
 
 
 class BudgetExceededError(MultiAgentError):
-    """Execution budget (cost, agents, iterations) exceeded."""
+    """Execution budget exceeded."""
 
 
 # Serialization ----------------------------------------------------------

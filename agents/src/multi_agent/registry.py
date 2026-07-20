@@ -20,10 +20,13 @@ from multi_agent.contracts import (
     AgentTask,
     StrictContract,
     ToolAuthority,
+    ToolDescriptor,
 )
 from multi_agent.errors import (
+    CapabilityValidationError,
     DisabledAgentError,
     DuplicateAgentError,
+    DuplicateToolError,
     UnauthorizedToolError,
     UnknownAgentError,
     UnknownToolError,
@@ -33,16 +36,6 @@ from multi_agent.serialization import content_hash
 # ---------------------------------------------------------------------------
 # Tool Catalog
 # ---------------------------------------------------------------------------
-
-
-class ToolDescriptor(StrictContract):
-    """Describes a single tool's authority, contract, and metadata."""
-
-    tool_name: str
-    authority: ToolAuthority
-    description: str = ""
-    input_contract: str = ""
-    output_contract: str = ""
 
 
 class ToolCatalog:
@@ -59,7 +52,7 @@ class ToolCatalog:
 
     def register(self, tool: ToolDescriptor) -> None:
         if tool.tool_name in self._tools:
-            raise DuplicateAgentError(f"Tool {tool.tool_name!r} is already registered")
+            raise DuplicateToolError(f"Tool {tool.tool_name!r} is already registered")
         self._tools[tool.tool_name] = tool
 
     def resolve(self, tool_name: str) -> ToolDescriptor:
@@ -79,7 +72,6 @@ class ToolCatalog:
         """Factory for the built-in Phase 2 tool catalog."""
         return cls(
             tools=[
-                # Read tools
                 ToolDescriptor(
                     tool_name="crm_reader.get_leads",
                     authority=ToolAuthority.READ,
@@ -120,13 +112,11 @@ class ToolCatalog:
                     authority=ToolAuthority.READ,
                     description="Keyword / full-text search",
                 ),
-                # Propose tools
                 ToolDescriptor(
                     tool_name="crm_writer.propose",
                     authority=ToolAuthority.PROPOSE,
                     description="Propose a CRM write",
                 ),
-                # Execute tools
                 ToolDescriptor(
                     tool_name="automation_executor.execute",
                     authority=ToolAuthority.EXECUTE,
@@ -176,7 +166,11 @@ class RegistrySnapshot(StrictContract):
 
 
 class AgentRegistry:
-    """Single registry of agent capabilities and handlers."""
+    """Single registry of agent capabilities and handlers.
+
+    Capabilities are frozen (immutable) so resolve_capability() returns the
+    same object safely.  Re-registration requires replace() which re-validates.
+    """
 
     def __init__(self, tool_catalog: ToolCatalog | None = None) -> None:
         self._tool_catalog = tool_catalog or ToolCatalog.default_catalog()
@@ -225,6 +219,7 @@ class AgentRegistry:
 
     def resolve_capability(self, agent_id: str) -> AgentCapability:
         cap, _ = self.resolve(agent_id)
+        # Capability is frozen (immutable) — safe to return directly
         return cap
 
     def is_registered(self, agent_id: str) -> bool:
@@ -233,33 +228,18 @@ class AgentRegistry:
     # -- Validation ---------------------------------------------------------
 
     def validate_task(self, task: AgentTask) -> AgentCapability:
-        """Validate that *task* can be dispatched to its target agent.
-
-        Returns the resolved AgentCapability on success.
-        """
         cap = self.resolve_capability(task.agent_id)
         if task.task_type not in cap.supported_tasks:
-            raise UnauthorizedToolError(
+            raise CapabilityValidationError(
                 f"Agent {task.agent_id!r} does not support task type {task.task_type!r}"
             )
         if task.timeout_ms > cap.timeout_ms:
-            raise UnauthorizedToolError(
+            raise CapabilityValidationError(
                 f"Task timeout {task.timeout_ms}ms exceeds agent capability {cap.timeout_ms}ms"
             )
-        # Authority check: a task requiring execute must go to an execute agent.
-        # We infer the required authority from task_type naming convention for now;
-        # Phase 3+ can formalize this.
         return cap
 
-    def validate_tool_access(
-        self,
-        agent_id: str,
-        tool_name: str,
-    ) -> ToolDescriptor:
-        """Validate that *agent_id* is authorised to use *tool_name*.
-
-        Returns the ToolDescriptor on success.
-        """
+    def validate_tool_access(self, agent_id: str, tool_name: str) -> ToolDescriptor:
         cap = self.resolve_capability(agent_id)
         tool = self._tool_catalog.resolve(tool_name)
 
@@ -268,7 +248,6 @@ class AgentRegistry:
                 f"Agent {agent_id!r} is not allowed to use tool {tool_name!r}"
             )
 
-        # Authority hierarchy check
         if (
             cap.authority == AgentAuthority.READ
             and tool.authority != ToolAuthority.READ
@@ -285,7 +264,7 @@ class AgentRegistry:
             )
         return tool
 
-    # -- Queries (sorted by agent_id for determinism) -----------------------
+    # -- Queries ------------------------------------------------------------
 
     def list_by_domain(self, domain: str) -> list[AgentCapability]:
         return sorted(
@@ -314,8 +293,13 @@ class AgentRegistry:
             cap = self._agents[agent_id]
             raw[agent_id] = cap.model_dump(mode="json")
         version = content_hash(raw)
+        # Return copies so mutation doesn't affect registry
+        agents_copy = {
+            aid: AgentCapability.model_validate(cap.model_dump(mode="json"))
+            for aid, cap in self._agents.items()
+        }
         return RegistrySnapshot(
-            agents=dict(sorted(self._agents.items(), key=lambda kv: kv[0])),
+            agents=dict(sorted(agents_copy.items(), key=lambda kv: kv[0])),
             version=version,
             created_at=datetime.now(timezone.utc),
         )
@@ -324,7 +308,7 @@ class AgentRegistry:
 
     def _validate_tool_authority(self, capability: AgentCapability) -> None:
         for tool_name in capability.allowed_tools:
-            tool = self._tool_catalog.resolve(tool_name)  # raises UnknownToolError
+            tool = self._tool_catalog.resolve(tool_name)
             if (
                 capability.authority == AgentAuthority.READ
                 and tool.authority != ToolAuthority.READ

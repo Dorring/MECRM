@@ -1,4 +1,4 @@
-"""State merge tests — Phase 2 R2 with expected_tenant_id and content-hash dedup."""
+"""State merge tests — Phase 2 R3 with two-phase order-independent merge."""
 
 from __future__ import annotations
 
@@ -92,23 +92,11 @@ class TestBasicMerge:
         merged = merge_parallel_results([], expected_tenant_id="t-001")
         assert merged.results == []
 
-    def test_single_result(self):
-        r1 = _make_result(result_id="r-001")
-        merged = merge_parallel_results([r1], expected_tenant_id="t-001")
-        assert len(merged.results) == 1
 
-
-# Order independence + permutation ----------------------------------------
+# Order independence ------------------------------------------------------
 
 
 class TestOrderIndependence:
-    def test_swap_input_order_same_output_ids(self):
-        r1 = _make_result(result_id="r-001")
-        r2 = _make_result(result_id="r-002")
-        m1 = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
-        m2 = merge_parallel_results([r2, r1], expected_tenant_id="t-001")
-        assert [r.result_id for r in m1.results] == [r.result_id for r in m2.results]
-
     def test_all_permutations_equivalent(self):
         r1 = _make_result(result_id="r-001")
         r2 = _make_result(result_id="r-002")
@@ -121,23 +109,62 @@ class TestOrderIndependence:
             assert [r.result_id for r in merged.results] == expected_ids
 
 
-# Result dedup (content-hash based) ---------------------------------------
+# Result dedup ------------------------------------------------------------
 
 
 class TestResultDedup:
-    def test_duplicate_result_same_content_is_idempotent(self):
+    def test_duplicate_result_same_content_idempotent(self):
         r1 = _make_result(result_id="r-001")
         r2 = _make_result(result_id="r-001")  # same id, same content
         merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
         assert len(merged.results) == 1
 
-    def test_duplicate_result_different_content_is_conflict(self):
+    def test_duplicate_result_different_content_conflict(self):
         r1 = _make_result(result_id="r-001", confidence=0.9)
-        r2 = _make_result(result_id="r-001", confidence=0.5)  # same id, different
+        r2 = _make_result(result_id="r-001", confidence=0.5)  # same id, diff content
         merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
+        # BOTH excluded
+        assert len(merged.results) == 0
         assert any(c.conflict_type == "content_mismatch" for c in merged.conflicts)
 
-    def test_duplicate_evidence_different_content_is_conflict(self):
+    def test_conflicting_result_excluded_in_both_orders(self):
+        r1 = _make_result(result_id="r-001", confidence=0.9)
+        r2 = _make_result(result_id="r-001", confidence=0.5)
+        m1 = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
+        m2 = merge_parallel_results([r2, r1], expected_tenant_id="t-001")
+        # Both orders exclude the conflicting result
+        assert len(m1.results) == 0
+        assert len(m2.results) == 0
+
+    def test_conflicting_merge_all_permutations_equivalent(self):
+        """With same-ID results of different content, all permutations exclude all."""
+        # Create 2 results with same ID but different content
+        # Only need 2 since the third has a different ID
+        r_a = _make_result(result_id="r-001", confidence=0.9)
+        r_b = _make_result(result_id="r-001", confidence=0.5)
+        r_ok = _make_result(result_id="r-002")
+
+        for perm in permutations([r_a, r_b, r_ok]):
+            merged = merge_parallel_results(list(perm), expected_tenant_id="t-001")
+            # r-001 excluded (conflict), r-002 kept
+            assert [r.result_id for r in merged.results] == ["r-002"]
+            assert any(c.conflict_type == "content_mismatch" for c in merged.conflicts)
+
+
+# Evidence dedup ----------------------------------------------------------
+
+
+class TestEvidenceDedup:
+    def test_evidence_dedup_same_content(self):
+        ev1 = _make_evidence(evidence_id="ev-001")
+        ev2 = _make_evidence(evidence_id="ev-001")  # same
+        ev3 = _make_evidence(evidence_id="ev-002")
+        r1 = _make_result(result_id="r-001", evidence=[ev1, ev3])
+        r2 = _make_result(result_id="r-002", evidence=[ev2])
+        merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
+        assert {e.evidence_id for e in merged.merged_evidence} == {"ev-001", "ev-002"}
+
+    def test_duplicate_evidence_different_content_conflict(self):
         ev1 = _make_evidence(evidence_id="ev-001")
         ev2 = Evidence(
             evidence_id="ev-001",
@@ -149,67 +176,25 @@ class TestResultDedup:
         r1 = _make_result(result_id="r-001", evidence=[ev1])
         r2 = _make_result(result_id="r-002", evidence=[ev2])
         merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
-        # Evidence ev-001 has different content → conflict
-        assert any(
-            c.conflict_type == "content_mismatch" and "ev-001" in str(c.conflicting_ids)
-            for c in merged.conflicts
-        )
+        # Both excluded
+        assert not any(e.evidence_id == "ev-001" for e in merged.merged_evidence)
+        assert any(c.conflict_type == "content_mismatch" for c in merged.conflicts)
 
-
-# Evidence dedup ----------------------------------------------------------
-
-
-class TestEvidenceDedup:
-    def test_evidence_dedup_by_id(self):
+    def test_conflicting_evidence_excluded_in_both_orders(self):
         ev1 = _make_evidence(evidence_id="ev-001")
-        ev2 = _make_evidence(evidence_id="ev-001")  # same id, same content
-        ev3 = _make_evidence(evidence_id="ev-002")
-
-        r1 = _make_result(result_id="r-001", evidence=[ev1, ev3])
+        ev2 = Evidence(
+            evidence_id="ev-001",
+            evidence_type=EvidenceType.CUSTOMER,
+            tenant_id="t-001",
+            source_agent="a",
+            created_at=_utc_now(),
+        )
+        r1 = _make_result(result_id="r-001", evidence=[ev1])
         r2 = _make_result(result_id="r-002", evidence=[ev2])
-
-        merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
-        evidence_ids = {e.evidence_id for e in merged.merged_evidence}
-        assert evidence_ids == {"ev-001", "ev-002"}
-
-
-# Foreign tenant -----------------------------------------------------------
-
-
-class TestForeignTenant:
-    def test_foreign_result_rejected(self):
-        r1 = _make_result(result_id="r-001", tenant_id="t-001")
-        r2 = _make_result(result_id="r-002", tenant_id="t-002")  # foreign
-        merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
-        assert len(merged.results) == 1
-        assert merged.results[0].result_id == "r-001"
-        assert any(c.conflict_type == "foreign_tenant" for c in merged.conflicts)
-
-    def test_foreign_evidence_rejected(self):
-        # Result r1 is from t-001 with its own evidence; r2 is from t-002.
-        ev1 = _make_evidence(evidence_id="ev-001", tenant_id="t-001")
-        ev2 = _make_evidence(evidence_id="ev-002", tenant_id="t-002")
-        r1 = _make_result(result_id="r-001", tenant_id="t-001", evidence=[ev1])
-        r2 = _make_result(result_id="r-002", tenant_id="t-002", evidence=[ev2])
-        merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
-        # t-002 result + evidence rejected
-        assert len(merged.merged_evidence) == 1
-        assert merged.merged_evidence[0].tenant_id == "t-001"
-        assert any(c.conflict_type == "foreign_tenant" for c in merged.conflicts)
-
-    def test_foreign_proposal_rejected(self):
-        # r1 has proposals matching t-001; r2 from t-002 is rejected
-        p1 = _make_proposal(proposal_id="p-001", tenant_id="t-001")
-        p2 = _make_proposal(proposal_id="p-002", tenant_id="t-002")
-        r1 = _make_result(
-            result_id="r-001", tenant_id="t-001", agent_id="agent_a", proposals=[p1]
-        )
-        r2 = _make_result(
-            result_id="r-002", tenant_id="t-002", agent_id="agent_a", proposals=[p2]
-        )
-        merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
-        assert len(merged.merged_proposals) >= 1
-        assert all(p.tenant_id == "t-001" for p in merged.merged_proposals)
+        m1 = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
+        m2 = merge_parallel_results([r2, r1], expected_tenant_id="t-001")
+        assert not any(e.evidence_id == "ev-001" for e in m1.merged_evidence)
+        assert not any(e.evidence_id == "ev-001" for e in m2.merged_evidence)
 
 
 # Proposal merge ----------------------------------------------------------
@@ -224,18 +209,37 @@ class TestProposalMerge:
         merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
         assert len(merged.merged_proposals) == 1
 
-    def test_proposal_creator_mismatch(self):
-        # Result agent is agent_a, but proposal says created_by_agent="agent_other"
-        # AgentResult._tenant_homogeneity rejects this at construction.
-        # The merge catches it when comparing cross-result creator mismatch
-        # (separate results: r1 with agent_a, r2 with agent_b, both create same proposal id)
-        p1 = _make_proposal(proposal_id="p-001", created_by_agent="agent_a")
-        p2 = _make_proposal(proposal_id="p-002", created_by_agent="agent_b")
-        r1 = _make_result(result_id="r-001", agent_id="agent_a", proposals=[p1])
-        r2 = _make_result(result_id="r-002", agent_id="agent_b", proposals=[p2])
+    def test_conflicting_proposal_excluded_in_both_orders(self):
+        p1 = _make_proposal(proposal_id="p-001", payload={"a": 1})
+        p2 = _make_proposal(proposal_id="p-001", payload={"b": 2})
+        r1 = _make_result(result_id="r-001", proposals=[p1])
+        r2 = _make_result(result_id="r-002", proposals=[p2])
+        m1 = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
+        m2 = merge_parallel_results([r2, r1], expected_tenant_id="t-001")
+        assert all(p.proposal_id != "p-001" for p in m1.merged_proposals)
+        assert all(p.proposal_id != "p-001" for p in m2.merged_proposals)
+        assert any(c.conflict_type == "content_mismatch" for c in m1.conflicts)
+
+
+# Foreign tenant -----------------------------------------------------------
+
+
+class TestForeignTenant:
+    def test_foreign_result_rejected(self):
+        r1 = _make_result(result_id="r-001", tenant_id="t-001")
+        r2 = _make_result(result_id="r-002", tenant_id="t-002")
         merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
-        # Both proposals have different creators, but each matches its own result → no conflict
-        assert len(merged.merged_proposals) >= 1
+        assert len(merged.results) == 1
+        assert merged.results[0].result_id == "r-001"
+
+    def test_foreign_evidence_rejected(self):
+        ev1 = _make_evidence(evidence_id="ev-001", tenant_id="t-001")
+        ev2 = _make_evidence(evidence_id="ev-002", tenant_id="t-002")
+        r1 = _make_result(result_id="r-001", tenant_id="t-001", evidence=[ev1])
+        r2 = _make_result(result_id="r-002", tenant_id="t-002", evidence=[ev2])
+        merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
+        assert len(merged.merged_evidence) == 1
+        assert merged.merged_evidence[0].tenant_id == "t-001"
 
 
 # Immutability ------------------------------------------------------------

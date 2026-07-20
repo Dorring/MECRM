@@ -197,12 +197,12 @@ class TestJsonRoundTrip:
         state = MultiAgentState(
             run_id="run-1",
             tenant_id="t-1",
-            budget=ExecutionBudget(max_cost=100, total_cost=50),
+            budget=ExecutionBudget(max_tasks=8, cost_budget_usd=Decimal("50")),
         )
         raw = serialize_contract(state)
         restored = deserialize_contract(raw, MultiAgentState)
         assert restored.run_id == "run-1"
-        assert restored.budget.total_cost == Decimal("50")
+        assert restored.budget.cost_budget_usd == Decimal("50")
 
     def test_action_proposal_round_trip(self):
         p = ActionProposal.create(

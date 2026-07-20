@@ -1,12 +1,14 @@
-"""Parallel agent result merge — Phase 2 R2.
+"""Parallel agent result merge — Phase 2 R3.
 
-Merge is order-independent: inputs are first canonicalised (by result_id sort)
-and conflicts are detected via content hash rather than silently keeping the
-first occurrence.
+Two-phase merge: group by ID, compare content hashes.
+Same ID + single content hash → keep one.
+Same ID + multiple content hashes → ALL excluded (content_mismatch).
+No first/last preference.
 """
 
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import datetime, timezone
 
 from pydantic import Field
@@ -49,62 +51,39 @@ def merge_parallel_results(
     *,
     expected_tenant_id: str,
 ) -> MergedState:
-    """Merge N parallel AgentResults into a single MergedState.
+    """Merge N parallel AgentResults.  Order-independent two-phase algorithm."""
 
-    All Results, their Evidence, and their Proposals must belong to
-    *expected_tenant_id*.  Foreign data is recorded as a conflict and
-    excluded from the merged output.
-    """
     if not results:
-        return MergedState(
-            merged_at=datetime.now(timezone.utc),
-        )
+        return MergedState(merged_at=datetime.now(timezone.utc))
 
     sorted_results = sorted(results, key=lambda r: r.result_id)
     conflicts: list[MergeConflict] = []
-    deduped_results: list[AgentResult] = []
-    merged_evidence: list[Evidence] = []
-    merged_proposals: list[ActionProposal] = []
 
-    seen_result_ids: dict[str, str] = {}  # result_id → content_hash
-    seen_evidence_ids: dict[str, str] = {}  # evidence_id → content_hash
-    seen_proposal_ids: dict[str, str] = {}  # proposal_id → content_hash
-    seen_proposal_hashes: set[str] = set()
-
-    for result in sorted_results:
-        # -- Tenant checks ---------------------------------------------------
-        if result.tenant_id != expected_tenant_id:
+    # -- Filter foreign tenants ----------------------------------------------
+    local_results: list[AgentResult] = []
+    for r in sorted_results:
+        if r.tenant_id != expected_tenant_id:
             conflicts.append(
                 MergeConflict(
                     conflict_type="foreign_tenant",
-                    detail=f"Result {result.result_id!r} tenant {result.tenant_id!r} != expected {expected_tenant_id!r}",
-                    conflicting_ids=[result.result_id],
+                    detail=f"Result {r.result_id!r} tenant {r.tenant_id!r} != expected {expected_tenant_id!r}",
+                    conflicting_ids=[r.result_id],
                 )
             )
-            continue
+        else:
+            local_results.append(r)
 
-        # -- Result dedup ---------------------------------------------------
-        rhash = content_hash(result.model_dump(mode="json"))
-        if result.result_id in seen_result_ids:
-            existing_hash = seen_result_ids[result.result_id]
-            if rhash == existing_hash:
-                # Same ID, same content → idempotent duplicate, skip
-                continue
+    # -- Phase 1: group by ID ------------------------------------------------
+    result_groups: dict[str, list[AgentResult]] = defaultdict(list)
+    evidence_groups: dict[str, list[Evidence]] = defaultdict(list)
+    proposal_groups: dict[str, list[ActionProposal]] = defaultdict(list)
+
+    for r in local_results:
+        result_groups[r.result_id].append(r)
+        for ev in r.evidence:
+            if ev.tenant_id == expected_tenant_id:
+                evidence_groups[ev.evidence_id].append(ev)
             else:
-                conflicts.append(
-                    MergeConflict(
-                        conflict_type="content_mismatch",
-                        detail=f"Result {result.result_id!r} has different content",
-                        conflicting_ids=[result.result_id],
-                    )
-                )
-                continue
-        seen_result_ids[result.result_id] = rhash
-        deduped_results.append(result)
-
-        # -- Evidence merge -------------------------------------------------
-        for ev in result.evidence:
-            if ev.tenant_id != expected_tenant_id:
                 conflicts.append(
                     MergeConflict(
                         conflict_type="foreign_tenant",
@@ -112,64 +91,64 @@ def merge_parallel_results(
                         conflicting_ids=[ev.evidence_id],
                     )
                 )
-                continue
-
-            ehash = content_hash(ev.model_dump(mode="json"))
-            if ev.evidence_id in seen_evidence_ids:
-                existing = seen_evidence_ids[ev.evidence_id]
-                if ehash != existing:
-                    conflicts.append(
-                        MergeConflict(
-                            conflict_type="content_mismatch",
-                            detail=f"Evidence {ev.evidence_id!r} has conflicting content",
-                            conflicting_ids=[ev.evidence_id],
-                        )
-                    )
-                # Same content or different: skip duplicate evidence_id
-                continue
-            seen_evidence_ids[ev.evidence_id] = ehash
-            merged_evidence.append(ev)
-
-        # -- Proposal merge -------------------------------------------------
-        for proposal in result.action_proposals:
-            if proposal.tenant_id != expected_tenant_id:
+        for p in r.action_proposals:
+            if p.tenant_id == expected_tenant_id:
+                proposal_groups[p.proposal_id].append(p)
+            else:
                 conflicts.append(
                     MergeConflict(
                         conflict_type="foreign_tenant",
-                        detail=f"Proposal {proposal.proposal_id!r} tenant {proposal.tenant_id!r} != expected {expected_tenant_id!r}",
-                        conflicting_ids=[proposal.proposal_id],
+                        detail=f"Proposal {p.proposal_id!r} tenant {p.tenant_id!r} != expected {expected_tenant_id!r}",
+                        conflicting_ids=[p.proposal_id],
                     )
                 )
-                continue
 
-            if proposal.created_by_agent != result.agent_id:
-                conflicts.append(
-                    MergeConflict(
-                        conflict_type="foreign_agent",
-                        detail=f"Proposal {proposal.proposal_id!r} created_by {proposal.created_by_agent!r} != result agent {result.agent_id!r}",
-                        conflicting_ids=[proposal.proposal_id, result.result_id],
-                    )
+    # -- Phase 2: resolve each group -----------------------------------------
+    deduped_results: list[AgentResult] = []
+    for result_id, group in sorted(result_groups.items(), key=lambda x: x[0]):
+        hashes = {content_hash(r.model_dump(mode="json")) for r in group}
+        if len(hashes) == 1:
+            deduped_results.append(group[0])
+        else:
+            conflicts.append(
+                MergeConflict(
+                    conflict_type="content_mismatch",
+                    detail=f"Result {result_id!r} has {len(hashes)} distinct content hashes; all excluded",
+                    conflicting_ids=[result_id],
                 )
-                continue
+            )
 
-            phash = content_hash(proposal.model_dump(mode="json"))
-            if proposal.proposal_id in seen_proposal_ids:
-                existing = seen_proposal_ids[proposal.proposal_id]
-                if phash != existing:
-                    conflicts.append(
-                        MergeConflict(
-                            conflict_type="content_mismatch",
-                            detail=f"Proposal {proposal.proposal_id!r} has conflicting content",
-                            conflicting_ids=[proposal.proposal_id],
-                        )
-                    )
-                continue
+    merged_evidence: list[Evidence] = []
+    for ev_id, group in sorted(evidence_groups.items(), key=lambda x: x[0]):
+        hashes = {content_hash(ev.model_dump(mode="json")) for ev in group}
+        if len(hashes) == 1:
+            merged_evidence.append(group[0])
+        else:
+            conflicts.append(
+                MergeConflict(
+                    conflict_type="content_mismatch",
+                    detail=f"Evidence {ev_id!r} has {len(hashes)} distinct content hashes; all excluded",
+                    conflicting_ids=[ev_id],
+                )
+            )
 
-            if proposal.proposal_hash in seen_proposal_hashes:
-                continue
-            seen_proposal_ids[proposal.proposal_id] = phash
-            seen_proposal_hashes.add(proposal.proposal_hash)
-            merged_proposals.append(proposal)
+    merged_proposals: list[ActionProposal] = []
+    seen_hashes: set[str] = set()
+    for prop_id, group in sorted(proposal_groups.items(), key=lambda x: x[0]):
+        hashes = {p.proposal_hash for p in group}
+        if len(hashes) == 1:
+            p = group[0]
+            if p.proposal_hash not in seen_hashes:
+                seen_hashes.add(p.proposal_hash)
+                merged_proposals.append(p)
+        else:
+            conflicts.append(
+                MergeConflict(
+                    conflict_type="content_mismatch",
+                    detail=f"Proposal {prop_id!r} has {len(hashes)} distinct content hashes; all excluded",
+                    conflicting_ids=[prop_id],
+                )
+            )
 
     return MergedState(
         results=deduped_results,
