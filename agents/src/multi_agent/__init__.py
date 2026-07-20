@@ -88,6 +88,7 @@ from multi_agent.planning import (
     TaskIntent,
     TOOL_TO_AGENT_AUTHORITY,
     build_expected_planned_tasks,
+    canonical_complexity_payload,
     canonical_request_payload,
     compute_plan_hash,
     compute_request_hash,

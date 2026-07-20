@@ -697,3 +697,33 @@ class TestCanonicalRequestSnapshot:
         codes = [i.code for i in report.issues]
         assert CODE_REQUEST_SNAPSHOT_MISMATCH in codes
         assert not report.valid
+
+
+# ============================================================================
+# R7.1 Hotfix — public export integrity
+# ============================================================================
+
+
+class TestPublicExportIntegrity:
+    """R7.1 hotfix: ``canonical_complexity_payload`` was listed in
+    ``__all__`` but never actually imported, so
+    ``from multi_agent import canonical_complexity_payload`` failed.
+    These tests guard against ``__all__`` / real-import drift forever
+    after."""
+
+    def test_canonical_complexity_payload_public_export(self) -> None:
+        """The public export must be the exact same object as the
+        source function in ``multi_agent.planning``."""
+        from multi_agent import canonical_complexity_payload as public_export
+        from multi_agent.planning import canonical_complexity_payload as source
+
+        assert public_export is source
+
+    def test_every_public_export_resolves(self) -> None:
+        """Every name in ``multi_agent.__all__`` must be a real
+        attribute on the package, so ``from multi_agent import *``
+        never raises ``ImportError`` for any advertised name."""
+        import multi_agent
+
+        for name in multi_agent.__all__:
+            assert hasattr(multi_agent, name), f"missing public export: {name}"
