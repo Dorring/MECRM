@@ -19,10 +19,10 @@ jobs:
       matrix:
         project: [gateway, frontend]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: "npm"
@@ -47,10 +47,10 @@ jobs:
     name: Lint Python
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -73,10 +73,10 @@ jobs:
     name: Validate Event Schemas
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -118,10 +118,10 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
 
@@ -238,10 +238,10 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
 
@@ -267,7 +267,7 @@ jobs:
           GATEWAY_DIR: ./gateway
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -309,10 +309,10 @@ jobs:
           --health-retries 5
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
 
@@ -324,7 +324,7 @@ jobs:
         working-directory: gateway
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -368,7 +368,7 @@ jobs:
     needs: [test-gateway, test-agents, test-policies, migration-runner]
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -433,7 +433,7 @@ jobs:
     needs: [lint, lint-python]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -482,7 +482,7 @@ jobs:
     name: Test OPA Policies
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup OPA
         uses: open-policy-agent/setup-opa@v2
@@ -500,7 +500,7 @@ jobs:
     name: Helm Lint & Template
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Helm
         uses: azure/setup-helm@v5
@@ -770,7 +770,7 @@ jobs:
             dockerfile: database/Dockerfile.migrate
             context: .
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
         id: buildx
@@ -1029,7 +1029,7 @@ jobs:
             dockerfile: database/Dockerfile.migrate
             context: .
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -1149,7 +1149,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - name: Download digest artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: digest-*
           merge-multiple: true
@@ -1220,10 +1220,10 @@ jobs:
       TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
       TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download digest map
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: digest-map
           path: /tmp/digest-map
@@ -1244,7 +1244,7 @@ jobs:
 
       - name: Configure kubectl
         if: ${{ env.SKIP_REMAINING != 'true' }}
-        uses: azure/k8s-set-context@v3
+        uses: azure/k8s-set-context@v5
         with:
           kubeconfig: ${{ env.KUBE_CONFIG_STAGING }}
 
@@ -1292,7 +1292,7 @@ jobs:
       TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
       TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Guard required integration-test secrets
         run: |
@@ -1306,7 +1306,7 @@ jobs:
 
       - name: Setup Node.js
         if: ${{ env.SKIP_REMAINING != 'true' }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: "npm"
@@ -1341,10 +1341,10 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       KUBE_CONFIG_PRODUCTION: ${{ secrets.KUBE_CONFIG_PRODUCTION }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download digest map
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: digest-map
           path: /tmp/digest-map
@@ -1365,7 +1365,7 @@ jobs:
 
       - name: Configure kubectl
         if: ${{ env.SKIP_REMAINING != 'true' }}
-        uses: azure/k8s-set-context@v3
+        uses: azure/k8s-set-context@v5
         with:
           kubeconfig: ${{ env.KUBE_CONFIG_PRODUCTION }}
 
@@ -1398,7 +1398,7 @@ jobs:
 
       - name: Notify deployment
         if: ${{ env.SKIP_REMAINING != 'true' }}
-        uses: slackapi/slack-github-action@v3.0.5
+        uses: slackapi/slack-github-action@v4.0.0
         with:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
