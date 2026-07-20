@@ -181,15 +181,3 @@ def validate_strict_json(value: Any) -> Any:
     raise ValueError(
         f"Value of type {type(value).__name__} is not valid strict JSON: {value!r}"
     )
-
-
-# ---------------------------------------------------------------------------
-# Canonicalizer-based validator (still used for hash/payload validation)
-# ---------------------------------------------------------------------------
-
-
-def validate_json_value(value: Any) -> Any:
-    """Validate via canonicalizer — used for payload fields that may contain
-    Decimal/datetime/Enum which are fine inside ActionProposal payloads but
-    will be canonicalized before hashing."""
-    return _canonical_value(value)

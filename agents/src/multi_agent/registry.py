@@ -155,7 +155,7 @@ class AgentHandler(Protocol):
 
 
 class RegistrySnapshot(StrictContract):
-    agents: dict[str, AgentCapability] = {}
+    agents: dict[str, AgentCapability] = Field(default_factory=dict)
     version: str = ""
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

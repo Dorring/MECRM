@@ -40,6 +40,7 @@ def _make_result() -> AgentResult:
         result_id="r-001",
         task_id="task-001",
         agent_id="agent_a",
+        agent_version="1.0.0",
         tenant_id="t-001",
         status="completed",
         summary="Done",

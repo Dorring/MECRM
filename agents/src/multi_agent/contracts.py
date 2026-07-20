@@ -1,4 +1,4 @@
-"""Unified multi-agent data contracts — Phase 2 R5.
+"""Unified multi-agent data contracts.
 
 Every contract inherits :class:`StrictContract`.  JSON fields are validated
 through :func:`validate_strict_json` at the Pydantic boundary — bytes, sets,
@@ -150,6 +150,41 @@ def _is_stable_agent_id(value: str) -> bool:
     return bool(_AGENT_ID_RE.fullmatch(value))
 
 
+# ---------------------------------------------------------------------------
+# Resource-id format — supports UUID, composite keys, dotted names
+# ---------------------------------------------------------------------------
+
+_RESOURCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+
+
+def _non_blank(value: str, field_name: str) -> str:
+    """Strip and reject blank strings.  Reused by every ID/identifier field."""
+    value = value.strip()
+    if not value:
+        raise ValueError(f"{field_name} must not be blank")
+    return value
+
+
+def _validate_resource_id(value: str, field_name: str) -> str:
+    """Non-blank + safe character class for resource identifiers."""
+    value = _non_blank(value, field_name)
+    if not _RESOURCE_ID_RE.fullmatch(value):
+        raise ValueError(
+            f"{field_name} must match {_RESOURCE_ID_RE.pattern!r}; got {value!r}"
+        )
+    return value
+
+
+def _validate_agent_id_field(value: str, field_name: str) -> str:
+    """Non-blank + stable agent-id format (lowercase snake_case)."""
+    value = _non_blank(value, field_name)
+    if not _is_stable_agent_id(value):
+        raise ValueError(
+            f"{field_name} must match {_AGENT_ID_RE.pattern!r}; got {value!r}"
+        )
+    return value
+
+
 # ============================================================================
 # CONTRACTS
 # ============================================================================
@@ -254,6 +289,16 @@ class Evidence(StrictContract):
     retrieved_at: datetime | None = None
     metadata: dict[str, JsonValue] | None = None
 
+    @field_validator("evidence_id")
+    @classmethod
+    def _evidence_id_required(cls, v: str) -> str:
+        return _validate_resource_id(v, "evidence_id")
+
+    @field_validator("source_agent")
+    @classmethod
+    def _source_agent_stable(cls, v: str) -> str:
+        return _validate_agent_id_field(v, "source_agent")
+
     @field_validator("tenant_id")
     @classmethod
     def _tenant_required(cls, v: str) -> str:
@@ -290,6 +335,11 @@ class ToolDescriptor(StrictContract):
     description: str = ""
     input_contract: str = ""
     output_contract: str = ""
+
+    @field_validator("tool_name")
+    @classmethod
+    def _tool_name_required(cls, v: str) -> str:
+        return _validate_resource_id(v, "tool_name")
 
 
 # -- ToolCallRecord ----------------------------------------------------------
@@ -366,10 +416,35 @@ class ActionProposal(StrictContract):
     justification: str | None = None
     evidence_ids: list[str] = Field(default_factory=list)
     requires_approval: bool = True
-    idempotency_key: str = ""
+    idempotency_key: str
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     # -- validators ----------------------------------------------------------
+
+    @field_validator("proposal_id")
+    @classmethod
+    def _proposal_id_required(cls, v: str) -> str:
+        return _validate_resource_id(v, "proposal_id")
+
+    @field_validator("created_by_agent")
+    @classmethod
+    def _created_by_agent_stable(cls, v: str) -> str:
+        return _validate_agent_id_field(v, "created_by_agent")
+
+    @field_validator("action_type")
+    @classmethod
+    def _action_type_non_blank(cls, v: str) -> str:
+        return _non_blank(v, "action_type")
+
+    @field_validator("target_entity")
+    @classmethod
+    def _target_entity_non_blank(cls, v: str) -> str:
+        return _non_blank(v, "target_entity")
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _idempotency_key_required(cls, v: str) -> str:
+        return _non_blank(v, "idempotency_key")
 
     @field_validator("tenant_id")
     @classmethod
@@ -516,6 +591,21 @@ class AgentTask(StrictContract):
     started_at: datetime | None = None
     completed_at: datetime | None = None
 
+    @field_validator("task_id")
+    @classmethod
+    def _task_id_required(cls, v: str) -> str:
+        return _validate_resource_id(v, "task_id")
+
+    @field_validator("agent_id")
+    @classmethod
+    def _agent_id_stable_task(cls, v: str) -> str:
+        return _validate_agent_id_field(v, "agent_id")
+
+    @field_validator("task_type")
+    @classmethod
+    def _task_type_non_blank(cls, v: str) -> str:
+        return _non_blank(v, "task_type")
+
     @field_validator("tenant_id")
     @classmethod
     def _tenant_required_task(cls, v: str) -> str:
@@ -573,7 +663,7 @@ class AgentResult(StrictContract):
     result_id: str
     task_id: str
     agent_id: str
-    agent_version: str = ""
+    agent_version: str
     tenant_id: str
     status: Literal[
         "completed", "failed", "degraded", "cancelled", "needs_input", "skipped"
@@ -592,6 +682,26 @@ class AgentResult(StrictContract):
     provider_metadata: ProviderMetadata | None = None
     started_at: datetime | None = None
     completed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator("result_id")
+    @classmethod
+    def _result_id_required(cls, v: str) -> str:
+        return _validate_resource_id(v, "result_id")
+
+    @field_validator("task_id")
+    @classmethod
+    def _task_id_required(cls, v: str) -> str:
+        return _validate_resource_id(v, "task_id")
+
+    @field_validator("agent_id")
+    @classmethod
+    def _agent_id_stable_result(cls, v: str) -> str:
+        return _validate_agent_id_field(v, "agent_id")
+
+    @field_validator("agent_version")
+    @classmethod
+    def _agent_version_required(cls, v: str) -> str:
+        return _non_blank(v, "agent_version")
 
     @field_validator("tenant_id")
     @classmethod
@@ -778,6 +888,11 @@ class MultiAgentState(StrictContract):
     current_iteration: int = Field(default=0, ge=0)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator("run_id")
+    @classmethod
+    def _run_id_required(cls, v: str) -> str:
+        return _validate_resource_id(v, "run_id")
 
     @field_validator("tenant_id")
     @classmethod

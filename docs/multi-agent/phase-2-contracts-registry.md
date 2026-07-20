@@ -1,16 +1,21 @@
 # Phase 2: Multi-Agent Contracts & Agent Registry
 
-## Status: Complete (R7)
+## Status: Complete (R8)
 
 **Branch:** `feat/ma-02-contracts-registry`
-**Tests:** 144 passed (R7) + 76 Phase 1 regression (AI_MODE=deterministic)
+**Tests:** 161 passed (R8) + 76 Phase 1 regression (AI_MODE=deterministic)
 
-R7 closes the four P0/P1 gaps identified in the R6 review:
+R8 closes the two foundation invariants from the R7 review:
 
-1. **Sensitive-key normalization** — patterns are now pre-normalized so `access_token`, `access-token`, `ACCESS_TOKEN` all collapse to `accesstoken`; recursive scan now covers lists, not only dicts.
-2. **Registry read APIs** — `list_by_domain` / `list_by_task` / `list_all` now return deep copies via a unified `_copy_capability()` helper, matching `resolve` / `resolve_capability` / `snapshot`.
-3. **Evidence reference integrity at boundaries** — `merge_parallel_results()` and `MultiAgentState` both verify that every `proposed_actions[*].evidence_ids` references evidence that actually survives into the output. Proposals with dangling references are excluded and recorded as `proposal_missing_evidence` conflicts.
-4. **Documentation** — this file now reflects the R3–R7 implementation rather than the R2 baseline.
+1. **Invalid proposals fully scrubbed** — a unified `excluded_proposal_ids` set is populated by every exclusion path (integrity failure, content mismatch, foreign tenant, missing evidence) and used to remove bad proposals from BOTH `merged_proposals` AND every `results[*].action_proposals`. No executable path in `MergedState` can reach a known-bad proposal.
+2. **Core IDs must not be blank** — `_non_blank()`, `_validate_resource_id()`, and `_validate_agent_id_field()` validators enforce non-blank + safe character class on every identifier that flows into Merge, dependency graph, Registry, Trace, or approval. `AgentResult.agent_version` and `ActionProposal.idempotency_key` no longer accept empty defaults.
+
+R7 closed the four P0/P1 gaps from the R6 review:
+
+3. **Sensitive-key normalization** — patterns are now pre-normalized so `access_token`, `access-token`, `ACCESS_TOKEN` all collapse to `accesstoken`; recursive scan now covers lists, not only dicts.
+4. **Registry read APIs** — `list_by_domain` / `list_by_task` / `list_all` now return deep copies via a unified `_copy_capability()` helper, matching `resolve` / `resolve_capability` / `snapshot`.
+5. **Evidence reference integrity at boundaries** — `merge_parallel_results()` and `MultiAgentState` both verify that every `proposed_actions[*].evidence_ids` references evidence that actually survives into the output. Proposals with dangling references are excluded and recorded as `proposal_missing_evidence` conflicts.
+6. **Documentation** — this file reflects the R3–R8 implementation rather than the R2 baseline.
 
 ---
 

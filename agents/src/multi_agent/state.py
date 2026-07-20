@@ -1,9 +1,15 @@
-"""Parallel agent result merge — Phase 2 R3.
+"""Parallel agent result merge.
 
 Two-phase merge: group by ID, compare content hashes.
 Same ID + single content hash → keep one.
 Same ID + multiple content hashes → ALL excluded (content_mismatch).
 No first/last preference.
+
+Invalid proposals (integrity failure, content mismatch, foreign tenant,
+missing evidence) are tracked in a single ``excluded_proposal_ids`` set
+and removed from BOTH ``merged_proposals`` AND every
+``results[*].action_proposals`` so that no executable path can reach a
+known-bad proposal.
 """
 
 from __future__ import annotations
@@ -61,6 +67,9 @@ def merge_parallel_results(
 
     sorted_results = sorted(results, key=lambda r: r.result_id)
     conflicts: list[MergeConflict] = []
+    # Unified set of proposal IDs that must not survive into MergedState.
+    # Populated by every exclusion path and used to scrub results at the end.
+    excluded_proposal_ids: set[str] = set()
 
     # -- Filter foreign tenants ----------------------------------------------
     local_results: list[AgentResult] = []
@@ -95,25 +104,8 @@ def merge_parallel_results(
                     )
                 )
         for p in r.action_proposals:
-            if p.tenant_id == expected_tenant_id:
-                try:
-                    p.verify_integrity()
-                except (
-                    ProposalHashMismatchError,
-                    ValidationError,
-                    ValueError,
-                    TypeError,
-                ):
-                    conflicts.append(
-                        MergeConflict(
-                            conflict_type="proposal_integrity_failure",
-                            detail=f"Proposal {p.proposal_id!r} failed integrity check; excluded",
-                            conflicting_ids=[p.proposal_id],
-                        )
-                    )
-                    continue
-                proposal_groups[p.proposal_id].append(p)
-            else:
+            if p.tenant_id != expected_tenant_id:
+                excluded_proposal_ids.add(p.proposal_id)
                 conflicts.append(
                     MergeConflict(
                         conflict_type="foreign_tenant",
@@ -121,6 +113,25 @@ def merge_parallel_results(
                         conflicting_ids=[p.proposal_id],
                     )
                 )
+                continue
+            try:
+                p.verify_integrity()
+            except (
+                ProposalHashMismatchError,
+                ValidationError,
+                ValueError,
+                TypeError,
+            ):
+                excluded_proposal_ids.add(p.proposal_id)
+                conflicts.append(
+                    MergeConflict(
+                        conflict_type="proposal_integrity_failure",
+                        detail=f"Proposal {p.proposal_id!r} failed integrity check; excluded",
+                        conflicting_ids=[p.proposal_id],
+                    )
+                )
+                continue
+            proposal_groups[p.proposal_id].append(p)
 
     # -- Phase 2: resolve each group -----------------------------------------
     deduped_results: list[AgentResult] = []
@@ -161,6 +172,7 @@ def merge_parallel_results(
                 seen_hashes.add(p.proposal_hash)
                 merged_proposals.append(p)
         else:
+            excluded_proposal_ids.add(prop_id)
             conflicts.append(
                 MergeConflict(
                     conflict_type="content_mismatch",
@@ -176,7 +188,6 @@ def merge_parallel_results(
     # all evidence and proposal conflict resolution so that the available
     # evidence set reflects the surviving objects only.
     available_evidence_ids = {ev.evidence_id for ev in merged_evidence}
-    excluded_proposal_ids: set[str] = set()
     final_proposals: list[ActionProposal] = []
     for p in merged_proposals:
         missing = sorted(set(p.evidence_ids) - available_evidence_ids)
@@ -196,10 +207,11 @@ def merge_parallel_results(
         final_proposals.append(p)
     merged_proposals = final_proposals
 
-    # Clean up deduped_results: remove excluded proposals from each result so
-    # that MergedState construction does not fail on re-validation of
-    # AgentResult (whose _tenant_homogeneity checks evidence references).
-    # model_copy(update=...) does NOT run validators, so this is safe.
+    # -- Scrub excluded proposals from deduped_results ----------------------
+    # Invalid proposals must not be reachable from any executable path in
+    # MergedState.  We remove them from each surviving result's
+    # action_proposals using model_copy(update=...) which does NOT re-run
+    # validators, so the already-validated AgentResult stays intact.
     if excluded_proposal_ids:
         cleaned_results: list[AgentResult] = []
         for r in deduped_results:

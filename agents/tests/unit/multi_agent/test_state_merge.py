@@ -36,6 +36,7 @@ def _make_result(
         result_id=result_id,
         task_id=task_id,
         agent_id=agent_id,
+        agent_version="1.0.0",
         tenant_id=tenant_id,
         status=status,
         confidence=0.95,
@@ -377,3 +378,118 @@ class TestMergeEvidenceReferenceIntegrity:
             and "p-dep" in c.conflicting_ids
             for c in merged.conflicts
         )
+
+
+# ============================================================================
+# R8: Excluded proposals must not survive in results[*].action_proposals
+# ============================================================================
+
+
+class TestExcludedProposalScrubbedFromResults:
+    """An invalid proposal must not be reachable from any executable path
+    in MergedState — neither ``merged_proposals`` nor
+    ``results[*].action_proposals``."""
+
+    def test_integrity_failure_removed_from_result_actions(self):
+        """A proposal whose hash is tampered AFTER construction is caught
+        by ``verify_integrity()`` at merge time and removed from both
+        ``merged_proposals`` and the owning result's ``action_proposals``."""
+        p = _make_proposal(proposal_id="p-tampered")
+        r = _make_result(result_id="r-001", proposals=[p])
+
+        # Tamper the hash after construction — merge must detect this
+        object.__setattr__(p, "proposal_hash", "deadbeef")
+
+        merged = merge_parallel_results([r], expected_tenant_id="t-001")
+
+        assert len(merged.merged_proposals) == 0
+        assert any(
+            c.conflict_type == "proposal_integrity_failure"
+            and "p-tampered" in c.conflicting_ids
+            for c in merged.conflicts
+        )
+        # Critical: the bad proposal must NOT survive inside results
+        for result in merged.results:
+            assert not any(
+                prop.proposal_id == "p-tampered" for prop in result.action_proposals
+            )
+
+    def test_conflicting_proposal_removed_from_result_actions(self):
+        """When the same proposal_id appears with different content hashes,
+        ALL copies are excluded from both ``merged_proposals`` and every
+        result's ``action_proposals``."""
+        p1 = _make_proposal(
+            proposal_id="p-conflict",
+            payload={"amount": 100},
+        )
+        p2 = _make_proposal(
+            proposal_id="p-conflict",
+            payload={"amount": 999},
+        )
+        r1 = _make_result(result_id="r-001", proposals=[p1])
+        r2 = _make_result(result_id="r-002", proposals=[p2])
+
+        merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
+
+        assert not any(
+            prop.proposal_id == "p-conflict" for prop in merged.merged_proposals
+        )
+        assert any(
+            c.conflict_type == "content_mismatch" and "p-conflict" in c.conflicting_ids
+            for c in merged.conflicts
+        )
+        for result in merged.results:
+            assert not any(
+                prop.proposal_id == "p-conflict" for prop in result.action_proposals
+            )
+
+    def test_missing_evidence_proposal_removed_from_result_actions(self):
+        """A proposal referencing missing evidence is excluded from both
+        ``merged_proposals`` and its owning result's ``action_proposals``."""
+        ev = _make_evidence(evidence_id="ev-gone")
+        p = _make_proposal(
+            proposal_id="p-orphan",
+            evidence_ids=["ev-gone"],
+            risk_level=ActionRiskLevel.HIGH,
+        )
+        r = _make_result(result_id="r-001", evidence=[ev], proposals=[p])
+        # Remove the evidence AFTER construction so the proposal dangles
+        r.evidence.clear()
+
+        merged = merge_parallel_results([r], expected_tenant_id="t-001")
+
+        assert not any(
+            prop.proposal_id == "p-orphan" for prop in merged.merged_proposals
+        )
+        assert any(
+            c.conflict_type == "proposal_missing_evidence"
+            and "p-orphan" in c.conflicting_ids
+            for c in merged.conflicts
+        )
+        for result in merged.results:
+            assert not any(
+                prop.proposal_id == "p-orphan" for prop in result.action_proposals
+            )
+
+    def test_no_excluded_proposal_reachable_from_merged_state(self):
+        """End-to-end: construct a result with one good and one bad proposal,
+        then assert the bad one is unreachable everywhere in MergedState."""
+        good_p = _make_proposal(proposal_id="p-good")
+        bad_p = _make_proposal(
+            proposal_id="p-bad",
+            payload={"x": 1},
+        )
+        r = _make_result(result_id="r-001", proposals=[good_p, bad_p])
+        # Tamper the bad proposal's hash
+        object.__setattr__(bad_p, "proposal_hash", "invalid")
+
+        merged = merge_parallel_results([r], expected_tenant_id="t-001")
+
+        # Good survives in both places
+        assert any(prop.proposal_id == "p-good" for prop in merged.merged_proposals)
+        # Bad is gone from both places
+        assert not any(prop.proposal_id == "p-bad" for prop in merged.merged_proposals)
+        for result in merged.results:
+            ids = {prop.proposal_id for prop in result.action_proposals}
+            assert "p-good" in ids
+            assert "p-bad" not in ids

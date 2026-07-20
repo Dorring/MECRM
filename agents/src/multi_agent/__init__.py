@@ -109,6 +109,5 @@ __all__ = [
     "serialize_contract",
     "serialize_set_for_json",
     "stable_hash",
-    "validate_json_value",
     "validate_strict_json",
 ]

@@ -28,6 +28,8 @@ from multi_agent.contracts import (
     MultiAgentState,
     ProviderMetadata,
     TokenUsage,
+    ToolAuthority,
+    ToolDescriptor,
     from_crm_writer_proposal,
     from_productivity_proposal,
 )
@@ -308,6 +310,7 @@ class TestActionProposalHashIntegrity:
                 result_id="r-1",
                 task_id="t-1",
                 agent_id="agent_a",
+                agent_version="1.0.0",
                 tenant_id="t-001",
                 status="completed",
                 action_proposals=[p],
@@ -673,6 +676,7 @@ class TestAgentResultNewStatuses:
             result_id="r-1",
             task_id="t-1",
             agent_id="a1",
+            agent_version="1.0.0",
             tenant_id="t-1",
             status="needs_input",
             completed_at=_utc_now(),
@@ -684,6 +688,7 @@ class TestAgentResultNewStatuses:
             result_id="r-1",
             task_id="t-1",
             agent_id="a1",
+            agent_version="1.0.0",
             tenant_id="t-1",
             status="skipped",
             completed_at=_utc_now(),
@@ -739,6 +744,7 @@ class TestStrictJsonRejection:
                 result_id="r-1",
                 task_id="t-1",
                 agent_id="a1",
+                agent_version="1.0.0",
                 tenant_id="t-1",
                 status="completed",
                 output={1: "value"},  # type: ignore[arg-type]
@@ -945,6 +951,7 @@ class TestEvidenceReferenceValidation:
                 result_id="r-1",
                 task_id="t-1",
                 agent_id="agent_a",
+                agent_version="1.0.0",
                 tenant_id="t-1",
                 status="completed",
                 evidence=[],  # empty!
@@ -982,6 +989,7 @@ class TestEvidenceReferenceValidation:
             result_id="r-1",
             task_id="t-1",
             agent_id="agent_a",
+            agent_version="1.0.0",
             tenant_id="t-1",
             status="completed",
             evidence=[
@@ -1028,6 +1036,7 @@ class TestEvidenceReferenceValidation:
             result_id="r-1",
             task_id="t-1",
             agent_id="agent_a",
+            agent_version="1.0.0",
             tenant_id="t-1",
             status="completed",
             evidence=[ev],
@@ -1075,6 +1084,7 @@ class TestMultiAgentStateEvidenceReference:
             result_id="r-1",
             task_id="t-1",
             agent_id="agent_a",
+            agent_version="1.0.0",
             tenant_id="t-1",
             status="completed",
             evidence=[self._make_evidence(evidence_id)],
@@ -1123,3 +1133,159 @@ class TestMultiAgentStateEvidenceReference:
             proposed_actions=[p],
         )
         assert state.proposed_actions[0].evidence_ids == [ev_id]
+
+
+# ============================================================================
+# R8: Core ID / action fields must not be blank
+# ============================================================================
+
+
+class TestCoreIdNonBlank:
+    """Every identifier that flows into Merge, dependency graph, Registry,
+    Trace or approval must be non-blank after strip."""
+
+    # -- Evidence ------------------------------------------------------------
+
+    def test_evidence_rejects_blank_id(self):
+        with pytest.raises(ValidationError):
+            Evidence(
+                evidence_id="   ",
+                evidence_type=EvidenceType.TOOL_RESULT,
+                tenant_id="t-1",
+                source_agent="agent_a",
+            )
+
+    # -- AgentTask -----------------------------------------------------------
+
+    def test_task_rejects_blank_task_id(self):
+        with pytest.raises(ValidationError):
+            AgentTask(
+                task_id="",
+                agent_id="agent_a",
+                task_type="triage",
+                objective="o",
+                tenant_id="t-1",
+            )
+
+    def test_task_rejects_blank_agent_id(self):
+        with pytest.raises(ValidationError):
+            AgentTask(
+                task_id="task-1",
+                agent_id="  ",
+                task_type="triage",
+                objective="o",
+                tenant_id="t-1",
+            )
+
+    def test_task_rejects_blank_task_type(self):
+        with pytest.raises(ValidationError):
+            AgentTask(
+                task_id="task-1",
+                agent_id="agent_a",
+                task_type="",
+                objective="o",
+                tenant_id="t-1",
+            )
+
+    # -- AgentResult ---------------------------------------------------------
+
+    def test_result_rejects_blank_result_id(self):
+        with pytest.raises(ValidationError):
+            AgentResult(
+                result_id="",
+                task_id="task-1",
+                agent_id="agent_a",
+                agent_version="1.0.0",
+                tenant_id="t-1",
+                status="completed",
+                completed_at=_utc_now(),
+            )
+
+    def test_result_requires_agent_version(self):
+        with pytest.raises(ValidationError):
+            AgentResult(
+                result_id="r-1",
+                task_id="task-1",
+                agent_id="agent_a",
+                agent_version="",
+                tenant_id="t-1",
+                status="completed",
+                completed_at=_utc_now(),
+            )
+
+    # -- ActionProposal ------------------------------------------------------
+
+    def test_proposal_rejects_blank_proposal_id(self):
+        with pytest.raises(ValidationError):
+            ActionProposal.create(
+                proposal_id="  ",
+                tenant_id="t-1",
+                created_by_agent="agent_a",
+                action_type="create",
+                target_entity="ticket",
+                idempotency_key="ik-1",
+            )
+
+    def test_proposal_rejects_blank_creator(self):
+        with pytest.raises(ValidationError):
+            ActionProposal.create(
+                proposal_id="p-1",
+                tenant_id="t-1",
+                created_by_agent="",
+                action_type="create",
+                target_entity="ticket",
+                idempotency_key="ik-1",
+            )
+
+    def test_proposal_rejects_blank_action_type(self):
+        with pytest.raises(ValidationError):
+            ActionProposal.create(
+                proposal_id="p-1",
+                tenant_id="t-1",
+                created_by_agent="agent_a",
+                action_type="   ",
+                target_entity="ticket",
+                idempotency_key="ik-1",
+            )
+
+    def test_proposal_rejects_blank_target_entity(self):
+        with pytest.raises(ValidationError):
+            ActionProposal.create(
+                proposal_id="p-1",
+                tenant_id="t-1",
+                created_by_agent="agent_a",
+                action_type="create",
+                target_entity="",
+                idempotency_key="ik-1",
+            )
+
+    def test_proposal_requires_idempotency_key(self):
+        with pytest.raises(ValidationError):
+            ActionProposal.create(
+                proposal_id="p-1",
+                tenant_id="t-1",
+                created_by_agent="agent_a",
+                action_type="create",
+                target_entity="ticket",
+                idempotency_key="",
+            )
+
+    # -- MultiAgentState -----------------------------------------------------
+
+    def test_state_rejects_blank_run_id(self):
+        with pytest.raises(ValidationError):
+            MultiAgentState(
+                run_id="  ",
+                tenant_id="t-1",
+                actor_id="user-1",
+                objective="test",
+            )
+
+    # -- ToolDescriptor ------------------------------------------------------
+
+    def test_tool_rejects_blank_name(self):
+        with pytest.raises(ValidationError):
+            ToolDescriptor(
+                tool_name="",
+                authority=ToolAuthority.READ,
+            )
