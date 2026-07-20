@@ -9,7 +9,6 @@ Responsible for:
 
 import json
 import uuid
-import os
 from typing import Dict, Any, Optional
 
 import structlog
@@ -75,7 +74,7 @@ class SupportAgent(BaseAgent):
             self._vector_search = VectorSearch(
                 weaviate_url=settings.WEAVIATE_URL,
                 ollama_url=settings.OLLAMA_URL,
-                embedding_model=os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text"),
+                embedding_model=settings.OLLAMA_EMBED_MODEL,
             )
         except Exception as e:  # pragma: no cover - dependency wiring failure
             logger.warning("VectorSearch unavailable, KB retrieval disabled", error=str(e))

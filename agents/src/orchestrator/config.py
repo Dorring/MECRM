@@ -40,8 +40,21 @@ class Settings:
         "crm.knowledge.published",
     ]
     
+    # AI runtime mode. Controls whether models are initialised at all.
+    #   disabled      — no model init, no embedding init, no network access
+    #   deterministic — local deterministic provider, no network, repeatable output
+    #   live          — real model via AI_PROVIDER (requires explicit config)
+    AI_MODE: str = os.getenv("AI_MODE", "deterministic").strip().lower()
+
+    # Agent orchestration mode (Phase 5+). Independent of AI_MODE.
+    #   legacy     — existing AgentRouter behaviour
+    #   shadow     — legacy path active, supervisor path runs in parallel
+    #   supervisor — only supervisor graph path active
+    AGENT_ORCHESTRATION_MODE: str = os.getenv("AGENT_ORCHESTRATION_MODE", "legacy").strip().lower()
+
     # AI inference provider. Ollama remains available for offline/local use,
     # while NVIDIA NIM is an OpenAI-compatible managed API provider.
+    # Only consulted when AI_MODE=live.
     AI_PROVIDER: str = os.getenv("AI_PROVIDER", "ollama").strip().lower()
     AI_REQUEST_TIMEOUT_SECONDS: float = float(os.getenv("AI_REQUEST_TIMEOUT_SECONDS", "30"))
     AI_MAX_RETRIES: int = int(os.getenv("AI_MAX_RETRIES", "2"))

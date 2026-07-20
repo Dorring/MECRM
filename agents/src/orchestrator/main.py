@@ -23,6 +23,7 @@ from .router import AgentRouter
 from .config import settings
 from governance.agent_telemetry import agents_running, metrics_response
 from governance.agent_telemetry import audit_queries_total, inc_dlq_routed
+from intelligence.providers import provider_health_check, provider_metadata
 
 from intelligence.search.search_agent import SearchAgent
 from intelligence.chat.chat_agent import ChatAgent
@@ -432,6 +433,17 @@ async def health_handler(request):
     return web.json_response({"status": "healthy"})
 
 
+async def ready_handler(request):
+    """Readiness endpoint — includes AI provider health.
+
+    /health only signals process-alive + HTTP reachable.
+    /ready signals whether the service can do useful work.
+    """
+    meta = provider_metadata()
+    health = await provider_health_check()
+    return web.json_response({**meta, **health})
+
+
 async def metrics_handler(request):
     resp = metrics_response()
     # aiohttp rejects charset inside content_type; set header directly
@@ -450,6 +462,7 @@ async def run_health_server():
     app["audit_indexer"] = AuditIndexer()
     app["compliance_intelligence_agent"] = ComplianceIntelligenceAgent()
     app.router.add_get("/health", health_handler)
+    app.router.add_get("/ready", ready_handler)
     app.router.add_get("/metrics", metrics_handler)
     app.router.add_post("/api/v1/intelligence/query",
                         intelligence_query_handler)
@@ -470,8 +483,7 @@ async def run_health_server():
                 vector_search=VectorSearch(
                     weaviate_url=settings.WEAVIATE_URL,
                     ollama_url=settings.OLLAMA_URL,
-                    embedding_model=_env(
-                        "OLLAMA_EMBED_MODEL", "nomic-embed-text"),
+                    embedding_model=settings.OLLAMA_EMBED_MODEL,
                 ),
                 search_adapter=SearchAdapter(search_agent=search_agent),
             )
@@ -771,11 +783,6 @@ async def audit_search_handler(request: web.Request) -> web.Response:
     except Exception as e:
         logger.error("Audit search failed", error=str(e))
         return web.json_response({"error": "search_failed"}, status=500)
-
-
-def _env(key: str, default: str) -> str:
-    val = os.getenv(key)
-    return val.strip() if val and val.strip() else default
 
 
 _AUDIO_FORMATS: set[AudioFormat] = {

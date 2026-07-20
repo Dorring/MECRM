@@ -46,10 +46,16 @@ class WhisperSTT:
         model: str = "whisper",
         timeout: float = 30.0,
     ):
+        # WHISPER_URL is the canonical env var for the Whisper endpoint.
+        # OLLAMA_URL fallback is preserved for backward compatibility
+        # (some deployments run Whisper behind the Ollama API endpoint).
         self._whisper_url = whisper_url or os.environ.get(
             "WHISPER_URL",
             os.environ.get("OLLAMA_URL", "http://localhost:11434")
         )
+        # TODO Phase 1: WHISPER_URL should not silently fall back to OLLAMA_URL.
+        # In AI_MODE=deterministic or AI_MODE=disabled, voice transcription
+        # should use a deterministic/fake STT provider or return unavailable.
         self._model = model
         self._timeout = timeout
     

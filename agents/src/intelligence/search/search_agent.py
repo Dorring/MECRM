@@ -44,7 +44,7 @@ class SearchAgent:
             database_url=settings.DATABASE_URL,
             weaviate_url=settings.WEAVIATE_URL,
             ollama_url=settings.OLLAMA_URL,
-            embedding_model=_env("OLLAMA_EMBED_MODEL", "nomic-embed-text"),
+            embedding_model=settings.OLLAMA_EMBED_MODEL,
         )
         self._llm = create_chat_model(temperature=0)
         self._opa = OpaClient(settings.OPA_URL, timeout_seconds=1.0)
@@ -243,13 +243,6 @@ def _plural(entity_type: str) -> str:
     if entity_type == "knowledge":
         return "knowledge"
     return entity_type if entity_type.endswith("s") else f"{entity_type}s"
-
-
-def _env(key: str, default: str) -> str:
-    import os
-
-    val = os.getenv(key)
-    return val.strip() if val and val.strip() else default
 
 
 def _topic(name: str) -> str:

@@ -93,7 +93,7 @@ class AuditHit:
 class AuditIndexer:
     def __init__(self):
         self._pool: Optional[asyncpg.Pool] = None
-        self._embeddings = create_embeddings(ollama_url=settings.OLLAMA_URL, embedding_model=_env("OLLAMA_EMBED_MODEL", "nomic-embed-text"))
+        self._embeddings = create_embeddings(ollama_url=settings.OLLAMA_URL, embedding_model=settings.OLLAMA_EMBED_MODEL)
         self._weaviate_url = settings.WEAVIATE_URL.rstrip("/")
         self._running = False
         self._task: asyncio.Task | None = None
@@ -252,10 +252,3 @@ class AuditIndexer:
                 await client.put(f"{self._weaviate_url}/v1/objects/{decision_id}", json=obj)
         except Exception:
             return
-
-
-def _env(key: str, default: str) -> str:
-    import os
-
-    val = os.getenv(key)
-    return val.strip() if val and val.strip() else default

@@ -26,7 +26,7 @@ class AuditSearchFilters:
 class ComplianceIntelligenceAgent:
     def __init__(self):
         self._weaviate_url = settings.WEAVIATE_URL.rstrip("/")
-        self._embeddings = create_embeddings(ollama_url=settings.OLLAMA_URL, embedding_model=_env("OLLAMA_EMBED_MODEL", "nomic-embed-text"))
+        self._embeddings = create_embeddings(ollama_url=settings.OLLAMA_URL, embedding_model=settings.OLLAMA_EMBED_MODEL)
 
     async def semantic_audit_search(
         self,
@@ -112,11 +112,4 @@ class ComplianceIntelligenceAgent:
                 }
             )
         return {"hits": hits}
-
-
-def _env(key: str, default: str) -> str:
-    import os
-
-    val = os.getenv(key)
-    return val.strip() if val and val.strip() else default
 
