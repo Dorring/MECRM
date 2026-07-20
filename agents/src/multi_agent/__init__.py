@@ -82,6 +82,9 @@ from multi_agent.planning import (
     TaskIntent,
     compute_plan_hash,
     compute_request_hash,
+    effective_domains,
+    effective_task_types,
+    resolve_expected_intents,
     task_intent_from_requested_task,
 )
 from multi_agent.planning_errors import (
@@ -184,6 +187,9 @@ __all__ = [
     "TaskIntent",
     "compute_plan_hash",
     "compute_request_hash",
+    "effective_domains",
+    "effective_task_types",
+    "resolve_expected_intents",
     "task_intent_from_requested_task",
     # Phase 3 — Errors
     "AmbiguousAgentSelectionError",

@@ -17,7 +17,12 @@ from typing import Protocol
 
 from multi_agent.contracts import AgentAuthority, ComplexityDecision
 from multi_agent.registry import AgentRegistry
-from multi_agent.planning import PlanningRequest, PlanningSignals
+from multi_agent.planning import (
+    PlanningRequest,
+    PlanningSignals,
+    effective_domains,
+    effective_task_types,
+)
 from multi_agent.planning_errors import (
     InsufficientContextError,
     PlanningInputError,
@@ -71,6 +76,10 @@ REASON_INSUFFICIENT_BUDGET = "insufficient_budget"
 
 #: The objective_kind value that triggers the Customer Recovery template.
 CUSTOMER_RECOVERY_OBJECTIVE_KIND = "customer_recovery"
+
+#: The domain used by Customer Recovery intents.  Imported lazily inside
+#: functions to avoid a circular import with planning_templates.
+_CUSTOMER_RECOVERY_DOMAIN = "customer_recovery"
 
 
 # ---------------------------------------------------------------------------
@@ -142,14 +151,23 @@ class RuleBasedComplexityGate:
                 requires_human_review=False,
             )
 
-        domains_sorted = sorted(signals.domains)
-        task_types_sorted = sorted(signals.requested_task_types)
+        # R2 P0-2: effective domains/task_types are derived from
+        # requested_tasks when present; otherwise the explicit signal
+        # sets are used.  This makes requested_tasks the primary input
+        # for routing decisions.
+        domains_sorted = sorted(effective_domains(signals))
+        task_types_sorted = sorted(effective_task_types(signals))
 
         # Step 5 — Customer Recovery template.
         if signals.objective_kind == CUSTOMER_RECOVERY_OBJECTIVE_KIND:
+            # Customer Recovery always uses the customer_recovery domain,
+            # even when the caller did not provide signals.domains.
+            recovery_domains = (
+                domains_sorted if domains_sorted else [_CUSTOMER_RECOVERY_DOMAIN]
+            )
             return ComplexityDecision(
                 route="multi_agent",
-                domains=domains_sorted,
+                domains=recovery_domains,
                 reasons=[REASON_CUSTOMER_RECOVERY_TEMPLATE],
                 confidence=1.0,
                 requires_human_review=False,
@@ -217,23 +235,24 @@ class RuleBasedComplexityGate:
         Only contradictions that make the request unplanneable are
         rejected:
 
-        * ``requires_cross_domain=True`` but ``domains`` has < 2 entries.
+        * ``requires_cross_domain=True`` but effective ``domains`` has
+          < 2 entries (effective set derives from ``requested_tasks``
+          when present, per R2 P0-2).
         * ``requires_approval=True`` and ``requires_write=False`` and
           no PROPOSE-level task type is requested.
-        * ``requested_task_types`` references a task type that doesn't
-          belong to any domain in ``domains`` (when both sets are
-          non-empty AND domains has exactly one member — a heuristic
-          for "the caller mislabelled the task type").
         """
-        if signals.requires_cross_domain and len(signals.domains) < 2:
+        eff_domains = effective_domains(signals)
+        if signals.requires_cross_domain and len(eff_domains) < 2:
             raise PlanningInputError(
-                "requires_cross_domain=True but domains has fewer than 2 entries"
+                "requires_cross_domain=True but effective domains has "
+                f"fewer than 2 entries: {sorted(eff_domains)!r}"
             )
 
+        eff_task_types = effective_task_types(signals)
         if (
             signals.requires_approval
             and not signals.requires_write
-            and not signals.requested_task_types
+            and not eff_task_types
         ):
             raise PlanningInputError(
                 "requires_approval=True with no requested_task_types; "

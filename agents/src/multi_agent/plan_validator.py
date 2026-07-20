@@ -7,6 +7,10 @@ Verifies a :class:`PlanDraft` against:
 * Plan hash integrity
 * Registry capability, authority hierarchy, and tool access
 * Complexity decision consistency (re-runs the gate)
+* **Plan-vs-expected-intent semantic binding (R2 P0-1)** — every
+  PlannedTask must match the intent produced by
+  :func:`resolve_expected_intents` for the same request + decision.
+  Stable task IDs and idempotency keys are recomputed and compared.
 * DAG structure (dependencies, cycles, topology)
 * Budget limits (hard fail-closed for structural budgets)
 * Authority bounds (no EXECUTE in Phase 3; agent authority >= task preferred)
@@ -28,11 +32,14 @@ from multi_agent.planning import (
     PlanValidationIssue,
     PlanValidationReport,
     compute_request_hash,
+    resolve_expected_intents,
 )
 from multi_agent.complexity_gate import (
     ComplexityGate,
     RuleBasedComplexityGate,
 )
+from multi_agent.planning_errors import PlanningError
+from multi_agent.serialization import stable_hash
 
 # ---------------------------------------------------------------------------
 # Issue codes (stable strings surfaced over HTTP / logs)
@@ -69,6 +76,13 @@ CODE_REQUIRED_DEPENDS_ON_OPTIONAL = "required_depends_on_optional"
 CODE_AUTHORITY_EXCEEDS_PROPOSE = "authority_exceeds_propose"
 CODE_TOKEN_BUDGET_ESTIMATE_UNAVAILABLE = "token_budget_estimate_unavailable"
 CODE_COST_BUDGET_ESTIMATE_UNAVAILABLE = "cost_budget_estimate_unavailable"
+
+# R2 P0-1 — intent-binding issue codes.
+CODE_PLAN_INTENT_MISMATCH = "plan_intent_mismatch"
+CODE_UNSTABLE_TASK_ID = "unstable_task_id"
+CODE_IDEMPOTENCY_KEY_MISMATCH = "idempotency_key_mismatch"
+CODE_PLANNED_TASK_REQUIRED_MISMATCH = "planned_task_required_mismatch"
+CODE_DUPLICATE_INTENT_ID = "duplicate_intent_id"
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +131,9 @@ class PlanValidator:
 
         # -- Complexity decision consistency ---------------------------------
         issues.extend(self._check_complexity_decision(request, plan, registry))
+
+        # -- Plan-vs-expected-intent binding (R2 P0-1) -----------------------
+        issues.extend(self._check_intent_binding(request, plan, registry))
 
         # -- Per-task registry + authority checks -----------------------------
         issues.extend(self._check_tasks_against_registry(plan, registry))
@@ -307,11 +324,16 @@ class PlanValidator:
         Compares route, domains (as sets), reasons (as sets), and
         requires_human_review.  ``confidence`` is not compared because
         it's a numeric hint, not a structural invariant.
+
+        R2 P1: only :class:`PlanningError` is caught.  Unknown
+        exceptions (programming bugs) are allowed to propagate so they
+        surface in tests, logs, and error monitoring rather than being
+        silently downgraded to a validation issue.
         """
         issues: list[PlanValidationIssue] = []
         try:
             expected = self._gate.decide(request, registry)
-        except Exception as exc:
+        except PlanningError as exc:
             issues.append(
                 PlanValidationIssue(
                     code=CODE_COMPLEXITY_DECISION_MISMATCH,
@@ -366,6 +388,255 @@ class PlanValidator:
                     ),
                 )
             )
+        return issues
+
+    # ------------------------------------------------------------------
+    # Plan-vs-expected-intent binding (R2 P0-1)
+    # ------------------------------------------------------------------
+
+    def _check_intent_binding(
+        self,
+        request: Any,
+        plan: PlanDraft,
+        registry: AgentRegistry,  # noqa: ARG002 - reserved for future use
+    ) -> list[PlanValidationIssue]:
+        """Verify every PlannedTask matches the expected
+        :class:`TaskIntent` produced by :func:`resolve_expected_intents`
+        for the same request + decision.
+
+        This closes the "Plan task substitution" hole: even if a
+        tampered task is registry-supported and the plan hash is
+        recomputed, the Validator will reject the plan because the
+        tampered task no longer matches the expected intent.
+
+        Fields compared per task:
+
+        * ``intent_id`` (must exist in expected intents)
+        * ``domain`` / ``task_type`` / ``objective``
+        * ``preferred_authority``
+        * ``required_tools`` (as sets)
+        * ``estimated_tool_calls``
+        * ``required``
+
+        Recomputed and compared:
+
+        * ``task_id`` = ``stable_hash({run_id, intent_id, task_type, agent_id})[:24]``
+        * ``idempotency_key`` = ``f"{run_id}:{task_id}"``
+        * ``planned_task.required`` == ``agent_task.required``
+
+        Also verifies:
+
+        * No duplicate ``intent_id`` among PlannedTasks.
+        * The set of plan intent_ids equals the set of expected
+          intent_ids (no extra / missing intents).
+        """
+        issues: list[PlanValidationIssue] = []
+
+        # Resolve expected intents via the shared pure function.
+        try:
+            expected = resolve_expected_intents(request, plan.complexity)
+        except PlanningError as exc:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_PLAN_INTENT_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"resolve_expected_intents() raised {type(exc).__name__}: {exc}"
+                    ),
+                )
+            )
+            return issues
+
+        expected_by_id = {i.intent_id: i for i in expected}
+
+        # Duplicate intent_id check.
+        seen_intent_ids: set[str] = set()
+        for pt in plan.tasks:
+            if pt.intent_id in seen_intent_ids:
+                issues.append(
+                    PlanValidationIssue(
+                        code=CODE_DUPLICATE_INTENT_ID,
+                        severity="error",
+                        message=f"duplicate intent_id {pt.intent_id!r}",
+                        task_id=pt.task.task_id,
+                    )
+                )
+            seen_intent_ids.add(pt.intent_id)
+
+        # Missing / extra intents.
+        expected_ids = set(expected_by_id.keys())
+        plan_ids = seen_intent_ids
+        missing = expected_ids - plan_ids
+        extra = plan_ids - expected_ids
+        if missing:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_PLAN_INTENT_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"plan is missing tasks for intent_ids: {sorted(missing)!r}"
+                    ),
+                )
+            )
+        if extra:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_PLAN_INTENT_MISMATCH,
+                    severity="error",
+                    message=(f"plan has extra tasks for intent_ids: {sorted(extra)!r}"),
+                )
+            )
+
+        # Per-task field comparison.
+        for pt in plan.tasks:
+            intent = expected_by_id.get(pt.intent_id)
+            if intent is None:
+                # Already reported above; skip field-level checks.
+                continue
+
+            if pt.domain != intent.domain:
+                issues.append(
+                    PlanValidationIssue(
+                        code=CODE_PLAN_INTENT_MISMATCH,
+                        severity="error",
+                        message=(
+                            f"PlannedTask {pt.intent_id!r} domain "
+                            f"{pt.domain!r} != expected {intent.domain!r}"
+                        ),
+                        task_id=pt.task.task_id,
+                    )
+                )
+            if pt.task.task_type != intent.task_type:
+                issues.append(
+                    PlanValidationIssue(
+                        code=CODE_PLAN_INTENT_MISMATCH,
+                        severity="error",
+                        message=(
+                            f"PlannedTask {pt.intent_id!r} task_type "
+                            f"{pt.task.task_type!r} != expected "
+                            f"{intent.task_type!r}"
+                        ),
+                        task_id=pt.task.task_id,
+                    )
+                )
+            if pt.task.objective != intent.objective:
+                issues.append(
+                    PlanValidationIssue(
+                        code=CODE_PLAN_INTENT_MISMATCH,
+                        severity="error",
+                        message=(
+                            f"PlannedTask {pt.intent_id!r} objective "
+                            f"{pt.task.objective!r} != expected "
+                            f"{intent.objective!r}"
+                        ),
+                        task_id=pt.task.task_id,
+                    )
+                )
+            if pt.preferred_authority != intent.preferred_authority:
+                issues.append(
+                    PlanValidationIssue(
+                        code=CODE_PLAN_INTENT_MISMATCH,
+                        severity="error",
+                        message=(
+                            f"PlannedTask {pt.intent_id!r} preferred_authority "
+                            f"{pt.preferred_authority.value!r} != expected "
+                            f"{intent.preferred_authority.value!r}"
+                        ),
+                        task_id=pt.task.task_id,
+                    )
+                )
+            if set(pt.required_tools) != set(intent.required_tools):
+                issues.append(
+                    PlanValidationIssue(
+                        code=CODE_PLAN_INTENT_MISMATCH,
+                        severity="error",
+                        message=(
+                            f"PlannedTask {pt.intent_id!r} required_tools "
+                            f"{sorted(pt.required_tools)!r} != expected "
+                            f"{sorted(intent.required_tools)!r}"
+                        ),
+                        task_id=pt.task.task_id,
+                    )
+                )
+            if pt.estimated_tool_calls != intent.estimated_tool_calls:
+                issues.append(
+                    PlanValidationIssue(
+                        code=CODE_PLAN_INTENT_MISMATCH,
+                        severity="error",
+                        message=(
+                            f"PlannedTask {pt.intent_id!r} estimated_tool_calls "
+                            f"{pt.estimated_tool_calls} != expected "
+                            f"{intent.estimated_tool_calls}"
+                        ),
+                        task_id=pt.task.task_id,
+                    )
+                )
+            if pt.required != intent.required:
+                issues.append(
+                    PlanValidationIssue(
+                        code=CODE_PLAN_INTENT_MISMATCH,
+                        severity="error",
+                        message=(
+                            f"PlannedTask {pt.intent_id!r} required "
+                            f"{pt.required} != expected {intent.required}"
+                        ),
+                        task_id=pt.task.task_id,
+                    )
+                )
+            # PlannedTask.required must equal AgentTask.required.
+            if pt.required != pt.task.required:
+                issues.append(
+                    PlanValidationIssue(
+                        code=CODE_PLANNED_TASK_REQUIRED_MISMATCH,
+                        severity="error",
+                        message=(
+                            f"PlannedTask {pt.intent_id!r} required="
+                            f"{pt.required} but AgentTask.required="
+                            f"{pt.task.required}"
+                        ),
+                        task_id=pt.task.task_id,
+                    )
+                )
+
+            # Stable task ID recomputation.
+            expected_task_id = stable_hash(
+                {
+                    "run_id": plan.run_id,
+                    "intent_id": intent.intent_id,
+                    "task_type": intent.task_type,
+                    "agent_id": pt.task.agent_id,
+                }
+            )[:24]
+            if pt.task.task_id != expected_task_id:
+                issues.append(
+                    PlanValidationIssue(
+                        code=CODE_UNSTABLE_TASK_ID,
+                        severity="error",
+                        message=(
+                            f"task_id {pt.task.task_id!r} != expected "
+                            f"{expected_task_id!r} for intent "
+                            f"{intent.intent_id!r}"
+                        ),
+                        task_id=pt.task.task_id,
+                    )
+                )
+
+            # Idempotency key recomputation.
+            expected_idem = f"{plan.run_id}:{expected_task_id}"
+            if pt.task.idempotency_key != expected_idem:
+                issues.append(
+                    PlanValidationIssue(
+                        code=CODE_IDEMPOTENCY_KEY_MISMATCH,
+                        severity="error",
+                        message=(
+                            f"idempotency_key {pt.task.idempotency_key!r} != "
+                            f"expected {expected_idem!r} for task "
+                            f"{pt.task.task_id!r}"
+                        ),
+                        task_id=pt.task.task_id,
+                    )
+                )
+
         return issues
 
     # ------------------------------------------------------------------

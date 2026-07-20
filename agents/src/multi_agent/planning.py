@@ -146,6 +146,20 @@ class RequestedTask(StrictContract):
             raise ValueError("RequestedTask cannot depend on itself")
         return self
 
+    @model_validator(mode="after")
+    def _tool_calls_cover_required_tools(self) -> "RequestedTask":
+        """R2 P0-5: a task that requires tools must not declare zero
+        tool calls.  The minimum estimate is one call per required tool.
+        """
+        if self.required_tools and self.estimated_tool_calls < len(self.required_tools):
+            raise ValueError(
+                f"RequestedTask {self.intent_id!r} requires "
+                f"{len(self.required_tools)} tool(s) but estimated_tool_calls="
+                f"{self.estimated_tool_calls}; must be >= "
+                f"{len(self.required_tools)}"
+            )
+        return self
+
 
 class PlanningSignals(StrictContract):
     """Trusted system-side signals about a request.
@@ -204,9 +218,14 @@ class PlanningSignals(StrictContract):
 
     @model_validator(mode="after")
     def _requested_tasks_consistency(self) -> "PlanningSignals":
-        """If requested_tasks is non-empty, it must be consistent with
-        the derived ``domains`` and ``requested_task_types`` sets (when
-        those sets are non-empty).
+        """If requested_tasks is non-empty, ``domains`` and
+        ``requested_task_types`` (when explicitly provided) must equal
+        the sets derived from the tasks.
+
+        R2 P0-2: ``requested_tasks`` is the primary source of truth.
+        When only ``requested_tasks`` is provided (``domains`` and
+        ``requested_task_types`` empty), no consistency check is
+        performed — the derived sets are the effective sets.
         """
         if not self.requested_tasks:
             return self
@@ -401,6 +420,20 @@ class TaskIntent(StrictContract):
             raise ValueError("TaskIntent cannot depend on itself")
         return self
 
+    @model_validator(mode="after")
+    def _tool_calls_cover_required_tools(self) -> "TaskIntent":
+        """R2 P0-5: a task that requires tools must not declare zero
+        tool calls.  The minimum estimate is one call per required tool.
+        """
+        if self.required_tools and self.estimated_tool_calls < len(self.required_tools):
+            raise ValueError(
+                f"TaskIntent {self.intent_id!r} requires "
+                f"{len(self.required_tools)} tool(s) but estimated_tool_calls="
+                f"{self.estimated_tool_calls}; must be >= "
+                f"{len(self.required_tools)}"
+            )
+        return self
+
 
 def task_intent_from_requested_task(rt: RequestedTask) -> TaskIntent:
     """Convert a :class:`RequestedTask` into a :class:`TaskIntent`."""
@@ -416,6 +449,131 @@ def task_intent_from_requested_task(rt: RequestedTask) -> TaskIntent:
         estimated_tool_calls=rt.estimated_tool_calls,
         metadata=dict(rt.metadata),
     )
+
+
+# ---------------------------------------------------------------------------
+# Effective domains / task types (R2 P0-2)
+# ---------------------------------------------------------------------------
+
+
+def effective_domains(signals: PlanningSignals) -> frozenset[str]:
+    """Return the effective domain set for *signals*.
+
+    If ``signals.requested_tasks`` is non-empty, the effective domain set
+    is *derived* from the tasks (the union of every ``RequestedTask.domain``).
+    Otherwise, the explicit ``signals.domains`` set is returned.
+
+    This makes :attr:`PlanningSignals.requested_tasks` the primary source
+    of truth for routing decisions, while keeping ``domains`` as a
+    compatibility field that must agree when both are present.
+    """
+    if signals.requested_tasks:
+        return frozenset({t.domain for t in signals.requested_tasks})
+    return signals.domains
+
+
+def effective_task_types(signals: PlanningSignals) -> frozenset[str]:
+    """Return the effective task-type set for *signals*.
+
+    Derived from ``requested_tasks`` when present; otherwise the explicit
+    ``requested_task_types`` set is returned.
+    """
+    if signals.requested_tasks:
+        return frozenset({t.task_type for t in signals.requested_tasks})
+    return signals.requested_task_types
+
+
+# ---------------------------------------------------------------------------
+# Expected intents — shared pure function (R2 P0-1)
+# ---------------------------------------------------------------------------
+
+
+def resolve_expected_intents(
+    request: PlanningRequest,
+    decision: ComplexityDecision,
+) -> list[TaskIntent]:
+    """Return the canonical list of :class:`TaskIntent` expected for *request*.
+
+    This is the **single source of truth** for what intents a plan should
+    contain.  Both :class:`DeterministicPlanner` and :class:`PlanValidator`
+    must call this function so that a tampered plan cannot pass validation
+    even if every individual task is registry-supported.
+
+    Routing rules:
+
+    * ``deterministic_workflow`` → empty list (no tasks).
+    * ``single_agent`` → exactly one intent.  Derived from
+      ``requested_tasks[0]`` when present, otherwise synthesised from
+      ``signals.domains`` / ``signals.requested_task_types`` /
+      ``request.objective``.  Multiple ``requested_tasks`` are rejected
+      (single-agent cannot carry multiple intents).
+    * ``multi_agent`` with ``objective_kind == customer_recovery`` →
+      Customer Recovery template intents (5 tasks).
+    * ``multi_agent`` otherwise → one intent per ``requested_tasks``.
+      Missing ``requested_tasks`` is a :class:`PlanningInputError`.
+    """
+    from multi_agent.planning_errors import PlanningInputError
+
+    route = decision.route
+
+    if route == "deterministic_workflow":
+        return []
+
+    if route == "single_agent":
+        rts = request.signals.requested_tasks
+        if len(rts) > 1:
+            raise PlanningInputError(
+                "single_agent route cannot carry more than one RequestedTask; "
+                f"got {len(rts)}"
+            )
+        if rts:
+            return [task_intent_from_requested_task(rts[0])]
+        # Synthesise a single primary intent from signals.
+        domains = effective_domains(request.signals)
+        task_types = effective_task_types(request.signals)
+        if not domains:
+            raise PlanningInputError(
+                "single_agent route requires at least one domain in signals"
+            )
+        domain = sorted(domains)[0]
+        task_type = sorted(task_types)[0] if task_types else "default"
+        authority = (
+            AgentAuthority.PROPOSE
+            if request.signals.requires_approval or request.signals.requires_write
+            else AgentAuthority.READ
+        )
+        return [
+            TaskIntent(
+                intent_id="primary",
+                task_type=task_type,
+                domain=domain,
+                objective=request.objective,
+                dependencies=[],
+                required=True,
+                preferred_authority=authority,
+                required_tools=frozenset(),
+                estimated_tool_calls=0,
+            )
+        ]
+
+    if route == "multi_agent":
+        # Customer Recovery template.
+        if request.signals.objective_kind == "customer_recovery":
+            from multi_agent.planning_templates import (
+                DEFAULT_CUSTOMER_RECOVERY_TEMPLATE,
+            )
+
+            return DEFAULT_CUSTOMER_RECOVERY_TEMPLATE.build_intents()
+
+        rts = request.signals.requested_tasks
+        if not rts:
+            raise PlanningInputError(
+                "multi_agent route without a template requires explicit "
+                "signals.requested_tasks; cannot infer domain→task mapping"
+            )
+        return [task_intent_from_requested_task(rt) for rt in rts]
+
+    raise PlanningInputError(f"unknown route {route!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -755,5 +913,8 @@ __all__ = [
     "TaskIntent",
     "compute_plan_hash",
     "compute_request_hash",
+    "effective_domains",
+    "effective_task_types",
+    "resolve_expected_intents",
     "task_intent_from_requested_task",
 ]
