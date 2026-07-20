@@ -31,6 +31,7 @@ from multi_agent.contracts import (
     ExecutionBudget,
     JsonValue,
     StrictContract,
+    ToolAuthority,
     _non_blank,
     _reject_sensitive_keys,
     _validate_resource_id,
@@ -41,7 +42,7 @@ from multi_agent.serialization import canonicalize, stable_hash
 # Planner version — bumped whenever the planner algorithm changes.
 # ---------------------------------------------------------------------------
 
-PLANNER_VERSION = "ma-03.4.0"
+PLANNER_VERSION = "ma-03.5.0"
 
 #: R3 P1 — upper bound on the number of cartesian-product combinations
 #: the global multi-agent assignment search will evaluate before
@@ -60,15 +61,31 @@ CODE_INTENT_MISSING_DEPENDENCY = "missing_intent_dependency"
 CODE_INTENT_CYCLE = "intent_cycle"
 
 # ---------------------------------------------------------------------------
+# R5 P0-1 — stable Write/Approval requirement issue codes (shared by
+# Planner and Validator so both sides agree on when a request that
+# declares requires_write / requires_approval is missing a PROPOSE
+# intent).
+# ---------------------------------------------------------------------------
+
+CODE_WRITE_REQUEST_MISSING_PROPOSE = "write_request_missing_propose_intent"
+CODE_APPROVAL_REQUEST_MISSING_PROPOSE = "approval_request_missing_propose_intent"
+
+# ---------------------------------------------------------------------------
 # R4 P0-3 — Tool Authority → Agent Authority mapping.  An Intent's
 # preferred_authority must cover the highest authority required by any
 # of its required_tools.  Silent auto-elevation is forbidden.
+#
+# R5 P1-1 — static definition.  ``ToolAuthority`` is imported at module
+# load (no circular dependency), so the mapping is populated eagerly and
+# never mutated.  The previous lazy ``_init_tool_authority_mapping()``
+# left the public mapping empty until first use, which made it unsafe
+# to read from external code.
 # ---------------------------------------------------------------------------
 
 TOOL_TO_AGENT_AUTHORITY: dict[Any, AgentAuthority] = {
-    # Imported lazily below to avoid a circular import at module load; the
-    # mapping is filled in after ToolAuthority is importable.  See
-    # ``_init_tool_authority_mapping()``.
+    ToolAuthority.READ: AgentAuthority.READ,
+    ToolAuthority.PROPOSE: AgentAuthority.PROPOSE,
+    ToolAuthority.EXECUTE: AgentAuthority.EXECUTE,
 }
 
 _AUTHORITY_RANK: dict[Any, int] = {
@@ -78,23 +95,6 @@ _AUTHORITY_RANK: dict[Any, int] = {
 }
 
 _COST_CLASS_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
-
-
-def _init_tool_authority_mapping() -> None:
-    """Populate :data:`TOOL_TO_AGENT_AUTHORITY` lazily.
-
-    :class:`ToolAuthority` lives in :mod:`multi_agent.contracts`, which is
-    imported before this module.  The lazy init keeps the mapping
-    declaration close to its consumers without risking import-order issues
-    in test environments that monkeypatch the enum.
-    """
-    if TOOL_TO_AGENT_AUTHORITY:
-        return
-    from multi_agent.contracts import ToolAuthority
-
-    TOOL_TO_AGENT_AUTHORITY[ToolAuthority.READ] = AgentAuthority.READ
-    TOOL_TO_AGENT_AUTHORITY[ToolAuthority.PROPOSE] = AgentAuthority.PROPOSE
-    TOOL_TO_AGENT_AUTHORITY[ToolAuthority.EXECUTE] = AgentAuthority.EXECUTE
 
 
 # ---------------------------------------------------------------------------
@@ -716,10 +716,7 @@ def validate_intent_tool_authority(intent: TaskIntent, registry: Any) -> None:
     calls it before Canonical Plan reconstruction so an invalid request
     produces a stable Issue instead of propagating an exception.
     """
-    from multi_agent.contracts import ToolAuthority
     from multi_agent.planning_errors import PlanningInputError
-
-    _init_tool_authority_mapping()
 
     if not intent.required_tools:
         return
@@ -870,8 +867,6 @@ def resolve_candidate_agents(
     4. ``agent_id`` — lexicographic
     5. ``version`` — lexicographic
     """
-    from multi_agent.contracts import ToolAuthority
-
     candidates: list[Any] = []
     # Pre-validate required tools against the catalog once per intent.
     for tool_name in intent.required_tools:
@@ -1305,20 +1300,118 @@ def _canonical_tasks_payload(tasks: list[PlannedTask]) -> list[dict[str, Any]]:
     return out
 
 
-def compute_request_hash(request: PlanningRequest) -> str:
-    """Stable SHA-256 over the canonical PlanningRequest content."""
-    payload = {
+def canonical_request_payload(request: PlanningRequest) -> dict[str, Any]:
+    """Build an order-invariant canonical payload for Request Hash.
+
+    R5 P0-3 — ``compute_request_hash`` previously hashed
+    ``request.signals.model_dump(mode="json")`` directly, which preserved
+    the insertion order of ``requested_tasks`` and ``dependencies``.
+    Two semantically identical requests differing only in list order
+    produced different hashes, violating the Phase 3 invariant that
+    *task order does not encode dependency — dependencies are expressed
+    by the DAG*.
+
+    This function normalizes the signals payload:
+
+    * ``requested_tasks`` → sorted by ``intent_id``;
+    * each task's ``dependencies`` → sorted lexicographically;
+    * ``domains``, ``requested_task_types``, ``required_tools`` → sorted
+      (these are already ``frozenset`` on the model, but ``model_dump``
+      emits them as lists with arbitrary order — we make the order
+      deterministic here so the hash is stable).
+
+    Field values themselves (e.g. ``objective``, ``intent_id``) are
+    NOT modified — only list ordering is normalized.
+    """
+    signals_data = request.signals.model_dump(mode="json")
+
+    # Sort requested_tasks by intent_id; sort each task's dependencies.
+    requested_tasks = signals_data.get("requested_tasks") or []
+    for task in requested_tasks:
+        if isinstance(task, dict) and "dependencies" in task:
+            deps = task["dependencies"]
+            if isinstance(deps, list):
+                task["dependencies"] = sorted(deps)
+    requested_tasks_sorted = sorted(
+        requested_tasks, key=lambda t: t.get("intent_id", "")
+    )
+    signals_data["requested_tasks"] = requested_tasks_sorted
+
+    # Sort set-like fields that model_dump emits as lists.
+    for set_field in ("domains", "requested_task_types"):
+        v = signals_data.get(set_field)
+        if isinstance(v, list):
+            signals_data[set_field] = sorted(v)
+    for task in signals_data["requested_tasks"]:
+        if isinstance(task, dict):
+            rt = task.get("required_tools")
+            if isinstance(rt, list):
+                task["required_tools"] = sorted(rt)
+
+    return {
         "run_id": request.run_id,
         "tenant_id": request.tenant_id,
         "actor_type": request.actor_type,
         "actor_id": request.actor_id,
         "objective": request.objective,
-        "signals": canonicalize(request.signals.model_dump(mode="json")),
+        "signals": canonicalize(signals_data),
         "budget": canonicalize(request.budget.model_dump(mode="json")),
         "context_summary": request.context_summary,
         "registry_version": request.registry_version,
     }
-    return stable_hash(payload)
+
+
+def compute_request_hash(request: PlanningRequest) -> str:
+    """Stable SHA-256 over the canonical PlanningRequest content.
+
+    R5 P0-3 — uses :func:`canonical_request_payload` so the hash is
+    invariant under list-order permutations of ``requested_tasks``,
+    ``dependencies``, ``domains``, ``requested_task_types``, and
+    ``required_tools``.  The hash only changes when the request's
+    *semantic* content changes.
+    """
+    return stable_hash(canonical_request_payload(request))
+
+
+def validate_write_approval_requirements(
+    request: PlanningRequest,
+    intents: Sequence[TaskIntent],
+) -> list[str]:
+    """Validate that a write/approval request carries at least one
+    PROPOSE intent.
+
+    R5 P0-1 — shared between Planner and Validator.  Previously the
+    rule lived only in :class:`DeterministicPlanner` as the private
+    method ``_validate_write_approval_requirements``, so a tampered
+    request bypassing ``create_plan`` (e.g. a hand-built
+    :class:`PlanDraft`) could pass Validator checks with
+    ``requires_write=True`` and only READ tasks.
+
+    Returns a list of stable Issue Codes (empty = valid):
+
+    * :data:`CODE_WRITE_REQUEST_MISSING_PROPOSE` — ``requires_write``
+      is set but no intent has ``preferred_authority == PROPOSE``.
+    * :data:`CODE_APPROVAL_REQUEST_MISSING_PROPOSE` —
+      ``requires_approval`` is set but no intent has
+      ``preferred_authority == PROPOSE``.
+
+    The Planner raises :class:`PlanningInputError` on the first issue;
+    the Validator returns the codes as :class:`PlanValidationIssue`.
+    """
+    issues: list[str] = []
+    if not intents:
+        return issues
+    signals = request.signals
+    if not (signals.requires_write or signals.requires_approval):
+        return issues
+    has_propose = any(i.preferred_authority is AgentAuthority.PROPOSE for i in intents)
+    if has_propose:
+        return issues
+    if signals.requires_write:
+        issues.append(CODE_WRITE_REQUEST_MISSING_PROPOSE)
+    if signals.requires_approval:
+        issues.append(CODE_APPROVAL_REQUEST_MISSING_PROPOSE)
+    return issues
 
 
 def compute_plan_hash(
@@ -1393,6 +1486,22 @@ class PlanDraft(StrictContract):
     @classmethod
     def _planner_version_required(cls, v: str) -> str:
         return _non_blank(v, "planner_version")
+
+    @field_validator("request")
+    @classmethod
+    def _request_deep_snapshot(cls, v: PlanningRequest) -> PlanningRequest:
+        """R5 P0-2 — force a deep copy of the caller's PlanningRequest.
+
+        Pydantic v2 reuses the same nested model instance when the
+        caller passes a pre-built model, so without this guard
+        ``plan.request is original_request`` holds and mutating the
+        caller's request (or its nested ``PlanningSignals`` /
+        ``RequestedTask``) corrupts the PlanDraft.  The snapshot must
+        be independent at construction time so the PlanDraft's
+        ``request_hash`` and ``plan_hash`` cannot be invalidated by
+        external mutation.
+        """
+        return PlanningRequest.model_validate(v.model_dump(mode="python"))
 
     @field_validator("request_hash")
     @classmethod
@@ -1489,9 +1598,25 @@ class PlanDraft(StrictContract):
                 f"recomputed plan content"
             )
 
-    def agent_tasks(self) -> list[AgentTask]:
-        """Return the wrapped :class:`AgentTask` list for Phase 4+."""
-        return [pt.task for pt in self.tasks]
+    def build_execution_tasks(self) -> list[AgentTask]:
+        """Return fresh :class:`AgentTask` copies for Phase 4+ dispatch.
+
+        R5 P0-2 — previously this method returned the *internal*
+        ``AgentTask`` references (``plan.tasks[i].task``), so mutating
+        any returned task (e.g. setting ``status`` / ``started_at``)
+        would corrupt the PlanDraft and invalidate ``plan_hash``.  The
+        method now builds new ``AgentTask`` instances via
+        ``model_validate(model_dump(mode="python"))`` so the PlanDraft
+        stays immutable.
+
+        Renamed from ``agent_tasks()`` to make the cost explicit —
+        callers should treat the result as *execution* tasks, not as
+        a view into the plan.
+        """
+        return [
+            AgentTask.model_validate(pt.task.model_dump(mode="python"))
+            for pt in self.tasks
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -1537,9 +1662,11 @@ class PlanValidationReport(StrictContract):
 
 
 __all__ = [
+    "CODE_APPROVAL_REQUEST_MISSING_PROPOSE",
     "CODE_INTENT_CYCLE",
     "CODE_INTENT_DUPLICATE_ID",
     "CODE_INTENT_MISSING_DEPENDENCY",
+    "CODE_WRITE_REQUEST_MISSING_PROPOSE",
     "MAX_ASSIGNMENT_COMBINATIONS",
     "PLANNER_VERSION",
     "PlanDraft",
@@ -1552,6 +1679,7 @@ __all__ = [
     "TOOL_TO_AGENT_AUTHORITY",
     "TaskIntent",
     "build_expected_planned_tasks",
+    "canonical_request_payload",
     "compute_plan_hash",
     "compute_request_hash",
     "effective_domains",
@@ -1562,4 +1690,5 @@ __all__ = [
     "task_intent_from_requested_task",
     "validate_intent_graph",
     "validate_intent_tool_authority",
+    "validate_write_approval_requirements",
 ]

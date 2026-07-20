@@ -71,9 +71,11 @@ from multi_agent.complexity_gate import (
     RuleBasedComplexityGate,
 )
 from multi_agent.planning import (
+    CODE_APPROVAL_REQUEST_MISSING_PROPOSE,
     CODE_INTENT_CYCLE,
     CODE_INTENT_DUPLICATE_ID,
     CODE_INTENT_MISSING_DEPENDENCY,
+    CODE_WRITE_REQUEST_MISSING_PROPOSE,
     MAX_ASSIGNMENT_COMBINATIONS,
     PLANNER_VERSION,
     PlanDraft,
@@ -86,6 +88,7 @@ from multi_agent.planning import (
     TaskIntent,
     TOOL_TO_AGENT_AUTHORITY,
     build_expected_planned_tasks,
+    canonical_request_payload,
     compute_plan_hash,
     compute_request_hash,
     effective_domains,
@@ -96,6 +99,7 @@ from multi_agent.planning import (
     task_intent_from_requested_task,
     validate_intent_graph,
     validate_intent_tool_authority,
+    validate_write_approval_requirements,
 )
 from multi_agent.planning_errors import (
     AmbiguousAgentSelectionError,
@@ -186,9 +190,11 @@ __all__ = [
     "REASON_SINGLE_DOMAIN_SINGLE_TASK",
     "RuleBasedComplexityGate",
     # Phase 3 — Planning
+    "CODE_APPROVAL_REQUEST_MISSING_PROPOSE",
     "CODE_INTENT_CYCLE",
     "CODE_INTENT_DUPLICATE_ID",
     "CODE_INTENT_MISSING_DEPENDENCY",
+    "CODE_WRITE_REQUEST_MISSING_PROPOSE",
     "MAX_ASSIGNMENT_COMBINATIONS",
     "PLANNER_VERSION",
     "PlanDraft",
@@ -201,6 +207,7 @@ __all__ = [
     "TaskIntent",
     "TOOL_TO_AGENT_AUTHORITY",
     "build_expected_planned_tasks",
+    "canonical_request_payload",
     "compute_plan_hash",
     "compute_request_hash",
     "effective_domains",
@@ -211,6 +218,7 @@ __all__ = [
     "task_intent_from_requested_task",
     "validate_intent_graph",
     "validate_intent_tool_authority",
+    "validate_write_approval_requirements",
     # Phase 3 — Errors
     "AmbiguousAgentSelectionError",
     "BudgetExceededPlanningError",

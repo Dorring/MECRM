@@ -39,6 +39,7 @@ from multi_agent.planning import (
     resolve_expected_intents,
     validate_intent_graph,
     validate_intent_tool_authority,
+    validate_write_approval_requirements,
 )
 from multi_agent.complexity_gate import (
     ComplexityGate,
@@ -561,6 +562,28 @@ class PlanValidator:
                     )
                 )
         if any(i.code == CODE_TOOL_AUTHORITY_MISMATCH for i in issues):
+            return issues
+
+        # Step 1d (R5 P0-1) — validate write/approval requirements.
+        # If the request declares ``requires_write`` or
+        # ``requires_approval``, at least one intent must have
+        # ``preferred_authority == PROPOSE``.  Previously this rule lived
+        # only in the Planner, so a hand-built PlanDraft could pass
+        # validation with ``requires_write=True`` and only READ tasks.
+        write_issues = validate_write_approval_requirements(request, expected_intents)
+        for code in write_issues:
+            issues.append(
+                PlanValidationIssue(
+                    code=code,
+                    severity="error",
+                    message=(
+                        f"signals requires_write/requires_approval but no "
+                        f"intent has preferred_authority=PROPOSE; "
+                        f"code={code}"
+                    ),
+                )
+            )
+        if write_issues:
             return issues
 
         # Duplicate intent_id check (kept from R2).

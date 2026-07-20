@@ -1,8 +1,8 @@
 # Phase 3: Complexity Gate + Planner + Plan Validator
 
-**Status:** Complete (R4)  
+**Status:** Complete (R5)  
 **Branch:** `feat/ma-03-complexity-gate-planner`  
-**Spec version:** ma-03.4.0
+**Spec version:** ma-03.5.0
 
 ---
 
@@ -316,7 +316,7 @@ if plan.planner_version != PLANNER_VERSION:
     issue(code="planner_version_mismatch", severity="error")
 ```
 
-当前 `PLANNER_VERSION = "ma-03.4.0"`。未来需要支持旧版本时，应使用显式版本 Registry `SUPPORTED_PLANNER_VERSIONS`，不接受任意非空字符串。
+当前 `PLANNER_VERSION = "ma-03.5.0"`。未来需要支持旧版本时，应使用显式版本 Registry `SUPPORTED_PLANNER_VERSIONS`，不接受任意非空字符串。
 
 ### 10.7 Intent Graph 校验（R4 P0-1）
 
@@ -355,6 +355,77 @@ if intent.preferred_authority < required_authority:
 ```
 
 **禁止静默提升 Preferred Authority** —— 调用方明确声明了权限边界，Validator 不得在 Planner 不知情的情况下修改它。违反时以 `PlanningInputError` Fail-Closed。Validator 在 `_check_canonical_plan` 的 Step 1c 调用同一函数；违反时返回稳定 Issue Code `tool_authority_mismatch`。
+
+### 10.9 Write / Approval Requirement 校验（R5 P0-1）
+
+R4 之前，"如果 `signals.requires_write` 或 `signals.requires_approval` 为 True，则至少一个 Intent 必须有 `preferred_authority == PROPOSE`" 这条规则只存在于 `DeterministicPlanner._validate_write_approval_requirements()` 私有方法中。Validator 的 Canonical Reconstruction 没有调用同一规则，因此绕过 `create_plan()`、直接手工构造 `PlanDraft` 的请求可以让 "要求写入" 的请求只包含 READ Task，并仍通过校验。
+
+R5 将该规则抽取为共享纯函数 `validate_write_approval_requirements(request, intents) -> list[str]`，Planner 和 Validator 共同调用。Validator 在 `_check_canonical_plan` 的 Step 1d 调用，返回稳定 Issue Code：
+
+| Issue Code | 触发条件 |
+|---|---|
+| `write_request_missing_propose_intent` | `requires_write=True` 但没有 Intent 的 `preferred_authority == PROPOSE` |
+| `approval_request_missing_propose_intent` | `requires_approval=True` 但没有 Intent 的 `preferred_authority == PROPOSE` |
+
+Planner 仍在 `create_plan()` 中以 `PlanningInputError` Fail-Closed；Validator 返回稳定 Issue 而不是抛异常。
+
+### 10.10 Immutable Request Snapshot + Execution Task Defensive Copy（R5 P0-2）
+
+`PlanDraft` 文档声明保存完整 `PlanningRequest` 快照，但 Pydantic v2 在调用方传入预构建模型时会复用同一嵌套实例，导致 `plan.request is original_request` 成立。外部修改原始请求（或其嵌套 `PlanningSignals` / `RequestedTask`）会同步破坏 PlanDraft 并使 `request_hash` / `plan_hash` 失效。
+
+R5 在 `PlanDraft` 的 `field_validator("request")` 中强制深拷贝：
+
+```python
+@field_validator("request")
+@classmethod
+def _request_deep_snapshot(cls, v: PlanningRequest) -> PlanningRequest:
+    return PlanningRequest.model_validate(v.model_dump(mode="python"))
+```
+
+边界由 PlanDraft Contract 自身强制，而非由 Planner 在调用点复制 —— 手工构造 PlanDraft 也无法绕过。
+
+类似地，原 `PlanDraft.agent_tasks()` 直接返回内部 `AgentTask` 引用（`plan.tasks[i].task`），外部修改返回任务的 `status` / `started_at` 会破坏 PlanDraft。R5 将其重命名为 `build_execution_tasks()` 并返回深拷贝：
+
+```python
+def build_execution_tasks(self) -> list[AgentTask]:
+    return [
+        AgentTask.model_validate(pt.task.model_dump(mode="python"))
+        for pt in self.tasks
+    ]
+```
+
+重命名同时让调用方明确这是一次有代价的"从不可变 Plan 生成新执行任务"操作，而非一个内部视图。
+
+### 10.11 Semantic Request Hash（R5 P0-3）
+
+R4 之前，`compute_request_hash()` 直接对 `request.signals.model_dump(mode="json")` 进行 Canonicalize，而 Canonicalizer 保留 List 顺序。因此：
+
+* 交换两个独立 `RequestedTask` 的列表顺序会改变 `request_hash`（进而改变 `plan_hash`）；
+* 某个 Intent 的 `dependencies = ["a", "b"]` 与 `["b", "a"]` 会产生不同 hash，尽管 Dependencies 的语义是集合，最终 `AgentTask.dependencies` 也是 `frozenset`。
+
+这与 Phase 3 的目标不一致 —— 任务顺序不代表依赖；依赖关系由 DAG 显式表达。
+
+R5 新增 `canonical_request_payload(request) -> dict[str, Any]` 函数，规范化以下字段的顺序：
+
+| 字段 | 规范化规则 |
+|---|---|
+| `signals.requested_tasks` | 按 `intent_id` 排序 |
+| 每个 `RequestedTask.dependencies` | 排序 |
+| `signals.domains` / `signals.requested_task_types` | 排序（已为 `frozenset`，但 `model_dump` 输出 list） |
+| 每个 `RequestedTask.required_tools` | 排序 |
+
+`compute_request_hash()` 改为 `stable_hash(canonical_request_payload(request))`。
+
+不变量：
+
+```
+同一 Intent DAG，仅输入列表顺序不同
+→ 相同 request_hash
+→ 相同 plan_hash
+
+依赖目标或任务语义真正变化
+→ Hash 必须变化
+```
 
 ## 11. Budget 校验
 
@@ -419,6 +490,7 @@ if required_tools and estimated_tool_calls < len(required_tools):
 | **Intent 图校验失败**（R4 P0-1） | `PlanValidationError` / `PlanCycleError` / `PlanningInputError` | `duplicate_intent_id` / `missing_intent_dependency` / `intent_cycle` |
 | **Intent / Tool Authority 不对齐**（R4 P0-3） | `PlanningInputError` | `tool_authority_mismatch` |
 | **预算可行分配不存在**（R4 P0-2） | `BudgetExceededPlanningError` | — |
+| **Write/Approval 请求缺 PROPOSE Intent**（R5 P0-1） | `PlanValidationError` / `PlanningInputError` | `write_request_missing_propose_intent` / `approval_request_missing_propose_intent` |
 
 ### 12.1 异常处理收紧（R2 P1-B）
 
@@ -471,9 +543,9 @@ Phase 4 Supervisor 将：
 6. **Authority 上限** — Phase 3 最高 `PROPOSE`，不选择 `EXECUTE` agent
 7. **Multi-agent 分配** — 使用有界笛卡尔积搜索（`MAX_ASSIGNMENT_COMBINATIONS=1,000,000`）+ R4 预算可行性过滤；不实现 Branch-and-Bound 或动态规划优化器（R3 P1 + R4 P0-2 更新）
 
-## 16. 共享纯函数（R3 + R4）
+## 16. 共享纯函数（R3 + R4 + R5）
 
-R3 将 Planner 的核心决策逻辑抽取为无副作用纯函数，位于 `multi_agent.planning` 模块。Planner 和 Validator **共同使用**这些函数，确保两边产生完全相同的 Canonical Plan。R4 新增 Intent Graph 校验和 Tool Authority 对齐两个共享纯函数：
+R3 将 Planner 的核心决策逻辑抽取为无副作用纯函数，位于 `multi_agent.planning` 模块。Planner 和 Validator **共同使用**这些函数，确保两边产生完全相同的 Canonical Plan。R4 新增 Intent Graph 校验和 Tool Authority 对齐两个共享纯函数。R5 新增 Write/Approval Requirement 校验和 Canonical Request Payload 两个共享纯函数：
 
 | 函数 | 签名 | 用途 |
 |---|---|---|
@@ -486,6 +558,8 @@ R3 将 Planner 的核心决策逻辑抽取为无副作用纯函数，位于 `mul
 | **`validate_intent_tool_authority`** | `(intent, registry) -> None` | **R4 P0-3 新增**：Intent preferred_authority 必须覆盖 required_tools 的最高 authority，违反抛 `PlanningInputError` |
 | **`_estimate_assignment_deadline_ms`** | `(intents, assignment) -> int` | **R4 P0-2 内部辅助**：计算给定 assignment 的 DAG 关键路径 timeout 之和 |
 | **`_longest_path_node_count`** | `(intents) -> int` | **R4 P0-2 内部辅助**：计算 Intent DAG 最长路径节点数，用于 max_iterations 预检 |
+| **`validate_write_approval_requirements`** | `(request, intents) -> list[str]` | **R5 P0-1 新增**：requires_write / requires_approval 时至少一个 Intent 必须为 PROPOSE，返回稳定 Issue Code 列表 |
+| **`canonical_request_payload`** | `(request) -> dict[str, Any]` | **R5 P0-3 新增**：构建顺序无关的 Request Hash payload（requested_tasks / dependencies / set 字段全部排序），由 `compute_request_hash` 调用 |
 
 **设计约束**：
 
@@ -508,10 +582,11 @@ R3 将 Planner 的核心决策逻辑抽取为无副作用纯函数，位于 `mul
 | `test_phase3_r2_review.py` | 26 | R2 反例：Intent Binding、requested_tasks 真值来源、Tool-aware 选择、Multi-agent 全局分配、Tool Budget 低报、Customer Recovery Domain、Gate 异常处理 |
 | `test_phase3_r3_review.py` | 35 | R3 反例：Agent Assignment 篡改、Dependency/Required Evidence 绑定、Canonical Task 字段、Customer Recovery 输入互斥、Planner Version、分配搜索上限、共享纯函数一致性 |
 | `test_phase3_r4_review.py` | 15 | R4 反例：Intent Graph 校验、Budget-aware Assignment（deadline/工具/迭代预算预检 + 可行性过滤）、Intent/Tool Authority 对齐、PlannedTask.planning_metadata 篡改 |
-| **Phase 3 合计** | **180** | |
+| `test_phase3_r5_review.py` | 16 | R5 反例：Write/Approval Requirement 共享校验、PlanDraft 深快照 + build_execution_tasks 防御性复制、Semantic Request Hash（顺序不变量 + 语义变化必变）、TOOL_TO_AGENT_AUTHORITY 静态化 |
+| **Phase 3 合计** | **196** | |
 | Phase 2 回归 | 168 | 全部通过 |
 | Phase 1 回归 | 76 | 全部通过 |
-| **总计** | **424** | |
+| **总计** | **440** | |
 
 ## 新增文件
 
@@ -523,10 +598,13 @@ agents/src/multi_agent/
 │                                # + build_expected_planned_tasks + _stable_task_id (R3)
 │                                # + validate_intent_graph + validate_intent_tool_authority (R4)
 │                                # + _estimate_assignment_deadline_ms + _longest_path_node_count (R4)
+│                                # + validate_write_approval_requirements + canonical_request_payload (R5)
+│                                # + TOOL_TO_AGENT_AUTHORITY 静态化 (R5 P1-1)
+│                                # + PlanDraft.request 深拷贝 + build_execution_tasks 防御性复制 (R5 P0-2)
 ├── complexity_gate.py          # RuleBasedComplexityGate (含 Customer Recovery 互斥校验, R3)
 ├── planning_templates.py       # CustomerRecoveryTemplate
-├── plan_validator.py           # PlanValidator (含 Canonical Plan Reconstruction, R3 + R4 Intent Graph / Tool Authority)
-└── planner.py                  # DeterministicPlanner (调用共享纯函数, R3 + R4; 无 customer_recovery_template 注入, R4)
+├── plan_validator.py           # PlanValidator (Canonical Plan Reconstruction + Intent Graph / Tool Authority / Write-Approval 校验)
+└── planner.py                  # DeterministicPlanner (调用共享纯函数, R3 + R4 + R5; 无 customer_recovery_template 注入, R4)
 
 agents/tests/unit/multi_agent/
 ├── test_complexity_gate.py
@@ -536,7 +614,8 @@ agents/tests/unit/multi_agent/
 ├── test_phase3_r1_review.py    # R1 反例测试
 ├── test_phase3_r2_review.py    # R2 反例测试
 ├── test_phase3_r3_review.py    # R3 反例测试 (35 tests)
-└── test_phase3_r4_review.py    # R4 反例测试 (15 tests)
+├── test_phase3_r4_review.py    # R4 反例测试 (15 tests)
+└── test_phase3_r5_review.py    # R5 反例测试 (16 tests)
 
 docs/multi-agent/
 └── phase-3-complexity-gate-planner.md  (本文件)

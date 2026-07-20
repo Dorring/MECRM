@@ -65,7 +65,6 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from multi_agent.contracts import AgentAuthority
 from multi_agent.registry import AgentRegistry
 from multi_agent.planning import (
     PLANNER_VERSION,
@@ -79,6 +78,7 @@ from multi_agent.planning import (
     resolve_expected_intents,
     validate_intent_graph,
     validate_intent_tool_authority,
+    validate_write_approval_requirements,
 )
 from multi_agent.planning_errors import (
     BudgetExceededPlanningError,
@@ -117,6 +117,9 @@ _HASH_CODES = {
     # R4 codes
     "missing_intent_dependency",
     "tool_authority_mismatch",
+    # R5 codes
+    "write_request_missing_propose_intent",
+    "approval_request_missing_propose_intent",
 }
 
 
@@ -236,22 +239,22 @@ class DeterministicPlanner:
         """If ``requires_write`` or ``requires_approval`` is set, at least
         one intent must have ``preferred_authority == PROPOSE``.
 
-        Otherwise the request is structurally contradictory — the caller
-        asked for write/approval but no task is allowed to propose.
+        R5 P0-1 — this is a thin wrapper around the shared
+        :func:`validate_write_approval_requirements` pure function.
+        Planner and Validator now share the exact same validation logic
+        so a tampered request bypassing ``create_plan`` (e.g. a
+        hand-built :class:`PlanDraft`) is rejected by both sides with
+        stable Issue Codes (``write_request_missing_propose_intent`` /
+        ``approval_request_missing_propose_intent``).
         """
-        if not (request.signals.requires_write or request.signals.requires_approval):
+        issues = validate_write_approval_requirements(request, intents)
+        if not issues:
             return
-        if not intents:
-            return
-        has_propose = any(
-            i.preferred_authority is AgentAuthority.PROPOSE for i in intents
+        raise PlanningInputError(
+            "signals.requires_write or requires_approval is True but no "
+            "task has preferred_authority=PROPOSE; cannot satisfy the "
+            f"request; issues={issues!r}"
         )
-        if not has_propose:
-            raise PlanningInputError(
-                "signals.requires_write or requires_approval is True but no "
-                "task has preferred_authority=PROPOSE; cannot satisfy the "
-                "request"
-            )
 
     # ------------------------------------------------------------------
     # Intent structure validation (R4 P0-1 — shared with Validator)
