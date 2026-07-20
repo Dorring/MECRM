@@ -167,37 +167,68 @@ Checkpoint 写入 PG 和事件发送到 Kafka 无法在同一事务中完成。
 
 ## 3. 各阶段涉及的具体文件
 
-### Phase 1：AI_MODE 和 Provider 运行边界
+### Phase 1：AI 运行模式、Provider 边界和确定性 Provider
 
-**目标：** 建立 `AI_MODE`（none/static/supervisor）运行模式开关；统一所有 `OLLAMA_*` env var 读取到 Provider 边界；Provider 健康检查。
+**目标：** 建立 `AI_MODE`（disabled/deterministic/live）运行模式开关；创建确定性 Provider；统一所有 `OLLAMA_*` env var 读取到 Provider 边界；Provider 健康检查与 readiness。
+
+**背景：** 核心 Chat Provider Factory（`providers.py`）可复用，但全仓 Provider 边界尚未完全统一（6 处绕过 Settings 直接读取 env var）。Phase 1 完成边界统一。
 
 ```
 新增:
-  agents/src/orchestrator/ai_mode.py               # AI_MODE enum + feature flags
-  tests/unit/test_provider_boundary.py              # Provider 边界单元测试
+  agents/src/orchestrator/ai_mode.py                    # AI_MODE enum + AGENT_ORCHESTRATION_MODE enum
+  agents/src/intelligence/deterministic_provider.py     # 确定性结构化 Provider（不连接 Ollama/NIM）
+  tests/unit/test_ai_mode.py                            # AI_MODE 行为测试
 
 修改:
-  agents/src/orchestrator/config.py                 # 新增 AI_MODE 环境变量
-  agents/src/intelligence/providers.py              # 新增 provider_health_check()
-  agents/src/intelligence/chat/chat_agent.py        # 替换 os.getenv("OLLAMA_EMBED_MODEL") → create_embeddings()
+  agents/src/orchestrator/config.py                     # 新增 AI_MODE + AGENT_ORCHESTRATION_MODE 环境变量
+  agents/src/intelligence/providers.py                  # 新增 provider_health_check()；AI_MODE 门控
+  agents/src/intelligence/chat/chat_agent.py            # 替换 os.getenv("OLLAMA_EMBED_MODEL") → create_embeddings()
   agents/src/intelligence/knowledge/knowledge_agent.py  # 同上
-  agents/src/intelligence/search/search_agent.py    # 同上
-  agents/src/orchestrator/main.py                   # 同上
-  agents/src/intelligence/i18n/voice_ingest.py      # 抽象 Whisper backend 选择
+  agents/src/intelligence/search/search_agent.py        # 同上
+  agents/src/orchestrator/main.py                       # 同上；新增 /health readiness 端点
+  agents/src/intelligence/i18n/voice_ingest.py          # 抽象 Whisper backend 选择
 ```
+
+**AI 运行模式定义：**
+
+| AI_MODE | 行为 |
+|---|---|
+| `disabled` | 不初始化模型和 Embedding Provider；AI 请求返回显式 unavailable |
+| `deterministic` | 使用本地确定性结构化 Provider，不访问 Ollama、NVIDIA NIM 或其他网络服务 |
+| `live` | 根据 `AI_PROVIDER` 调用真实模型（仅此模式下 `AI_PROVIDER` 生效） |
+
+**Agent 编排模式（独立开关）：**
+
+| 开关 | 默认值 | 说明 |
+|---|---|---|
+| `AGENT_ORCHESTRATION_MODE` | `legacy` | `legacy` — 现有 AgentRouter 行为；`shadow` — 旧路径生效、新路径并行比对；`supervisor` — 仅新路径生效 |
+
+**测试覆盖：**
+- `disabled` 模式不发生网络连接
+- `deterministic` 模式不连接 Ollama/NIM
+- `live` 模式未配置 Provider 时明确失败
+- `live` + ollama 服务不可用时 readiness 为 degraded
+- `deterministic` 输出可重复
 
 ### Phase 2：Contracts 和未接线的 Agent Registry
 
-**目标：** 统一 `AgentResponse` Schema；创建 `AgentRegistry`（注册但不替换 Router 的运行时 DI）；`SpecialistCapability` 声明。
+**目标：** 定义统一核心契约（`AgentCapability`, `AgentTask`, `AgentResult`, `Evidence`, `ActionProposal`, `TokenUsage`, `ProviderMetadata`）；创建 `AgentRegistry`（注册但不替换 Router 的运行时 DI，Phase 4 的五个 Specialist 直接注册到此 Registry）。
+
+**核心契约命名规则：**
+- Supervisor 委派使用 `AgentTask`
+- Specialist 返回 `AgentResult`
+- 待执行业务动作使用 `ActionProposal`（复用仓库已有 `ActionProposal`/`ProposedWrite` 的字段，通过 Adapter 扩展）
+- 不使用语义模糊的 `AgentAction` 和 `AgentResponse`
+- `Evidence` 为 Reviewer 校验的原子证据单元
 
 ```
 新增:
   agents/src/multi_agent/__init__.py
-  agents/src/multi_agent/shared/schema.py           # AgentResponse, AgentAction, SpecialistCapability
-  agents/src/multi_agent/registry.py                # AgentRegistry（独立于 Router）
+  agents/src/multi_agent/shared/schema.py           # AgentCapability, AgentTask, AgentResult, Evidence, ActionProposal, TokenUsage, ProviderMetadata
+  agents/src/multi_agent/registry.py                # AgentRegistry（独立于 Router，Phase 4 共用）
 
 修改:
-  agents/src/agents/base.py                         # 添加 agent_response() 辅助方法（可选）
+  agents/src/agents/base.py                         # 添加 agent_result() 辅助方法（可选）
 
 不修改:
   agents/src/orchestrator/router.py                 # DI 注入保持不变
@@ -218,13 +249,12 @@ Checkpoint 写入 PG 和事件发送到 Kafka 无法在同一事务中完成。
 
 ### Phase 4：旗舰场景 5 个 Specialist Adapter
 
-**目标：** 为 5 个旗舰场景创建 Adapter——Customer Context、Support、Sales、Knowledge、Analytics。
+**目标：** 为 5 个旗舰场景创建 Adapter——Customer Context、Support、Sales、Knowledge、Analytics。五个 Specialist 直接注册到 Phase 2 的 `AgentRegistry`。
 
 ```
 新增:
   agents/src/multi_agent/specialist/__init__.py
   agents/src/multi_agent/specialist/base.py              # SpecialistAgent(ABC)
-  agents/src/multi_agent/specialist/registry.py          # SpecialistRegistry
   agents/src/multi_agent/specialist/adapters/__init__.py
   agents/src/multi_agent/specialist/adapters/customer_context.py
   agents/src/multi_agent/specialist/adapters/support.py
@@ -232,6 +262,9 @@ Checkpoint 写入 PG 和事件发送到 Kafka 无法在同一事务中完成。
   agents/src/multi_agent/specialist/adapters/knowledge.py
   agents/src/multi_agent/specialist/adapters/analytics.py
   tests/unit/test_specialist_adapters.py                 # Adapter 行为测试
+
+修改:
+  agents/src/multi_agent/registry.py                     # 注册 5 个 Specialist
 
 不修改:
   agents/src/agents/sales.py                             # 原 SalesAgent 不变
@@ -241,7 +274,7 @@ Checkpoint 写入 PG 和事件发送到 Kafka 无法在同一事务中完成。
 
 ### Phase 5：独立入口的 Supervisor Graph
 
-**目标：** 新增 `POST /api/agents/objectives` 和 `crm.agent.objective.requested` Topic；Supervisor StateGraph。
+**目标：** 新增 `POST /api/agents/objectives` 和 `crm.agent.objective.requested` Topic；Supervisor StateGraph。通过 `AGENT_ORCHESTRATION_MODE` 控制是否启用。
 
 ```
 新增:
@@ -280,11 +313,20 @@ Checkpoint 写入 PG 和事件发送到 Kafka 无法在同一事务中完成。
   agents/src/multi_agent/executor/base.py                # GovernedExecutor(ABC)
   agents/src/multi_agent/executor/approve_gate.py        # 审批门控
   agents/src/multi_agent/executor/proposal_hash.py       # Proposal Hash 计算与校验
-  database/migrations/13-langgraph-checkpoint.sql        # LangGraph checkpoints 表
 
 依赖新增:
-  langgraph-checkpoint-postgres>=2.0
+  langgraph-checkpoint-postgres（锁定版本，见下文）
+
+不新增:
+  database/migrations/13-langgraph-checkpoint.sql        # 不手工定义自有 Checkpoint Schema
 ```
+
+**Checkpointer 初始化计划（开放实施项）：**
+1. 锁定 `langgraph-checkpoint-postgres` 版本
+2. 验证官方 `PostgresSaver.setup()` 创建和升级的表结构
+3. 决定由部署 Migration Job 调用 `setup()`，或将对应固定版本的官方迁移纳入项目迁移
+4. 在完成验证前，不手工定义自有 Checkpoint Schema
+5. Checkpoint 表与 Business Task、Run Evidence、Memory 继续保持语义隔离
 
 ### Phase 8：Run Trace 和确定性 Demo
 
@@ -320,7 +362,7 @@ Checkpoint 写入 PG 和事件发送到 Kafka 无法在同一事务中完成。
 
 | 现有表 | 复用方式 |
 |---|---|
-| `ai_agents` | 新增 Supervisor/Reviewer/GovernedExecutor 行 |
+| `ai_agents` | 默认只计划注册 Supervisor 和 Reviewer；GovernedExecutor 视为确定性执行服务，是否注册到 `ai_agents` 留到 Phase 7 决定 |
 | `agent_tasks` | 作为 **Business Task** 存储（面向用户的任务视图） |
 | `agent_events` | 作为 **Run Evidence** 存储（事件类型记录） |
 | `agent_decisions` | 作为 **Run Evidence** 存储（Reviewer 决策记录） |
@@ -339,15 +381,19 @@ Checkpoint 写入 PG 和事件发送到 Kafka 无法在同一事务中完成。
 | `PendingAction` | 复用为 GovernedExecutor 预执行存储 |
 | `ResolutionSuggestion` / `ResolutionStep` | 保持不变，作为 Specialist 内部验证 |
 | `ForecastResult` / `ForecastPrediction` | 保持不变，作为 Specialist 内部验证 |
-| `ActionProposal` / `ProposedWrite` | 复用为 GovernedExecutor Proposal 格式 |
+| `ActionProposal` / `ProposedWrite` | Phase 2 的统一 `ActionProposal` 契约复用其字段结构，通过 Adapter 扩展；GovernedExecutor 执行前验证 Proposal Hash |
 
 ### 4.3 需要新增的 Schema
 
 | 新增 Schema | 用途 | Phase |
 |---|---|---|
-| `AgentResponse` (Pydantic) | 统一所有 Agent 的返回格式 | Phase 2 |
-| `AgentAction` (Pydantic) | Supervisor 向 Specialist 的委托指令 | Phase 2 |
-| `SpecialistCapability` (Pydantic) | Specialist 能力声明 | Phase 2 |
+| `AgentCapability` (Pydantic) | Agent 能力声明（含 `schema_version`、`prompt_version`） | Phase 2 |
+| `AgentTask` (Pydantic) | Supervisor 向 Specialist 的委托指令 | Phase 2 |
+| `AgentResult` (Pydantic) | Specialist 返回的统一结果（含 `TokenUsage`、`Evidence`） | Phase 2 |
+| `Evidence` (Pydantic) | Reviewer 校验的原子证据单元 | Phase 2 |
+| `ActionProposal` (Pydantic) | 待执行业务动作（复用仓库已有 `ActionProposal`/`ProposedWrite` 字段，通过 Adapter 扩展） | Phase 2 |
+| `TokenUsage` (Pydantic) | LLM 调用 token 消耗归因 | Phase 2 |
+| `ProviderMetadata` (Pydantic) | Provider 标识与版本信息 | Phase 2 |
 | `Objective` (Pydantic) | 用户/系统提交的跨域目标 | Phase 3 |
 | `Plan` / `TaskNode` (Pydantic) | Planner 生成的执行计划 | Phase 3 |
 | `ReviewResult` (Pydantic) | Reviewer 合同检查输出 | Phase 6 |
@@ -359,18 +405,25 @@ Checkpoint 写入 PG 和事件发送到 Kafka 无法在同一事务中完成。
 ## 5. Feature Flag 设计
 
 ```bash
-# Phase 1
-AI_MODE=none                     # none | static | supervisor
-                                 # none: 现有行为不变
-                                 # static: 使用 AgentRegistry + AgentResponse 但路由不变
-                                 # supervisor: 启用 Supervisor Graph 入口
+# Phase 1 — AI 运行模式
+AI_MODE=disabled                  # disabled | deterministic | live
+                                  # disabled: 不初始化模型和 Embedding Provider，AI 请求返回 unavailable
+                                  # deterministic: 使用本地确定性结构化 Provider
+                                  # live: 根据 AI_PROVIDER 调用真实模型
 
-# Phase 5
-SUPERVISOR_ENTRY_ENABLED=false   # POST /api/agents/objectives 开关
+AI_PROVIDER=ollama                # ollama | nvidia_nim（仅 AI_MODE=live 时生效）
+
+# Phase 1 — Agent 编排模式（独立于 AI_MODE）
+AGENT_ORCHESTRATION_MODE=legacy   # legacy | shadow | supervisor
+                                  # legacy: 现有 AgentRouter 行为
+                                  # shadow: 旧路径生效、新路径并行比对结果
+                                  # supervisor: 仅新 Supervisor Graph 路径生效
 
 # Phase 8
-RUN_TRACE_ENABLED=false          # 统一 Run Trace 收集开关
+RUN_TRACE_ENABLED=false           # 统一 Run Trace 收集开关
 ```
+
+> 注意：不保留 `SUPERVISOR_ENTRY_ENABLED` 和 `SUPERVISOR_SHADOW_MODE` 两个独立开关。`AGENT_ORCHESTRATION_MODE` 统一控制两条路径的生效关系。
 
 ---
 
@@ -389,14 +442,14 @@ RUN_TRACE_ENABLED=false          # 统一 Run Trace 收集开关
 | R9 | Agent ID 冲突 | 低 | `AgentRegistry.register()` 检查唯一性 | Phase 2 |
 | R10 | OPA 策略盲区 | 中 | 新增 Agent 角色时同步更新 `policies/agents/core.rego` | Phase 5/6/7 |
 | R11 | **无限循环与成本失控** | **高** | Planner 设置 `max_steps`；Supervisor 设置 `token_budget`；每步有成本归因 | Phase 3/5 |
-| R12 | **并行竞态与部分失败** | **高** | Specialist 并行执行结果合并策略（all_succeed / any_succeed / majority）；部分失败时触发 Replan 或降级 | Phase 5/6 |
+| R12 | **并行竞态与部分失败** | **高** | required/optional task 分类；dependency-aware completion；per-task failure policy；最终状态为 completed/degraded/failed/needs_input；Knowledge 或 Analytics 等可选任务失败时允许降级，但必要任务失败必须阻止后续执行 | Phase 5/6 |
 | R13 | **Tenant Context 与 Foreign Evidence** | **高** | 所有 Specialist 检索和 Reviewer 验证强制 `SET app.tenant_id`；跨租户证据泄露作为评测硬性失败 | Phase 4/6/9 |
 | R14 | **审批后 Proposal 篡改** | 中 | GovernedExecutor 计算 Proposal Hash，与审批时的 Hash 比对；不匹配则拒绝执行 | Phase 7 |
 | R15 | **Kafka Replay 和重复副作用** | 中 | 所有 emit_event 携带 Idempotency Key；Executor 在执行前检查 Key 是否已处理 | Phase 7 |
-| R16 | **Shadow Mode 双执行** | 中 | `AI_MODE=shadow` 时两条路径并行执行、比对结果、仅旧路径生效；适用于迁移验证 | Phase 5+ |
+| R16 | **Shadow Mode 双执行** | 中 | `AGENT_ORCHESTRATION_MODE=shadow` 时两条路径并行执行、比对结果、仅旧路径生效；适用于迁移验证 | Phase 5+ |
 | R17 | **Checkpoint 数据保留 / GDPR** | 中 | Checkpoint 数据 TTL 与租户数据保留策略对齐；PII 字段标记 + 擦除 API | Phase 7 |
 | R18 | **Prompt/Schema/Registry 版本漂移** | 中 | `SpecialistCapability` 包含 `schema_version` 和 `prompt_version`；Supervisor 路由前校验版本兼容性 | Phase 2/5 |
-| R19 | **Trace PII 与高基数指标** | 中 | Trace 中的 prompt/response 不存储原文，仅存储 hash；Agent ID × Objective ID 聚合，禁止 Tenant ID × Task ID 标签 | Phase 8 |
+| R19 | **Trace PII 与高基数指标** | 中 | Trace 中的 prompt/response 不存储原文，仅存储 hash；Prometheus 低基数 Label 仅包括 agent_id、node_type、execution_mode、status、error_category、provider、model_family；run_id/objective_id/task_id/tenant_id/user_id/customer_id/conversation_id 等唯一标识只能进入日志、Trace 或 Run Evidence | Phase 8 |
 | R20 | **Reviewer 相关性错误** | 中 | Reviewer 合同定义与 Plan 结构对齐；合同检查结果可被 Run Trace 回溯 | Phase 6/8 |
 | R21 | **Live Model 非确定性** | 中 | Complexity Gate 使用确定性规则；Plan Validator 不调用 LLM；Reviewer 关键检查使用规则式；Phase 9 评测统计多次运行的通过率 | Phase 3/6/9 |
 | R22 | **P95 延迟与单位任务成本** | 中 | Phase 5 起记录每 Task 的 wall-clock 和 token cost；Phase 9 评测报告 P50/P95/P99 延迟和单位成本 | Phase 5/9 |
