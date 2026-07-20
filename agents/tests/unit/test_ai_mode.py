@@ -742,6 +742,17 @@ class TestProviderHealthCheck:
 class TestEmbeddingCollectionIsolation:
     """Different modes/providers/models → different collection names."""
 
+    def test_default_deterministic_collection_name(self):
+        """Smoke test: deterministic mode produces a valid collection name."""
+        _set_env(AI_MODE="deterministic")
+        try:
+            from intelligence.providers import vector_collection_name
+            name = vector_collection_name("KnowledgeBase")
+            assert name.startswith("KnowledgeBase_")
+            assert "deterministic" in name.lower()
+        finally:
+            _del_env("AI_MODE")
+
     def test_deterministic_different_from_live_ollama(self):
         """Deterministic and live collections are isolated."""
         _set_env(AI_MODE="deterministic")
@@ -788,6 +799,387 @@ class TestEmbeddingCollectionIsolation:
 
         assert name_disabled != name_det
         assert "disabled" in name_disabled.lower()
+
+
+# ---------------------------------------------------------------------------
+# Chat Graph integration tests (Fix 3)
+# ---------------------------------------------------------------------------
+
+
+class TestDeterministicChatGraphIntegration:
+    """Actual Chat Graph compilation + invocation with fixture injection."""
+
+    @pytest.mark.asyncio
+    async def test_show_open_tickets_routes_to_crm_reader(self):
+        """'Show my open tickets' → read/ticket → crm_reader.get_tickets."""
+        from intelligence.deterministic_provider import (
+            DeterministicChatProvider,
+            register_chat_intent_fixture,
+            clear_fixtures,
+        )
+        from intelligence.chat.graph import ChatDeps, ChatState, build_chat_graph
+
+        # Register a fixture that returns a read/ticket intent
+        register_chat_intent_fixture(
+            "Show my open tickets",
+            '{"intent":"read","entity":"ticket","confidence":0.95}',
+        )
+        try:
+            llm = DeterministicChatProvider()
+            graph = build_chat_graph(deps=ChatDeps(
+                llm=llm, tool_executor=_NoopToolExecutor(), memory=None, memory_window=8,
+            ))
+            state = ChatState(
+                query="Show my open tickets",
+                tenant_id="tenant-1",
+                user_id="user-1",
+                roles=[],
+            )
+            result = await graph.ainvoke(state)
+            # graph.ainvoke returns dict (LangGraph without checkpointer)
+            assert result["intent"] is not None
+            assert result["intent"].intent == "read"
+            assert result["intent"].entity == "ticket"
+            assert result["tool_call"] is not None
+            assert result["tool_call"].tool == "crm_reader.get_tickets"
+        finally:
+            clear_fixtures()
+
+    @pytest.mark.asyncio
+    async def test_create_followup_task_routes_to_crm_writer(self):
+        """'Create a follow-up task' → write/task → crm_writer.propose."""
+        from intelligence.deterministic_provider import (
+            DeterministicChatProvider,
+            register_chat_intent_fixture,
+            clear_fixtures,
+        )
+        from intelligence.chat.graph import ChatDeps, ChatState, build_chat_graph
+
+        register_chat_intent_fixture(
+            "Create a follow-up task",
+            '{"intent":"write","entity":"task","confidence":0.90}',
+        )
+        try:
+            llm = DeterministicChatProvider()
+            graph = build_chat_graph(deps=ChatDeps(
+                llm=llm, tool_executor=_NoopToolExecutor(), memory=None, memory_window=8,
+            ))
+            state = ChatState(
+                query="Create a follow-up task",
+                tenant_id="tenant-1",
+                user_id="user-1",
+                roles=[],
+            )
+            result = await graph.ainvoke(state)
+            # graph.ainvoke returns dict (LangGraph without checkpointer)
+            assert result["intent"] is not None
+            assert result["intent"].intent == "write"
+            assert result["intent"].entity == "task"
+            assert result["tool_call"] is not None
+            assert result["tool_call"].tool == "crm_writer.propose"
+        finally:
+            clear_fixtures()
+
+    @pytest.mark.asyncio
+    async def test_explain_renewal_policy_routes_to_vector_search(self):
+        """'Explain the renewal policy' → question/unknown → vector_search.search."""
+        from intelligence.deterministic_provider import (
+            DeterministicChatProvider,
+            register_chat_intent_fixture,
+            clear_fixtures,
+        )
+        from intelligence.chat.graph import ChatDeps, ChatState, build_chat_graph
+
+        register_chat_intent_fixture(
+            "Explain the renewal policy",
+            '{"intent":"question","entity":"unknown","confidence":0.85}',
+        )
+        try:
+            llm = DeterministicChatProvider()
+            graph = build_chat_graph(deps=ChatDeps(
+                llm=llm, tool_executor=_NoopToolExecutor(), memory=None, memory_window=8,
+            ))
+            state = ChatState(
+                query="Explain the renewal policy",
+                tenant_id="tenant-1",
+                user_id="user-1",
+                roles=[],
+            )
+            result = await graph.ainvoke(state)
+            # graph.ainvoke returns dict (LangGraph without checkpointer)
+            assert result["intent"] is not None
+            assert result["intent"].intent == "question"
+            assert result["tool_call"] is not None
+            assert result["tool_call"].tool == "vector_search.search"
+        finally:
+            clear_fixtures()
+
+
+class _NoopToolExecutor:
+    """ToolExecutor that returns ok for any tool call."""
+    async def execute(self, **kwargs):
+        from intelligence.chat.graph import ToolResult
+        return ToolResult(tool=kwargs.get("call").tool if kwargs.get("call") else "none", ok=True)
+
+
+# ---------------------------------------------------------------------------
+# aiohttp /ready test (Fix 2 + Fix 4)
+# ---------------------------------------------------------------------------
+
+
+class TestReadyEndpoint:
+    """Real aiohttp test client against ready_handler."""
+
+    @pytest.mark.asyncio
+    async def test_ready_200_for_deterministic(self):
+        _set_env(AI_MODE="deterministic")
+        try:
+            from aiohttp.test_utils import make_mocked_request
+            from orchestrator.main import ready_handler
+            req = make_mocked_request("GET", "/ready")
+            resp = await ready_handler(req)
+            assert resp.status == 200
+            import json
+            data = json.loads(resp.body)
+            assert data["status"] == "ready"
+            assert data["provider"] == "deterministic"
+        finally:
+            _del_env("AI_MODE")
+
+    @pytest.mark.asyncio
+    async def test_ready_503_for_live_without_provider(self):
+        _set_env(AI_MODE="live", AI_PROVIDER="")
+        try:
+            from aiohttp.test_utils import make_mocked_request
+            from orchestrator.main import ready_handler
+            req = make_mocked_request("GET", "/ready")
+            resp = await ready_handler(req)
+            assert resp.status == 503
+        finally:
+            _del_env("AI_MODE", "AI_PROVIDER")
+
+    @pytest.mark.asyncio
+    async def test_ready_503_for_invalid_ai_mode(self):
+        _set_env(AI_MODE="garbage_mode")
+        try:
+            from aiohttp.test_utils import make_mocked_request
+            from orchestrator.main import ready_handler
+            req = make_mocked_request("GET", "/ready")
+            resp = await ready_handler(req)
+            assert resp.status == 503
+        finally:
+            _del_env("AI_MODE")
+
+
+# ---------------------------------------------------------------------------
+# NVIDIA single HTTP call test (Fix 4)
+# ---------------------------------------------------------------------------
+
+
+class TestNvidiaHealthCheck:
+    """NVIDIA provider_health_check makes exactly 1 HTTP call."""
+
+    @pytest.mark.asyncio
+    async def test_nvidia_makes_exactly_one_http_get(self):
+        import httpx
+        from unittest import mock as umock
+        call_count = 0
+
+        class _MockClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def get(self, url, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                headers = kwargs.get("headers", {})
+                auth = headers.get("Authorization", "")
+                if "Bearer sk-test" in auth:
+                    return httpx.Response(401)
+                return httpx.Response(200)
+
+        _set_env(AI_MODE="live", AI_PROVIDER="nvidia_nim",
+                  NVIDIA_API_KEY="sk-test",
+                  NVIDIA_CHAT_MODEL="meta/llama3-70b",
+                  NVIDIA_EMBED_MODEL="nvidia/nv-embedqa")
+        try:
+            with umock.patch.object(httpx, "AsyncClient", _MockClient):
+                from intelligence.providers import provider_health_check
+                await provider_health_check()
+            assert call_count == 1, (
+                f"Expected exactly 1 HTTP GET, got {call_count}"
+            )
+        finally:
+            _del_env("AI_MODE", "AI_PROVIDER", "NVIDIA_API_KEY",
+                     "NVIDIA_CHAT_MODEL", "NVIDIA_EMBED_MODEL")
+
+
+# ---------------------------------------------------------------------------
+# Provider metadata tests (Fix 5)
+# ---------------------------------------------------------------------------
+
+
+class TestProviderMetadata:
+    """provider_metadata returns correct labels per mode."""
+
+    def test_disabled_metadata(self):
+        _set_env(AI_MODE="disabled")
+        try:
+            from intelligence.providers import provider_metadata
+            meta = provider_metadata()
+            assert meta["ai_mode"] == "disabled"
+            assert meta["provider"] == "disabled"
+            assert meta["chat_model"] == "disabled"
+            assert meta["embedding_model"] == "disabled"
+        finally:
+            _del_env("AI_MODE")
+
+    def test_deterministic_metadata(self):
+        _set_env(AI_MODE="deterministic")
+        try:
+            from intelligence.providers import provider_metadata
+            meta = provider_metadata()
+            assert meta["ai_mode"] == "deterministic"
+            assert meta["provider"] == "deterministic"
+            assert "deterministic" in meta["chat_model"]
+            assert "deterministic" in meta["embedding_model"]
+        finally:
+            _del_env("AI_MODE")
+
+    @pytest.mark.asyncio
+    async def test_live_ollama_metadata(self):
+        # Can't actually init Ollama, but metadata should still resolve
+        _set_env(AI_MODE="live", AI_PROVIDER="ollama")
+        try:
+            from intelligence.providers import provider_metadata
+            meta = provider_metadata()
+            assert meta["ai_mode"] == "live"
+            assert meta["provider"] == "ollama"
+        finally:
+            _del_env("AI_MODE", "AI_PROVIDER")
+
+
+# ---------------------------------------------------------------------------
+# Voice API status tests (Fix 7)
+# ---------------------------------------------------------------------------
+
+
+class TestVoiceApiStatus:
+    """Voice API returns correct status and HTTP codes."""
+
+    @pytest.mark.asyncio
+    async def test_disabled_voice_returns_unavailable_status(self, monkeypatch):
+        import httpx
+        calls: list[str] = []
+
+        async def _tracking_get(url, **kwargs):
+            calls.append(f"GET {url}")
+
+        async def _tracking_post(url, **kwargs):
+            calls.append(f"POST {url}")
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", _tracking_get)
+        monkeypatch.setattr(httpx.AsyncClient, "post", _tracking_post)
+        _set_env(AI_MODE="disabled")
+        try:
+            import intelligence.i18n.voice_ingest as vi
+            vi._default_stt = None
+            from intelligence.i18n.voice_ingest import transcribe_audio
+            result = await transcribe_audio(b"test audio")
+            assert not result.success
+            assert "disabled" in (result.error or "").lower()
+            assert len(calls) == 0
+        finally:
+            _del_env("AI_MODE")
+
+    @pytest.mark.asyncio
+    async def test_deterministic_voice_returns_fixed_transcript(self, monkeypatch):
+        import httpx
+        calls: list[str] = []
+
+        async def _tracking_get(url, **kwargs):
+            calls.append(f"GET {url}")
+
+        async def _tracking_post(url, **kwargs):
+            calls.append(f"POST {url}")
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", _tracking_get)
+        monkeypatch.setattr(httpx.AsyncClient, "post", _tracking_post)
+        _set_env(AI_MODE="deterministic")
+        try:
+            import intelligence.i18n.voice_ingest as vi
+            vi._default_stt = None
+            from intelligence.i18n.voice_ingest import transcribe_audio
+            result = await transcribe_audio(b"test audio")
+            assert result.success
+            assert result.model_used == "deterministic-stt-v1"
+            assert len(calls) == 0
+        finally:
+            _del_env("AI_MODE")
+
+    @pytest.mark.asyncio
+    async def test_live_missing_whisper_url_raises_config_error(self):
+        _set_env(AI_MODE="live", AI_PROVIDER="ollama")
+        try:
+            import intelligence.i18n.voice_ingest as vi
+            vi._default_stt = None
+            from intelligence.i18n.voice_ingest import WhisperSTT
+            with pytest.raises(RuntimeError, match="WHISPER_URL"):
+                WhisperSTT()
+        finally:
+            _del_env("AI_MODE", "AI_PROVIDER")
+
+
+# ---------------------------------------------------------------------------
+# Settings .env loading test (Fix 6)
+# ---------------------------------------------------------------------------
+
+
+class TestSettingsFromDotenv:
+    """Settings singleton picks up values from .env file."""
+
+    def test_settings_loads_all_ai_vars_from_env(self):
+        """Verify all AI-related Settings keys are loadable from env vars."""
+        _set_env(
+            AI_MODE="live",
+            AI_PROVIDER="ollama",
+            OLLAMA_URL="http://ollama:9999",
+            OLLAMA_MODEL="test-model-42b",
+            OLLAMA_EMBED_MODEL="test-embed-v2",
+            NVIDIA_BASE_URL="https://test.nvidia.example.com/v1",
+            NVIDIA_CHAT_MODEL="test/chat-model",
+            NVIDIA_EMBED_MODEL="test/embed-model",
+        )
+        try:
+            # Reload the settings module to pick up new env vars
+            import importlib
+            import orchestrator.config
+            importlib.reload(orchestrator.config)
+            from orchestrator.config import settings
+
+            assert settings.AI_MODE == "live"
+            assert settings.AI_PROVIDER == "ollama"
+            assert settings.OLLAMA_URL == "http://ollama:9999"
+            assert settings.OLLAMA_MODEL == "test-model-42b"
+            assert settings.OLLAMA_EMBED_MODEL == "test-embed-v2"
+            assert settings.NVIDIA_BASE_URL == "https://test.nvidia.example.com/v1"
+            assert settings.NVIDIA_CHAT_MODEL == "test/chat-model"
+            assert settings.NVIDIA_EMBED_MODEL == "test/embed-model"
+        finally:
+            _del_env(
+                "AI_MODE", "AI_PROVIDER", "OLLAMA_URL", "OLLAMA_MODEL",
+                "OLLAMA_EMBED_MODEL", "NVIDIA_BASE_URL", "NVIDIA_CHAT_MODEL",
+                "NVIDIA_EMBED_MODEL",
+            )
+            # Reload again to restore defaults
+            import orchestrator.config
+            importlib.reload(orchestrator.config)
 
 
 # ---------------------------------------------------------------------------

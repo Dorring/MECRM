@@ -186,15 +186,33 @@ def _flatten_input(input_: Any) -> list[Any]:
 _FIXTURES: dict[str, str] = {}
 """Global fixture registry: scenario_id -> response text."""
 
+# Chat-intent fixture registry: when a prompt contains a registered key phrase,
+# return the corresponding ChatIntent JSON instead of the generic response.
+# This allows integration tests to control intent routing without
+# hard-coding business schemas into the provider.
+_CHAT_INTENT_FIXTURES: dict[str, str] = {}
+"""Registry: key phrase (matched via substring) -> ChatIntent JSON string."""
+
 
 def register_fixture(scenario_id: str, response_text: str) -> None:
     """Register a deterministic fixture response."""
     _FIXTURES[scenario_id] = response_text
 
 
+def register_chat_intent_fixture(query_key: str, intent_json: str) -> None:
+    """Register a ChatIntent fixture for a query key phrase.
+
+    When DeterministicChatProvider is asked to classify a prompt that
+    *contains* *query_key*, it returns *intent_json* instead of the
+    generic response.  Used by deterministic Chat Graph integration tests.
+    """
+    _CHAT_INTENT_FIXTURES[query_key] = intent_json
+
+
 def clear_fixtures() -> None:
     """Remove all registered fixtures (useful between tests)."""
     _FIXTURES.clear()
+    _CHAT_INTENT_FIXTURES.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +237,12 @@ class DeterministicChatProvider:
         if scenario_id and scenario_id in _FIXTURES:
             return _FIXTURES[scenario_id]
 
-        # 2. Fault injection (prefix match)
+        # 2. ChatIntent fixture (substring match against query text)
+        for key, fixture in _CHAT_INTENT_FIXTURES.items():
+            if key in messages_text:
+                return fixture
+
+        # 3. Fault injection (prefix match)
         if scenario_id:
             sid = scenario_id
             if sid.startswith(FAULT_TIMEOUT):
@@ -241,7 +264,7 @@ class DeterministicChatProvider:
                     f"Deterministic provider error injected for scenario={sid}"
                 )
 
-        # 3. Default: stable structured response
+        # 4. Default: stable structured response (valid JSON, but generic)
         h = _stable_hash(messages_text, 16)
         return json.dumps({
             "analysis": (

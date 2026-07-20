@@ -83,10 +83,10 @@ def create_chat_model(*, temperature: float = 0.0) -> AsyncChatModel:
     """
     mode = resolve_ai_mode()
 
-    if mode is AIMode.DISABLED:
+    if mode == AIMode.DISABLED:
         return DisabledChatProvider()  # type: ignore[return-value]
 
-    if mode is AIMode.DETERMINISTIC:
+    if mode == AIMode.DETERMINISTIC:
         from intelligence.deterministic_provider import DeterministicChatProvider
         return DeterministicChatProvider()  # type: ignore[return-value]
 
@@ -98,13 +98,13 @@ def create_chat_model(*, temperature: float = 0.0) -> AsyncChatModel:
             f"received {settings.AI_PROVIDER!r}"
         )
 
-    if provider is AIProvider.OLLAMA:
+    if provider == AIProvider.OLLAMA:
         return ChatOllama(
             base_url=settings.OLLAMA_URL,
             model=settings.OLLAMA_MODEL,
             temperature=temperature,
         )
-    if provider is AIProvider.NVIDIA_NIM:
+    if provider == AIProvider.NVIDIA_NIM:
         _validate_nvidia("NVIDIA_CHAT_MODEL")
         from langchain_openai import ChatOpenAI
 
@@ -147,10 +147,10 @@ def create_embeddings(
 
     mode = resolve_ai_mode()
 
-    if mode is AIMode.DISABLED:
+    if mode == AIMode.DISABLED:
         return DisabledEmbeddingsProvider()  # type: ignore[return-value]
 
-    if mode is AIMode.DETERMINISTIC:
+    if mode == AIMode.DETERMINISTIC:
         from intelligence.deterministic_provider import DeterministicEmbeddingsProvider
         return DeterministicEmbeddingsProvider()  # type: ignore[return-value]
 
@@ -162,12 +162,12 @@ def create_embeddings(
             f"received {settings.AI_PROVIDER!r}"
         )
 
-    if provider is AIProvider.OLLAMA:
+    if provider == AIProvider.OLLAMA:
         return OllamaEmbeddings(
             base_url=resolved_url or settings.OLLAMA_URL,
             model=resolved_model or settings.OLLAMA_EMBED_MODEL,
         )
-    if provider is AIProvider.NVIDIA_NIM:
+    if provider == AIProvider.NVIDIA_NIM:
         _validate_nvidia("NVIDIA_EMBED_MODEL")
         from langchain_openai import OpenAIEmbeddings
 
@@ -189,7 +189,7 @@ def provider_metadata() -> dict[str, str | bool]:
     mode = resolve_ai_mode()
     provider = resolve_ai_provider(mode)
 
-    if mode is AIMode.DISABLED:
+    if mode == AIMode.DISABLED:
         chat_model = "disabled"
         embedding_model = "disabled"
     elif mode is AIMode.DETERMINISTIC:
@@ -199,10 +199,10 @@ def provider_metadata() -> dict[str, str | bool]:
         )
         chat_model = DeterministicChatProvider.MODEL
         embedding_model = DeterministicEmbeddingsProvider.MODEL
-    elif provider is AIProvider.NVIDIA_NIM:
+    elif provider == AIProvider.NVIDIA_NIM:
         chat_model = settings.NVIDIA_CHAT_MODEL
         embedding_model = settings.NVIDIA_EMBED_MODEL
-    elif provider is AIProvider.OLLAMA:
+    elif provider == AIProvider.OLLAMA:
         chat_model = settings.OLLAMA_MODEL
         embedding_model = settings.OLLAMA_EMBED_MODEL
     else:
@@ -211,10 +211,10 @@ def provider_metadata() -> dict[str, str | bool]:
 
     return {
         "ai_mode": mode.value,
-        "provider": provider.value if provider else "none",
+        "provider": _provider_label(mode, provider),
         "chat_model": chat_model,
         "embedding_model": embedding_model,
-        "remote": provider is AIProvider.NVIDIA_NIM,
+        "remote": provider == AIProvider.NVIDIA_NIM,
     }
 
 
@@ -245,7 +245,7 @@ async def provider_health_check() -> dict[str, Any]:
         # Fail-fast validation error → unavailable
         return {
             "ai_mode": (settings.AI_MODE or "deterministic"),
-            "provider": (settings.AI_PROVIDER or "none"),
+            "provider": "unknown",
             "status": "unavailable",
             "chat_model": "unset",
             "embedding_model": "unset",
@@ -254,11 +254,11 @@ async def provider_health_check() -> dict[str, Any]:
 
     base: dict[str, Any] = {
         "ai_mode": mode.value,
-        "provider": provider.value if provider else "none",
+        "provider": _provider_label(mode, provider),
     }
 
     # -- disabled -----------------------------------------------------------
-    if mode is AIMode.DISABLED:
+    if mode == AIMode.DISABLED:
         base["status"] = "ready"
         base["chat_model"] = "disabled"
         base["embedding_model"] = "disabled"
@@ -266,7 +266,7 @@ async def provider_health_check() -> dict[str, Any]:
         return base
 
     # -- deterministic -----------------------------------------------------
-    if mode is AIMode.DETERMINISTIC:
+    if mode == AIMode.DETERMINISTIC:
         try:
             from intelligence.deterministic_provider import (
                 DeterministicChatProvider,
@@ -303,7 +303,7 @@ async def provider_health_check() -> dict[str, Any]:
         return base
 
     # -- live + ollama -----------------------------------------------------
-    if provider is AIProvider.OLLAMA:
+    if provider == AIProvider.OLLAMA:
         base["chat_model"] = settings.OLLAMA_MODEL
         base["embedding_model"] = settings.OLLAMA_EMBED_MODEL
         checks: dict[str, str] = {}
@@ -362,7 +362,7 @@ async def provider_health_check() -> dict[str, Any]:
         return base
 
     # -- live + nvidia_nim -------------------------------------------------
-    if provider is AIProvider.NVIDIA_NIM:
+    if provider == AIProvider.NVIDIA_NIM:
         base["chat_model"] = settings.NVIDIA_CHAT_MODEL or "unset"
         base["embedding_model"] = settings.NVIDIA_EMBED_MODEL or "unset"
         checks: dict[str, str] = {}
@@ -377,15 +377,10 @@ async def provider_health_check() -> dict[str, Any]:
             checks["nvidia_config"] = _safe_err(exc)
             status = "degraded"
 
-        # Probe endpoint if API key is set
+        # Probe endpoint if API key is set (single real request only)
         if settings.NVIDIA_API_KEY:
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.get(
-                        f"{settings.NVIDIA_BASE_URL.rstrip('/')}/models",
-                        headers={"Authorization": "Bearer <redacted>"},
-                    )
-                    # Use actual API key internally but never log it
                     resp = await client.get(
                         f"{settings.NVIDIA_BASE_URL.rstrip('/')}/models",
                         headers={"Authorization": f"Bearer {settings.NVIDIA_API_KEY}"},
@@ -430,29 +425,53 @@ def vector_collection_name(base_name: str) -> str:
 
     mode = resolve_ai_mode()
 
-    if mode is AIMode.DISABLED:
-        return f"{base_name}_disabled"
+    # -- disabled -----------------------------------------------------------
+    if mode == AIMode.DISABLED:
+        safe_name = _sanitise_weaviate_name(base_name)
+        return f"{safe_name}_disabled"
 
-    if mode is AIMode.DETERMINISTIC:
+    # -- deterministic ------------------------------------------------------
+    if mode == AIMode.DETERMINISTIC:
         from intelligence.deterministic_provider import DeterministicEmbeddingsProvider
         ident = DeterministicEmbeddingsProvider.MODEL
-    else:
-        provider = resolve_ai_provider(mode)
-        provider_str = provider.value if provider else "unknown"
-        if provider is AIProvider.OLLAMA:
-            ident = settings.OLLAMA_EMBED_MODEL
-        elif provider is AIProvider.NVIDIA_NIM:
-            ident = settings.NVIDIA_EMBED_MODEL
-        else:
-            ident = "unknown"
-        # Include a short hash of the model to avoid name collisions
-        model_hash = hashlib.sha256(ident.encode()).hexdigest()[:8]
-        ident = f"{provider_str}_{model_hash}"
+        safe_name = _sanitise_weaviate_name(base_name)
+        safe_ident = _sanitise_weaviate_name(ident)
+        return f"{safe_name}_deterministic_{safe_ident}"
 
-    # Sanitise: replace chars Weaviate doesn't like in class names
-    safe_name = base_name.replace(" ", "_").replace("-", "_")
-    safe_ident = ident.replace("/", "_").replace("-", "_").replace(".", "_")
+    # -- live — resolve provider (may raise AIConfigurationError) ------------
+    provider = resolve_ai_provider(mode)  # can raise — let it propagate
+
+    if provider == AIProvider.OLLAMA:
+        ident = settings.OLLAMA_EMBED_MODEL
+    elif provider == AIProvider.NVIDIA_NIM:
+        ident = settings.NVIDIA_EMBED_MODEL
+    else:
+        ident = "unknown"
+
+    provider_str = provider.value
+    model_hash = hashlib.sha256(ident.encode()).hexdigest()[:8]
+    safe_name = _sanitise_weaviate_name(base_name)
+    ident_str = f"{provider_str}_{model_hash}"
+    safe_ident = _sanitise_weaviate_name(ident_str)
     return f"{safe_name}_{safe_ident}"
+
+
+def _sanitise_weaviate_name(raw: str) -> str:
+    """Replace characters that Weaviate dislikes in class names."""
+    return raw.replace(" ", "_").replace("-", "_").replace("/", "_").replace(".", "_")
+
+
+def _provider_label(mode: AIMode, provider: AIProvider | None) -> str:
+    """Return the canonical provider label for any mode/provider combination."""
+    if mode == AIMode.DISABLED:
+        return "disabled"
+    if mode == AIMode.DETERMINISTIC:
+        return "deterministic"
+    if provider == AIProvider.OLLAMA:
+        return "ollama"
+    if provider == AIProvider.NVIDIA_NIM:
+        return "nvidia_nim"
+    return "unknown"
 
 
 def _validate_nvidia(required_model_env: str) -> None:

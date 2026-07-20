@@ -18,7 +18,7 @@ import signal
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import cast
+from typing import Any, cast
 
 import structlog
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -443,10 +443,34 @@ async def ready_handler(request):
     /ready signals whether the service can do useful work.
 
     HTTP 200 — ready
-    HTTP 503 — degraded or unavailable
+    HTTP 503 — degraded, unavailable, or misconfigured
     """
-    meta = provider_metadata()
-    health = await provider_health_check()
+    from orchestrator.ai_mode import AIConfigurationError
+    try:
+        meta = provider_metadata()
+    except AIConfigurationError as exc:
+        meta = {
+            "ai_mode": "unknown",
+            "provider": "unknown",
+            "chat_model": "unset",
+            "embedding_model": "unset",
+            "remote": False,
+        }
+        health: dict[str, Any] = {
+            "status": "unavailable",
+            "error": str(exc),
+            "checks": {},
+        }
+    else:
+        try:
+            health = await provider_health_check()
+        except AIConfigurationError as exc:
+            health = {
+                "status": "unavailable",
+                "error": str(exc),
+                "checks": {},
+            }
+
     status = health.get("status", "unavailable")
     http_status = 200 if status == "ready" else 503
     return web.json_response({**meta, **health}, status=http_status)
