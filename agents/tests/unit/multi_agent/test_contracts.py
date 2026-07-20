@@ -16,6 +16,7 @@ from multi_agent.contracts import (
     ActionRiskLevel,
     AgentAuthority,
     AgentCapability,
+    AgentError,
     AgentExecutionContext,
     AgentResult,
     AgentTask,
@@ -400,6 +401,7 @@ class TestCapabilityFrozen:
 class TestAgentTask:
     def test_dependencies_frozenset(self):
         task = AgentTask(
+            objective="test",
             task_id="t1",
             agent_id="a1",
             task_type="t",
@@ -487,6 +489,7 @@ class TestMultiAgentState:
 
     def test_rejects_foreign_tenant_task(self):
         task = AgentTask(
+            objective="test",
             task_id="t1",
             agent_id="a1",
             task_type="t",
@@ -496,10 +499,18 @@ class TestMultiAgentState:
             idempotency_key="ik-1",
         )
         with pytest.raises(ValidationError):
-            MultiAgentState(run_id="r1", tenant_id="t-1", tasks=[task])
+            MultiAgentState(
+                objective="test",
+                actor_id="test",
+                run_id="r1",
+                tenant_id="t-1",
+                plan=[task],
+            )
 
     def test_with_complexity_and_budget(self):
         state = MultiAgentState(
+            objective="test",
+            actor_id="test",
             run_id="r1",
             tenant_id="t-1",
             complexity=ComplexityDecision(route="multi_agent", reasons=["high"]),
@@ -698,5 +709,75 @@ class TestMultiAgentStateActor:
         assert state.actor_id == "svc-pipeline"
 
     def test_default_actor_is_user(self):
-        state = MultiAgentState(run_id="r1", tenant_id="t-1", objective="Test")
+        state = MultiAgentState(
+            run_id="r1", tenant_id="t-1", objective="Test", actor_id="test"
+        )
         assert state.actor_type == "user"
+
+
+# ============================================================================
+# R5: Strict JSON boundary tests
+# ============================================================================
+
+
+class TestStrictJsonRejection:
+    def test_bytes_rejected(self):
+        with pytest.raises(ValidationError):
+            _make_proposal(payload={"blob": b"binary"})
+
+    def test_set_rejected(self):
+        with pytest.raises(ValidationError):
+            _make_proposal(payload={"values": {1, 2, 3}})
+
+    def test_tuple_rejected(self):
+        with pytest.raises(ValidationError):
+            _make_proposal(payload={"coords": (1, 2)})
+
+    def test_non_string_dict_key_rejected(self):
+        with pytest.raises(ValidationError):
+            AgentResult(
+                result_id="r-1",
+                task_id="t-1",
+                agent_id="a1",
+                tenant_id="t-1",
+                status="completed",
+                output={1: "value"},  # type: ignore[arg-type]
+                completed_at=_utc_now(),
+            )
+
+    def test_nan_rejected_in_metadata(self):
+        with pytest.raises(ValidationError):
+            Evidence(
+                evidence_id="ev-1",
+                evidence_type=EvidenceType.TOOL_RESULT,
+                tenant_id="t-1",
+                source_agent="a",
+                metadata={"score": float("nan")},
+            )
+
+    def test_custom_object_rejected_in_details(self):
+        class Custom:
+            pass
+
+        with pytest.raises((ValidationError, ValueError, TypeError)):
+            AgentError(
+                error_code="E1",
+                message="msg",
+                details={"obj": Custom()},  # type: ignore[arg-type]
+            )
+
+    def test_decimal_rejected_in_policy_context(self):
+        from decimal import Decimal
+
+        with pytest.raises(ValidationError):
+            AgentExecutionContext(
+                tenant_id="t-1",
+                policy_context={"cost": Decimal("10.50")},
+            )
+
+    def test_datetime_rejected_in_run_metadata(self):
+        with pytest.raises(ValidationError):
+            AgentExecutionContext(
+                tenant_id="t-1",
+                run_metadata={"timestamp": _utc_now()},
+            )

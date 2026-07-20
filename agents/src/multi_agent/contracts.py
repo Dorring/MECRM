@@ -1,12 +1,8 @@
-"""Unified multi-agent data contracts — Phase 2 R4.
+"""Unified multi-agent data contracts — Phase 2 R5.
 
-Every contract inherits :class:`StrictContract`.  Field-level validators
-enforce Phase 2 rules; :meth:`ActionProposal.verify_integrity` provides an
-explicit integrity gate for merge and execution paths.
-
-All JSON fields are validated through the shared canonicalizer at
-construction time — arbitrary Python objects, NaN, Infinity, and bytes are
-rejected at the boundary.
+Every contract inherits :class:`StrictContract`.  JSON fields are validated
+through :func:`validate_strict_json` at the Pydantic boundary — bytes, sets,
+tuples, Decimal, NaN, and non-string dict keys are rejected at construction.
 """
 
 from __future__ import annotations
@@ -28,10 +24,8 @@ from pydantic import (
 
 from multi_agent.errors import ProposalHashMismatchError
 from multi_agent.integrity import compute_proposal_hash
-from multi_agent.serialization import validate_json_value
+from multi_agent.serialization import validate_strict_json
 
-# Use Any for JSON fields; validation happens at field-validator and
-# verify_integrity() levels.
 JsonValue = Any
 
 # ---------------------------------------------------------------------------
@@ -148,6 +142,11 @@ class AgentCapability(StrictContract):
             raise ValueError("version must not be empty")
         return v.strip()
 
+    @field_validator("metadata")
+    @classmethod
+    def _validate_cap_metadata(cls, v: dict[str, Any]) -> dict[str, Any]:
+        return validate_strict_json(v)  # type: ignore[return-value]
+
     @field_validator("timeout_ms")
     @classmethod
     def _timeout_positive(cls, v: int) -> int:
@@ -213,9 +212,18 @@ class Evidence(StrictContract):
 
     @field_validator("created_at", "retrieved_at")
     @classmethod
-    def _utc_aware(cls, v: datetime | None) -> datetime | None:
+    def _utc_aware_evidence(cls, v: datetime | None) -> datetime | None:
         if v is not None and v.tzinfo is None:
             raise ValueError("datetime must be timezone-aware (UTC)")
+        return v
+
+    @field_validator("metadata")
+    @classmethod
+    def _validate_evidence_metadata(
+        cls, v: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        if v is not None:
+            validate_strict_json(v)
         return v
 
 
@@ -259,6 +267,15 @@ class AgentError(StrictContract):
         if not v.strip():
             raise ValueError("error_code must not be empty")
         return v.strip()
+
+    @field_validator("details")
+    @classmethod
+    def _validate_agent_error_details(
+        cls, v: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        if v is not None:
+            validate_strict_json(v)
+        return v
 
 
 # ============================================================================
@@ -312,7 +329,7 @@ class ActionProposal(StrictContract):
     @classmethod
     def _validate_payload(cls, v: dict[str, Any]) -> dict[str, Any]:
         _scan_payload_for_tenant_override(v)
-        validate_json_value(v)  # reject non-JSON types
+        validate_strict_json(v)  # reject non-JSON types
         return v
 
     @field_validator("created_at")
@@ -419,7 +436,7 @@ class AgentTask(StrictContract):
     task_id: str
     agent_id: str
     task_type: str
-    objective: str = "pending"
+    objective: str = Field(min_length=1)
     priority: Literal["low", "medium", "high", "critical"] = "medium"
     status: Literal[
         "pending",
@@ -456,7 +473,7 @@ class AgentTask(StrictContract):
     @field_validator("input_data")
     @classmethod
     def _validate_input_data(cls, v: dict[str, Any]) -> dict[str, Any]:
-        return validate_json_value(v)  # type: ignore[return-value]
+        return validate_strict_json(v)  # type: ignore[return-value]
 
     @field_validator("timeout_ms")
     @classmethod
@@ -540,13 +557,13 @@ class AgentResult(StrictContract):
     @classmethod
     def _validate_output(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
         if v is not None:
-            validate_json_value(v)
+            validate_strict_json(v)
         return v
 
     @field_validator("findings")
     @classmethod
     def _validate_findings(cls, v: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        validate_json_value(v)
+        validate_strict_json(v)
         return v
 
     @model_validator(mode="after")
@@ -602,10 +619,20 @@ class AgentExecutionContext(StrictContract):
 
     @field_validator("tenant_id")
     @classmethod
-    def _tenant_required(cls, v: str) -> str:
+    def _tenant_required_ctx(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("AgentExecutionContext must have a tenant_id")
         return v.strip()
+
+    @field_validator("policy_context")
+    @classmethod
+    def _validate_policy_context(cls, v: dict[str, Any]) -> dict[str, Any]:
+        return validate_strict_json(v)  # type: ignore[return-value]
+
+    @field_validator("run_metadata")
+    @classmethod
+    def _validate_run_metadata(cls, v: dict[str, Any]) -> dict[str, Any]:
+        return validate_strict_json(v)  # type: ignore[return-value]
 
 
 # ============================================================================
@@ -667,11 +694,10 @@ class MultiAgentState(StrictContract):
     run_id: str
     tenant_id: str
     actor_type: Literal["user", "service"] = "user"
-    actor_id: str = ""
-    objective: str = "pending"
+    actor_id: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
     status: RunStatus = "idle"
-    plan: list[str] = Field(default_factory=list)
-    tasks: list[AgentTask] = Field(default_factory=list)
+    plan: list[AgentTask] = Field(default_factory=list)
     agent_results: list[AgentResult] = Field(default_factory=list)
     evidence: list[Evidence] = Field(default_factory=list)
     proposed_actions: list[ActionProposal] = Field(default_factory=list)
@@ -698,7 +724,7 @@ class MultiAgentState(StrictContract):
 
     @model_validator(mode="after")
     def _tenant_homogeneity_and_integrity(self) -> "MultiAgentState":
-        for task in self.tasks:
+        for task in self.plan:
             if task.tenant_id != self.tenant_id:
                 raise ValueError(
                     f"Task {task.task_id!r} tenant {task.tenant_id!r} "

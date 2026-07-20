@@ -55,6 +55,7 @@ from multi_agent.serialization import (
     serialize_set_for_json,
     stable_hash,
     validate_json_value,
+    validate_strict_json,
 )
 from multi_agent.state import MergeConflict, MergedState, merge_parallel_results
 
@@ -110,4 +111,5 @@ __all__ = [
     "serialize_set_for_json",
     "stable_hash",
     "validate_json_value",
+    "validate_strict_json",
 ]

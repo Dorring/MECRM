@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timezone
 
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, ValidationError
 
 from multi_agent.contracts import (
     ActionProposal,
@@ -19,6 +19,7 @@ from multi_agent.contracts import (
     Evidence,
     StrictContract,
 )
+from multi_agent.errors import ProposalHashMismatchError
 from multi_agent.serialization import content_hash
 
 
@@ -97,7 +98,12 @@ def merge_parallel_results(
             if p.tenant_id == expected_tenant_id:
                 try:
                     p.verify_integrity()
-                except Exception:
+                except (
+                    ProposalHashMismatchError,
+                    ValidationError,
+                    ValueError,
+                    TypeError,
+                ):
                     conflicts.append(
                         MergeConflict(
                             conflict_type="proposal_integrity_failure",

@@ -82,6 +82,7 @@ class TestCanonicalizer:
 
     def test_canonicalize_base_model(self):
         task = AgentTask(
+            objective="test",
             task_id="task-001",
             agent_id="a",
             task_type="t",
@@ -110,7 +111,7 @@ from datetime import datetime, timezone
 from multi_agent.contracts import AgentTask
 from multi_agent.serialization import serialize_contract
 
-task = AgentTask(
+task = AgentTask(objective="test",
     task_id="task-001",
     agent_id="agent_a",
     task_type="test",
@@ -154,6 +155,7 @@ print(serialize_contract(task))
 class TestJsonRoundTrip:
     def test_agent_task_round_trip(self):
         task = AgentTask(
+            objective="test",
             task_id="task-001",
             agent_id="a",
             task_type="t",
@@ -195,6 +197,8 @@ class TestJsonRoundTrip:
 
     def test_multi_agent_state_round_trip(self):
         state = MultiAgentState(
+            objective="test",
+            actor_id="test",
             run_id="run-1",
             tenant_id="t-1",
             budget=ExecutionBudget(max_tasks=8, cost_budget_usd=Decimal("50")),

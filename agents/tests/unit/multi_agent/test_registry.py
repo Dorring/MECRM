@@ -194,6 +194,7 @@ class TestValidateTask:
             FakeHandler("aa"),
         )
         task = AgentTask(
+            objective="test",
             task_id="t-1",
             agent_id="aa",
             task_type="triage",
@@ -212,6 +213,7 @@ class TestValidateTask:
             FakeHandler("aa"),
         )
         task = AgentTask(
+            objective="test",
             task_id="t-1",
             agent_id="aa",
             task_type="y",
@@ -229,6 +231,7 @@ class TestValidateTask:
             _make_capability(agent_id="aa", timeout_ms=10_000), FakeHandler("aa")
         )
         task = AgentTask(
+            objective="test",
             task_id="t-1",
             agent_id="aa",
             task_type="test_task",

@@ -129,13 +129,67 @@ def content_hash(obj: Any) -> str:
     return stable_hash(obj)
 
 
-def validate_json_value(value: Any) -> Any:
-    """Validate that *value* is JSON-compatible via the canonicalizer.
+def validate_strict_json(value: Any) -> Any:
+    """Validate that *value* is strict JSON-compatible.
 
-    Returns the canonicalized value on success; raises ``TypeError`` or
-    ``ValueError`` for non-JSON types (custom objects, NaN, Infinity, bytes,
-    non-string dict keys, etc.).
+    Only these types are allowed at the contract boundary:
+      - None
+      - bool
+      - int
+      - finite float (no NaN, no Infinity)
+      - str
+      - list of strict-JSON values
+      - dict with **string** keys and strict-JSON values
 
-    Use this as a Pydantic field validator for JSON fields.
+    Rejected types (MUST fail):
+      - bytes / bytearray
+      - set / frozenset
+      - tuple
+      - Decimal
+      - datetime
+      - Enum
+      - custom objects
+      - NaN / Infinity
+      - non-string dict keys
     """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        import math
+
+        if math.isnan(value) or math.isinf(value):
+            raise ValueError(f"float value {value!r} is not valid JSON")
+        return value
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return [validate_strict_json(v) for v in value]
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise ValueError(
+                    f"JSON object keys must be strings; got {type(k).__name__}: {k!r}"
+                )
+            result[k] = validate_strict_json(v)
+        return result
+    # Everything else is rejected
+    raise ValueError(
+        f"Value of type {type(value).__name__} is not valid strict JSON: {value!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Canonicalizer-based validator (still used for hash/payload validation)
+# ---------------------------------------------------------------------------
+
+
+def validate_json_value(value: Any) -> Any:
+    """Validate via canonicalizer — used for payload fields that may contain
+    Decimal/datetime/Enum which are fine inside ActionProposal payloads but
+    will be canonicalized before hashing."""
     return _canonical_value(value)
