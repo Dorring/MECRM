@@ -10,13 +10,14 @@ Flow (per Phase 3 spec §7):
 1. Verify Registry Snapshot version.
 2. Run Complexity Gate.
 3. ``deterministic_workflow`` → return empty plan.
-4. Build TaskIntents (from template or single intent).
-5. Select minimum-privilege agent per intent.
-6. Generate stable AgentTask IDs.
-7. Assemble PlanDraft (without hash).
-8. Run PlanValidator.
-9. If valid → compute plan_hash and return.
-10. If invalid → raise ``PlanValidationError``.
+4. Build TaskIntents (from template or from ``requested_tasks``).
+5. Validate intents (unique IDs, dependencies exist, no cycle).
+6. Select minimum-privilege agent per intent.
+7. Generate stable AgentTask IDs.
+8. Resolve intent_id dependencies → task_id dependencies.
+9. Assemble PlanDraft (hashes auto-computed).
+10. Run PlanValidator.
+11. If invalid → raise the appropriate specific error type.
 
 Agent selection (per Phase 3 review R1):
 
@@ -24,6 +25,10 @@ Agent selection (per Phase 3 review R1):
   on sight.  If filtering leaves at least one READ/PROPOSE candidate,
   the minimum-privilege one is chosen.  If only EXECUTE candidates
   remain, the planner fails closed.
+* ``preferred_authority`` comes from the :class:`RequestedTask` (or
+  template), never hardcoded.
+* ``requires_write=True`` or ``requires_approval=True`` require at
+  least one PROPOSE-level intent, else :class:`PlanningInputError`.
 """
 
 from __future__ import annotations
@@ -43,8 +48,12 @@ from multi_agent.planning import (
     PlanningRequest,
     TaskIntent,
     compute_request_hash,
+    task_intent_from_requested_task,
 )
 from multi_agent.planning_errors import (
+    BudgetExceededPlanningError,
+    PlanCycleError,
+    PlanIntegrityError,
     PlanValidationError,
     PlanningInputError,
     RegistryVersionMismatchError,
@@ -71,6 +80,17 @@ _AUTHORITY_RANK: dict[AgentAuthority, int] = {
 }
 
 _COST_CLASS_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
+
+# Validation issue codes that map to specific error types.
+_BUDGET_CODES = {
+    "task_budget_exceeded",
+    "agent_call_budget_exceeded",
+    "tool_call_budget_exceeded",
+    "iteration_budget_exceeded",
+    "deadline_exceeded",
+}
+_CYCLE_CODES = {"cycle"}
+_HASH_CODES = {"plan_hash_mismatch", "request_hash_mismatch"}
 
 
 # ---------------------------------------------------------------------------
@@ -106,11 +126,10 @@ class DeterministicPlanner:
         gate: RuleBasedComplexityGate | None = None,
         customer_recovery_template: CustomerRecoveryTemplate | None = None,
     ) -> None:
-        # Late import to avoid circular module load.
         from multi_agent.plan_validator import PlanValidator
 
         self._gate = gate or RuleBasedComplexityGate()
-        self._validator = PlanValidator()
+        self._validator = PlanValidator(gate=self._gate)
         self._recovery_template = (
             customer_recovery_template or DEFAULT_CUSTOMER_RECOVERY_TEMPLATE
         )
@@ -142,10 +161,13 @@ class DeterministicPlanner:
         # Step 4 — Build intents.
         intents = self._build_intents(request, decision)
 
-        # Step 5 — Select agents for all intents (first pass).
-        # We need all task_ids before we can resolve dependencies, because
-        # TaskIntent.dependencies reference intent_ids, but AgentTask.dependencies
-        # must reference task_ids.
+        # Step 4b — Validate write/approval requirements.
+        self._validate_write_approval_requirements(request, intents)
+
+        # Step 5 — Validate intent structure (unique IDs, deps exist, no cycle).
+        self._validate_intents(intents)
+
+        # Step 6 — Select agents for all intents (first pass).
         intent_to_task_id: dict[str, str] = {}
         intent_to_cap: dict[str, AgentCapability] = {}
         for intent in intents:
@@ -159,46 +181,36 @@ class DeterministicPlanner:
             intent_to_task_id[intent.intent_id] = task_id
             intent_to_cap[intent.intent_id] = cap
 
-        # Step 6 — Build PlannedTasks with resolved dependencies.
+        # Step 7+8 — Build PlannedTasks with resolved dependencies.
         planned_tasks: list[PlannedTask] = []
         for intent in intents:
             cap = intent_to_cap[intent.intent_id]
             # Convert intent_id dependencies → task_id dependencies.
+            # No filtering — missing deps already rejected in step 5.
             resolved_deps: frozenset[str] = frozenset(
-                intent_to_task_id[dep]
-                for dep in intent.dependencies
-                if dep in intent_to_task_id
+                intent_to_task_id[dep] for dep in intent.dependencies
             )
             pt = self._build_planned_task(intent, cap, request, resolved_deps)
             planned_tasks.append(pt)
 
-        # Step 7 — Assemble draft (hash auto-computed by PlanDraft).
+        # Step 9 — Assemble draft (hashes auto-computed by PlanDraft).
         request_hash = compute_request_hash(request)
         draft = PlanDraft(
-            run_id=request.run_id,
-            tenant_id=request.tenant_id,
-            actor_type=request.actor_type,
-            actor_id=request.actor_id,
-            objective=request.objective,
+            request=request,
+            request_hash=request_hash,
             complexity=decision,
             tasks=planned_tasks,
             planner_version=PLANNER_VERSION,
-            registry_version=snapshot.version,
-            request_hash=request_hash,
             summary=self._build_summary(request, decision, planned_tasks),
             warnings=[],
         )
 
-        # Step 8 — Validate.
+        # Step 10 — Validate.
         report = self._validator.validate(request, draft, registry)
         if not report.valid:
-            errors = [i for i in report.issues if i.severity == "error"]
-            messages = "; ".join(f"{i.code}: {i.message}" for i in errors[:5])
-            raise PlanValidationError(
-                f"Plan validation failed with {len(errors)} error(s): {messages}"
-            )
+            # Step 11 — Raise the appropriate specific error type.
+            self._raise_for_issues(report.issues)
 
-        # Step 9 — Hash is already computed & verified by PlanDraft.
         return draft
 
     # ------------------------------------------------------------------
@@ -215,6 +227,10 @@ class DeterministicPlanner:
 
         # Single-agent route — one intent covering the whole objective.
         if decision.route == "single_agent":
+            if request.signals.requested_tasks:
+                # If explicit tasks are given, use the first one.
+                rt = request.signals.requested_tasks[0]
+                return [task_intent_from_requested_task(rt)]
             domain = (
                 sorted(request.signals.domains)[0]
                 if request.signals.domains
@@ -244,40 +260,104 @@ class DeterministicPlanner:
                 )
             ]
 
-        # Multi-agent route without a template — synthesise intents from
-        # requested_task_types.  Each task type becomes its own intent.
+        # Multi-agent route without a template — requires explicit
+        # requested_tasks.  Guessing domains or building a cartesian
+        # product is forbidden.
         if decision.route == "multi_agent":
-            if not request.signals.requested_task_types:
+            if not request.signals.requested_tasks:
                 raise PlanningInputError(
-                    "multi_agent route requires requested_task_types when "
-                    "no template matches"
+                    "multi_agent route without a template requires explicit "
+                    "signals.requested_tasks; cannot infer domain→task mapping"
                 )
-            domain = (
-                sorted(request.signals.domains)[0]
-                if request.signals.domains
-                else "default"
-            )
-            intents: list[TaskIntent] = []
-            for idx, task_type in enumerate(
-                sorted(request.signals.requested_task_types)
-            ):
-                intents.append(
-                    TaskIntent(
-                        intent_id=f"task_{idx:02d}",
-                        task_type=task_type,
-                        domain=domain,
-                        objective=request.objective,
-                        dependencies=[],
-                        required=True,
-                        preferred_authority=AgentAuthority.READ,
-                        required_tools=frozenset(),
-                        estimated_tool_calls=0,
-                    )
-                )
-            return intents
+            return [
+                task_intent_from_requested_task(rt)
+                for rt in request.signals.requested_tasks
+            ]
 
         # Should not reach here — gate already validated the route.
         raise PlanningInputError(f"unknown route {decision.route!r}")
+
+    # ------------------------------------------------------------------
+    # Write / approval requirement validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_write_approval_requirements(
+        request: PlanningRequest, intents: list[TaskIntent]
+    ) -> None:
+        """If ``requires_write`` or ``requires_approval`` is set, at least
+        one intent must have ``preferred_authority == PROPOSE``.
+
+        Otherwise the request is structurally contradictory — the caller
+        asked for write/approval but no task is allowed to propose.
+        """
+        if not (request.signals.requires_write or request.signals.requires_approval):
+            return
+        if not intents:
+            return
+        has_propose = any(
+            i.preferred_authority is AgentAuthority.PROPOSE for i in intents
+        )
+        if not has_propose:
+            raise PlanningInputError(
+                "signals.requires_write or requires_approval is True but no "
+                "task has preferred_authority=PROPOSE; cannot satisfy the "
+                "request"
+            )
+
+    # ------------------------------------------------------------------
+    # Intent structure validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_intents(intents: list[TaskIntent]) -> None:
+        """Validate intent_id uniqueness, dependency existence, and cycles.
+
+        Per Phase 3 review R1 P0-5: missing intent dependencies must
+        Fail-Closed, not be silently dropped.
+        """
+        if not intents:
+            return
+
+        intent_ids: set[str] = set()
+        for intent in intents:
+            if intent.intent_id in intent_ids:
+                raise PlanningInputError(f"duplicate intent_id {intent.intent_id!r}")
+            intent_ids.add(intent.intent_id)
+
+        # All dependencies must reference existing intent_ids.
+        for intent in intents:
+            missing = set(intent.dependencies) - intent_ids
+            if missing:
+                raise PlanningInputError(
+                    f"Intent {intent.intent_id!r} has missing dependencies: "
+                    f"{sorted(missing)}"
+                )
+
+        # Cycle detection on intent_id graph.
+        graph: dict[str, set[str]] = {i.intent_id: set() for i in intents}
+        in_degree: dict[str, int] = {i.intent_id: 0 for i in intents}
+        for intent in intents:
+            for dep in intent.dependencies:
+                graph[dep].add(intent.intent_id)
+                in_degree[intent.intent_id] += 1
+        # Kahn's algorithm.
+        queue: list[str] = sorted(
+            i.intent_id for i in intents if in_degree[i.intent_id] == 0
+        )
+        visited: set[str] = set()
+        while queue:
+            node = queue.pop(0)
+            visited.add(node)
+            for neighbor in sorted(graph[node]):
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+        cycle_nodes = sorted(set(in_degree.keys()) - visited)
+        if cycle_nodes:
+            raise PlanCycleError(
+                f"Intent dependency graph contains a cycle involving {cycle_nodes!r}"
+            )
 
     # ------------------------------------------------------------------
     # Agent selection
@@ -331,8 +411,7 @@ class DeterministicPlanner:
         3. ``domains`` contains ``intent.domain``
         4. ``authority`` is READ or PROPOSE (EXECUTE filtered out)
         5. ``authority >= intent.preferred_authority``
-        6. ``timeout_ms`` covers a notional task (any positive value —
-           the planner uses the agent's own timeout_ms for the task)
+        6. ``timeout_ms`` covers a notional task (any positive value)
 
         Sort key (ascending, deterministic):
 
@@ -406,16 +485,11 @@ class DeterministicPlanner:
     def _build_empty_plan(self, request: PlanningRequest, decision: Any) -> PlanDraft:
         request_hash = compute_request_hash(request)
         return PlanDraft(
-            run_id=request.run_id,
-            tenant_id=request.tenant_id,
-            actor_type=request.actor_type,
-            actor_id=request.actor_id,
-            objective=request.objective,
+            request=request,
+            request_hash=request_hash,
             complexity=decision,
             tasks=[],
             planner_version=PLANNER_VERSION,
-            registry_version=request.registry_version,
-            request_hash=request_hash,
             summary="deterministic_workflow: no tasks",
             warnings=[],
         )
@@ -437,6 +511,39 @@ class DeterministicPlanner:
         return (
             f"route={route} tasks={n} agents={','.join(agents)} "
             f"objective_kind={request.signals.objective_kind or 'none'}"
+        )
+
+    # ------------------------------------------------------------------
+    # Error mapping
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _raise_for_issues(issues: list[Any]) -> None:
+        """Raise the appropriate specific error type for the first error.
+
+        Mapping (per Phase 3 review R1 P1-B):
+
+        * budget codes → :class:`BudgetExceededPlanningError`
+        * cycle codes → :class:`PlanCycleError`
+        * hash codes → :class:`PlanIntegrityError`
+        * anything else → :class:`PlanValidationError`
+        """
+        errors = [i for i in issues if i.severity == "error"]
+        if not errors:
+            return
+        first = errors[0]
+        messages = "; ".join(f"{i.code}: {i.message}" for i in errors[:5])
+
+        if first.code in _BUDGET_CODES:
+            raise BudgetExceededPlanningError(
+                f"Plan validation failed (budget): {messages}"
+            )
+        if first.code in _CYCLE_CODES:
+            raise PlanCycleError(f"Plan validation failed (cycle): {messages}")
+        if first.code in _HASH_CODES:
+            raise PlanIntegrityError(f"Plan validation failed (integrity): {messages}")
+        raise PlanValidationError(
+            f"Plan validation failed with {len(errors)} error(s): {messages}"
         )
 
 

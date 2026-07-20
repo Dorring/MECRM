@@ -3,11 +3,14 @@
 Verifies a :class:`PlanDraft` against:
 
 * Identity & tenant homogeneity
-* Registry capability and tool access
+* Request snapshot integrity (request_hash + plan.request == request)
+* Plan hash integrity
+* Registry capability, authority hierarchy, and tool access
+* Complexity decision consistency (re-runs the gate)
 * DAG structure (dependencies, cycles, topology)
 * Budget limits (hard fail-closed for structural budgets)
-* Authority bounds (no EXECUTE in Phase 3)
-* Plan hash integrity
+* Authority bounds (no EXECUTE in Phase 3; agent authority >= task preferred)
+* Route-specific constraints
 
 The validator is **read-only** — it never mutates the plan, request,
 or registry.
@@ -24,7 +27,11 @@ from multi_agent.planning import (
     PlanDraft,
     PlanValidationIssue,
     PlanValidationReport,
-    PlannedTask,
+    compute_request_hash,
+)
+from multi_agent.complexity_gate import (
+    ComplexityGate,
+    RuleBasedComplexityGate,
 )
 
 # ---------------------------------------------------------------------------
@@ -40,6 +47,9 @@ CODE_TENANT_MISMATCH = "tenant_mismatch"
 CODE_RUN_ID_MISMATCH = "run_id_mismatch"
 CODE_REGISTRY_VERSION_MISMATCH = "registry_version_mismatch"
 CODE_PLAN_HASH_MISMATCH = "plan_hash_mismatch"
+CODE_REQUEST_HASH_MISMATCH = "request_hash_mismatch"
+CODE_REQUEST_SNAPSHOT_MISMATCH = "request_snapshot_mismatch"
+CODE_COMPLEXITY_DECISION_MISMATCH = "complexity_decision_mismatch"
 CODE_DETERMINISTIC_HAS_TASKS = "deterministic_route_has_tasks"
 CODE_SINGLE_AGENT_NOT_ONE = "single_agent_not_one_task"
 CODE_MULTI_AGENT_TOO_FEW_TASKS = "multi_agent_too_few_tasks"
@@ -47,6 +57,7 @@ CODE_MULTI_AGENT_TOO_FEW_AGENTS = "multi_agent_too_few_agents"
 CODE_UNSUPPORTED_TASK = "unsupported_task"
 CODE_DISABLED_AGENT = "disabled_agent"
 CODE_EXECUTE_AGENT = "execute_agent_rejected"
+CODE_INSUFFICIENT_AGENT_AUTHORITY = "insufficient_agent_authority"
 CODE_UNKNOWN_TOOL = "unknown_tool"
 CODE_UNAUTHORIZED_TOOL = "unauthorized_tool"
 CODE_TASK_BUDGET_EXCEEDED = "task_budget_exceeded"
@@ -71,20 +82,29 @@ class PlanValidator:
     The validator collects *all* issues (errors + warnings) before
     deciding ``valid``.  This gives reviewers a complete picture of
     what's wrong rather than a single failure point.
+
+    The validator injects a :class:`ComplexityGate` so it can re-run
+    the gate decision and verify the plan's ``complexity`` matches
+    what the gate would produce for the same request + registry.
     """
+
+    def __init__(self, gate: ComplexityGate | None = None) -> None:
+        self._gate = gate or RuleBasedComplexityGate()
 
     def validate(
         self,
-        request: Any,  # PlanningRequest — typed as Any to avoid import cycle
+        request: Any,
         plan: PlanDraft,
         registry: AgentRegistry,
     ) -> PlanValidationReport:
-        # Late import to avoid circular dependency at module load time.
         from multi_agent.planning import PlanningRequest
 
         assert isinstance(request, PlanningRequest)
 
         issues: list[PlanValidationIssue] = []
+
+        # -- Request snapshot integrity --------------------------------------
+        issues.extend(self._check_request_snapshot(request, plan))
 
         # -- Identity & tenant ------------------------------------------------
         issues.extend(self._check_identity(request, plan))
@@ -95,11 +115,14 @@ class PlanValidator:
         # -- Registry version -------------------------------------------------
         issues.extend(self._check_registry_version(request, plan, registry))
 
+        # -- Complexity decision consistency ---------------------------------
+        issues.extend(self._check_complexity_decision(request, plan, registry))
+
         # -- Per-task registry + authority checks -----------------------------
         issues.extend(self._check_tasks_against_registry(plan, registry))
 
         # -- DAG structure ----------------------------------------------------
-        issues.extend(self._check_dag(plan, issues))
+        issues.extend(self._check_dag(plan))
 
         # -- Route-specific constraints --------------------------------------
         issues.extend(self._check_route_constraints(plan))
@@ -115,8 +138,6 @@ class PlanValidator:
         errors = [i for i in issues if i.severity == "error"]
         valid = len(errors) == 0
 
-        # Topological order — always computed (even on failure) so reviewers
-        # can inspect the partial order.  Returns [] if cyclic.
         topo = self._topological_order(plan)
 
         return PlanValidationReport(
@@ -128,6 +149,61 @@ class PlanValidator:
             estimated_iterations=estimates["iterations"],
             estimated_deadline_ms=estimates["deadline_ms"],
         )
+
+    # ------------------------------------------------------------------
+    # Request snapshot integrity
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_request_snapshot(
+        request: Any, plan: PlanDraft
+    ) -> list[PlanValidationIssue]:
+        """Verify plan.request matches the caller's request, and that
+        plan.request_hash is consistent with both.
+        """
+        issues: list[PlanValidationIssue] = []
+
+        # request_hash on plan must equal compute_request_hash(plan.request).
+        expected_from_snapshot = compute_request_hash(plan.request)
+        if plan.request_hash != expected_from_snapshot:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_REQUEST_HASH_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"plan.request_hash={plan.request_hash[:12]!r} != "
+                        f"compute_request_hash(plan.request)="
+                        f"{expected_from_snapshot[:12]!r}"
+                    ),
+                )
+            )
+
+        # plan.request must equal the caller's request.
+        if plan.request != request:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_REQUEST_SNAPSHOT_MISMATCH,
+                    severity="error",
+                    message="plan.request snapshot does not match caller request",
+                )
+            )
+
+        # request_hash must also equal compute_request_hash(request).
+        expected_from_request = compute_request_hash(request)
+        if plan.request_hash != expected_from_request:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_REQUEST_HASH_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"plan.request_hash={plan.request_hash[:12]!r} != "
+                        f"compute_request_hash(request)="
+                        f"{expected_from_request[:12]!r}"
+                    ),
+                )
+            )
+
+        return issues
 
     # ------------------------------------------------------------------
     # Identity & tenant
@@ -220,6 +296,79 @@ class PlanValidator:
         return issues
 
     # ------------------------------------------------------------------
+    # Complexity decision consistency
+    # ------------------------------------------------------------------
+
+    def _check_complexity_decision(
+        self, request: Any, plan: PlanDraft, registry: AgentRegistry
+    ) -> list[PlanValidationIssue]:
+        """Re-run the gate and verify plan.complexity matches.
+
+        Compares route, domains (as sets), reasons (as sets), and
+        requires_human_review.  ``confidence`` is not compared because
+        it's a numeric hint, not a structural invariant.
+        """
+        issues: list[PlanValidationIssue] = []
+        try:
+            expected = self._gate.decide(request, registry)
+        except Exception as exc:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_COMPLEXITY_DECISION_MISMATCH,
+                    severity="error",
+                    message=f"gate.decide() raised {type(exc).__name__}: {exc}",
+                )
+            )
+            return issues
+
+        if plan.complexity.route != expected.route:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_COMPLEXITY_DECISION_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"plan.complexity.route={plan.complexity.route!r} != "
+                        f"gate route={expected.route!r}"
+                    ),
+                )
+            )
+        if set(plan.complexity.domains) != set(expected.domains):
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_COMPLEXITY_DECISION_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"plan.complexity.domains={sorted(plan.complexity.domains)!r} != "
+                        f"gate domains={sorted(expected.domains)!r}"
+                    ),
+                )
+            )
+        if set(plan.complexity.reasons) != set(expected.reasons):
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_COMPLEXITY_DECISION_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"plan.complexity.reasons={sorted(plan.complexity.reasons)!r} != "
+                        f"gate reasons={sorted(expected.reasons)!r}"
+                    ),
+                )
+            )
+        if plan.complexity.requires_human_review != expected.requires_human_review:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_COMPLEXITY_DECISION_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"plan.complexity.requires_human_review="
+                        f"{plan.complexity.requires_human_review} != "
+                        f"gate={expected.requires_human_review}"
+                    ),
+                )
+            )
+        return issues
+
+    # ------------------------------------------------------------------
     # Per-task registry + authority checks
     # ------------------------------------------------------------------
 
@@ -245,6 +394,12 @@ class PlanValidator:
 
         # Second pass: per-task capability + tool access.
         from multi_agent.errors import DisabledAgentError
+
+        _authority_rank: dict[AgentAuthority, int] = {
+            AgentAuthority.READ: 0,
+            AgentAuthority.PROPOSE: 1,
+            AgentAuthority.EXECUTE: 2,
+        }
 
         for pt in plan.tasks:
             cap_id = pt.task.agent_id
@@ -284,12 +439,27 @@ class PlanValidator:
                 )
                 continue
 
+            # PlannedTask preferred_authority must not be EXECUTE.
             if pt.preferred_authority is AgentAuthority.EXECUTE:
                 issues.append(
                     PlanValidationIssue(
                         code=CODE_AUTHORITY_EXCEEDS_PROPOSE,
                         severity="error",
                         message=f"PlannedTask {pt.intent_id!r} preferred_authority is EXECUTE",
+                        task_id=pt.task.task_id,
+                    )
+                )
+            # Agent authority must be >= task preferred_authority.
+            if _authority_rank[cap.authority] < _authority_rank[pt.preferred_authority]:
+                issues.append(
+                    PlanValidationIssue(
+                        code=CODE_INSUFFICIENT_AGENT_AUTHORITY,
+                        severity="error",
+                        message=(
+                            f"agent {cap_id!r} authority={cap.authority.value} "
+                            f"< task {pt.task.task_id!r} preferred_authority="
+                            f"{pt.preferred_authority.value}"
+                        ),
                         task_id=pt.task.task_id,
                     )
                 )
@@ -376,16 +546,14 @@ class PlanValidator:
     # ------------------------------------------------------------------
 
     @classmethod
-    def _check_dag(
-        cls, plan: PlanDraft, existing_issues: list[PlanValidationIssue]
-    ) -> list[PlanValidationIssue]:
+    def _check_dag(cls, plan: PlanDraft) -> list[PlanValidationIssue]:
         issues: list[PlanValidationIssue] = []
 
         task_ids: set[str] = {pt.task.task_id for pt in plan.tasks}
 
         for pt in plan.tasks:
             deps = pt.task.dependencies
-            # Self-dependency (defensive — AgentTask already enforces).
+            # Self-dependency.
             if pt.task.task_id in deps:
                 issues.append(
                     PlanValidationIssue(
@@ -395,9 +563,7 @@ class PlanValidator:
                         task_id=pt.task.task_id,
                     )
                 )
-            # Duplicate dependencies (defensive — PlannedTask dedups at
-            # construction, but AgentTask.dependencies is a frozenset so
-            # duplicates are already impossible — still check for clarity).
+            # Duplicate dependencies.
             dep_list = list(deps)
             if len(dep_list) != len(set(dep_list)):
                 issues.append(
@@ -420,8 +586,7 @@ class PlanValidator:
                         )
                     )
 
-        # Cycle detection (Kahn's algorithm).  Only run if no missing
-        # dependencies — otherwise missing deps would masquerade as roots.
+        # Cycle detection — skip if missing deps exist (they'd masquerade as roots).
         missing_dep_issues = [i for i in issues if i.code == CODE_MISSING_DEPENDENCY]
         if not missing_dep_issues:
             cycle = cls._detect_cycle(plan)
@@ -439,7 +604,6 @@ class PlanValidator:
     @staticmethod
     def _detect_cycle(plan: PlanDraft) -> list[str] | None:
         """Return a list of task_ids involved in a cycle, or None."""
-        # Build adjacency list: task_id -> set of dependents.
         graph: dict[str, set[str]] = {pt.task.task_id: set() for pt in plan.tasks}
         in_degree: dict[str, int] = {pt.task.task_id: 0 for pt in plan.tasks}
         for pt in plan.tasks:
@@ -448,9 +612,6 @@ class PlanValidator:
                     graph[dep].add(pt.task.task_id)
                     in_degree[pt.task.task_id] = in_degree.get(pt.task.task_id, 0) + 1
 
-        # Kahn's algorithm — but we need to detect cycle nodes, not just
-        # existence.  Nodes that never reach in_degree 0 are in a cycle
-        # (or depend on a cycle).
         queue: deque[str] = deque(
             sorted(tid for tid, deg in in_degree.items() if deg == 0)
         )
@@ -471,8 +632,6 @@ class PlanValidator:
         """Return stable topological order, or [] if cyclic."""
         if cls._detect_cycle(plan) is not None:
             return []
-        # Build in_degree from scratch (Kahn's, deterministic ordering by
-        # sorting the ready queue at every step).
         task_ids = {pt.task.task_id for pt in plan.tasks}
         graph: dict[str, set[str]] = {tid: set() for tid in task_ids}
         in_degree: dict[str, int] = {tid: 0 for tid in task_ids}
@@ -490,7 +649,6 @@ class PlanValidator:
             for neighbor in sorted(graph[node]):
                 in_degree[neighbor] -= 1
                 if in_degree[neighbor] == 0:
-                    # Insert in sorted position to keep order stable.
                     import bisect
 
                     bisect.insort(ready, neighbor)
@@ -550,26 +708,15 @@ class PlanValidator:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _check_required_vs_optional(
-        plan: PlanDraft,
-    ) -> list[PlanValidationIssue]:
+    def _check_required_vs_optional(plan: PlanDraft) -> list[PlanValidationIssue]:
         """A required task must not depend on an optional task."""
         issues: list[PlanValidationIssue] = []
         optional_ids: set[str] = set()
-        id_to_pt: dict[str, PlannedTask] = {}
+        task_id_by_intent_id: dict[str, str] = {}
         for pt in plan.tasks:
-            id_to_pt[pt.intent_id] = pt
+            task_id_by_intent_id[pt.intent_id] = pt.task.task_id
             if not pt.required:
                 optional_ids.add(pt.intent_id)
-
-        # Also consider task_id → intent_id mapping, since dependencies
-        # are expressed in task_id space (AgentTask.dependencies).
-        intent_id_by_task_id: dict[str, str] = {
-            pt.task.task_id: pt.intent_id for pt in plan.tasks
-        }
-        task_id_by_intent_id: dict[str, str] = {
-            pt.intent_id: pt.task.task_id for pt in plan.tasks
-        }
 
         # Build optional set in task_id space.
         optional_task_ids: set[str] = {
@@ -594,8 +741,6 @@ class PlanValidator:
                             task_id=pt.task.task_id,
                         )
                     )
-        # Silence unused-variable warnings from the lookup maps.
-        _ = (id_to_pt, intent_id_by_task_id)
         return issues
 
     # ------------------------------------------------------------------
@@ -614,13 +759,6 @@ class PlanValidator:
         * ``tool_calls``  = sum of PlannedTask.estimated_tool_calls
         * ``iterations``  = longest path node count in the DAG
         * ``deadline_ms`` = sum of task.timeout_ms along the longest path
-
-        Hard fail-closed limits: max_tasks, max_agent_calls,
-        max_tool_calls, max_iterations, deadline_ms.
-
-        Soft (warning) limits: token_budget, cost_budget_usd — Phase 3
-        has no reliable estimate, so a warning is emitted when they are
-        set.  No dollar amounts are fabricated.
         """
         from multi_agent.planning import PlanningRequest
 
@@ -635,7 +773,6 @@ class PlanValidator:
 
         issues: list[PlanValidationIssue] = []
 
-        # Structural budgets — hard fail-closed.
         if n_tasks > budget.max_tasks:
             issues.append(
                 PlanValidationIssue(
@@ -677,7 +814,6 @@ class PlanValidator:
                 )
             )
 
-        # Token / cost budgets — warning only, no fabricated estimates.
         if budget.token_budget is not None:
             issues.append(
                 PlanValidationIssue(
@@ -715,15 +851,11 @@ class PlanValidator:
 
     @classmethod
     def _longest_path_length(cls, plan: PlanDraft) -> int:
-        """Return the number of nodes on the longest path (0 if empty)."""
         if not plan.tasks:
             return 0
         if cls._detect_cycle(plan) is not None:
-            # Cyclic — return node count as an upper bound; the cycle
-            # issue will already be reported by _check_dag.
             return len(plan.tasks)
 
-        # Topological order via Kahn's algorithm.
         task_ids = {pt.task.task_id for pt in plan.tasks}
         graph: dict[str, set[str]] = {tid: set() for tid in task_ids}
         in_degree: dict[str, int] = {tid: 0 for tid in task_ids}
@@ -733,15 +865,12 @@ class PlanValidator:
                     graph[dep].add(pt.task.task_id)
                     in_degree[pt.task.task_id] += 1
 
-        # Longest path DP over topological order.
         longest: dict[str, int] = {tid: 1 for tid in task_ids}
         queue: deque[str] = deque(
             sorted(tid for tid, deg in in_degree.items() if deg == 0)
         )
-        visited: set[str] = set()
         while queue:
             node = queue.popleft()
-            visited.add(node)
             for neighbor in sorted(graph[node]):
                 if longest[neighbor] < longest[node] + 1:
                     longest[neighbor] = longest[node] + 1
@@ -752,7 +881,6 @@ class PlanValidator:
 
     @classmethod
     def _longest_path_deadline_ms(cls, plan: PlanDraft) -> int:
-        """Sum of timeout_ms along the longest path."""
         if not plan.tasks:
             return 0
         if cls._detect_cycle(plan) is not None:
@@ -783,6 +911,4 @@ class PlanValidator:
         return max(deadline.values()) if deadline else 0
 
 
-__all__ = [
-    "PlanValidator",
-]
+__all__ = ["PlanValidator"]

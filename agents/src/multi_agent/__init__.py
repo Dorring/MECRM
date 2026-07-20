@@ -78,9 +78,11 @@ from multi_agent.planning import (
     PlannedTask,
     PlanningRequest,
     PlanningSignals,
+    RequestedTask,
     TaskIntent,
     compute_plan_hash,
     compute_request_hash,
+    task_intent_from_requested_task,
 )
 from multi_agent.planning_errors import (
     AmbiguousAgentSelectionError,
@@ -178,9 +180,11 @@ __all__ = [
     "PlannedTask",
     "PlanningRequest",
     "PlanningSignals",
+    "RequestedTask",
     "TaskIntent",
     "compute_plan_hash",
     "compute_request_hash",
+    "task_intent_from_requested_task",
     # Phase 3 — Errors
     "AmbiguousAgentSelectionError",
     "BudgetExceededPlanningError",

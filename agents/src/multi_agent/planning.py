@@ -3,14 +3,15 @@
 All contracts inherit :class:`StrictContract` from Phase 2 so that
 ``extra="forbid"`` and ``validate_assignment=True`` apply uniformly.
 
-Hash design (per Phase 3 review R1):
+Hash design (R1, post-review):
 
-* ``request_hash`` — covers everything in :class:`PlanningRequest`
-  *except* volatile fields.  Stored on :class:`PlanDraft` so the draft
-  can be verified *without* holding the original request.
-* ``plan_hash`` — covers ``request_hash`` + ``complexity`` + canonical
-  tasks + ``planner_version``.  Excludes ``summary``, ``warnings``,
-  wall-clock times, and ``plan_hash`` itself.
+* ``request_hash`` — SHA-256 over the canonical :class:`PlanningRequest`
+  content.  Stored on :class:`PlanDraft` AND the full request snapshot
+  is stored too, so the draft can be verified *without* holding the
+  original request.
+* ``plan_hash`` — SHA-256 over ``request_hash`` + ``complexity`` +
+  canonical tasks + ``planner_version``.  Excludes ``summary``,
+  ``warnings``, wall-clock times, and ``plan_hash`` itself.
 
 Both hashes use the shared :func:`multi_agent.serialization.stable_hash`
 pipeline so they are stable across processes and platforms.
@@ -40,12 +41,110 @@ from multi_agent.serialization import canonicalize, stable_hash
 # Planner version — bumped whenever the planner algorithm changes.
 # ---------------------------------------------------------------------------
 
-PLANNER_VERSION = "ma-03.1.0"
+PLANNER_VERSION = "ma-03.2.0"
 
 
 # ---------------------------------------------------------------------------
 # PlanningSignals
 # ---------------------------------------------------------------------------
+
+
+class RequestedTask(StrictContract):
+    """Explicit Domain→Task mapping for non-template multi-agent plans.
+
+    When a request enters the ``multi_agent`` route without a template,
+    the planner requires an explicit :class:`RequestedTask` per task.
+    This prevents the planner from arbitrarily binding every task to
+    ``sorted(domains)[0]`` or guessing the domain from the task type.
+
+    The ``preferred_authority`` field carries the *minimum* authority
+    the eventual agent must have.  Phase 3 bounds it to READ or PROPOSE.
+    """
+
+    intent_id: str
+    domain: str
+    task_type: str
+    objective: str
+
+    dependencies: list[str] = Field(default_factory=list)
+    required: bool = True
+
+    preferred_authority: AgentAuthority = AgentAuthority.READ
+    required_tools: frozenset[str] = Field(default_factory=frozenset)
+    estimated_tool_calls: int = Field(default=0, ge=0)
+
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @field_validator("intent_id")
+    @classmethod
+    def _intent_id_required(cls, v: str) -> str:
+        return _validate_resource_id(v, "intent_id")
+
+    @field_validator("domain")
+    @classmethod
+    def _domain_non_blank(cls, v: str) -> str:
+        return _non_blank(v, "domain")
+
+    @field_validator("task_type")
+    @classmethod
+    def _task_type_non_blank(cls, v: str) -> str:
+        return _non_blank(v, "task_type")
+
+    @field_validator("objective")
+    @classmethod
+    def _objective_non_blank(cls, v: str) -> str:
+        return _non_blank(v, "objective")
+
+    @field_validator("preferred_authority")
+    @classmethod
+    def _authority_bounded(cls, v: AgentAuthority) -> AgentAuthority:
+        if v is AgentAuthority.EXECUTE:
+            raise ValueError(
+                "RequestedTask.preferred_authority must not be EXECUTE in Phase 3"
+            )
+        return v
+
+    @field_validator("dependencies")
+    @classmethod
+    def _dependencies_dedup(cls, v: list[str]) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for dep in v:
+            stripped = dep.strip()
+            if not stripped:
+                raise ValueError("dependency must not be blank")
+            if stripped in seen:
+                continue
+            seen.add(stripped)
+            out.append(stripped)
+        return out
+
+    @field_validator("required_tools")
+    @classmethod
+    def _required_tools_non_blank(cls, v: frozenset[str]) -> frozenset[str]:
+        cleaned: set[str] = set()
+        for item in v:
+            if not isinstance(item, str):
+                raise ValueError("required_tools members must be strings")
+            stripped = item.strip()
+            if not stripped:
+                raise ValueError("required_tools members must not be blank")
+            cleaned.add(stripped)
+        return frozenset(cleaned)
+
+    @field_validator("metadata")
+    @classmethod
+    def _validate_metadata(cls, v: dict[str, Any]) -> dict[str, Any]:
+        _reject_sensitive_keys(v, "RequestedTask.metadata")
+        from multi_agent.serialization import validate_strict_json
+
+        return validate_strict_json(v)  # type: ignore[return-value]
+
+    @model_validator(mode="after")
+    def _no_self_dependency(self) -> "RequestedTask":
+        if self.intent_id and self.intent_id in self.dependencies:
+            raise ValueError("RequestedTask cannot depend on itself")
+        return self
 
 
 class PlanningSignals(StrictContract):
@@ -60,6 +159,7 @@ class PlanningSignals(StrictContract):
     event_type: str | None = None
     domains: frozenset[str] = Field(default_factory=frozenset)
     requested_task_types: frozenset[str] = Field(default_factory=frozenset)
+    requested_tasks: list[RequestedTask] = Field(default_factory=list)
 
     requires_cross_domain: bool = False
     requires_write: bool = False
@@ -101,6 +201,31 @@ class PlanningSignals(StrictContract):
                 raise ValueError("signal set members must not be blank")
             cleaned.add(stripped)
         return frozenset(cleaned)
+
+    @model_validator(mode="after")
+    def _requested_tasks_consistency(self) -> "PlanningSignals":
+        """If requested_tasks is non-empty, it must be consistent with
+        the derived ``domains`` and ``requested_task_types`` sets (when
+        those sets are non-empty).
+        """
+        if not self.requested_tasks:
+            return self
+        task_domains = {t.domain for t in self.requested_tasks}
+        task_types = {t.task_type for t in self.requested_tasks}
+        if self.domains and self.domains != frozenset(task_domains):
+            raise ValueError(
+                "signals.domains must equal the set of RequestedTask.domain "
+                f"values when both are present: {self.domains} vs {task_domains}"
+            )
+        if self.requested_task_types and self.requested_task_types != frozenset(
+            task_types
+        ):
+            raise ValueError(
+                "signals.requested_task_types must equal the set of "
+                "RequestedTask.task_type values when both are present: "
+                f"{self.requested_task_types} vs {task_types}"
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -157,13 +282,9 @@ class PlanningRequest(StrictContract):
         v = v.strip()
         if not v:
             return None
-        # Sensitive-key scan — context_summary is a string, so we only
-        # need to reject obvious token patterns.  A full structured
-        # scan is unnecessary here, but we keep the same normaliser to
-        # stay consistent with Phase 2.
         from multi_agent.contracts import (
-            _normalize_sensitive_key,
             _NORMALIZED_SECRET_PATTERNS,
+            _normalize_sensitive_key,
         )
 
         normalized = _normalize_sensitive_key(v)
@@ -178,12 +299,16 @@ class PlanningRequest(StrictContract):
 
 
 # ---------------------------------------------------------------------------
-# TaskIntent
+# TaskIntent (template-only — RequestedTask is the user-facing form)
 # ---------------------------------------------------------------------------
 
 
 class TaskIntent(StrictContract):
     """Planner's intent for a single task — *before* agent selection.
+
+    Emitted by templates (e.g. CustomerRecoveryTemplate) and by the
+    generic multi-agent planner when converting
+    :class:`RequestedTask` instances into intents.
 
     A :class:`TaskIntent` does not carry a concrete handler or Python
     object.  ``preferred_authority`` is bounded to ``READ`` or
@@ -236,7 +361,7 @@ class TaskIntent(StrictContract):
 
     @field_validator("dependencies")
     @classmethod
-    def _dependencies_dedup_and_no_self(cls, v: list[str]) -> list[str]:
+    def _dependencies_dedup(cls, v: list[str]) -> list[str]:
         seen: set[str] = set()
         out: list[str] = []
         for dep in v:
@@ -275,6 +400,22 @@ class TaskIntent(StrictContract):
         if self.intent_id and self.intent_id in self.dependencies:
             raise ValueError("TaskIntent cannot depend on itself")
         return self
+
+
+def task_intent_from_requested_task(rt: RequestedTask) -> TaskIntent:
+    """Convert a :class:`RequestedTask` into a :class:`TaskIntent`."""
+    return TaskIntent(
+        intent_id=rt.intent_id,
+        task_type=rt.task_type,
+        domain=rt.domain,
+        objective=rt.objective,
+        dependencies=list(rt.dependencies),
+        required=rt.required,
+        preferred_authority=rt.preferred_authority,
+        required_tools=rt.required_tools,
+        estimated_tool_calls=rt.estimated_tool_calls,
+        metadata=dict(rt.metadata),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -335,14 +476,8 @@ class PlannedTask(StrictContract):
         return frozenset(cleaned)
 
     @model_validator(mode="after")
-    def _intent_task_consistency(self) -> "PlannedTask":
-        # The wrapped AgentTask must share tenant_id with the planning
-        # context — caller sets it explicitly, but we double-check.
-        if self.task.task_type and self.intent_id == self.task.task_id:
-            # task_id may equal intent_id in some templates; that's fine.
-            pass
+    def _task_no_self_dependency(self) -> "PlannedTask":
         if self.task.task_id and self.task.task_id in self.task.dependencies:
-            # AgentTask already enforces no-self-dependency, but be defensive.
             raise ValueError("PlannedTask.task cannot depend on itself")
         return self
 
@@ -378,12 +513,7 @@ def _canonical_tasks_payload(tasks: list[PlannedTask]) -> list[dict[str, Any]]:
 
 
 def compute_request_hash(request: PlanningRequest) -> str:
-    """Stable SHA-256 over the canonical PlanningRequest content.
-
-    Excludes nothing — every field on PlanningRequest is semantic.
-    ``context_summary`` is included because it is part of the planning
-    input contract.
-    """
+    """Stable SHA-256 over the canonical PlanningRequest content."""
     payload = {
         "run_id": request.run_id,
         "tenant_id": request.tenant_id,
@@ -423,58 +553,53 @@ def compute_plan_hash(
 class PlanDraft(StrictContract):
     """A complete, hash-verified plan ready for Phase 4+ execution.
 
-    Carries enough context (``run_id``, ``tenant_id``, ``actor_*``,
-    ``objective``, ``request_hash``) to be re-verified *without* the
-    original :class:`PlanningRequest`.
+    Stores the **full** :class:`PlanningRequest` snapshot so the draft
+    can be re-verified *without* the caller holding the original
+    request.  ``request_hash`` binds the snapshot; ``plan_hash`` binds
+    the plan content.
     """
 
-    run_id: str
-    tenant_id: str
-    actor_type: Literal["user", "service"]
-    actor_id: str
-    objective: str
+    request: PlanningRequest
+    request_hash: str
 
     complexity: ComplexityDecision
     tasks: list[PlannedTask] = Field(default_factory=list)
 
     planner_version: str
-    registry_version: str
-
-    request_hash: str
-    plan_hash: str = ""  # auto-computed if empty
+    plan_hash: str = ""
 
     summary: str = ""
     warnings: list[str] = Field(default_factory=list)
 
-    @field_validator("run_id")
-    @classmethod
-    def _run_id_required(cls, v: str) -> str:
-        return _validate_resource_id(v, "run_id")
+    # Convenience accessors that delegate to the request snapshot.
+    @property
+    def run_id(self) -> str:
+        return self.request.run_id
 
-    @field_validator("tenant_id")
-    @classmethod
-    def _tenant_required(cls, v: str) -> str:
-        return _non_blank(v, "tenant_id")
+    @property
+    def tenant_id(self) -> str:
+        return self.request.tenant_id
 
-    @field_validator("actor_id")
-    @classmethod
-    def _actor_id_required(cls, v: str) -> str:
-        return _non_blank(v, "actor_id")
+    @property
+    def actor_type(self) -> Literal["user", "service"]:
+        return self.request.actor_type
 
-    @field_validator("objective")
-    @classmethod
-    def _objective_required(cls, v: str) -> str:
-        return _non_blank(v, "objective")
+    @property
+    def actor_id(self) -> str:
+        return self.request.actor_id
+
+    @property
+    def objective(self) -> str:
+        return self.request.objective
+
+    @property
+    def registry_version(self) -> str:
+        return self.request.registry_version
 
     @field_validator("planner_version")
     @classmethod
     def _planner_version_required(cls, v: str) -> str:
         return _non_blank(v, "planner_version")
-
-    @field_validator("registry_version")
-    @classmethod
-    def _registry_version_required(cls, v: str) -> str:
-        return _non_blank(v, "registry_version")
 
     @field_validator("request_hash")
     @classmethod
@@ -484,10 +609,9 @@ class PlanDraft(StrictContract):
     @field_validator("summary")
     @classmethod
     def _summary_safe(cls, v: str) -> str:
-        # Summary is a free-form string; reject obvious secret patterns.
         from multi_agent.contracts import (
-            _normalize_sensitive_key,
             _NORMALIZED_SECRET_PATTERNS,
+            _normalize_sensitive_key,
         )
 
         normalized = _normalize_sensitive_key(v)
@@ -513,18 +637,20 @@ class PlanDraft(StrictContract):
         return out
 
     @model_validator(mode="after")
-    def _auto_compute_and_verify_hash(self) -> "PlanDraft":
-        """Auto-compute plan_hash if empty; verify if provided.
+    def _verify_request_hash(self) -> "PlanDraft":
+        expected = compute_request_hash(self.request)
+        if not compare_digest(self.request_hash, expected):
+            raise ValueError(
+                f"request_hash mismatch: provided "
+                f"{self.request_hash[:12]!r} != computed {expected[:12]!r}"
+            )
+        return self
 
-        Runs *after* all field validators, so ``self.tasks`` is a fully
-        validated ``list[PlannedTask]``.  This avoids the fragility of
-        trying to compute the hash from raw dict input in ``before``
-        mode.
-        """
+    @model_validator(mode="after")
+    def _auto_compute_and_verify_hash(self) -> "PlanDraft":
+        """Auto-compute plan_hash if empty; verify if provided."""
         expected = self.compute_plan_hash()
         if not self.plan_hash:
-            # Auto-compute.  Use object.__setattr__ to bypass
-            # validate_assignment — the value is already validated.
             object.__setattr__(self, "plan_hash", expected)
         elif not compare_digest(self.plan_hash, expected):
             raise ValueError(
@@ -555,13 +681,19 @@ class PlanDraft(StrictContract):
         )
 
     def verify_integrity(self) -> None:
-        """Raise :class:`PlanIntegrityError` if stored hash != recomputed hash."""
-        if not compare_digest(self.plan_hash, self.compute_plan_hash()):
-            from multi_agent.planning_errors import PlanIntegrityError
+        """Raise :class:`PlanIntegrityError` if any hash is invalid."""
+        from multi_agent.planning_errors import PlanIntegrityError
 
+        expected_request_hash = compute_request_hash(self.request)
+        if not compare_digest(self.request_hash, expected_request_hash):
+            raise PlanIntegrityError(
+                f"Plan {self.run_id!r}: stored request_hash does not match "
+                f"recomputed request content"
+            )
+        if not compare_digest(self.plan_hash, self.compute_plan_hash()):
             raise PlanIntegrityError(
                 f"Plan {self.run_id!r}: stored plan_hash does not match "
-                f"recomputed content"
+                f"recomputed plan content"
             )
 
     def agent_tasks(self) -> list[AgentTask]:
@@ -619,7 +751,9 @@ __all__ = [
     "PlannedTask",
     "PlanningRequest",
     "PlanningSignals",
+    "RequestedTask",
     "TaskIntent",
     "compute_plan_hash",
     "compute_request_hash",
+    "task_intent_from_requested_task",
 ]

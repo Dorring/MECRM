@@ -273,18 +273,13 @@ class TestDagValidation:
             ),
         ]
         plan = PlanDraft(
-            run_id="run-001",
-            tenant_id="t-001",
-            actor_type="user",
-            actor_id="user-001",
-            objective="Cycle test",
+            request=request,
+            request_hash=compute_request_hash(request),
             complexity=__import__("multi_agent").ComplexityDecision(
                 route="multi_agent"
             ),
             tasks=planned,
             planner_version="test",
-            registry_version=reg.snapshot().version,
-            request_hash=compute_request_hash(request),
         )
         report = PlanValidator().validate(request, plan, reg)
         codes = [i.code for i in report.issues]
@@ -376,11 +371,8 @@ class TestRouteConstraints:
             ),
         )
         plan = PlanDraft(
-            run_id="run-001",
-            tenant_id="t-001",
-            actor_type="user",
-            actor_id="user-001",
-            objective="Multi agent test",
+            request=request,
+            request_hash=compute_request_hash(request),
             complexity=ComplexityDecision(route="multi_agent"),
             tasks=[
                 PlannedTask(
@@ -397,8 +389,6 @@ class TestRouteConstraints:
                 ),
             ],
             planner_version="test",
-            registry_version=reg.snapshot().version,
-            request_hash=compute_request_hash(request),
         )
         report = PlanValidator().validate(request, plan, reg)
         codes = [i.code for i in report.issues]
@@ -462,11 +452,11 @@ class TestRegistryValidation:
             ),
             _FakeHandler(),
         )
-        request = _make_request(reg)
-        # The request's registry_version is now stale, but we only care
-        # about the disabled-agent error here.
-        object.__setattr__(request, "registry_version", reg.snapshot().version)
-        object.__setattr__(plan, "registry_version", reg.snapshot().version)
+        # Use the original request (registry_version is now stale, but
+        # we only care about the disabled-agent error here).  Note:
+        # plan.registry_version is a read-only property delegating to
+        # plan.request.registry_version, so we cannot mutate it.
+        request = _make_request(reg, registry_version=plan.registry_version)
         _set_plan_tasks(plan, list(plan.tasks))
         report = PlanValidator().validate(request, plan, reg)
         codes = [i.code for i in report.issues]
@@ -507,11 +497,8 @@ class TestRegistryValidation:
         )
         request = _make_request(reg)
         plan = PlanDraft(
-            run_id="run-001",
-            tenant_id="t-001",
-            actor_type="user",
-            actor_id="user-001",
-            objective="Exec test",
+            request=request,
+            request_hash=compute_request_hash(request),
             complexity=ComplexityDecision(route="single_agent"),
             tasks=[
                 PlannedTask(
@@ -522,8 +509,6 @@ class TestRegistryValidation:
                 )
             ],
             planner_version="test",
-            registry_version=reg.snapshot().version,
-            request_hash=compute_request_hash(request),
         )
         report = PlanValidator().validate(request, plan, reg)
         codes = [i.code for i in report.issues]
@@ -584,18 +569,13 @@ class TestBudgetValidation:
             )
         request = _make_request(reg2)
         plan = PlanDraft(
-            run_id="run-001",
-            tenant_id="t-001",
-            actor_type="user",
-            actor_id="user-001",
-            objective="Budget test",
+            request=request,
+            request_hash=compute_request_hash(request),
             complexity=ComplexityDecision(route="multi_agent")
             if n >= 2
             else ComplexityDecision(route="single_agent"),
             tasks=tasks,
             planner_version="test",
-            registry_version=reg2.snapshot().version,
-            request_hash=compute_request_hash(request),
         )
         return plan, request, reg2
 
@@ -661,16 +641,11 @@ class TestBudgetValidation:
         request = _make_request(reg)
         object.__setattr__(request, "budget", ExecutionBudget(max_iterations=2))
         plan = PlanDraft(
-            run_id="run-001",
-            tenant_id="t-001",
-            actor_type="user",
-            actor_id="user-001",
-            objective="Iteration test",
+            request=request,
+            request_hash=compute_request_hash(request),
             complexity=ComplexityDecision(route="multi_agent"),
             tasks=tasks,
             planner_version="test",
-            registry_version=reg.snapshot().version,
-            request_hash=compute_request_hash(request),
         )
         report = PlanValidator().validate(request, plan, reg)
         codes = [i.code for i in report.issues]
@@ -699,11 +674,8 @@ class TestBudgetValidation:
         request = _make_request(reg)
         object.__setattr__(request, "budget", ExecutionBudget(deadline_ms=30_000))
         plan = PlanDraft(
-            run_id="run-001",
-            tenant_id="t-001",
-            actor_type="user",
-            actor_id="user-001",
-            objective="Deadline test",
+            request=request,
+            request_hash=compute_request_hash(request),
             complexity=ComplexityDecision(route="single_agent"),
             tasks=[
                 PlannedTask(
@@ -714,8 +686,6 @@ class TestBudgetValidation:
                 )
             ],
             planner_version="test",
-            registry_version=reg.snapshot().version,
-            request_hash=compute_request_hash(request),
         )
         report = PlanValidator().validate(request, plan, reg)
         codes = [i.code for i in report.issues]
@@ -751,11 +721,8 @@ class TestRequiredVsOptional:
         )
         request = _make_request(reg)
         plan = PlanDraft(
-            run_id="run-001",
-            tenant_id="t-001",
-            actor_type="user",
-            actor_id="user-001",
-            objective="Required/Optional test",
+            request=request,
+            request_hash=compute_request_hash(request),
             complexity=ComplexityDecision(route="multi_agent"),
             tasks=[
                 PlannedTask(
@@ -774,8 +741,6 @@ class TestRequiredVsOptional:
                 ),
             ],
             planner_version="test",
-            registry_version=reg.snapshot().version,
-            request_hash=compute_request_hash(request),
         )
         report = PlanValidator().validate(request, plan, reg)
         codes = [i.code for i in report.issues]
@@ -888,28 +853,18 @@ class TestOrderIndependence:
 
         request = _make_request(reg)
         plan1 = PlanDraft(
-            run_id="run-001",
-            tenant_id="t-001",
-            actor_type="user",
-            actor_id="user-001",
-            objective="Order test",
+            request=request,
+            request_hash=compute_request_hash(request),
             complexity=ComplexityDecision(route="multi_agent"),
             tasks=[pt_a, pt_b],
             planner_version="test",
-            registry_version=reg.snapshot().version,
-            request_hash=compute_request_hash(request),
         )
         plan2 = PlanDraft(
-            run_id="run-001",
-            tenant_id="t-001",
-            actor_type="user",
-            actor_id="user-001",
-            objective="Order test",
+            request=request,
+            request_hash=compute_request_hash(request),
             complexity=ComplexityDecision(route="multi_agent"),
             tasks=[pt_b, pt_a],  # Reversed order
             planner_version="test",
-            registry_version=reg.snapshot().version,
-            request_hash=compute_request_hash(request),
         )
         v = PlanValidator()
         r1 = v.validate(request, plan1, reg)

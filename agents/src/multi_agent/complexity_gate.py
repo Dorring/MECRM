@@ -46,12 +46,15 @@ DETERMINISTIC_EVENT_TYPES: frozenset[str] = frozenset(
 #: Phase 3 does NOT subscribe to Kafka — this map exists only so that
 #: upstream callers (and the docs) can translate router topics into the
 #: PlanningSignals.event_type namespace unambiguously.
+#:
+#: Only topics whose semantic meaning is *exactly equivalent* to a
+#: canonical event_type are listed here.  Topics without a precise
+#: canonical equivalent are intentionally absent — upstream callers
+#: must not route them through the deterministic_workflow allowlist.
 KAFKA_TOPIC_TO_EVENT_TYPE: dict[str, str] = {
     "crm.tickets.sla-breached": "ticket.sla_breached",
     "crm.approvals.decision": "approval.resolved",
-    "crm.knowledge.published": "audit.event_recorded",
-    "crm.conversations.closed": "lifecycle.stage_changed",
-    "crm.automation.simulation.requested": "automation.triggered",
+    "crm.deals.stage-changed": "lifecycle.stage_changed",
 }
 
 #: Stable reason codes used in :class:`ComplexityDecision.reasons`.

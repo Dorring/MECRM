@@ -22,7 +22,7 @@ from multi_agent.contracts import (
 from multi_agent.planner import DeterministicPlanner
 from multi_agent.planning import PlanningRequest, PlanningSignals
 from multi_agent.planning_errors import (
-    PlanValidationError,
+    BudgetExceededPlanningError,
     UnsupportedCapabilityError,
 )
 from multi_agent.planning_templates import (
@@ -333,7 +333,7 @@ class TestFailClosedScenarios:
             reg,
             budget=ExecutionBudget(max_tasks=3),
         )
-        with pytest.raises(PlanValidationError):
+        with pytest.raises(BudgetExceededPlanningError):
             DeterministicPlanner().create_plan(request, reg)
 
 
