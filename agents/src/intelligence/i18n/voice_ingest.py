@@ -38,6 +38,7 @@ class TranscriptResult:
     processing_time_ms: float
     model_used: str
     error: str | None = None
+    error_code: str | None = None
 
     @property
     def success(self) -> bool:
@@ -67,6 +68,7 @@ class DisabledWhisperSTT:
             processing_time_ms=0.0,
             model_used="disabled",
             error="Voice transcription is not available (AI_MODE=disabled)",
+            error_code="voice_ai_disabled",
         )
 
 
@@ -96,6 +98,7 @@ class DeterministicWhisperSTT:
             duration_seconds=len(audio_bytes) / 16000 / 2 if audio_bytes else 0.0,
             processing_time_ms=1.0,
             model_used="deterministic-stt-v1",
+            error_code=None,  # success
         )
 
 
@@ -136,17 +139,17 @@ class WhisperSTT:
         language_hint: str | None = None,
     ) -> TranscriptResult:
         """Transcribe audio to text.
-        
+
         Args:
             audio_bytes: Raw audio data
             audio_format: Audio format (webm, wav, mp3, etc.)
             language_hint: Optional language hint for better accuracy
-            
+
         Returns:
             TranscriptResult with transcript and metadata
         """
         start_time = time.time()
-        
+
         if not audio_bytes:
             return TranscriptResult(
                 text="",
@@ -156,6 +159,7 @@ class WhisperSTT:
                 processing_time_ms=0.0,
                 model_used=self._model,
                 error="Empty audio input",
+                error_code="voice_transcription_failed",
             )
         
         try:
@@ -163,13 +167,13 @@ class WhisperSTT:
             result = await self._transcribe_ollama(audio_bytes, audio_format, language_hint)
             if result.success:
                 return result
-            
+
             # Fallback to OpenAI Whisper API style
             result = await self._transcribe_openai_style(audio_bytes, audio_format, language_hint)
             return result
-            
+
         except Exception as e:
-            logger.error(f"Transcription failed: {e}")
+            logger.exception("Transcription failed")
             return TranscriptResult(
                 text="",
                 language=None,
@@ -177,7 +181,8 @@ class WhisperSTT:
                 duration_seconds=0.0,
                 processing_time_ms=(time.time() - start_time) * 1000,
                 model_used=self._model,
-                error=str(e),
+                error="Transcription service error",
+                error_code="voice_transcription_failed",
             )
     
     async def _transcribe_ollama(
@@ -216,7 +221,8 @@ class WhisperSTT:
                         duration_seconds=0.0,
                         processing_time_ms=(time.time() - start_time) * 1000,
                         model_used=self._model,
-                        error=f"Ollama returned {response.status_code}",
+                        error="Transcription service error",
+                        error_code="voice_transcription_failed",
                     )
                 
                 data = response.json()
@@ -231,8 +237,8 @@ class WhisperSTT:
                     model_used=self._model,
                 )
                 
-        except Exception as e:
-            logger.warning(f"Ollama transcription failed: {e}")
+        except Exception:
+            logger.exception("Ollama transcription failed")
             return TranscriptResult(
                 text="",
                 language=None,
@@ -240,7 +246,8 @@ class WhisperSTT:
                 duration_seconds=0.0,
                 processing_time_ms=(time.time() - start_time) * 1000,
                 model_used=self._model,
-                error=str(e),
+                error="Transcription service error",
+                error_code="voice_transcription_failed",
             )
     
     async def _transcribe_openai_style(
@@ -280,7 +287,8 @@ class WhisperSTT:
                                 duration_seconds=0.0,
                                 processing_time_ms=(time.time() - start_time) * 1000,
                                 model_used="whisper-1",
-                                error=f"Whisper API returned {response.status_code}",
+                                error="Transcription service error",
+                                error_code="voice_transcription_failed",
                             )
                         
                         result = response.json()
@@ -301,8 +309,8 @@ class WhisperSTT:
                 except Exception:
                     pass
                     
-        except Exception as e:
-            logger.error(f"OpenAI-style transcription failed: {e}")
+        except Exception:
+            logger.exception("OpenAI-style transcription failed")
             return TranscriptResult(
                 text="",
                 language=None,
@@ -310,7 +318,8 @@ class WhisperSTT:
                 duration_seconds=0.0,
                 processing_time_ms=(time.time() - start_time) * 1000,
                 model_used="whisper-1",
-                error=str(e),
+                error="Transcription service error",
+                error_code="voice_transcription_failed",
             )
 
 
@@ -361,6 +370,7 @@ async def transcribe_audio(
             processing_time_ms=0.0,
             model_used="none",
             error="Empty audio input",
+            error_code="voice_transcription_failed",
         )
     stt = get_stt()
     return await stt.transcribe(audio_bytes, audio_format=audio_format, language_hint=language_hint)

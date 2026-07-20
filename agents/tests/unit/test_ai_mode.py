@@ -7,6 +7,7 @@ Network isolation tests use Mock HTTP Client — cross-platform, no skip needed.
 
 from __future__ import annotations
 
+import io
 import os
 from unittest import mock
 
@@ -1234,6 +1235,159 @@ class TestVoiceApiStatus:
                 WhisperSTT()
         finally:
             _del_env("AI_MODE", "AI_PROVIDER")
+
+
+# ---------------------------------------------------------------------------
+# Voice Handler HTTP semantics tests (Phase 1 final)
+# ---------------------------------------------------------------------------
+
+
+class TestVoiceHandlerHttpSemantics:
+    """voice_handler / voice_query_handler return correct HTTP status."""
+
+    @pytest.mark.asyncio
+    async def test_voice_handler_disabled_returns_503(self, monkeypatch):
+        import httpx
+        from unittest import mock as umock
+        calls: list[str] = []
+        async def _track(method, url, **kw): calls.append(f"{method} {url}")
+        monkeypatch.setattr(httpx.AsyncClient, "get", _track)
+        monkeypatch.setattr(httpx.AsyncClient, "post", _track)
+        _set_env(AI_MODE="disabled")
+        try:
+            import intelligence.i18n.voice_ingest as vi
+            vi._default_stt = None
+            from aiohttp.test_utils import make_mocked_request
+            req = make_mocked_request("POST", "/api/v1/intelligence/voice",
+                                      headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"})
+            # Mock request.read() to return audio bytes
+            async def _read():
+                return b"fake audio bytes for testing"
+            with umock.patch.object(req, "read", _read):
+                from orchestrator.main import voice_handler
+                resp = await voice_handler(req)
+            assert resp.status == 503
+            import json
+            body = json.loads(resp.body)
+            assert body == {"error": "voice_ai_disabled"}
+            assert "details" not in body
+            assert len(calls) == 0
+        finally:
+            _del_env("AI_MODE")
+
+    @pytest.mark.asyncio
+    async def test_voice_handler_deterministic_returns_200(self, monkeypatch):
+        import httpx
+        from unittest import mock as umock
+        calls: list[str] = []
+        async def _track(method, url, **kw): calls.append(f"{method} {url}")
+        monkeypatch.setattr(httpx.AsyncClient, "get", _track)
+        monkeypatch.setattr(httpx.AsyncClient, "post", _track)
+        _set_env(AI_MODE="deterministic")
+        try:
+            import intelligence.i18n.voice_ingest as vi
+            vi._default_stt = None
+            from aiohttp.test_utils import make_mocked_request
+            req = make_mocked_request("POST", "/api/v1/intelligence/voice",
+                                      headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"})
+            async def _read():
+                return b"fake audio bytes for testing"
+            with umock.patch.object(req, "read", _read):
+                from orchestrator.main import voice_handler
+                resp = await voice_handler(req)
+            assert resp.status == 200
+            import json
+            body = json.loads(resp.body)
+            assert body["transcript"]["text"] != ""
+            assert "error" not in body
+            assert len(calls) == 0
+        finally:
+            _del_env("AI_MODE")
+
+    @pytest.mark.asyncio
+    async def test_voice_handler_live_without_whisper_returns_503(self):
+        from unittest import mock as umock
+        _set_env(AI_MODE="live", AI_PROVIDER="ollama")
+        try:
+            import intelligence.i18n.voice_ingest as vi
+            vi._default_stt = None
+            from aiohttp.test_utils import make_mocked_request
+            req = make_mocked_request("POST", "/api/v1/intelligence/voice",
+                                      headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"})
+            async def _read():
+                return b"fake audio bytes for testing"
+            with umock.patch.object(req, "read", _read):
+                from orchestrator.main import voice_handler
+                resp = await voice_handler(req)
+            assert resp.status == 503
+            import json
+            body = json.loads(resp.body)
+            assert body == {"error": "voice_provider_unavailable"}
+            assert "details" not in body
+        finally:
+            _del_env("AI_MODE", "AI_PROVIDER")
+
+    @pytest.mark.asyncio
+    async def test_voice_handler_does_not_expose_internal_exception(self, monkeypatch):
+        """Internal errors return 500 with no details/stacktrace."""
+        from unittest import mock as umock
+        async def _failing_stt(*args, **kwargs):
+            raise ValueError("secret internal error XYZ123")
+        # Patch inside orchestrator.main where the function is imported
+        import orchestrator.main as _main
+        monkeypatch.setattr(_main, "process_multilingual_input", _failing_stt)
+        _set_env(AI_MODE="deterministic")
+        try:
+            from aiohttp.test_utils import make_mocked_request
+            req = make_mocked_request("POST", "/api/v1/intelligence/voice",
+                                      headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"})
+            async def _read():
+                return b"fake audio"
+            with umock.patch.object(req, "read", _read):
+                from orchestrator.main import voice_handler
+                resp = await voice_handler(req)
+            assert resp.status == 500
+            import json
+            body = json.loads(resp.body)
+            assert body == {"error": "transcription_failed"}
+            assert "details" not in body
+            assert "XYZ123" not in str(body)
+        finally:
+            _del_env("AI_MODE")
+
+    @pytest.mark.asyncio
+    async def test_voice_query_handler_does_not_expose_internal_exception(self, monkeypatch):
+        """voice_query_handler internal errors return 500, no details."""
+        from unittest import mock as umock
+        async def _failing_stt(*args, **kwargs):
+            raise ValueError("secret internal error ABC789")
+        import orchestrator.main as _main
+        monkeypatch.setattr(_main, "process_multilingual_input", _failing_stt)
+        _set_env(AI_MODE="deterministic")
+        try:
+            from aiohttp import web
+            app = web.Application()
+            # The handler accesses app["search_agent"] — provide a minimal stub
+            class _FakeSearch:
+                async def search(self, **kw): return {}
+            app["search_agent"] = _FakeSearch()
+            from aiohttp.test_utils import make_mocked_request
+            req = make_mocked_request("POST", "/api/v1/intelligence/voice/query",
+                                      headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"},
+                                      app=app)
+            async def _read():
+                return b"fake audio"
+            with umock.patch.object(req, "read", _read):
+                from orchestrator.main import voice_query_handler
+                resp = await voice_query_handler(req)
+            assert resp.status == 500
+            import json
+            body = json.loads(resp.body)
+            assert body == {"error": "voice_query_failed"}
+            assert "details" not in body
+            assert "ABC789" not in str(body)
+        finally:
+            _del_env("AI_MODE")
 
 
 # ---------------------------------------------------------------------------

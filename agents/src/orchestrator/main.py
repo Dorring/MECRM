@@ -604,7 +604,14 @@ async def intelligence_query_handler(request: web.Request) -> web.Response:
 
 
 async def voice_handler(request: web.Request) -> web.Response:
-    """Handle voice transcription requests."""
+    """Handle voice transcription requests.
+
+    HTTP semantics:
+      - 200  success
+      - 400  missing audio / context
+      - 503  AI disabled or provider unavailable
+      - 500  unexpected internal error (safe, no details)
+    """
     try:
         audio_bytes = await request.read()
     except Exception:
@@ -630,6 +637,19 @@ async def voice_handler(request: web.Request) -> web.Response:
             tenant_id=str(tenant_id),
             user_id=str(user_id),
         )
+
+        # Check for STT-level error codes
+        transcript = state.transcript
+        if transcript is not None:
+            err_code = getattr(transcript, "error_code", None)
+            if err_code == "voice_ai_disabled":
+                return web.json_response(
+                    {"error": "voice_ai_disabled"}, status=503,
+                )
+            if err_code == "voice_provider_unavailable":
+                return web.json_response(
+                    {"error": "voice_provider_unavailable"}, status=503,
+                )
 
         return web.json_response({
             "transcript": {
@@ -653,19 +673,34 @@ async def voice_handler(request: web.Request) -> web.Response:
             "translation_latency_ms": state.translation_latency_ms,
             "total_latency_ms": state.total_latency_ms,
         })
-    except Exception as e:
-        logger.error("Voice transcription failed", error=str(e))
+    except RuntimeError as exc:
+        # Live mode with WHISPER_URL unset → 503
+        msg = str(exc).lower()
+        if "whisper_url" in msg:
+            logger.error("Voice provider unavailable: WHISPER_URL not set")
+            return web.json_response(
+                {"error": "voice_provider_unavailable"}, status=503)
+        logger.exception("Voice transcription failed (RuntimeError)")
         return web.json_response(
-            {"error": "transcription_failed", "details": str(e)}, status=500)
+            {"error": "transcription_failed"}, status=500)
+    except Exception:
+        logger.exception("Voice transcription failed")
+        return web.json_response(
+            {"error": "transcription_failed"}, status=500)
 
 
 async def voice_query_handler(request: web.Request) -> web.Response:
     """Handle full voice query pipeline: transcribe, detect, translate.
 
     Routes the canonical query to search/chat.
+
+    HTTP semantics:
+      - 200  success
+      - 400  missing audio / context / no transcript
+      - 503  AI disabled
+      - 500  unexpected internal error (safe, no details)
     """
     search_agent: SearchAgent = request.app["search_agent"]
-    # chat_agent: ChatAgent | None = request.app.get("chat_agent")
 
     try:
         audio_bytes = await request.read()
@@ -681,7 +716,6 @@ async def voice_query_handler(request: web.Request) -> web.Response:
     roles = [r.strip() for r in roles_raw.split(",") if r.strip()]
     module = request.headers.get("X-Client-Module")
     correlation_id = request.headers.get("X-Correlation-Id")
-    # authorization = request.headers.get("Authorization")
     audio_format = _normalize_audio_format(
         request.headers.get("X-Audio-Format"),
     )
@@ -697,6 +731,15 @@ async def voice_query_handler(request: web.Request) -> web.Response:
             tenant_id=str(tenant_id),
             user_id=str(user_id),
         )
+
+        # Check for STT-level error codes
+        transcript = state.transcript
+        if transcript is not None:
+            err_code = getattr(transcript, "error_code", None)
+            if err_code == "voice_ai_disabled":
+                return web.json_response(
+                    {"error": "voice_ai_disabled"}, status=503,
+                )
 
         if not state.canonical_query:
             return web.json_response({
@@ -728,10 +771,19 @@ async def voice_query_handler(request: web.Request) -> web.Response:
 
         return web.json_response(resp)
 
-    except Exception as e:
-        logger.error("Voice query failed", error=str(e))
+    except RuntimeError as exc:
+        msg = str(exc).lower()
+        if "whisper_url" in msg:
+            logger.error("Voice provider unavailable: WHISPER_URL not set")
+            return web.json_response(
+                {"error": "voice_provider_unavailable"}, status=503)
+        logger.exception("Voice query failed (RuntimeError)")
         return web.json_response(
-            {"error": "voice_query_failed", "details": str(e)}, status=500)
+            {"error": "voice_query_failed"}, status=500)
+    except Exception:
+        logger.exception("Voice query failed")
+        return web.json_response(
+            {"error": "voice_query_failed"}, status=500)
 
 
 async def automation_parse_handler(request: web.Request) -> web.Response:
