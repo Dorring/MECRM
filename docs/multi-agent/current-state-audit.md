@@ -2,7 +2,8 @@
 
 > **审计日期:** 2026-07-20
 > **审计范围:** 全仓库源码级审计（非 README 推断）
-> **目标:** 为 Supervisor/Specialist/Reviewer/Executor 多智能体架构升级提供基线
+> **目标:** 为 Supervisor/Specialist/Reviewer/受控 Executor 多智能体架构升级提供基线
+> **分支:** `chore/ma-00-baseline-audit-v2`
 
 ---
 
@@ -10,7 +11,15 @@
 
 ### 1.1 Agent 体系总览
 
-当前共有 **11 个 Agent**，全部继承自 `BaseAgent`（ABC），在 `AgentRouter` 中手动实例化：
+全仓库共有 **至少 12 个 `BaseAgent` 子类**，其中 11 个在 `AgentRouter` 中手动实例化并接入 Kafka 消费链路。
+
+**复现命令：**
+```bash
+grep -r "class.*Agent(BaseAgent)" agents/src/ --include="*.py"       # 12 个子类
+grep -E "= \w+Agent\(\)" agents/src/orchestrator/router.py           # 11 个在 Router 中
+```
+
+**AgentRouter 中的 11 个 Agent：**
 
 | # | Agent 类 | 模块 | agent_id | 类型 |
 |---|---|---|---|---|
@@ -26,11 +35,13 @@
 | 10 | `AutomationExecutorAgent` | `intelligence/automation/` | `automation-executor-agent` | 智能 Agent |
 | 11 | `KnowledgeAgent` | `intelligence/knowledge/` | `knowledge-agent` | 智能 Agent |
 
-另有通过 HTTP API 直接调用的 Agent（不在 Kafka 消费链路中）：
+**Router 之外的第 12 个 `BaseAgent` 子类：**
+- `DevExperienceAgent` (`intelligence/devx/devx_agent.py`) — 不通过 Kafka 消费，通过 HTTP API 直接调用
+
+另有通过 HTTP API 直接调用的 Agent（不继承 `BaseAgent`，不在 Kafka 消费链路中）：
 - `ChatAgent` — `intelligence/chat/chat_agent.py`
 - `SearchAgent` — `intelligence/search/search_agent.py`
 - `ComplianceIntelligenceAgent` — `intelligence/compliance/compliance_agent.py`
-- `DevExperienceAgent` — `intelligence/devx/devx_agent.py`
 
 ### 1.2 编排模型
 
@@ -39,36 +50,62 @@
 - 11 个 Agent 在 `__init__` 中手动 `AgentClass()` 实例化
 - 5 个治理组件（KillSwitch、GovernanceGuard、ApprovalService、ExplainabilityEngine、DataGuard）在 `__init__` 中实例化
 - `initialize()` 方法包含 **44 行 setter 注入代码**（11 agent × 4 治理组件），全部硬编码
-- 23 个 Kafka Topic 通过 `self.routes: Dict[str, Callable]` 映射到 handler 方法
-- **没有**：
-  - 依赖注入容器
-  - Agent 注册表/发现机制
-  - 装饰器注册
-  - 动态路由
-  - 工厂模式
 
-**Agent 间通信仅通过 Kafka 事件**——一个 Agent 发送事件到 Topic，下游 Agent 消费。没有 Agent-to-Agent 直接调用或委托。
+**复现命令：**
+```bash
+grep -cE "set_(governance_guard|data_guard|approval_service|explainability_engine)" \
+  agents/src/orchestrator/router.py   # 44
+```
+
+- 23 个 Kafka Topic 通过 `self.routes: Dict[str, Callable]` 映射到 handler 方法
+
+**复现命令：**
+```bash
+grep -c "crm\." agents/src/orchestrator/config.py   # 23
+```
+
+- **没有**：依赖注入容器、Agent 注册表/发现机制、装饰器注册、动态路由、工厂模式
+
+**Agent 间通信存在两种模式，而非仅 Kafka：**
+
+1. **进程内顺序调用** — Router handler 方法在同一进程内依次调用多个 Agent 的领域方法（如 `_handle_deal_created` 中先 `journey_agent.process()` 再 `sales_agent.analyze_deal()` 再 `compliance_agent.validate_data()`）。调用结果通过返回值传递，但 Router 不检查下游 Agent 的返回值来决定是否继续。
+
+2. **Kafka 跨业务流程事件传播** — Agent 通过 `BaseAgent.emit_event()` 发送 CloudEvents 到 Kafka Topic，由其他 Consumer 或后续事件触发新的消费。
+
+**当前真正缺少的是：动态 Handoff（运行时决定委托给谁）、共享任务状态（多 Agent 可读写同一任务上下文）、结构化结果依赖（声明式"B 依赖 A 的输出"）、以及重规划（Plan → 执行 → 发现缺口 → 修订 Plan）。**
 
 ### 1.3 Agent 调用模式
 
-Router 的 handler 方法直接调用 Agent 的**领域特定方法**，而非通过 `process()` 抽象接口：
+Router 的 handler 方法**多数**直接调用 Agent 的领域特定方法，少数通过 `process()` 抽象接口。
 
-```python
-# router.py _handle_lead_created()
-await self.sales_agent.qualify_lead(event)        # 直接调用
-await self.compliance_agent.validate_data(event)   # 直接调用
+`process()` 调用统计（共 7 处）：
 
-# router.py _handle_deal_created()
-await self.journey_agent.process(event)            # 唯一走抽象接口的调用
-await self.sales_agent.analyze_deal(event)         # 直接调用
-await self.compliance_agent.validate_data(event)   # 直接调用
+**复现命令：**
+```bash
+grep -n "\.process(" agents/src/orchestrator/router.py
 ```
 
-**关键发现：`BaseAgent.process()` 抽象方法定义存在，但 Router 从不通过它调用核心 Agent。** 仅 `JourneyAgent` 通过 `process()` 被调用。
+- `JourneyAgent.process()` — 在 6 个 handler 中被调用（ticket_created、ticket_updated、deal_created、deal_stage_changed、deal_updated/deal_closed/sla-breached/customers/payments 共用 handler、approval_decision）
+- `PredictiveAnalyticsAgent.process()` — 在 1 个 handler 中被调用（journey_updated）
+
+```python
+# router.py _handle_deal_created() — 混合调用模式
+await self.productivity_signals_agent.ingest_event(...)  # 领域方法
+await self.journey_agent.process(event)                   # 抽象接口
+await self.sales_agent.analyze_deal(event)                # 领域方法
+await self.compliance_agent.validate_data(event, ...)     # 领域方法
+```
+
+**关键发现：`BaseAgent.process()` 抽象方法存在，但仅有 JourneyAgent 和 PredictiveAnalyticsAgent 通过它被调用。** 核心 Agent（Sales、Support、Compliance、Analytics）的 `process()` 实现虽然存在，Router 却绕过它直接调用领域方法。
 
 ### 1.4 LangGraph 使用情况
 
-仓库中共有 **12 个 LangGraph 图**，全部为 `StateGraph`：
+仓库中共有 **至少 12 个 LangGraph 图**（`StateGraph` 实例），分布在 11 个文件中（`i18n/graph.py` 包含 2 个图）。
+
+**复现命令：**
+```bash
+grep -rn "StateGraph(" agents/src/ --include="*.py"   # 12 处
+```
 
 | 模块 | 图 | 节点数 | 模式 |
 |---|---|---|---|
@@ -87,11 +124,40 @@ await self.compliance_agent.validate_data(event)   # 直接调用
 
 **关键缺失：**
 - ❌ **无 Checkpointer** — 所有图 `compile()` 均未传入 `checkpointer` 参数
+
+**复现命令：**
+```bash
+grep -rn "checkpointer\|MemorySaver\|SqliteSaver\|PostgresSaver" agents/src/ --include="*.py"
+# (no matches)
+```
+
 - ❌ **无 Interrupt** — 所有图均未使用 `interrupt_before`/`interrupt_after`
-- ❌ **无 MemorySaver** / `SqliteSaver` / `PostgresSaver`
+
+**复现命令：**
+```bash
+grep -rn "interrupt_before\|interrupt_after\|\.interrupt" agents/src/ --include="*.py"
+# (no matches)
+```
+
 - ❌ **无条件边** — 所有图为严格线性 DAG，无分支、循环
 - ❌ **无 Supervisor Graph** — 没有多 Agent 协调图模式
-- ❌ **无 Run Trace** — 没有使用 LangGraph 的 `Command` streaming 或 tracing
+
+**关于 Run Trace 的准确描述：**
+
+已有基础设施：
+- ✅ **OpenTelemetry** — `agents/requirements.txt` 包含 `opentelemetry-api>=1.21.0`、`opentelemetry-sdk>=1.43.0`；Gateway 有 `@opentelemetry/auto-instrumentations-node`
+- ✅ **Agent Decision 记录** — `ExplainabilityEngine` 将每次 Agent 决策写入 `agent_decisions` 表（含 reasoning、evidence、tool_calls、approval_id、correlation_id）
+- ✅ **Agent Event 记录** — `AgentEvent` 表记录事件类型、推理、置信度、审批状态
+- ✅ **Agent Task 记录** — `AgentTask` 表记录任务状态、输入/输出、correlation_id
+- ✅ **审计日志** — `audit_logs` 表记录所有写操作
+
+**缺少的是统一的多智能体 Trace：**
+- ❌ 无 Run/DAG 级别 Trace（一次 Objective → Completion 的完整图遍历记录）
+- ❌ 无 Task/Handoff 级别 Trace（Supervisor→Specialist→Reviewer→Executor 的委托链）
+- ❌ 无 Replan 记录（初始 Plan vs 修订 Plan 的 diff）
+- ❌ 无 Token/Cost 归因（每次 LLM 调用的 token 消耗归属于哪个 Task/Agent/Step）
+- ❌ 无 Checkpoint Trace（LangGraph 状态快照与业务事件的关联）
+- ❌ 现有 OpenTelemetry 未与 Agent 决策链路打通
 
 **LangGraph 当前本质上是顺序管道编排器**——相同的功能可以用 `async/await` 函数组合实现。
 
@@ -99,38 +165,66 @@ await self.compliance_agent.validate_data(event)   # 直接调用
 
 **单一边界**：`intelligence/providers.py` 提供 `create_chat_model()` 和 `create_embeddings()` 工厂函数。
 
+**复现命令：**
+```bash
+grep -n "def create_chat_model\|def create_embeddings" agents/src/intelligence/providers.py
+# create_chat_model (line 158), create_embeddings (line 185)
+```
+
 | 特性 | 状态 |
 |---|---|
 | 支持 Provider | `ollama`（默认）、`nvidia_nim` |
 | 切换方式 | `AI_PROVIDER` 环境变量 |
-| Ollama 默认启用 | ❌ 否 — docker-compose.profiles: `["local-llm"]` |
-| Ollama 隐式依赖 | ❌ 否 — 通过 factory 抽象，切换后无需改业务代码 |
-| 参数名误导 | ⚠️ 部分构造函数参数名为 `ollama_url`，但功能上安全 |
-| ChatOpenAI 使用 | 仅在 `AI_PROVIDER=nvidia_nim` 时延迟导入 |
-| AzureOpenAI | ❌ 不存在 |
+| Ollama 服务默认启动 | ❌ 否 — docker-compose.profiles: `["local-llm"]`，需 `docker compose --profile local-llm up -d ollama` |
+| Chat Model 延迟创建 | ✅ 是 — `BaseAgent.call_llm()` 中首次调用时 `self._llm = create_chat_model(temperature=0)` |
+| 运行时默认 `AI_PROVIDER` | ⚠️ 仍为 `ollama`（`config.py` 第 45 行 `os.getenv("AI_PROVIDER", "ollama")`） |
+| 首次模型调用可能连接未启动的 Ollama | ⚠️ 是 — 若 `AI_PROVIDER=ollama`（默认）但 Ollama 容器未启动，`ChatOllama.ainvoke()` 将因连接拒绝失败 |
+| 历史检索模块 Ollama 专用命名 | ⚠️ 存在 — 多个模块的构造函数参数名为 `ollama_url`，且部分模块绕过 Settings 直接读取 `OLLAMA_*` 环境变量 |
 
-**结论：Ollama 仅在显式启用 `local-llm` profile 时启动，代码不硬编码连接 Ollama。**
+**绕过 Provider 边界直接读取 Ollama 环境变量的位置（隐式耦合）：**
+
+**复现命令：**
+```bash
+grep -rn "os.getenv.*OLLAMA\|os.environ.*OLLAMA" agents/src/ --include="*.py"
+```
+
+| 文件 | 直接读取的变量 | 风险 |
+|---|---|---|
+| `intelligence/chat/chat_agent.py:47` | `OLLAMA_EMBED_MODEL` | 绕过 `settings` 和 `create_embeddings()` |
+| `intelligence/knowledge/knowledge_agent.py:43` | `OLLAMA_EMBED_MODEL` | 同上 |
+| `intelligence/search/search_agent.py:47` | `OLLAMA_EMBED_MODEL` | 同上 |
+| `orchestrator/main.py:474` | `OLLAMA_EMBED_MODEL` | 同上 |
+| `intelligence/i18n/voice_ingest.py:51` | `OLLAMA_URL` | 直接拼接 Whisper API URL |
+| `intelligence/i18n/voice_ingest.py:87-88` | — | `_transcribe_ollama()` 硬编码 Ollama multimodal 端点 |
+
+**结论：Ollama 服务默认不启动；Chat Model 通过延迟 Provider Factory 创建；但运行时默认 `AI_PROVIDER` 仍为 `ollama`；首次真实模型或 Embedding 调用可能连接未启动的 Ollama；部分历史检索模块仍保留 Ollama 专用配置命名和直接环境变量读取。**
 
 ### 1.6 治理链路总览
 
 | 组件 | 位置 | 实现 |
 |---|---|---|
 | **Kill Switch** | `agents/governance/kill_switch.py` + `gateway/routes/governance.ts` | Redis 4 作用域（global/tenant/agent/tenant-agent），pub/sub 通知 |
-| **OPA 策略** | `policies/*.rego`（10 个文件） | 每次请求 3 策略并行检查（tenant_isolation + rbac + abac） |
+| **OPA 策略** | `policies/*.rego`（至少 11 个文件） | 每次请求 3 策略并行检查（tenant_isolation + rbac + abac） |
 | **审批流程** | `agents/governance/approval_service.py` + `gateway/routes/approvals.ts` + `policies/agents/approval.rego` | Redis 待处理队列 + Kafka `crm.approvals.required/decision` 事件 |
-| **RLS** | `database/migrations/02-rls-policies.sql` | 32+ 表 `FORCE ROW LEVEL SECURITY`，`app.tenant_id` 上下文 |
+| **RLS** | `database/migrations/02-rls-policies.sql` | 至少 33 张表 `FORCE ROW LEVEL SECURITY`，`app.tenant_id` 上下文 |
 | **审计链路** | `gateway/middleware/audit.ts` → Kafka → `consumers/auditEvents.ts` → `audit_logs` 表 | 写操作捕获（请求体已脱敏），幂等写入 |
 | **Explainability** | `agents/governance/explainability.py` → `agent_decisions` 表 | 每次 Agent 决策记录 reasoning + evidence + tool_calls |
 | **Data Guard** | `agents/governance/data_guard.py` | 客户/用户 opt-out 检查，软删除感知 |
 | **Input Safety** | `agents/governance/input_safety.py` | 不可信文本评估（注入检测） |
+
+**复现命令：**
+```bash
+find policies/ -name "*.rego" -type f | wc -l                              # 11
+grep -Ec "^\s+'[a-z_]+'" database/migrations/02-rls-policies.sql           # 33
+```
 
 ### 1.7 Agent 输出 Schema
 
 **没有统一的 Agent 输出 Schema。**
 
 - `BaseAgent.process()` 返回 `Dict[str, Any]`，各 Agent 返回异构字典
-- 通用状态字段：`status` ∈ {`completed`, `failed`, `denied`, `skipped`, `pending_approval`}
-- Kafka 事件使用 CloudEvents 1.0 信封（标准化）
+- 通用状态字段（非强制）：`status` ∈ {`completed`, `failed`, `denied`, `skipped`, `pending_approval`}
+- Kafka 事件使用 CloudEvents 1.0 信封（标准化，在 `BaseAgent.emit_event()` 中构建）
 - **仅 2 个 Agent 使用 Pydantic 进行 LLM 输出验证**（不是 Agent 自身返回值）：
   - `SupportAgent` → `ResolutionSuggestion`, `ResolutionStep`
   - `AnalyticsAgent` → `ForecastResult`, `ForecastPrediction`
@@ -161,14 +255,14 @@ await self.compliance_agent.validate_data(event)   # 直接调用
 
 经源码核实，以下能力**仅在 README/文档中提及，未在代码中实现**：
 
-| 声称的能力 | 实际状态 |
-|---|---|
-| "LangGraph 多 Agent 协作" | LangGraph 仅用作线性管道，无 Supervisor/AgentNode |
-| "Agent 协作工作流" | 实际是 AgentRouter 手动串联 Agent 调用，Agent 间无直接通信 |
-| "Checkpointer/持久化状态" | 不存在 — 所有图 `compile()` 无 checkpointer |
-| "Human-in-loop via LangGraph interrupt" | 不存在 — 审批通过 Kafka 事件 + Redis 队列实现，非 LangGraph interrupt |
-| "Agent 动态发现/注册" | 不存在 — 全部手动硬编码实例化 |
-| "统一 Agent 输出 Schema" | 不存在 — 各 Agent 返回异构 dict |
+| 声称的能力 | 实际状态 | 验证命令 |
+|---|---|---|
+| "LangGraph 多 Agent 协作" | LangGraph 仅用作线性管道，无 Supervisor/AgentNode | `grep -rn "StateGraph(" agents/src/` — 12 个图全部为单图线性 DAG |
+| "Agent 协作工作流" | 实际是 AgentRouter 手动串联 Agent 调用，Agent 间无直接通信 | `grep -rn "class.*Agent(BaseAgent)"` — 无 Supervisor 或 Delegator 模式 |
+| "Checkpointer/持久化状态" | 不存在 — 所有图 `compile()` 无 checkpointer | `grep -rn "checkpointer\|MemorySaver\|SqliteSaver\|PostgresSaver" agents/src/` — no matches |
+| "Human-in-loop via LangGraph interrupt" | 不存在 — 审批通过 Kafka 事件 + Redis 队列实现，非 LangGraph interrupt | `grep -rn "interrupt_before\|interrupt_after" agents/src/` — no matches |
+| "Agent 动态发现/注册" | 不存在 — 全部手动硬编码实例化 | `grep -rn "register\|Registry\|discover" agents/src/orchestrator/` — 无 Agent 注册机制 |
+| "统一 Agent 输出 Schema" | 不存在 — 各 Agent 返回异构 dict | `grep -rn "class.*Response\|AgentOutput\|AgentResult" agents/src/agents/` — 无统一 BaseModel |
 
 ---
 
@@ -224,22 +318,30 @@ gateway/src/routes/governance.ts       # Kill Switch 控制
 policies/common/tenant_isolation.rego  # 租户隔离
 policies/common/rbac.rego              # 角色权限
 policies/common/abac.rego              # 属性访问控制
+policies/common/tenant.rego            # 租户匹配
 policies/agents/core.rego              # Agent 能力定义
 policies/agents/approval.rego          # 审批阈值
 policies/approval.rego                 # 通用审批
 policies/knowledge.rego                # 知识库治理
 policies/twins.rego                    # 数字孪生治理
 policies/devx.rego                     # DevX 治理
+policies/tests/tenant_isolation_test.rego  # 租户隔离测试
 ```
+**精确数量：11 个 .rego 文件**
 
 ### 3.7 数据库
 ```
-gateway/prisma/schema.prisma           # 36 个 Prisma 模型
+gateway/prisma/schema.prisma           # 35 个 Prisma 模型
 database/migrations/01-core-tables.sql # 核心表
-database/migrations/02-rls-policies.sql# RLS 策略 (32+ 表)
+database/migrations/02-rls-policies.sql# RLS 策略（33 张表）
 database/migrations/09-agent-decisions.sql # Agent 决策表
 database/migrations/10-data-governance.sql # 数据治理
 database/migrations/11-intelligence-twins.sql # 智能与数字孪生
+```
+**复现命令：**
+```bash
+grep -c "^model " gateway/prisma/schema.prisma                        # 35
+grep -Ec "^\s+'[a-z_]+'" database/migrations/02-rls-policies.sql      # 33
 ```
 
 ### 3.8 评测
@@ -254,7 +356,7 @@ agents/src/intelligence/evaluation/evaluate_workflow_trace.py # Trace 评测 CLI
 
 ### 3.9 Docker / 配置
 ```
-docker-compose.yml                     # 20 个服务（含 profile-gated ollama）
+docker-compose.yml                     # 约 20 个服务（含 profile-gated ollama）
 .env.example                           # 环境变量模板
 ```
 
@@ -268,13 +370,13 @@ docker-compose.yml                     # 20 个服务（含 profile-gated ollama
 |---|---|---|
 | CloudEvents 1.0 事件信封 | ✅ 高 | 标准化，包含 tenantid + correlationid |
 | `BaseAgent` 治理 setter 模式 | ✅ 高 | 可改为 DI 容器以消除硬编码 |
-| `providers.py` Provider 边界 | ✅ 高 | 干净抽象，支持新增 Provider |
+| `providers.py` Provider 边界 | ✅ 高 | 干净抽象，支持新增 Provider；但存在绕过边界的直接 env var 读取 |
 | `AgentKillSwitch` (Redis) | ✅ 高 | 4 作用域完整实现 |
 | OPA 3 策略并行检查 | ✅ 高 | `agents/core.rego` 可直接扩展 |
 | `ApprovalService` (Redis 队列) | ✅ 高 | 人在回路基础设施完整 |
 | `ExplainabilityEngine` (PG) | ✅ 高 | 决策记录 Schema 完整 |
-| `AgentDecision` / `AgentEvent` / `AgentTask` 表 | ✅ 高 | 可直接用于 Trace 存储 |
-| RLS (32+ 表) | ✅ 高 | 无需修改 |
+| `AgentDecision` / `AgentEvent` / `AgentTask` 表 | ✅ 高 | 可作为 Run Evidence 存储基础 |
+| RLS（33 张表） | ✅ 高 | 无需修改 |
 | 审计中间件 + audit_logs 表 | ✅ 高 | 无需修改 |
 | `HybridRetriever` (结构化+语义+知识) | ✅ 中 | RAG 基础存在 |
 | 评测 Runner 框架 | ✅ 中 | 可扩展评测维度 |
@@ -285,13 +387,14 @@ docker-compose.yml                     # 20 个服务（含 profile-gated ollama
 |---|---|---|
 | Agent 注册表/发现 | ❌ 手动实例化 | `AgentRegistry` 或 DI 容器 |
 | 统一 Agent 输出 Schema | ❌ 异构 dict | Pydantic `AgentResponse` |
+| AI_MODE 运行边界 | ❌ 仅 AI_PROVIDER 切换 | `AI_MODE` (none/static/supervisor) 控制 Agent 行为模式 |
 | Supervisor 路由逻辑 | ❌ 手动 handler | Supervisor Agent + LangGraph StateGraph |
-| Specialist 委托模式 | ❌ Router 直接调用 | Specialist Agent 注册 + 能力匹配 |
-| Reviewer 验证模式 | ❌ 不存在 | Reviewer Agent + OPA/合同检查 |
-| Executor 安全执行 | ❌ 部分（approval 后 emit_event） | 受控 Executor，带 approve-gate |
-| LangGraph Checkpointer | ❌ 不存在 | PostgresSaver / MemorySaver |
+| Specialist 委托模式 | ❌ Router 直接调用 | Specialist 注册 + 能力匹配 |
+| Reviewer 验证模式 | ❌ 不存在（ComplianceAgent ≠ Reviewer） | 独立 Reviewer：Evidence Grounding、完整性、冲突和 Action 校验 |
+| GovernedExecutor 安全执行 | ❌ 部分（approval 后 emit_event） | 独立受控 Executor，带 approve-gate |
+| LangGraph Checkpointer | ❌ 不存在 | PostgresSaver |
 | LangGraph Interrupt | ❌ 不存在 | 人在回路中断点 |
-| Run Trace | ❌ 不存在 | LangGraph tracing 或自定义 |
+| 统一多 Agent Run Trace | ❌ 分散在 OTel/Decision/Event/Task/Audit | 单一 Run/DAG/Task/Handoff/Replan/Token/Cost/Checkpoint Trace |
 | Agent 输出质量评测 | ❌ 不存在 | LLM Judge / 对比评测 |
 | 多 Agent Trace 评测 | ⚠️ 仅合同评分 | 端到端工作流正确性 |
 
@@ -301,27 +404,59 @@ docker-compose.yml                     # 20 个服务（含 profile-gated ollama
 
 | # | 风险 | 严重程度 | 描述 |
 |---|---|---|---|
-| R1 | **循环依赖** | 中 | 若 Supervisor 调用 Specialist 而 Specialist 回调 Supervisor，需在设计层面禁止回环。当前 AgentRouter 是单向的，改造后需显式禁止。 |
-| R2 | **同步/异步边界** | 中 | Kafka 消费者是异步的，LangGraph StateGraph 需要同步状态传递。若在图中调用 `await producer.send()`，需要确保状态持久化与事件发送的一致性。 |
-| R3 | **Kafka 与 LangGraph 状态冲突** | 高 | 当前 Agent 通过 Kafka 事件通信，LangGraph Checkpointer 通过 PG 持久化状态。若两者不同步（图状态已更新但事件未发出），会导致状态不一致。需实现事务性发件箱（已有 OutboxEvent 表可供复用）。 |
-| R4 | **数据库 Schema 重复** | 低 | 已有 `agent_tasks`、`agent_events`、`agent_decisions` 表。新增 Supervisor trace 表时注意与现有表字段关系，避免重复。 |
-| R5 | **Provider 耦合** | 中 | `create_chat_model()` 当前返回 LangChain `BaseChatModel`。若 Specialist 需要不同的 temperature/model 配置，需扩展 factory 而非新增 Provider 依赖。 |
+| R1 | **循环依赖** | 中 | 若 Supervisor 调用 Specialist 而 Specialist 回调 Supervisor，需在设计层面禁止回环。 |
+| R2 | **同步/异步边界** | 中 | Kafka 消费者是异步的，LangGraph StateGraph 需要同步状态传递。 |
+| R3 | **Kafka 与 LangGraph 状态一致性** | **高** | 顺序双写（先写 Checkpoint 再写 Outbox）不具备原子性。需设计 Proposal Hash、Idempotency Key、Outbox、执行后验证和必要的事务方案。 |
+| R4 | **数据库 Schema 重复** | 低 | 已有 `agent_tasks`、`agent_events`、`agent_decisions` 表。新增 Checkpoint 和 Trace 表时需明确四类存储的不同语义（见 implementation-map.md §存储分类）。 |
+| R5 | **Provider 耦合** | 中 | 部分模块绕过 `create_chat_model()` 直接读取 `OLLAMA_*` 环境变量；扩展 Provider 时需先统一入口。 |
 | R6 | **测试环境依赖** | 中 | 现有测试依赖 Docker Compose（Postgres、Redis、OPA），新增测试需保持同等隔离级别。 |
-| R7 | **前端 API 兼容性** | 低 | `GET /api/v1/agents` 和 `GET /api/v1/agents/workflows/recent` 返回的字段需保持向后兼容。若新增 Supervisor Agent 类型，前端 Agent 卡片需支持新 type。 |
-| R8 | **治理注入冗余** | 中 | 当前 44 行 setter 注入难以维护。若新增 Specialist 类型，需改为注册时自动注入。 |
-| R9 | **Agent ID 冲突** | 低 | 新增 Agent 的 `agent_id` 需保持唯一，建议使用注册表统一管理。 |
-| R10 | **OPA 策略盲区** | 中 | 当前 OPA 策略仅覆盖 4 个核心 Agent 的能力。新增 Specialist/Executor 需在 `policies/agents/core.rego` 中注册能力。 |
+| R7 | **前端 API 兼容性** | 低 | `GET /api/v1/agents` 返回字段需保持向后兼容。 |
+| R8 | **治理注入冗余** | 中 | 当前 44 行 setter 注入难以维护；Router DI 迁移应作为独立、可回归测试的改动。 |
+| R9 | **Agent ID 冲突** | 低 | 新增 Agent 的 `agent_id` 需保持唯一，通过注册表统一管理。 |
+| R10 | **OPA 策略盲区** | 中 | OPA 策略仅覆盖 4 个核心 Agent 的能力注册，新增角色需同步更新。 |
+| R11 | **无限循环与成本失控** | **高** | Supervisor → Specialist → Reviewer → Replan 循环若无 max_iterations 和 token 预算上限，可能导致无限循环和成本失控。 |
+| R12 | **并行竞态与部分失败** | **高** | 多个 Specialist 并行执行时，若部分成功部分失败，Supervisor 需处理部分结果合并、回滚和重试。 |
+| R13 | **Tenant Context 与 Foreign Evidence** | **高** | Specialist 检索和 Reviewer 验证时必须强制 tenant 隔离；跨租户证据泄露是安全红线。 |
+| R14 | **审批后 Proposal 篡改** | 中 | 审批通过后、Executor 执行前，Proposal 的 payload 若被修改可导致越权操作。需 Proposal Hash 校验。 |
+| R15 | **Kafka Replay 和重复副作用** | 中 | Kafka 消息重放时，若 Supervisor Graph 重新执行，可能产生重复的 emit_event 副作用。需 Idempotency Key。 |
+| R16 | **Shadow Mode 双执行** | 中 | 迁移阶段可能需要 Shadow Mode（旧路径和新路径并行执行、比对结果但仅旧路径生效），增加复杂度。 |
+| R17 | **Checkpoint 数据保留 / GDPR** | 中 | LangGraph Checkpoint 包含用户输入和 Agent 推理，属于 PII 范畴；需与现有 DataGuard 和 GDPR 擦除流程对齐。 |
+| R18 | **Prompt / Schema / Registry 版本漂移** | 中 | Specialist 的 system prompt、AgentResponse Schema、AgentRegistry 能力声明三者需要版本同步，否则 Supervisor 可能选择错误的 Specialist。 |
+| R19 | **Trace PII 与高基数指标** | 中 | Run Trace 中的 prompt 和 response 内容可能包含 PII；Agent ID × Tenant ID × Task ID 的指标组合可能导致 Prometheus 高基数问题。 |
+| R20 | **Reviewer 相关性错误** | 中 | Reviewer 的合同检查必须与 Specialist 的实际产出相关——检查错误的合同条款或遗漏关键约束都会导致 Reviewer 失职。 |
+| R21 | **Live Model 非确定性** | 中 | 同一输入、同一 LLM 可能产生不同输出；Supervisor 的意图分类和 Reviewer 的质量判断都可能不稳定。 |
+| R22 | **P95 延迟与单位任务成本** | 中 | Supervisor → 多个 Specialist → Reviewer → Executor 的串行链路可能导致单任务延迟远超现有 Kafka handler 的 P95。 |
+| R23 | **Agent Capability 与 Tool 权限不一致** | 中 | Specialist 声明的 capability 与其实际可调用的 Tool/API 权限若不一致，可能导致运行时错误或安全问题。 |
 
 ---
 
 ## 6. 建议的后续实施顺序
 
-基于风险评估，建议：
+基于风险评估和依赖关系，建议调整原有顺序为：
 
-1. **Phase 0 — 基线保护**：添加 Agent 输出 Pydantic Schema + Agent 注册表。不改行为。
-2. **Phase 1 — 状态基础设施**：LangGraph PostgresSaver + Checkpointer + Run Trace。不改编排逻辑。
-3. **Phase 2 — 角色引入**：Supervisor + Specialist + Reviewer Agent 基类。与现有 Agent 并行运行。
-4. **Phase 3 — 迁移**：将现有 Router 逻辑迁移到 Supervisor Graph。渐进式替换。
-5. **Phase 4 — 评测扩展**：LLM Judge + 多 Agent Trace 评测。
+| Phase | 名称 | 核心交付 | 依赖 |
+|---|---|---|---|
+| **Phase 1** | AI_MODE 和 Provider 运行边界 | `AI_MODE` 环境变量；统一所有 `OLLAMA_*` env var 读取到 Provider 边界；Provider 健康检查 | 无 |
+| **Phase 2** | Contracts 和未接线的 Agent Registry | `AgentResponse` Schema；`AgentRegistry`（不替换 Router DI）；`SpecialistCapability` 声明 | Phase 1 |
+| **Phase 3** | Complexity Gate、Planner 和 Plan Validator | 请求复杂度评估；Plan 生成器；Plan 结构验证器（确定性规则） | Phase 2 |
+| **Phase 4** | 旗舰场景 5 个 Specialist Adapter | Customer Context、Support、Sales、Knowledge、Analytics Adapter | Phase 2 + 3 |
+| **Phase 5** | 独立入口的 Supervisor Graph | `POST /api/agents/objectives` 或 `crm.agent.objective.requested` Topic；Supervisor StateGraph | Phase 3 + 4 |
+| **Phase 6** | Reviewer 和有限 Replan | Reviewer Agent（Evidence Grounding、完整性、冲突、Action 校验）；最多 1 次 Replan | Phase 5 |
+| **Phase 7** | Postgres Checkpointer、Human Approval、GovernedExecutor 和 Verify | PostgresSaver；Interrupt + 审批；GovernedExecutor（approve-gate + verify）；Proposal Hash 校验 | Phase 6 |
+| **Phase 8** | Run Trace 和确定性 Demo | 统一 Run/DAG/Task/Handoff/Token/Cost/Checkpoint Trace；可重复的端到端演示 | Phase 7 |
+| **Phase 9** | 三组评测 | Single Agent 回归评测；Static Workflow 评测；Supervisor Multi-Agent 端到端评测 | Phase 8 |
 
-**当前阶段完成后建议的下一步：Phase 0（基线保护），因为它是无破坏性的基础改造。**
+**重要说明：**
+- Router DI 迁移不作为 Phase 2 的一部分；它是独立、可回归测试的改动，在 Phase 4 之后评估。
+- Phase 5 的 Supervisor 入口是**新增独立路径**，不影响现有 `AgentRouter.route()`。
+- 固定事件、SLA、审批结果、审计和生命周期更新**继续走现有 Deterministic Kafka Handler 路径**，不迁移。
+
+---
+
+## 7. 尚未解决的开放架构问题
+
+1. **双写原子性** — Checkpoint 写入 PG 和事件发送到 Kafka 无法在同一事务中完成。方案方向：Proposal Hash + Idempotency Key + Outbox 轮询 + 执行后 Verify，但具体实现待设计。
+2. **Checkpoint 数据保留与 GDPR** — LangGraph Checkpoint 的 PII 擦除策略与现有 `DataGuard` / GDPR forget 流程的集成方式待定。
+3. **Supervisor 入口的 AuthN/AuthZ** — 新增入口的认证授权粒度（Objective 级别的 OPA 策略）待设计。
+4. **多 Agent 评测数据集** — Phase 9 的端到端评测用例和 ground truth 标注方案待定。
+5. **Feature Flag 粒度** — 开关控制从简单的 `AI_MODE` 逐步演进到 per-tenant per-topic 的细粒度控制。

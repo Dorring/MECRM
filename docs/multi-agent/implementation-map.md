@@ -2,39 +2,83 @@
 
 > **基线:** 2026-07-20 审计 (`docs/multi-agent/current-state-audit.md`)
 > **目标:** 从"并列 Agent"升级为"具备 Supervisor、Specialist、Reviewer、受控 Executor 和可量化评测的企业级多智能体应用"
-> **原则:** 不重构现有 Agent、不修改业务代码、不破坏运行路径
+> **核心原则:** 两条路径长期共存 — Deterministic Kafka Handler 不迁移、Supervisor Multi-Agent 为独立新入口
 
 ---
 
 ## 1. 目标架构概述
 
+### 1.1 两条长期共存的执行路径
+
 ```
-┌─────────────────────────────────────────────────────┐
-│                   Kafka Event Bus                    │
-└──────────┬──────────────────────────────────────────┘
-           │
-    ┌──────▼──────┐
-    │  Supervisor  │  ← 新：LangGraph StateGraph
-    │  Agent       │    含 Checkpointer + Interrupt
-    └──┬───┬───┬──┘
-       │   │   │
-  ┌────▼┐ ┌▼──┐ ┌▼─────┐
-  │Spec │ │Spc│ │Spec   │  ← 迁移：现有 Agent 通过 Adapter 复用
-  │Sales│ │Sup│ │Compl  │
-  └──┬──┘ └┬──┘ └──┬───┘
-     │      │       │
-  ┌──▼──────▼───────▼──┐
-  │     Reviewer        │  ← 新：合同检查 + OPA + 质量评分
-  └────────┬───────────┘
-           │
-  ┌────────▼───────────┐
-  │  Executor (gated)   │  ← 新：approve-gate → emit_event
-  └─────────────────────┘
-           │
-  ┌────────▼───────────┐
-  │  Evaluation Layer   │  ← 扩展：LLM Judge + Trace 评测
-  └─────────────────────┘
+                        ┌─────────────────────────┐
+                        │     Kafka Event Bus      │
+                        └─────┬──────────────┬─────┘
+                              │              │
+              ┌───────────────▼──┐   ┌───────▼────────────────┐
+              │  Deterministic   │   │  Supervisor Multi-Agent │
+              │  Kafka Handler   │   │  Graph (独立入口)        │
+              │  (保持不变)        │   │                         │
+              │                  │   │  POST /api/agents/       │
+              │  固定事件/SLA/    │   │    objectives            │
+              │  审批/审计/       │   │  或                       │
+              │  生命周期更新      │   │  crm.agent.objective     │
+              │                  │   │    .requested Topic       │
+              └──────────────────┘   └─────┬───────────────────┘
+                                           │
+                              ┌────────────▼────────────┐
+                              │    Complexity Gate       │  ← Phase 3
+                              │    (simple → handler     │
+                              │     complex → graph)     │
+                              └────────────┬────────────┘
+                                           │
+                              ┌────────────▼────────────┐
+                              │    Planner + Plan        │  ← Phase 3
+                              │    Validator             │
+                              └────────────┬────────────┘
+                                           │
+                    ┌──────────────────────┼──────────────────────┐
+                    │                      │                      │
+            ┌───────▼──────┐    ┌─────────▼──────┐    ┌──────────▼──────┐
+            │  Specialist   │    │   Specialist    │    │   Specialist     │
+            │  (5 个旗舰)    │    │   (5 个旗舰)     │    │   (5 个旗舰)      │
+            └───────┬──────┘    └─────────┬──────┘    └──────────┬──────┘
+                    │                      │                      │
+                    └──────────────────────┼──────────────────────┘
+                                           │
+                              ┌────────────▼────────────┐
+                              │       Reviewer           │  ← Phase 6
+                              │  (Evidence Grounding,    │
+                              │   完整性, 冲突, Action)    │
+                              └────────────┬────────────┘
+                                           │
+                              ┌────────────▼────────────┐
+                              │   GovernedExecutor       │  ← Phase 7
+                              │  (approve-gate → verify) │
+                              └─────────────────────────┘
 ```
+
+### 1.2 两条路径的分工
+
+| 事件类型 | 走 Deterministic Kafka Handler | 走 Supervisor Graph |
+|---|---|---|
+| `crm.leads.created` (单实体 CRUD 触发) | ✅ | — |
+| `crm.tickets.sla-breached` (SLA 报警) | ✅ | — |
+| `crm.approvals.decision` (审批结果) | ✅ | — |
+| `crm.audit.events` (审计事件) | ✅ | — |
+| `crm.deals.closed` (生命周期) | ✅ | — |
+| "分析客户续约意向，生成挽留方案" (跨域目标) | — | ✅ |
+| "评估本月销售 Pipeline 健康度" (综合判断) | — | ✅ |
+| "排查某客户投诉升级原因" (根因分析) | — | ✅ |
+
+### 1.3 独立入口
+
+Supervisor Multi-Agent 通过**新增独立入口**进入，不修改 `AgentRouter.route()`：
+
+- `POST /api/agents/objectives` — HTTP API，接受 `{objective, context, constraints}`，返回 `{run_id}`
+- `crm.agent.objective.requested` — Kafka Topic，异步入口
+
+**现有 `AgentRouter.route()` 不无条件进入 Supervisor。**
 
 ---
 
@@ -42,321 +86,339 @@
 
 ### 2.1 Agent 映射
 
-| 现有模块 | 目标角色 | 映射方式 | 说明 |
+| 现有模块 | 目标角色 | 映射方式 | Phase |
 |---|---|---|---|
-| `SalesAgent` | **Specialist:Sales** | Adapter 包装 | 保留 `qualify_lead`、`analyze_deal`、`recommend_next_action`；通过 `SalesSpecialistAdapter` 暴露统一 `process(event) -> AgentResponse` |
-| `SupportAgent` | **Specialist:Support** | Adapter 包装 | 保留 `triage_ticket`、`suggest_resolution`；`SupportSpecialistAdapter` 统一接口 |
-| `ComplianceAgent` | **Specialist:Compliance** + **Reviewer 基础** | 双重角色 | `validate_data` 既是 Specialist 能力，也是 Reviewer 的验证逻辑来源 |
-| `AnalyticsAgent` | **Specialist:Analytics** | Adapter 包装 | 保留 `track_*`、`generate_forecast` 方法 |
-| `ProductivitySignalsAgent` | **Specialist:Productivity** | Adapter 包装 | `ingest_event` 能力 |
-| `ProductivityAgent` | **Specialist:Productivity** | Adapter 包装 | `handle_signal` 能力 |
-| `JourneyAgent` | **Specialist:Journey** | Adapter 包装 | `process` 已符合抽象接口 |
-| `PredictiveAnalyticsAgent` | **Specialist:PredictiveAnalytics** | Adapter 包装 | 预测能力 |
-| `AutomationSimulationAgent` | **Specialist:Automation** | Adapter 包装 | 模拟能力 |
-| `AutomationExecutorAgent` | **Executor 基础** | 直接升级 | 已有 `execute` 语义，升级为受控 Executor |
-| `KnowledgeAgent` | **Specialist:Knowledge** | Adapter 包装 | KB 管理能力 |
-| `ChatAgent` (HTTP) | **Specialist:Chat** | Adapter 包装 | 对话能力，HTTP 接口保持不变 |
-| `SearchAgent` (HTTP) | **Specialist:Search** | Adapter 包装 | 检索能力，HTTP 接口保持不变 |
-| `ComplianceIntelligenceAgent` (HTTP) | **Specialist:AuditSearch** | Adapter 包装 | 审计搜索，HTTP 接口保持不变 |
-| `AgentRouter` | **Supervisor（部分保留）+ Router（部分废弃）** | 拆分 | 见 2.2 |
-| **不存在** | **Supervisor Agent** | 新增 | LangGraph StateGraph + AgentNode 路由 |
-| **不存在** | **Reviewer Agent** | 新增 | 合同验证 + OPA + 质量评分 |
-| **不存在** | **Executor Agent** | 新增 | approve-gate → 安全执行 |
+| `SalesAgent` | **Specialist:Sales** (Adapter) | Adapter 包装，保留 `qualify_lead`/`analyze_deal` | Phase 4 |
+| `SupportAgent` | **Specialist:Support** (Adapter) | Adapter 包装，保留 `triage_ticket`/`suggest_resolution` | Phase 4 |
+| `ComplianceAgent` | **作为 Reviewer 的输入/工具之一** | ❌ 不直接等同于 Reviewer。Reviewer 需要独立执行 Evidence Grounding、完整性、冲突和 Action 校验；ComplianceAgent 提供规则式 PII 检测能力 | Phase 6 |
+| `AnalyticsAgent` | **Specialist:Analytics** (Adapter) | Adapter 包装，保留 `generate_forecast`/`track_*` | Phase 4 |
+| `ProductivitySignalsAgent` | 保留在 Deterministic Handler | 不迁移 | — |
+| `ProductivityAgent` | 保留在 Deterministic Handler | 不迁移 | — |
+| `JourneyAgent` | 保留在 Deterministic Handler | 不迁移 | — |
+| `PredictiveAnalyticsAgent` | 保留在 Deterministic Handler | 不迁移 | — |
+| `AutomationSimulationAgent` | 保留在 Deterministic Handler | 不迁移 | — |
+| `AutomationExecutorAgent` | **领域 Execute Adapter 或 Tool** | ❌ 不直接升级成统一 Executor。新增 `GovernedExecutor`；现有 `AutomationExecutorAgent` 仅作为自动化领域的 Execute Adapter 复用 | Phase 7 |
+| `KnowledgeAgent` | **Specialist:Knowledge** (Adapter) | Adapter 包装 | Phase 4 |
+| `ChatAgent` (HTTP) | 保留在 HTTP API | 不迁移 | — |
+| `SearchAgent` (HTTP) | 保留在 HTTP API | 不迁移 | — |
+| `ComplianceIntelligenceAgent` (HTTP) | 保留在 HTTP API | 不迁移 | — |
+| **不存在** | **Supervisor Agent** | 新增：LangGraph StateGraph + AgentNode 路由 + Complexity Gate | Phase 5 |
+| **不存在** | **Reviewer Agent** | 新增：独立验证层（Evidence Grounding、完整性、冲突、Action 校验） | Phase 6 |
+| **不存在** | **GovernedExecutor** | 新增：approve-gate + verify + Proposal Hash | Phase 7 |
 
-### 2.2 AgentRouter 拆分方案
+### 2.2 旗舰场景 5 个 Specialist Adapter（Phase 4）
 
-`orchestrator/router.py` (599 行) 将拆分为：
+第一版**不实现全部 11 个 Specialist Adapter**。旗舰场景仅包含：
+
+| Specialist | 复用的现有 Agent | 核心能力 |
+|---|---|---|
+| **Customer Context** | `CustomerProfile` + `CustomerTimeline` 查询 | 客户画像、历史交互、当前阶段 |
+| **Support** | `SupportAgent` | 工单分类、解决方案推荐、KB 检索 |
+| **Sales** | `SalesAgent` | 线索评分、交易分析、下一步建议 |
+| **Knowledge** | `KnowledgeAgent` | KB 文章检索、草稿生成 |
+| **Analytics** | `AnalyticsAgent` | 预测、异常检测、趋势分析 |
+
+### 2.3 AgentRouter 拆分方案
+
+`orchestrator/router.py` 的拆分：
 
 | 保留部分 | 目标位置 | 说明 |
 |---|---|---|
-| `AgentRouter.routes` 字典 | `multi_agent/topic_registry.py` | Topic → handler 映射表，保持不变 |
-| `AgentRouter.route()` 方法 | 保留为兼容入口 | 调用 Supervisor Graph |
-| Governance 组件初始化 | `multi_agent/governance_provider.py` | 提取到 DI 容器 |
-| 44 行 setter 注入 | `multi_agent/agent_factory.py` | 改为注册时自动注入 |
-| `_blocked` / `_blocked_data` 辅助函数 | `multi_agent/guards.py` | 提取为公共函数 |
-| `_tenant_id` / `_extract_subjects` | `multi_agent/event_utils.py` | 提取为公共函数 |
+| `AgentRouter.routes` 字典 | 保留在 `router.py` | 23 topic → handler 映射，不迁移 |
+| `AgentRouter.route()` 方法 | 保留为 Deterministic 入口 | 不修改 |
+| 所有 handler 方法 | 保留在 `router.py` | 固定事件/SLA/审批/审计/生命周期继续走此路径 |
+| Governance 组件初始化 | 提取到 `multi_agent/shared/governance.py` | 供两套路径共享 |
 
-| 废弃/重构部分 | 替代方案 |
+| 新增部分（不修改 router.py） | 目标位置 |
 |---|---|
-| 手动 Agent 实例化 (11 行) | `AgentRegistry` 注册 + DI 容器 |
-| 手动 handler 中的 Agent 串联调用 | Supervisor LangGraph 中的条件边 |
-| `_handle_approval_decision` 中的 4-agent 硬编码 dispatch | `AgentRegistry.get(agent_id)` 通用查找 |
-| handler 中的 governance 检查重复代码 | Supervisor 图中统一 pre-node guard |
+| Supervisor 入口 handler | `multi_agent/supervisor/entrypoint.py` |
+| 新 HTTP 路由 `POST /api/agents/objectives` | `agents/src/orchestrator/main.py`（新增路由） |
+| 新 Kafka Consumer `crm.agent.objective.requested` | `multi_agent/supervisor/consumer.py` |
 
-### 2.3 新增目录结构
+| Router DI 迁移 | 作为独立、可回归测试的改动 |
+|---|---|
+| 44 行 setter 注入 → DI 容器 | 在 Phase 4 后评估，独立 PR |
 
-```
-agents/src/multi_agent/
-  __init__.py
-  supervisor/
-    __init__.py
-    graph.py              # Supervisor StateGraph
-    state.py              # SupervisorState dataclass
-    routing.py            # Intent → Specialist 路由逻辑
-  specialist/
-    __init__.py
-    base.py               # SpecialistAgent 基类
-    registry.py           # Specialist 注册表
-    adapters/
-      __init__.py
-      sales.py            # SalesSpecialistAdapter
-      support.py          # SupportSpecialistAdapter
-      compliance.py       # ComplianceSpecialistAdapter
-      analytics.py        # AnalyticsSpecialistAdapter
-      productivity.py     # ProductivitySpecialistAdapter
-      journey.py          # JourneySpecialistAdapter
-      automation.py       # AutomationSpecialistAdapter
-      knowledge.py        # KnowledgeSpecialistAdapter
-      chat.py             # ChatSpecialistAdapter
-      search.py           # SearchSpecialistAdapter
-  reviewer/
-    __init__.py
-    base.py               # ReviewerAgent 基类
-    contracts.py          # 合同定义 (Pydantic)
-    evaluator.py          # 合同评估器
-  executor/
-    __init__.py
-    base.py               # ExecutorAgent 基类
-    approve_gate.py       # 审批门控
-  shared/
-    __init__.py
-    schema.py             # 统一 AgentResponse / AgentAction
-    checkpointer.py       # PostgresSaver 工厂
-    tracer.py             # Run Trace 记录器
-    governance.py         # 共享治理注入
-  registry.py             # AgentRegistry
-  factory.py              # AgentFactory (DI 容器)
-  topic_registry.py       # Kafka Topic 映射表（从 router.py 迁移）
-  event_utils.py          # 事件辅助函数
-  guards.py               # Governance 检查辅助
-```
+### 2.4 存储分类（四种不同语义的存储，不可混淆）
+
+| 存储类型 | 现有表/机制 | 用途 | 生命周期 |
+|---|---|---|---|
+| **Checkpoint** (运行时恢复状态) | **不存在**，需新增 `langgraph_checkpoints` | LangGraph 图状态快照，用于暂停/恢复和 Interrupt | 短期（任务生命周期内），可过期清理 |
+| **Run Evidence** (审计和可观测性) | `agent_decisions`、`agent_events`、OpenTelemetry | 每次决策的推理、证据、工具调用、Trace 关联 | 长期（与租户数据保留策略对齐） |
+| **Business Task** (业务状态) | `agent_tasks` | 面向用户的任务状态、输入/输出、correlation_id | 长期（业务数据） |
+| **Memory** (长期上下文) | `ai_memory`、Weaviate ChatMemory | Agent 跨会话记忆、知识积累 | 长期（用户可控删除） |
+
+**这四类存储不可混淆为同一种。** LangGraph Checkpoint 是运行时恢复状态，不能替代 Run Evidence 的审计功能；Business Task 是面向用户的任务视图，不能替代 Checkpoint 的精确状态恢复。
+
+### 2.5 双写一致性（开放设计问题）
+
+Checkpoint 写入 PG 和事件发送到 Kafka 无法在同一事务中完成。
+
+**不走"顺序双写"简易方案。** 后续通过以下技术组合解决：
+- Proposal Hash（审批前后 payload 一致性校验）
+- Idempotency Key（Kafka 消息去重）
+- Outbox 模式（已有 `outbox_events` 表可供复用，写 Checkpoint 后将事件写入 Outbox，独立 Publisher 发送）
+- 执行后 Verify（Executor 执行后验证结果与 Proposal 一致）
+- 必要时引入 PG 事务包裹 Checkpoint + Outbox 写入（两者同库可原子提交）
+
+具体方案在 Phase 7 中设计。
 
 ---
 
-## 3. 可复用的现有数据结构
+## 3. 各阶段涉及的具体文件
 
-### 3.1 数据库表（无需修改）
+### Phase 1：AI_MODE 和 Provider 运行边界
 
-| 现有表 | 复用方式 |
-|---|---|
-| `ai_agents` | 保持不变 — 新增 Supervisor/Reviewer/Executor 行 |
-| `agent_tasks` | 复用为 LangGraph 任务节点记录；`correlation_id` 用于 Trace 关联 |
-| `agent_events` | 复用为 LangGraph 步骤事件记录 |
-| `agent_decisions` | 复用为 Reviewer 决策记录；`evidence` JSON 字段可直接存储合同检查结果 |
-| `approvals` | 复用为 Executor approve-gate；`requestor_type: "agent"` 路径已存在 |
-| `audit_logs` | 保持不变 |
-| `ai_memory` | 复用为 Supervisor 上下文记忆 |
+**目标：** 建立 `AI_MODE`（none/static/supervisor）运行模式开关；统一所有 `OLLAMA_*` env var 读取到 Provider 边界；Provider 健康检查。
 
-### 3.2 现有 Pydantic 模型
+```
+新增:
+  agents/src/orchestrator/ai_mode.py               # AI_MODE enum + feature flags
+  tests/unit/test_provider_boundary.py              # Provider 边界单元测试
 
-| 模型 | 复用方式 |
-|---|---|
-| `ChatIntent` | 扩展为 Supervisor 意图分类输出 |
-| `SearchIntent` | 复用为 Specialist 参数 |
-| `DecisionArtifact` | 复用为 Reviewer 输出基础 |
-| `PendingAction` | 复用为 Executor 预执行存储 |
-| `ResolutionSuggestion` / `ResolutionStep` | 保持不变，作为 Specialist 内部验证 |
-| `ForecastResult` / `ForecastPrediction` | 保持不变，作为 Specialist 内部验证 |
-| `ActionProposal` / `ProposedWrite` | 复用为 Executor 输出格式 |
+修改:
+  agents/src/orchestrator/config.py                 # 新增 AI_MODE 环境变量
+  agents/src/intelligence/providers.py              # 新增 provider_health_check()
+  agents/src/intelligence/chat/chat_agent.py        # 替换 os.getenv("OLLAMA_EMBED_MODEL") → create_embeddings()
+  agents/src/intelligence/knowledge/knowledge_agent.py  # 同上
+  agents/src/intelligence/search/search_agent.py    # 同上
+  agents/src/orchestrator/main.py                   # 同上
+  agents/src/intelligence/i18n/voice_ingest.py      # 抽象 Whisper backend 选择
+```
 
-### 3.3 需要新增的 Schema
+### Phase 2：Contracts 和未接线的 Agent Registry
 
-| 新增 Schema | 用途 |
-|---|---|
-| `AgentResponse` (Pydantic) | 统一所有 Agent 的返回格式 |
-| `AgentAction` (Pydantic) | Supervisor 向 Specialist 的委托指令 |
-| `ReviewResult` (Pydantic) | Reviewer 合同检查输出 |
-| `ExecutionReceipt` (Pydantic) | Executor 执行回执 |
-| `SupervisorState` (dataclass) | LangGraph Supervisor 图状态 |
-| `SpecialistCapability` (Pydantic) | Specialist 能力声明 |
-| `HandoffRecord` (Pydantic) | Agent 间 handoff 记录 |
-
----
-
-## 4. 各阶段涉及的具体文件
-
-### Phase 0：基线保护（无行为变化）
-
-**目标：** 建立统一 Schema + Agent 注册表，不改现有运行路径。
+**目标：** 统一 `AgentResponse` Schema；创建 `AgentRegistry`（注册但不替换 Router 的运行时 DI）；`SpecialistCapability` 声明。
 
 ```
 新增:
   agents/src/multi_agent/__init__.py
-  agents/src/multi_agent/shared/schema.py           # AgentResponse, AgentAction
-  agents/src/multi_agent/registry.py                # AgentRegistry
-  agents/src/multi_agent/shared/governance.py       # GovernanceProvider (DI)
+  agents/src/multi_agent/shared/schema.py           # AgentResponse, AgentAction, SpecialistCapability
+  agents/src/multi_agent/registry.py                # AgentRegistry（独立于 Router）
 
 修改:
-  agents/src/agents/base.py                         # 添加 agent_response() 辅助方法
-  agents/src/orchestrator/router.py                 # 替换手动实例化为 AgentRegistry
-  tests/infra/test_h2_multi_agent_trace_evaluation.py # 扩展测试
+  agents/src/agents/base.py                         # 添加 agent_response() 辅助方法（可选）
+
+不修改:
+  agents/src/orchestrator/router.py                 # DI 注入保持不变
 ```
 
-### Phase 1：状态基础设施
+### Phase 3：Complexity Gate、Planner 和 Plan Validator
 
-**目标：** LangGraph PostgresSaver + Checkpointer + Run Trace。
+**目标：** 请求复杂度评估；Plan 结构生成；确定性 Plan 验证器。
 
 ```
 新增:
-  agents/src/multi_agent/shared/checkpointer.py     # PostgresSaver 工厂
-  agents/src/multi_agent/shared/tracer.py           # RunTraceCollector
-  database/migrations/13-langgraph-checkpoint.sql   # LangGraph checkpoints 表（若需）
+  agents/src/multi_agent/supervisor/complexity_gate.py   # 复杂度评估（规则式）
+  agents/src/multi_agent/supervisor/planner.py           # Plan 生成
+  agents/src/multi_agent/supervisor/plan_validator.py    # Plan 结构验证（确定性）
+  agents/src/multi_agent/supervisor/plan_schema.py       # Objective, Plan, Task Graph Schema
+  tests/unit/test_plan_validator.py                      # Plan 验证器测试
+```
+
+### Phase 4：旗舰场景 5 个 Specialist Adapter
+
+**目标：** 为 5 个旗舰场景创建 Adapter——Customer Context、Support、Sales、Knowledge、Analytics。
+
+```
+新增:
+  agents/src/multi_agent/specialist/__init__.py
+  agents/src/multi_agent/specialist/base.py              # SpecialistAgent(ABC)
+  agents/src/multi_agent/specialist/registry.py          # SpecialistRegistry
+  agents/src/multi_agent/specialist/adapters/__init__.py
+  agents/src/multi_agent/specialist/adapters/customer_context.py
+  agents/src/multi_agent/specialist/adapters/support.py
+  agents/src/multi_agent/specialist/adapters/sales.py
+  agents/src/multi_agent/specialist/adapters/knowledge.py
+  agents/src/multi_agent/specialist/adapters/analytics.py
+  tests/unit/test_specialist_adapters.py                 # Adapter 行为测试
+
+不修改:
+  agents/src/agents/sales.py                             # 原 SalesAgent 不变
+  agents/src/agents/support.py                           # 原 SupportAgent 不变
+  agents/src/agents/analytics.py                         # 原 AnalyticsAgent 不变
+```
+
+### Phase 5：独立入口的 Supervisor Graph
+
+**目标：** 新增 `POST /api/agents/objectives` 和 `crm.agent.objective.requested` Topic；Supervisor StateGraph。
+
+```
+新增:
+  agents/src/multi_agent/supervisor/graph.py             # Supervisor StateGraph
+  agents/src/multi_agent/supervisor/state.py             # SupervisorState
+  agents/src/multi_agent/supervisor/routing.py           # Complexity Gate → Plan → Specialist 选择
+  agents/src/multi_agent/supervisor/entrypoint.py        # HTTP + Kafka 入口
 
 修改:
-  agents/src/intelligence/chat/graph.py             # 添加 checkpointer（可选）
-  agents/src/orchestrator/main.py                   # 启动时初始化 PostgresSaver
+  agents/src/orchestrator/main.py                        # 新增 POST /api/agents/objectives 路由
+  agents/src/orchestrator/config.py                      # 新增 crm.agent.objective.requested topic
+```
+
+### Phase 6：Reviewer 和有限 Replan
+
+**目标：** 独立 Reviewer Agent（Evidence Grounding、完整性、冲突、Action 校验）；最多 1 次 Replan。
+
+```
+新增:
+  agents/src/multi_agent/reviewer/__init__.py
+  agents/src/multi_agent/reviewer/base.py                # ReviewerAgent(ABC)
+  agents/src/multi_agent/reviewer/contracts.py           # EvidenceGrounding / Completeness / Conflict / Action 合同
+  agents/src/multi_agent/reviewer/evaluator.py           # 合同评估器
+  agents/src/multi_agent/supervisor/replan.py            # 有限 Replan 逻辑（最多 1 次）
+  tests/unit/test_reviewer_contracts.py
+```
+
+### Phase 7：Postgres Checkpointer、Human Approval、GovernedExecutor 和 Verify
+
+**目标：** PostgresSaver；Interrupt + 审批集成；GovernedExecutor（approve-gate + Proposal Hash + verify）。
+
+```
+新增:
+  agents/src/multi_agent/shared/checkpointer.py          # PostgresSaver 工厂
+  agents/src/multi_agent/executor/__init__.py
+  agents/src/multi_agent/executor/base.py                # GovernedExecutor(ABC)
+  agents/src/multi_agent/executor/approve_gate.py        # 审批门控
+  agents/src/multi_agent/executor/proposal_hash.py       # Proposal Hash 计算与校验
+  database/migrations/13-langgraph-checkpoint.sql        # LangGraph checkpoints 表
 
 依赖新增:
   langgraph-checkpoint-postgres>=2.0
 ```
 
-### Phase 2：角色引入
+### Phase 8：Run Trace 和确定性 Demo
 
-**目标：** Supervisor + Specialist + Reviewer + Executor 基类，与现有 Agent 并行。
-
-```
-新增:
-  agents/src/multi_agent/supervisor/graph.py        # Supervisor StateGraph
-  agents/src/multi_agent/supervisor/state.py        # SupervisorState
-  agents/src/multi_agent/supervisor/routing.py      # 意图分类 → Specialist 选择
-  agents/src/multi_agent/specialist/base.py         # SpecialistAgent(ABC)
-  agents/src/multi_agent/specialist/registry.py     # SpecialistRegistry
-  agents/src/multi_agent/specialist/adapters/*.py   # 11 个 Adapter
-  agents/src/multi_agent/reviewer/base.py           # ReviewerAgent(ABC)
-  agents/src/multi_agent/reviewer/contracts.py      # 合同 Schema
-  agents/src/multi_agent/executor/base.py           # ExecutorAgent(ABC)
-  agents/src/multi_agent/executor/approve_gate.py   # 审批门控
-  policies/agents/supervisor.rego                   # Supervisor OPA 策略
-
-修改:
-  agents/src/orchestrator/router.py                 # 添加可选 Supervisor 路径（feature flag）
-  policies/agents/core.rego                         # 新增 Supervisor/Reviewer/Executor 能力注册
-```
-
-### Phase 3：渐进迁移
-
-**目标：** 将现有 Router handler 逻辑迁移到 Supervisor Graph。
-
-```
-修改:
-  agents/src/orchestrator/router.py                 # 逐步将 topic handler → Supervisor 调用
-  agents/src/orchestrator/main.py                   # 启动时创建 Supervisor 实例
-
-可能废弃（feature flag 保护）:
-  agents/src/orchestrator/router.py 中的 handler 方法  # 逐 topic 迁移
-```
-
-### Phase 4：评测扩展
-
-**目标：** LLM Judge + 多 Agent Trace 评测 + 质量指标体系。
+**目标：** 统一 Run/DAG/Task/Handoff/Token/Cost/Checkpoint Trace；可重复端到端演示。
 
 ```
 新增:
-  evals/llm_judge.py                                # LLM Judge 评测
-  evals/multi_agent_trace.py                        # 端到端多 Agent Trace 评测
-  evals/datasets/multi_agent_cases.jsonl            # 多 Agent 测试用例
-  evals/datasets/llm_judge_references.jsonl         # LLM Judge 参考答案
+  agents/src/multi_agent/shared/tracer.py                # RunTraceCollector
+  agents/src/multi_agent/shared/trace_schema.py          # RunTrace / TaskTrace / HandoffTrace
+  scripts/demo-supervisor-workflow.sql                   # 确定性 Demo 种子数据
 
 修改:
-  agents/src/intelligence/evaluation/workflow_trace.py  # 扩展为多 Agent 合同
-  evals/run_safety_contract_eval.py                 # 扩展覆盖新 Agent 角色
+  agents/src/intelligence/evaluation/workflow_trace.py   # 扩展 Trace 合同覆盖
+```
+
+### Phase 9：三组评测
+
+**目标：** Single Agent 回归评测；Static Workflow 评测；Supervisor Multi-Agent 端到端评测。
+
+```
+新增:
+  evals/single_agent_regression.py                       # Single Agent 回归
+  evals/static_workflow_eval.py                          # Static Workflow 评测
+  evals/supervisor_multi_agent_eval.py                   # Supervisor 端到端评测
+  evals/datasets/multi_agent_scenarios.jsonl             # 多 Agent 场景用例
 ```
 
 ---
 
-## 5. 审批决策复用方案
+## 4. 可复用的现有数据结构
 
-现有 `_handle_approval_decision`（router.py:498-553）中的 4-agent 硬编码 dispatch：
+### 4.1 数据库表（无需修改）
 
-```python
-# 现有代码（仅覆盖 4 个核心 Agent）
-agent = {
-    self.sales_agent.agent_id: self.sales_agent,
-    self.support_agent.agent_id: self.support_agent,
-    self.compliance_agent.agent_id: self.compliance_agent,
-    self.analytics_agent.agent_id: self.analytics_agent,
-}.get(pending.agent_id)
-```
-
-**升级方案：**
-```python
-# 通过 AgentRegistry 通用查找（覆盖所有已注册 Agent）
-agent = self.registry.get(pending.agent_id)
-```
-
-`AgentRegistry` 在 Phase 0 中建立，Phase 2 中所有 Specialist Adapter 自动注册。
-
----
-
-## 6. Topic 路由迁移方案
-
-现有 23 个 Kafka Topic → handler 映射保持不变。迁移策略：
-
-| 阶段 | 路由方式 |
+| 现有表 | 复用方式 |
 |---|---|
-| Phase 0-1 | `AgentRouter.route()` 不变，直接调用 handler |
-| Phase 2 | 新增并行路径：部分 topic 同时走 Supervisor Graph（feature flag `SUPERVISOR_ENABLED_TOPICS`） |
-| Phase 3 | 全部 topic 迁移到 Supervisor Graph；原 handler 降级为回退路径 |
+| `ai_agents` | 新增 Supervisor/Reviewer/GovernedExecutor 行 |
+| `agent_tasks` | 作为 **Business Task** 存储（面向用户的任务视图） |
+| `agent_events` | 作为 **Run Evidence** 存储（事件类型记录） |
+| `agent_decisions` | 作为 **Run Evidence** 存储（Reviewer 决策记录） |
+| `approvals` | 作为 GovernedExecutor approve-gate 的审批记录 |
+| `audit_logs` | 保持不变 |
+| `ai_memory` | 作为 **Memory** 存储（长期上下文） |
+| `outbox_events` | 作为 Checkpoint → Event 的事务性发件箱 |
+
+### 4.2 现有 Pydantic 模型
+
+| 模型 | 复用方式 |
+|---|---|
+| `ChatIntent` | 扩展为 Complexity Gate 的意图分类输入 |
+| `SearchIntent` | 复用为 Specialist 参数 |
+| `DecisionArtifact` | 复用为 Run Evidence 写入基础 |
+| `PendingAction` | 复用为 GovernedExecutor 预执行存储 |
+| `ResolutionSuggestion` / `ResolutionStep` | 保持不变，作为 Specialist 内部验证 |
+| `ForecastResult` / `ForecastPrediction` | 保持不变，作为 Specialist 内部验证 |
+| `ActionProposal` / `ProposedWrite` | 复用为 GovernedExecutor Proposal 格式 |
+
+### 4.3 需要新增的 Schema
+
+| 新增 Schema | 用途 | Phase |
+|---|---|---|
+| `AgentResponse` (Pydantic) | 统一所有 Agent 的返回格式 | Phase 2 |
+| `AgentAction` (Pydantic) | Supervisor 向 Specialist 的委托指令 | Phase 2 |
+| `SpecialistCapability` (Pydantic) | Specialist 能力声明 | Phase 2 |
+| `Objective` (Pydantic) | 用户/系统提交的跨域目标 | Phase 3 |
+| `Plan` / `TaskNode` (Pydantic) | Planner 生成的执行计划 | Phase 3 |
+| `ReviewResult` (Pydantic) | Reviewer 合同检查输出 | Phase 6 |
+| `ProposalHash` (Pydantic) | GovernedExecutor 审批前后校验 | Phase 7 |
+| `RunTrace` / `TaskTrace` / `HandoffTrace` (Pydantic) | 统一多 Agent Trace | Phase 8 |
 
 ---
 
-## 7. Feature Flag 设计
+## 5. Feature Flag 设计
 
 ```bash
-# .env 中控制迁移节奏
-SUPERVISOR_ENABLED=false                   # Phase 2 总开关
-SUPERVISOR_ENABLED_TOPICS=crm.leads.created,crm.deals.created  # 逐 topic 启用
-SUPERVISOR_CHECKPOINTER_ENABLED=false      # Phase 1 开关
-SUPERVISOR_INTERRUPT_ENABLED=false         # Phase 2 开关（人在回路中断）
+# Phase 1
+AI_MODE=none                     # none | static | supervisor
+                                 # none: 现有行为不变
+                                 # static: 使用 AgentRegistry + AgentResponse 但路由不变
+                                 # supervisor: 启用 Supervisor Graph 入口
+
+# Phase 5
+SUPERVISOR_ENTRY_ENABLED=false   # POST /api/agents/objectives 开关
+
+# Phase 8
+RUN_TRACE_ENABLED=false          # 统一 Run Trace 收集开关
 ```
 
 ---
 
-## 8. 风险控制矩阵
+## 6. 风险控制矩阵（扩展）
 
-| 风险 | 缓解措施 |
-|---|---|
-| R1 循环依赖 | Supervisor 图中禁止 Specialist → Supervisor 边；`AgentRegistry` 验证无环 |
-| R2 同步/异步边界 | 所有 LangGraph 节点为 `async`；Kafka 发送在事务后执行 |
-| R3 Kafka 与 Graph 状态冲突 | 复用 `outbox_events` 表；Graph checkpoint 后写入 outbox，独立 publisher 发送 |
-| R4 Schema 重复 | `AgentTask` 表新增 `graph_state_id` 外键，不创建重复表 |
-| R5 Provider 耦合 | `SpecialistAdapter` 通过 `create_chat_model()` 获取 LLM，不直接依赖具体 Provider |
-| R6 测试环境依赖 | 新增测试使用相同的 `tests/conftest.py` 夹具 |
-| R7 前端兼容性 | 新增 Agent type 值（`supervisor`、`specialist`、`reviewer`、`executor`）；前端 `page.tsx` 扩展 icon 映射但不破坏现有 type |
-| R8 治理注入冗余 | Phase 0 的 `GovernanceProvider` 替换 44 行 setter |
-| R9 Agent ID 冲突 | `AgentRegistry.register()` 检查唯一性 |
-| R10 OPA 策略盲区 | 每新增 Agent 角色时同步更新 `policies/agents/core.rego` |
-
----
-
-## 9. 建议的实施顺序调整
-
-基于审计发现，建议按以下优先级调整：
-
-| 原计划 | 调整建议 | 原因 |
-|---|---|---|
-| 先建 Supervisor Graph | **先做 Phase 0 基线保护** | 现有 Agent 无统一 Schema，Supervisor 需要统一接口才能路由 |
-| LangGraph Checkpointer 后做 | **Phase 1 提前** | PostgresSaver 是 Supervisor 持久化状态的硬依赖；且现有代码零影响 |
-| 一次性迁移所有 Topic | **逐 Topic 渐进迁移** | Feature flag 保护，降低回滚风险 |
-| LLM Judge 最后 | **Phase 2 同步启动 Reviewer 设计** | Reviewer 需要合同定义，可与 Judge 评测共享合同 Schema |
-
-**最终推荐顺序：Phase 0 → Phase 1 → Phase 2 → Phase 3（逐 topic） → Phase 4**
+| # | 风险 | 严重程度 | 缓解措施 | Phase |
+|---|---|---|---|---|
+| R1 | 循环依赖 | 中 | Supervisor 图禁止 Specialist → Supervisor 边；PlanValidator 验证无环 | Phase 3 |
+| R2 | 同步/异步边界 | 中 | 所有 LangGraph 节点为 async；Kafka 发送通过 Outbox 解耦 | Phase 7 |
+| R3 | 双写原子性 | **高** | Proposal Hash + Idempotency Key + Outbox + 执行后 Verify；PG 事务包裹 Checkpoint+Outbox | Phase 7 |
+| R4 | Schema 重复 | 低 | 四类存储清晰分类；新增 Checkpoint 表与现有表互补不重叠 | Phase 7 |
+| R5 | Provider 耦合 | 中 | Phase 1 统一所有 env var 读取到 Provider 边界 | Phase 1 |
+| R6 | 测试环境依赖 | 中 | 新增测试使用相同 `tests/conftest.py` 夹具 | 全 Phase |
+| R7 | 前端兼容性 | 低 | 新增 type 值，不破坏现有 icon 映射 | Phase 5 |
+| R8 | 治理注入冗余 | 中 | Router DI 迁移作为独立改动，先建 AgentRegistry 再评估替换时机 | Phase 2→4 |
+| R9 | Agent ID 冲突 | 低 | `AgentRegistry.register()` 检查唯一性 | Phase 2 |
+| R10 | OPA 策略盲区 | 中 | 新增 Agent 角色时同步更新 `policies/agents/core.rego` | Phase 5/6/7 |
+| R11 | **无限循环与成本失控** | **高** | Planner 设置 `max_steps`；Supervisor 设置 `token_budget`；每步有成本归因 | Phase 3/5 |
+| R12 | **并行竞态与部分失败** | **高** | Specialist 并行执行结果合并策略（all_succeed / any_succeed / majority）；部分失败时触发 Replan 或降级 | Phase 5/6 |
+| R13 | **Tenant Context 与 Foreign Evidence** | **高** | 所有 Specialist 检索和 Reviewer 验证强制 `SET app.tenant_id`；跨租户证据泄露作为评测硬性失败 | Phase 4/6/9 |
+| R14 | **审批后 Proposal 篡改** | 中 | GovernedExecutor 计算 Proposal Hash，与审批时的 Hash 比对；不匹配则拒绝执行 | Phase 7 |
+| R15 | **Kafka Replay 和重复副作用** | 中 | 所有 emit_event 携带 Idempotency Key；Executor 在执行前检查 Key 是否已处理 | Phase 7 |
+| R16 | **Shadow Mode 双执行** | 中 | `AI_MODE=shadow` 时两条路径并行执行、比对结果、仅旧路径生效；适用于迁移验证 | Phase 5+ |
+| R17 | **Checkpoint 数据保留 / GDPR** | 中 | Checkpoint 数据 TTL 与租户数据保留策略对齐；PII 字段标记 + 擦除 API | Phase 7 |
+| R18 | **Prompt/Schema/Registry 版本漂移** | 中 | `SpecialistCapability` 包含 `schema_version` 和 `prompt_version`；Supervisor 路由前校验版本兼容性 | Phase 2/5 |
+| R19 | **Trace PII 与高基数指标** | 中 | Trace 中的 prompt/response 不存储原文，仅存储 hash；Agent ID × Objective ID 聚合，禁止 Tenant ID × Task ID 标签 | Phase 8 |
+| R20 | **Reviewer 相关性错误** | 中 | Reviewer 合同定义与 Plan 结构对齐；合同检查结果可被 Run Trace 回溯 | Phase 6/8 |
+| R21 | **Live Model 非确定性** | 中 | Complexity Gate 使用确定性规则；Plan Validator 不调用 LLM；Reviewer 关键检查使用规则式；Phase 9 评测统计多次运行的通过率 | Phase 3/6/9 |
+| R22 | **P95 延迟与单位任务成本** | 中 | Phase 5 起记录每 Task 的 wall-clock 和 token cost；Phase 9 评测报告 P50/P95/P99 延迟和单位成本 | Phase 5/9 |
+| R23 | **Agent Capability 与 Tool 权限不一致** | 中 | `SpecialistCapability` 声明与实际 Tool 列表在注册时交叉校验；OPA `agents/core.rego` 中能力与权限联合定义 | Phase 2/4 |
 
 ---
 
-## 10. 验证清单
+## 7. 验证清单
 
-实施每个 Phase 后需验证：
+每个 Phase 完成后需验证：
 
-- [ ] 现有 23 个 Kafka Topic 的消费者未被修改
+- [ ] 现有 23 个 Kafka Topic 消费者未被修改或行为变化
 - [ ] `docker-compose up -d`（不含 `--profile local-llm`）可正常启动
+- [ ] `AI_PROVIDER=nvidia_nim` 配置下所有 Agent 可正常工作
 - [ ] `pytest tests -v` 全部通过（agents）
 - [ ] `cd gateway && npm test` 全部通过
 - [ ] `cd frontend && npm run build` 成功
 - [ ] `GET /api/v1/agents` 返回数据格式不变
 - [ ] `GET /api/v1/agents/workflows/recent` 返回数据格式不变
-- [ ] OPA 策略检查不受影响（无新增 deny）
-- [ ] Kill Switch 行为不变（global/tenant/agent/tenant-agent 四级）
+- [ ] OPA 策略检查不受影响
+- [ ] Kill Switch 行为不变
 - [ ] RLS 租户隔离未被绕过
 - [ ] 审计日志持续记录
 - [ ] `python -m src.orchestrator.main` 可正常启动
+- [ ] 无新增 `os.getenv("OLLAMA_*")` 调用（Phase 1 后）
