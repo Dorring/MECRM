@@ -172,7 +172,9 @@ class TestOrderIndependence:
 class TestDeduplication:
     def test_same_result_id_keeps_first(self):
         r1 = _make_result(result_id="r-001", agent_id="agent_a")
-        r2 = _make_result(result_id="r-001", agent_id="agent_b")  # same id, different agent
+        r2 = _make_result(
+            result_id="r-001", agent_id="agent_b"
+        )  # same id, different agent
 
         merged = merge_parallel_results([r1, r2])
         assert len(merged.results) == 1

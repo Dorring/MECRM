@@ -84,9 +84,7 @@ class AgentRegistry:
     # Registration
     # ------------------------------------------------------------------
 
-    def register(
-        self, capability: AgentCapability, handler: AgentHandler
-    ) -> None:
+    def register(self, capability: AgentCapability, handler: AgentHandler) -> None:
         """Register a new agent.  Raises DuplicateAgentError if *capability.agent_id*
         is already known — use ``replace()`` for explicit overwrites.
         """
@@ -99,9 +97,7 @@ class AgentRegistry:
         self._agents[agent_id] = capability
         self._handlers[agent_id] = handler
 
-    def replace(
-        self, capability: AgentCapability, handler: AgentHandler
-    ) -> None:
+    def replace(self, capability: AgentCapability, handler: AgentHandler) -> None:
         """Replace an existing agent's capability and handler.
 
         No-op if the agent_id is unknown (matches explicit-replace semantics:
@@ -131,13 +127,9 @@ class AgentRegistry:
         """
         capability = self._agents.get(agent_id)
         if capability is None:
-            raise UnknownAgentError(
-                f"Agent {agent_id!r} is not registered"
-            )
+            raise UnknownAgentError(f"Agent {agent_id!r} is not registered")
         if not capability.enabled:
-            raise DisabledAgentError(
-                f"Agent {agent_id!r} is disabled"
-            )
+            raise DisabledAgentError(f"Agent {agent_id!r} is disabled")
         handler = self._handlers[agent_id]
         return capability, handler
 
@@ -145,13 +137,9 @@ class AgentRegistry:
         """Return only the capability (no handler).  Same rules as ``resolve()``."""
         capability = self._agents.get(agent_id)
         if capability is None:
-            raise UnknownAgentError(
-                f"Agent {agent_id!r} is not registered"
-            )
+            raise UnknownAgentError(f"Agent {agent_id!r} is not registered")
         if not capability.enabled:
-            raise DisabledAgentError(
-                f"Agent {agent_id!r} is disabled"
-            )
+            raise DisabledAgentError(f"Agent {agent_id!r} is disabled")
         return capability
 
     def is_registered(self, agent_id: str) -> bool:
@@ -164,11 +152,7 @@ class AgentRegistry:
 
     def list_by_domain(self, domain: str) -> list[AgentCapability]:
         """Return enabled agents whose ``domains`` include *domain*."""
-        return [
-            c
-            for c in self._agents.values()
-            if c.enabled and domain in c.domains
-        ]
+        return [c for c in self._agents.values() if c.enabled and domain in c.domains]
 
     def list_by_task(self, task_type: str) -> list[AgentCapability]:
         """Return enabled agents whose ``supported_tasks`` include *task_type*."""
@@ -192,9 +176,7 @@ class AgentRegistry:
         raw: dict[str, Any] = {}
         for agent_id in sorted(self._agents):
             cap = self._agents[agent_id]
-            raw[agent_id] = json.loads(
-                cap.model_dump_json(exclude_defaults=False)
-            )
+            raw[agent_id] = json.loads(cap.model_dump_json(exclude_defaults=False))
 
         canonical = json.dumps(
             raw,

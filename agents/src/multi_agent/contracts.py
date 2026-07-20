@@ -86,9 +86,7 @@ class AgentCapability(BaseModel):
     @classmethod
     def _agent_id_stable(cls, v: str) -> str:
         if not _is_stable_agent_id(v):
-            raise ValueError(
-                f"agent_id must match {_AGENT_ID_RE.pattern!r}; got {v!r}"
-            )
+            raise ValueError(f"agent_id must match {_AGENT_ID_RE.pattern!r}; got {v!r}")
         return v
 
     @field_validator("version")
@@ -198,7 +196,14 @@ class ProviderMetadata(BaseModel):
     @classmethod
     def _no_secrets(cls, v: str) -> str:
         low = v.lower()
-        for secret in ("api_key", "apikey", "token", "password", "secret", "authorization"):
+        for secret in (
+            "api_key",
+            "apikey",
+            "token",
+            "password",
+            "secret",
+            "authorization",
+        ):
             if secret in low:
                 raise ValueError(f"ProviderMetadata must not contain {secret!r}")
         return v
@@ -247,9 +252,7 @@ class Evidence(BaseModel):
     @classmethod
     def _type_allowed(cls, v: str) -> str:
         if v not in _EVIDENCE_TYPE_ALLOWLIST:
-            raise ValueError(
-                f"evidence_type {v!r} not in allowlist"
-            )
+            raise ValueError(f"evidence_type {v!r} not in allowlist")
         return v
 
     @field_validator("created_at")

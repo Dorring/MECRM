@@ -61,9 +61,7 @@ class FakeHandler:
         self.agent_id = agent_id
         self.calls: list[tuple[AgentTask, AgentExecutionContext]] = []
 
-    async def run(
-        self, task: AgentTask, context: AgentExecutionContext
-    ) -> AgentResult:
+    async def run(self, task: AgentTask, context: AgentExecutionContext) -> AgentResult:
         self.calls.append((task, context))
         from datetime import datetime, timezone
 

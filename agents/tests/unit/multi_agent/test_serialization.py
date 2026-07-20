@@ -81,9 +81,16 @@ def _make_result() -> AgentResult:
         evidence=[ev],
         action_proposals=[p],
         token_usage=TokenUsage(input_tokens=100, output_tokens=50, total_tokens=150),
-        tool_calls=[ToolCallRecord(tool_name="crm_reader.get_leads", authority=ToolAuthority.READ, ok=True)],
+        tool_calls=[
+            ToolCallRecord(
+                tool_name="crm_reader.get_leads", authority=ToolAuthority.READ, ok=True
+            )
+        ],
         provider_metadata=ProviderMetadata(
-            provider="ollama", chat_model="llama3.1", embedding_model="nomic", ai_mode="live"
+            provider="ollama",
+            chat_model="llama3.1",
+            embedding_model="nomic",
+            ai_mode="live",
         ),
         completed_at=datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
     )

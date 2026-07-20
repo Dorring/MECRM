@@ -84,7 +84,11 @@ def _make_proposal(
     **overrides,
 ) -> ActionProposal:
     """Build an ActionProposal with sensible defaults and a valid hash."""
-    eids = evidence_ids if evidence_ids is not None else (["ev-001"] if priority == "high" else [])
+    eids = (
+        evidence_ids
+        if evidence_ids is not None
+        else (["ev-001"] if priority == "high" else [])
+    )
     now = _utc_now()
 
     # Fields needed for hash calculation
@@ -605,7 +609,9 @@ class TestEvidence:
                 tenant_id="t-001",
                 source_agent="test_agent",
             )
-        assert "allowlist" in str(exc.value).lower() or "evidence_type" in str(exc.value)
+        assert "allowlist" in str(exc.value).lower() or "evidence_type" in str(
+            exc.value
+        )
 
     def test_created_at_utc_aware(self):
         ev = Evidence(
@@ -896,7 +902,9 @@ class TestAgentExecutionContext:
 
 class TestToolCallRecord:
     def test_valid_record(self):
-        tcr = ToolCallRecord(tool_name="crm_reader.get_leads", authority=ToolAuthority.READ, ok=True)
+        tcr = ToolCallRecord(
+            tool_name="crm_reader.get_leads", authority=ToolAuthority.READ, ok=True
+        )
         assert tcr.tool_name == "crm_reader.get_leads"
         assert tcr.ok is True
 
