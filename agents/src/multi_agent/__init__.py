@@ -71,6 +71,7 @@ from multi_agent.complexity_gate import (
     RuleBasedComplexityGate,
 )
 from multi_agent.planning import (
+    MAX_ASSIGNMENT_COMBINATIONS,
     PLANNER_VERSION,
     PlanDraft,
     PlanValidationIssue,
@@ -80,10 +81,13 @@ from multi_agent.planning import (
     PlanningSignals,
     RequestedTask,
     TaskIntent,
+    build_expected_planned_tasks,
     compute_plan_hash,
     compute_request_hash,
     effective_domains,
     effective_task_types,
+    resolve_agent_assignment,
+    resolve_candidate_agents,
     resolve_expected_intents,
     task_intent_from_requested_task,
 )
@@ -176,6 +180,7 @@ __all__ = [
     "REASON_SINGLE_DOMAIN_SINGLE_TASK",
     "RuleBasedComplexityGate",
     # Phase 3 — Planning
+    "MAX_ASSIGNMENT_COMBINATIONS",
     "PLANNER_VERSION",
     "PlanDraft",
     "PlanValidationIssue",
@@ -185,10 +190,13 @@ __all__ = [
     "PlanningSignals",
     "RequestedTask",
     "TaskIntent",
+    "build_expected_planned_tasks",
     "compute_plan_hash",
     "compute_request_hash",
     "effective_domains",
     "effective_task_types",
+    "resolve_agent_assignment",
+    "resolve_candidate_agents",
     "resolve_expected_intents",
     "task_intent_from_requested_task",
     # Phase 3 — Errors

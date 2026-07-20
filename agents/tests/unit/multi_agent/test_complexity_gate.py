@@ -238,7 +238,7 @@ class TestRouteDecisions:
         reg = _make_registry([cap])
         signals = _make_signals(
             domains=frozenset({"customer_recovery"}),
-            requested_task_types=frozenset({"support_analysis"}),
+            requested_task_types=frozenset(),
             objective_kind=CUSTOMER_RECOVERY_OBJECTIVE_KIND,
         )
         request = _make_request(reg, signals=signals)

@@ -41,7 +41,14 @@ from multi_agent.serialization import canonicalize, stable_hash
 # Planner version — bumped whenever the planner algorithm changes.
 # ---------------------------------------------------------------------------
 
-PLANNER_VERSION = "ma-03.2.0"
+PLANNER_VERSION = "ma-03.3.0"
+
+#: R3 P1 — upper bound on the number of cartesian-product combinations
+#: the global multi-agent assignment search will evaluate before
+#: failing closed.  Phase 3 task/candidate counts are bounded by
+#: ``max_tasks`` (default 16), but this guard prevents pathological
+#: registries from exhausting CPU during planning.
+MAX_ASSIGNMENT_COMBINATIONS = 1_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +584,349 @@ def resolve_expected_intents(
 
 
 # ---------------------------------------------------------------------------
+# Shared pure functions for Planner + Validator (R3)
+# ---------------------------------------------------------------------------
+
+# Authority ordering — READ < PROPOSE < EXECUTE
+_AUTHORITY_RANK: dict[Any, int] = {
+    AgentAuthority.READ: 0,
+    AgentAuthority.PROPOSE: 1,
+    AgentAuthority.EXECUTE: 2,
+}
+
+_COST_CLASS_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
+
+
+def _stable_task_id(
+    *,
+    run_id: str,
+    intent_id: str,
+    task_type: str,
+    agent_id: str,
+) -> str:
+    """Deterministic 24-char task ID — no random UUIDs.
+
+    Shared between Planner and Validator so both sides agree on what
+    the canonical task_id should be for a given (run_id, intent_id,
+    task_type, agent_id) tuple.
+    """
+    return stable_hash(
+        {
+            "run_id": run_id,
+            "intent_id": intent_id,
+            "task_type": task_type,
+            "agent_id": agent_id,
+        }
+    )[:24]
+
+
+def resolve_candidate_agents(
+    intent: TaskIntent,
+    registry: Any,
+) -> list[Any]:
+    """Return the stable, **tool-aware** candidate list for *intent*.
+
+    Shared between Planner and Validator (R3 P0-2).  Both sides must
+    agree on which agents are eligible — otherwise a tampered plan
+    could substitute a more privileged or more expensive agent that
+    the Validator would accept as "registry-supported".
+
+    Filters (all AND, R2 P0-3):
+
+    1. ``enabled=True``
+    2. ``supported_tasks`` contains ``intent.task_type``
+    3. ``domains`` contains ``intent.domain``
+    4. ``authority`` is READ or PROPOSE (EXECUTE filtered out)
+    5. ``authority >= intent.preferred_authority``
+    6. ``required_tools ⊆ cap.allowed_tools`` AND every required tool
+       exists in the catalog with authority <= cap.authority and
+       <= PROPOSE (Phase 3 ceiling).
+
+    Sort key (ascending, deterministic):
+
+    1. ``_AUTHORITY_RANK[authority]`` — READ before PROPOSE
+    2. ``_COST_CLASS_RANK[estimated_cost_class]``
+    3. ``timeout_ms`` — smaller first
+    4. ``agent_id`` — lexicographic
+    5. ``version`` — lexicographic
+    """
+    from multi_agent.contracts import ToolAuthority
+
+    candidates: list[Any] = []
+    # Pre-validate required tools against the catalog once per intent.
+    for tool_name in intent.required_tools:
+        if not registry.tool_catalog.is_registered(tool_name):
+            # Unknown tool → no candidate can satisfy this intent.
+            return []
+        tool = registry.tool_catalog.resolve(tool_name)
+        # Phase 3 ceiling: required tools must be READ or PROPOSE.
+        if tool.authority is ToolAuthority.EXECUTE:
+            return []
+
+    for cap in registry.list_all():
+        if not cap.enabled:
+            continue
+        if intent.task_type not in cap.supported_tasks:
+            continue
+        if intent.domain not in cap.domains:
+            continue
+        if cap.authority is AgentAuthority.EXECUTE:
+            # EXECUTE agents are filtered out, not failed on sight.
+            continue
+        if _AUTHORITY_RANK[cap.authority] < _AUTHORITY_RANK[intent.preferred_authority]:
+            continue
+        # R2 P0-3: tool-aware filtering.
+        if not intent.required_tools.issubset(cap.allowed_tools):
+            continue
+        # Per-tool authority hierarchy check.
+        tool_ok = True
+        for tool_name in intent.required_tools:
+            tool = registry.tool_catalog.resolve(tool_name)
+            if (
+                cap.authority is AgentAuthority.READ
+                and tool.authority is not ToolAuthority.READ
+            ):
+                tool_ok = False
+                break
+            if (
+                cap.authority is AgentAuthority.PROPOSE
+                and tool.authority is ToolAuthority.EXECUTE
+            ):
+                tool_ok = False
+                break
+        if not tool_ok:
+            continue
+        candidates.append(cap)
+
+    candidates.sort(
+        key=lambda c: (
+            _AUTHORITY_RANK[c.authority],
+            _COST_CLASS_RANK[c.estimated_cost_class],
+            c.timeout_ms,
+            c.agent_id,
+            c.version,
+        )
+    )
+    return candidates
+
+
+def resolve_agent_assignment(
+    request: PlanningRequest,
+    decision: ComplexityDecision,
+    intents: list[TaskIntent],
+    registry: Any,
+) -> dict[str, Any]:
+    """Return the canonical agent assignment for *intents*.
+
+    Shared between Planner and Validator (R3 P0-2).  Both sides must
+    agree on which agent is selected for each intent — otherwise a
+    tampered plan could substitute a more privileged or more expensive
+    agent that the Validator would accept as "registry-supported".
+
+    Algorithm:
+
+    * ``single_agent`` or ``len(intents) < 2``: greedy per-intent
+      selection (first candidate per intent).
+    * ``multi_agent`` with ``len(intents) >= 2``: deterministic
+      cartesian-product search for an assignment with at least two
+      distinct agents.  Composite sort key: total authority rank →
+      total cost class rank → total timeout → agent_id concat →
+      version concat.
+
+    R3 P1: the search is bounded by :data:`MAX_ASSIGNMENT_COMBINATIONS`.
+    If the cartesian product exceeds this limit, the function fails
+    closed with :class:`UnsupportedCapabilityError`.
+
+    R3 P1: if no feasible diverse assignment exists for
+    ``multi_agent``, the function fails closed with
+    :class:`UnsupportedCapabilityError` instead of returning a greedy
+    assignment that the Validator would reject.
+
+    Pre-checks (R3 P1):
+
+    * ``len(intents) <= budget.max_tasks``
+    * ``len(intents) <= budget.max_agent_calls``
+    """
+    from itertools import product
+
+    from multi_agent.planning_errors import (
+        BudgetExceededPlanningError,
+        UnsupportedCapabilityError,
+    )
+
+    # R3 P1 — pre-check budgets before searching.
+    budget = request.budget
+    if len(intents) > budget.max_tasks:
+        raise BudgetExceededPlanningError(
+            f"intent count {len(intents)} > max_tasks {budget.max_tasks}"
+        )
+    if len(intents) > budget.max_agent_calls:
+        raise BudgetExceededPlanningError(
+            f"intent count {len(intents)} > max_agent_calls {budget.max_agent_calls}"
+        )
+
+    # Build per-intent candidate lists.
+    intent_candidates: dict[str, list[Any]] = {}
+    for intent in intents:
+        candidates = resolve_candidate_agents(intent, registry)
+        if not candidates:
+            raise UnsupportedCapabilityError(
+                f"No READ/PROPOSE agent with required tools supports "
+                f"task_type={intent.task_type!r} domain={intent.domain!r} "
+                f"authority>={intent.preferred_authority.value} "
+                f"required_tools={sorted(intent.required_tools)!r}"
+            )
+        intent_candidates[intent.intent_id] = candidates
+
+    # single_agent or fewer than 2 intents → greedy selection.
+    if decision.route != "multi_agent" or len(intents) < 2:
+        return {
+            intent.intent_id: intent_candidates[intent.intent_id][0]
+            for intent in intents
+        }
+
+    # multi_agent → search for a diverse assignment.
+    lists = [intent_candidates[i.intent_id] for i in intents]
+    intent_ids = [i.intent_id for i in intents]
+
+    # R3 P1 — bound the search space.
+    total_combinations = 1
+    for lst in lists:
+        total_combinations *= max(len(lst), 1)
+        if total_combinations > MAX_ASSIGNMENT_COMBINATIONS:
+            raise UnsupportedCapabilityError(
+                f"agent assignment search space exceeds "
+                f"MAX_ASSIGNMENT_COMBINATIONS={MAX_ASSIGNMENT_COMBINATIONS}; "
+                f"cannot find a deterministic diverse assignment"
+            )
+
+    best_assignment: dict[str, Any] | None = None
+    best_key: tuple[Any, ...] | None = None
+
+    for combo in product(*lists):
+        distinct_agents = {c.agent_id for c in combo}
+        if len(distinct_agents) < 2:
+            continue
+        total_auth = sum(_AUTHORITY_RANK[c.authority] for c in combo)
+        total_cost = sum(_COST_CLASS_RANK[c.estimated_cost_class] for c in combo)
+        total_timeout = sum(c.timeout_ms for c in combo)
+        agent_ids_sorted = sorted(c.agent_id for c in combo)
+        versions_sorted = sorted(c.version for c in combo)
+        key = (
+            total_auth,
+            total_cost,
+            total_timeout,
+            agent_ids_sorted,
+            versions_sorted,
+        )
+        if best_key is None or key < best_key:
+            best_key = key
+            best_assignment = dict(zip(intent_ids, combo))
+
+    if best_assignment is None:
+        # R3 P1 — fail closed instead of returning a greedy assignment
+        # that the Validator would reject with multi_agent_too_few_agents.
+        raise UnsupportedCapabilityError(
+            "no feasible multi-agent assignment with >=2 distinct agents; "
+            "cannot satisfy multi_agent route diversity requirement"
+        )
+
+    return best_assignment
+
+
+def build_expected_planned_tasks(
+    request: PlanningRequest,
+    intents: list[TaskIntent],
+    assignment: dict[str, Any],
+) -> list[PlannedTask]:
+    """Build the canonical :class:`PlannedTask` list for *intents*.
+
+    Shared between Planner and Validator (R3 P0-3).  Both sides must
+    agree on every field of the canonical task — otherwise a tampered
+    plan could substitute different timeout, max_retries, status,
+    input_data, etc. values that the Validator would accept.
+
+    The canonical task is **fully determined** by
+    (request, intent, capability).  No field is left to the Planner's
+    discretion.
+
+    Canonical field values:
+
+    * ``task_id`` = ``stable_hash({run_id, intent_id, task_type, agent_id})[:24]``
+    * ``agent_id`` = ``assignment[intent_id].agent_id``
+    * ``task_type`` = ``intent.task_type``
+    * ``objective`` = ``intent.objective``
+    * ``tenant_id`` = ``request.tenant_id``
+    * ``dependencies`` = resolved intent dependencies (intent_id → task_id)
+    * ``required`` = ``intent.required``
+    * ``required_evidence`` = ``list(intent.required_evidence)``
+    * ``timeout_ms`` = ``cap.timeout_ms``  (R3 P0-3 — not lowerable)
+    * ``max_retries`` = ``0``  (Phase 3 default, not configurable)
+    * ``idempotency_key`` = ``f"{run_id}:{task_id}"``
+    * ``priority`` = ``"medium"``  (Phase 3 default)
+    * ``status`` = ``"pending"``  (R3 P0-3 — Plan-time invariant)
+    * ``input_data`` = ``{}``  (R3 P0-3 — Plan-time invariant)
+    * ``user_id`` = ``None``  (R3 P0-3 — Plan-time invariant)
+    * ``correlation_id`` = ``None``  (R3 P0-3 — Plan-time invariant)
+    * ``started_at`` = ``None``  (R3 P0-3 — Plan-time invariant)
+    * ``completed_at`` = ``None``  (R3 P0-3 — Plan-time invariant)
+    """
+    from multi_agent.contracts import AgentTask
+
+    # Build intent_id → task_id mapping first (for dependency resolution).
+    intent_to_task_id: dict[str, str] = {}
+    for intent in intents:
+        cap = assignment[intent.intent_id]
+        task_id = _stable_task_id(
+            run_id=request.run_id,
+            intent_id=intent.intent_id,
+            task_type=intent.task_type,
+            agent_id=cap.agent_id,
+        )
+        intent_to_task_id[intent.intent_id] = task_id
+
+    planned_tasks: list[PlannedTask] = []
+    for intent in intents:
+        cap = assignment[intent.intent_id]
+        task_id = intent_to_task_id[intent.intent_id]
+        resolved_deps: frozenset[str] = frozenset(
+            intent_to_task_id[dep] for dep in intent.dependencies
+        )
+        task = AgentTask(
+            task_id=task_id,
+            agent_id=cap.agent_id,
+            task_type=intent.task_type,
+            objective=intent.objective,
+            tenant_id=request.tenant_id,
+            dependencies=resolved_deps,
+            required=intent.required,
+            required_evidence=list(intent.required_evidence),
+            timeout_ms=cap.timeout_ms,
+            max_retries=0,
+            idempotency_key=f"{request.run_id}:{task_id}",
+            priority="medium",
+            status="pending",
+            input_data={},
+            user_id=None,
+            correlation_id=None,
+            started_at=None,
+            completed_at=None,
+        )
+        planned_tasks.append(
+            PlannedTask(
+                intent_id=intent.intent_id,
+                domain=intent.domain,
+                preferred_authority=intent.preferred_authority,
+                required_tools=intent.required_tools,
+                estimated_tool_calls=intent.estimated_tool_calls,
+                required=intent.required,
+                task=task,
+            )
+        )
+    return planned_tasks
+
+
+# ---------------------------------------------------------------------------
 # PlannedTask
 # ---------------------------------------------------------------------------
 
@@ -902,6 +1252,7 @@ class PlanValidationReport(StrictContract):
 
 
 __all__ = [
+    "MAX_ASSIGNMENT_COMBINATIONS",
     "PLANNER_VERSION",
     "PlanDraft",
     "PlanValidationIssue",
@@ -911,10 +1262,13 @@ __all__ = [
     "PlanningSignals",
     "RequestedTask",
     "TaskIntent",
+    "build_expected_planned_tasks",
     "compute_plan_hash",
     "compute_request_hash",
     "effective_domains",
     "effective_task_types",
+    "resolve_agent_assignment",
+    "resolve_candidate_agents",
     "resolve_expected_intents",
     "task_intent_from_requested_task",
 ]

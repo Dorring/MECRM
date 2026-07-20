@@ -28,10 +28,14 @@ from typing import Any
 from multi_agent.contracts import AgentAuthority, ToolAuthority
 from multi_agent.registry import AgentRegistry
 from multi_agent.planning import (
+    PLANNER_VERSION,
     PlanDraft,
+    PlannedTask,
     PlanValidationIssue,
     PlanValidationReport,
+    build_expected_planned_tasks,
     compute_request_hash,
+    resolve_agent_assignment,
     resolve_expected_intents,
 )
 from multi_agent.complexity_gate import (
@@ -39,7 +43,6 @@ from multi_agent.complexity_gate import (
     RuleBasedComplexityGate,
 )
 from multi_agent.planning_errors import PlanningError
-from multi_agent.serialization import stable_hash
 
 # ---------------------------------------------------------------------------
 # Issue codes (stable strings surfaced over HTTP / logs)
@@ -84,6 +87,16 @@ CODE_IDEMPOTENCY_KEY_MISMATCH = "idempotency_key_mismatch"
 CODE_PLANNED_TASK_REQUIRED_MISMATCH = "planned_task_required_mismatch"
 CODE_DUPLICATE_INTENT_ID = "duplicate_intent_id"
 
+# R3 — Canonical Plan reconstruction issue codes.
+CODE_PLANNER_VERSION_MISMATCH = "planner_version_mismatch"
+CODE_AGENT_ASSIGNMENT_MISMATCH = "agent_assignment_mismatch"
+CODE_AGENT_VERSION_MISMATCH = "agent_version_mismatch"
+CODE_DEPENDENCY_MISMATCH = "dependency_mismatch"
+CODE_REQUIRED_EVIDENCE_MISMATCH = "required_evidence_mismatch"
+CODE_TASK_LIFECYCLE_VIOLATION = "task_lifecycle_violation"
+CODE_TASK_FIELD_MISMATCH = "task_field_mismatch"
+CODE_CUSTOMER_RECOVERY_INPUT_CONFLICT = "customer_recovery_input_conflict"
+
 
 # ---------------------------------------------------------------------------
 # Validator
@@ -126,14 +139,23 @@ class PlanValidator:
         # -- Plan hash --------------------------------------------------------
         issues.extend(self._check_plan_hash(plan))
 
+        # -- R3 P0-5: Planner version ---------------------------------------
+        issues.extend(self._check_planner_version(plan))
+
         # -- Registry version -------------------------------------------------
         issues.extend(self._check_registry_version(request, plan, registry))
 
         # -- Complexity decision consistency ---------------------------------
         issues.extend(self._check_complexity_decision(request, plan, registry))
 
-        # -- Plan-vs-expected-intent binding (R2 P0-1) -----------------------
-        issues.extend(self._check_intent_binding(request, plan, registry))
+        # -- R3: Canonical Plan reconstruction (replaces R2 intent binding) --
+        # This is the core R3 change: the Validator rebuilds the entire
+        # expected plan from (request, registry) and compares every field
+        # of every PlannedTask.  This closes the "substitute a more
+        # privileged / cheaper / faster agent" hole, the "lower timeout
+        # to bypass deadline budget" hole, and the "remove dependencies"
+        # hole.
+        issues.extend(self._check_canonical_plan(request, plan, registry))
 
         # -- Per-task registry + authority checks -----------------------------
         issues.extend(self._check_tasks_against_registry(plan, registry))
@@ -391,50 +413,79 @@ class PlanValidator:
         return issues
 
     # ------------------------------------------------------------------
-    # Plan-vs-expected-intent binding (R2 P0-1)
+    # Planner version (R3 P0-5)
     # ------------------------------------------------------------------
 
-    def _check_intent_binding(
+    @staticmethod
+    def _check_planner_version(plan: PlanDraft) -> list[PlanValidationIssue]:
+        """R3 P0-5: plan.planner_version must equal the supported
+        :data:`PLANNER_VERSION`.
+
+        ``planner_version`` is included in the plan hash, but without
+        this check a caller could forge both the version string and the
+        hash.  This check ensures the Validator only accepts plans
+        produced by the current supported planner.
+        """
+        issues: list[PlanValidationIssue] = []
+        if plan.planner_version != PLANNER_VERSION:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_PLANNER_VERSION_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"plan.planner_version={plan.planner_version!r} != "
+                        f"supported PLANNER_VERSION={PLANNER_VERSION!r}"
+                    ),
+                )
+            )
+        return issues
+
+    # ------------------------------------------------------------------
+    # Canonical Plan reconstruction (R3 — replaces R2 intent binding)
+    # ------------------------------------------------------------------
+
+    def _check_canonical_plan(
         self,
         request: Any,
         plan: PlanDraft,
-        registry: AgentRegistry,  # noqa: ARG002 - reserved for future use
+        registry: AgentRegistry,
     ) -> list[PlanValidationIssue]:
-        """Verify every PlannedTask matches the expected
-        :class:`TaskIntent` produced by :func:`resolve_expected_intents`
-        for the same request + decision.
+        """R3: rebuild the entire expected plan from (request, registry)
+        and compare every field of every PlannedTask.
 
-        This closes the "Plan task substitution" hole: even if a
-        tampered task is registry-supported and the plan hash is
-        recomputed, the Validator will reject the plan because the
-        tampered task no longer matches the expected intent.
+        This is the core R3 change.  R2's ``_check_intent_binding``
+        only compared intent-level fields (domain, task_type, etc.) and
+        recomputed task_id / idempotency_key.  It did *not* verify:
 
-        Fields compared per task:
+        * The selected agent matches the deterministic assignment
+          (R3 P0-2).
+        * Dependencies match the expected intent dependencies (R3 P0-1).
+        * ``required_evidence`` matches (R3 P0-1).
+        * ``timeout_ms`` matches the capability (R3 P0-3 — prevents
+          deadline budget bypass via lowered timeout).
+        * ``max_retries``, ``priority``, ``status``, ``input_data``,
+          ``user_id``, ``correlation_id``, ``started_at``,
+          ``completed_at`` match canonical values (R3 P0-3).
 
-        * ``intent_id`` (must exist in expected intents)
-        * ``domain`` / ``task_type`` / ``objective``
-        * ``preferred_authority``
-        * ``required_tools`` (as sets)
-        * ``estimated_tool_calls``
-        * ``required``
+        The Validator now calls the same shared pure functions as the
+        Planner:
 
-        Recomputed and compared:
+        1. :func:`resolve_expected_intents` — what intents the plan
+           should contain.
+        2. :func:`resolve_agent_assignment` — which agent should be
+           selected for each intent.
+        3. :func:`build_expected_planned_tasks` — the canonical
+           PlannedTask list.
 
-        * ``task_id`` = ``stable_hash({run_id, intent_id, task_type, agent_id})[:24]``
-        * ``idempotency_key`` = ``f"{run_id}:{task_id}"``
-        * ``planned_task.required`` == ``agent_task.required``
-
-        Also verifies:
-
-        * No duplicate ``intent_id`` among PlannedTasks.
-        * The set of plan intent_ids equals the set of expected
-          intent_ids (no extra / missing intents).
+        Then compares every field of every PlannedTask against the
+        canonical reconstruction.  Any mismatch produces a specific
+        issue code.
         """
         issues: list[PlanValidationIssue] = []
 
-        # Resolve expected intents via the shared pure function.
+        # Step 1 — resolve expected intents.
         try:
-            expected = resolve_expected_intents(request, plan.complexity)
+            expected_intents = resolve_expected_intents(request, plan.complexity)
         except PlanningError as exc:
             issues.append(
                 PlanValidationIssue(
@@ -447,9 +498,22 @@ class PlanValidator:
             )
             return issues
 
-        expected_by_id = {i.intent_id: i for i in expected}
+        # deterministic_workflow → no tasks, no further checks.
+        if not expected_intents:
+            if plan.tasks:
+                issues.append(
+                    PlanValidationIssue(
+                        code=CODE_DETERMINISTIC_HAS_TASKS,
+                        severity="error",
+                        message=(
+                            f"deterministic_workflow route must have 0 tasks, "
+                            f"got {len(plan.tasks)}"
+                        ),
+                    )
+                )
+            return issues
 
-        # Duplicate intent_id check.
+        # Duplicate intent_id check (kept from R2).
         seen_intent_ids: set[str] = set()
         for pt in plan.tasks:
             if pt.intent_id in seen_intent_ids:
@@ -463,8 +527,8 @@ class PlanValidator:
                 )
             seen_intent_ids.add(pt.intent_id)
 
-        # Missing / extra intents.
-        expected_ids = set(expected_by_id.keys())
+        # Missing / extra intents (kept from R2).
+        expected_ids = {i.intent_id for i in expected_intents}
         plan_ids = seen_intent_ids
         missing = expected_ids - plan_ids
         extra = plan_ids - expected_ids
@@ -487,155 +551,410 @@ class PlanValidator:
                 )
             )
 
-        # Per-task field comparison.
+        # Step 2 — resolve the canonical agent assignment.
+        # This is the key R3 P0-2 check: the Validator recomputes the
+        # deterministic assignment and rejects any plan that picked a
+        # different agent.
+        try:
+            expected_assignment = resolve_agent_assignment(
+                request, plan.complexity, expected_intents, registry
+            )
+        except PlanningError as exc:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_AGENT_ASSIGNMENT_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"resolve_agent_assignment() raised {type(exc).__name__}: {exc}"
+                    ),
+                )
+            )
+            return issues
+
+        # Step 3 — build the canonical PlannedTask list.
+        expected_tasks = build_expected_planned_tasks(
+            request, expected_intents, expected_assignment
+        )
+        expected_by_intent_id = {pt.intent_id: pt for pt in expected_tasks}
+
+        # Step 4 — per-task field comparison.
         for pt in plan.tasks:
-            intent = expected_by_id.get(pt.intent_id)
-            if intent is None:
+            expected_pt = expected_by_intent_id.get(pt.intent_id)
+            if expected_pt is None:
                 # Already reported above; skip field-level checks.
                 continue
 
-            if pt.domain != intent.domain:
-                issues.append(
-                    PlanValidationIssue(
-                        code=CODE_PLAN_INTENT_MISMATCH,
-                        severity="error",
-                        message=(
-                            f"PlannedTask {pt.intent_id!r} domain "
-                            f"{pt.domain!r} != expected {intent.domain!r}"
-                        ),
-                        task_id=pt.task.task_id,
-                    )
+            expected_cap = expected_assignment[pt.intent_id]
+            issues.extend(
+                self._compare_planned_task_fields(
+                    pt, expected_pt, expected_cap, registry
                 )
-            if pt.task.task_type != intent.task_type:
-                issues.append(
-                    PlanValidationIssue(
-                        code=CODE_PLAN_INTENT_MISMATCH,
-                        severity="error",
-                        message=(
-                            f"PlannedTask {pt.intent_id!r} task_type "
-                            f"{pt.task.task_type!r} != expected "
-                            f"{intent.task_type!r}"
-                        ),
-                        task_id=pt.task.task_id,
-                    )
-                )
-            if pt.task.objective != intent.objective:
-                issues.append(
-                    PlanValidationIssue(
-                        code=CODE_PLAN_INTENT_MISMATCH,
-                        severity="error",
-                        message=(
-                            f"PlannedTask {pt.intent_id!r} objective "
-                            f"{pt.task.objective!r} != expected "
-                            f"{intent.objective!r}"
-                        ),
-                        task_id=pt.task.task_id,
-                    )
-                )
-            if pt.preferred_authority != intent.preferred_authority:
-                issues.append(
-                    PlanValidationIssue(
-                        code=CODE_PLAN_INTENT_MISMATCH,
-                        severity="error",
-                        message=(
-                            f"PlannedTask {pt.intent_id!r} preferred_authority "
-                            f"{pt.preferred_authority.value!r} != expected "
-                            f"{intent.preferred_authority.value!r}"
-                        ),
-                        task_id=pt.task.task_id,
-                    )
-                )
-            if set(pt.required_tools) != set(intent.required_tools):
-                issues.append(
-                    PlanValidationIssue(
-                        code=CODE_PLAN_INTENT_MISMATCH,
-                        severity="error",
-                        message=(
-                            f"PlannedTask {pt.intent_id!r} required_tools "
-                            f"{sorted(pt.required_tools)!r} != expected "
-                            f"{sorted(intent.required_tools)!r}"
-                        ),
-                        task_id=pt.task.task_id,
-                    )
-                )
-            if pt.estimated_tool_calls != intent.estimated_tool_calls:
-                issues.append(
-                    PlanValidationIssue(
-                        code=CODE_PLAN_INTENT_MISMATCH,
-                        severity="error",
-                        message=(
-                            f"PlannedTask {pt.intent_id!r} estimated_tool_calls "
-                            f"{pt.estimated_tool_calls} != expected "
-                            f"{intent.estimated_tool_calls}"
-                        ),
-                        task_id=pt.task.task_id,
-                    )
-                )
-            if pt.required != intent.required:
-                issues.append(
-                    PlanValidationIssue(
-                        code=CODE_PLAN_INTENT_MISMATCH,
-                        severity="error",
-                        message=(
-                            f"PlannedTask {pt.intent_id!r} required "
-                            f"{pt.required} != expected {intent.required}"
-                        ),
-                        task_id=pt.task.task_id,
-                    )
-                )
-            # PlannedTask.required must equal AgentTask.required.
-            if pt.required != pt.task.required:
-                issues.append(
-                    PlanValidationIssue(
-                        code=CODE_PLANNED_TASK_REQUIRED_MISMATCH,
-                        severity="error",
-                        message=(
-                            f"PlannedTask {pt.intent_id!r} required="
-                            f"{pt.required} but AgentTask.required="
-                            f"{pt.task.required}"
-                        ),
-                        task_id=pt.task.task_id,
-                    )
-                )
+            )
 
-            # Stable task ID recomputation.
-            expected_task_id = stable_hash(
-                {
-                    "run_id": plan.run_id,
-                    "intent_id": intent.intent_id,
-                    "task_type": intent.task_type,
-                    "agent_id": pt.task.agent_id,
-                }
-            )[:24]
-            if pt.task.task_id != expected_task_id:
-                issues.append(
-                    PlanValidationIssue(
-                        code=CODE_UNSTABLE_TASK_ID,
-                        severity="error",
-                        message=(
-                            f"task_id {pt.task.task_id!r} != expected "
-                            f"{expected_task_id!r} for intent "
-                            f"{intent.intent_id!r}"
-                        ),
-                        task_id=pt.task.task_id,
-                    )
-                )
+        return issues
 
-            # Idempotency key recomputation.
-            expected_idem = f"{plan.run_id}:{expected_task_id}"
-            if pt.task.idempotency_key != expected_idem:
-                issues.append(
-                    PlanValidationIssue(
-                        code=CODE_IDEMPOTENCY_KEY_MISMATCH,
-                        severity="error",
-                        message=(
-                            f"idempotency_key {pt.task.idempotency_key!r} != "
-                            f"expected {expected_idem!r} for task "
-                            f"{pt.task.task_id!r}"
-                        ),
-                        task_id=pt.task.task_id,
-                    )
+    @staticmethod
+    def _compare_planned_task_fields(
+        pt: PlannedTask,
+        expected: PlannedTask,
+        expected_cap: Any,
+        registry: AgentRegistry,
+    ) -> list[PlanValidationIssue]:
+        """Compare a single PlannedTask against its canonical form.
+
+        Field groups:
+
+        * Intent-level: domain, task_type, objective, preferred_authority,
+          required_tools, estimated_tool_calls, required.
+        * Agent assignment: agent_id, agent version.
+        * Task identity: task_id, idempotency_key.
+        * Dependencies: frozenset equality (R3 P0-1).
+        * Required evidence: list equality (R3 P0-1).
+        * Capability-derived: timeout_ms (R3 P0-3 — not lowerable).
+        * Plan-time lifecycle: status, started_at, completed_at
+          (R3 P0-3 — must be pending / None).
+        * Fixed canonical: max_retries, priority, input_data,
+          user_id, correlation_id (R3 P0-3).
+        """
+        issues: list[PlanValidationIssue] = []
+        intent_id = pt.intent_id
+        task_id = pt.task.task_id
+        expected_task = expected.task
+        actual_task = pt.task
+
+        # -- Intent-level fields (R2 P0-1, kept) ---------------------------
+        if pt.domain != expected.domain:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_PLAN_INTENT_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} domain {pt.domain!r} != "
+                        f"expected {expected.domain!r}"
+                    ),
+                    task_id=task_id,
                 )
+            )
+        if pt.task.task_type != expected_task.task_type:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_PLAN_INTENT_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} task_type "
+                        f"{pt.task.task_type!r} != expected "
+                        f"{expected_task.task_type!r}"
+                    ),
+                    task_id=task_id,
+                )
+            )
+        if pt.task.objective != expected_task.objective:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_PLAN_INTENT_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} objective "
+                        f"{pt.task.objective!r} != expected "
+                        f"{expected_task.objective!r}"
+                    ),
+                    task_id=task_id,
+                )
+            )
+        if pt.preferred_authority != expected.preferred_authority:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_PLAN_INTENT_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} preferred_authority "
+                        f"{pt.preferred_authority.value!r} != expected "
+                        f"{expected.preferred_authority.value!r}"
+                    ),
+                    task_id=task_id,
+                )
+            )
+        if set(pt.required_tools) != set(expected.required_tools):
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_PLAN_INTENT_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} required_tools "
+                        f"{sorted(pt.required_tools)!r} != expected "
+                        f"{sorted(expected.required_tools)!r}"
+                    ),
+                    task_id=task_id,
+                )
+            )
+        if pt.estimated_tool_calls != expected.estimated_tool_calls:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_PLAN_INTENT_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} estimated_tool_calls "
+                        f"{pt.estimated_tool_calls} != expected "
+                        f"{expected.estimated_tool_calls}"
+                    ),
+                    task_id=task_id,
+                )
+            )
+        if pt.required != expected.required:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_PLAN_INTENT_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} required "
+                        f"{pt.required} != expected {expected.required}"
+                    ),
+                    task_id=task_id,
+                )
+            )
+        # PlannedTask.required must equal AgentTask.required (R2, kept).
+        if pt.required != pt.task.required:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_PLANNED_TASK_REQUIRED_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} required={pt.required} "
+                        f"but AgentTask.required={pt.task.required}"
+                    ),
+                    task_id=task_id,
+                )
+            )
+
+        # -- Agent assignment (R3 P0-2) -------------------------------------
+        if actual_task.agent_id != expected_task.agent_id:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_AGENT_ASSIGNMENT_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} agent_id "
+                        f"{actual_task.agent_id!r} != expected "
+                        f"{expected_task.agent_id!r}"
+                    ),
+                    task_id=task_id,
+                )
+            )
+        else:
+            # R3 P0-2: agent version check.  Verify the capability
+            # currently in the registry has the same version as the
+            # capability that the deterministic assignment selected.
+            # In normal operation these always match (same registry),
+            # but this check exists for defense-in-depth: if the
+            # registry is mutated between planning and validation, the
+            # version drift is detected here.
+            try:
+                actual_cap = registry.resolve_capability(actual_task.agent_id)
+                if actual_cap.version != expected_cap.version:
+                    issues.append(
+                        PlanValidationIssue(
+                            code=CODE_AGENT_VERSION_MISMATCH,
+                            severity="error",
+                            message=(
+                                f"PlannedTask {intent_id!r} agent "
+                                f"{actual_task.agent_id!r} registry version "
+                                f"{actual_cap.version!r} != expected "
+                                f"{expected_cap.version!r}"
+                            ),
+                            task_id=task_id,
+                        )
+                    )
+            except Exception:  # noqa: BLE001
+                # Already reported by _check_tasks_against_registry.
+                pass
+
+        # -- Task identity (R2, kept) ---------------------------------------
+        # The canonical task_id is built by build_expected_planned_tasks
+        # using stable_hash({run_id, intent_id, task_type, agent_id}).
+        # Since expected_task was built with the correct run_id from the
+        # request snapshot, comparing actual_task.task_id against
+        # expected_task.task_id is sufficient.
+        if actual_task.task_id != expected_task.task_id:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_UNSTABLE_TASK_ID,
+                    severity="error",
+                    message=(
+                        f"task_id {actual_task.task_id!r} != expected "
+                        f"{expected_task.task_id!r} for intent "
+                        f"{intent_id!r}"
+                    ),
+                    task_id=task_id,
+                )
+            )
+        # Idempotency key.
+        if actual_task.idempotency_key != expected_task.idempotency_key:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_IDEMPOTENCY_KEY_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"idempotency_key {actual_task.idempotency_key!r} != "
+                        f"expected {expected_task.idempotency_key!r} for task "
+                        f"{actual_task.task_id!r}"
+                    ),
+                    task_id=task_id,
+                )
+            )
+
+        # -- Dependencies (R3 P0-1) -----------------------------------------
+        if set(actual_task.dependencies) != set(expected_task.dependencies):
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_DEPENDENCY_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} dependencies "
+                        f"{sorted(actual_task.dependencies)!r} != expected "
+                        f"{sorted(expected_task.dependencies)!r}"
+                    ),
+                    task_id=task_id,
+                )
+            )
+
+        # -- Required evidence (R3 P0-1) ------------------------------------
+        if list(actual_task.required_evidence) != list(expected_task.required_evidence):
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_REQUIRED_EVIDENCE_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} required_evidence "
+                        f"{actual_task.required_evidence!r} != expected "
+                        f"{expected_task.required_evidence!r}"
+                    ),
+                    task_id=task_id,
+                )
+            )
+
+        # -- Capability-derived: timeout_ms (R3 P0-3) -----------------------
+        if actual_task.timeout_ms != expected_task.timeout_ms:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_TASK_FIELD_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} timeout_ms "
+                        f"{actual_task.timeout_ms} != expected "
+                        f"{expected_task.timeout_ms} (capability timeout; "
+                        f"not lowerable)"
+                    ),
+                    task_id=task_id,
+                )
+            )
+
+        # -- Plan-time lifecycle (R3 P0-3) ----------------------------------
+        if actual_task.status != "pending":
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_TASK_LIFECYCLE_VIOLATION,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} status "
+                        f"{actual_task.status!r} != 'pending' (Plan-time "
+                        f"invariant: tasks must be pending at plan time)"
+                    ),
+                    task_id=task_id,
+                )
+            )
+        if actual_task.started_at is not None:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_TASK_LIFECYCLE_VIOLATION,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} started_at is not None "
+                        f"(Plan-time invariant: tasks must not have "
+                        f"started_at at plan time)"
+                    ),
+                    task_id=task_id,
+                )
+            )
+        if actual_task.completed_at is not None:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_TASK_LIFECYCLE_VIOLATION,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} completed_at is not None "
+                        f"(Plan-time invariant: tasks must not have "
+                        f"completed_at at plan time)"
+                    ),
+                    task_id=task_id,
+                )
+            )
+
+        # -- Fixed canonical fields (R3 P0-3) -------------------------------
+        if actual_task.max_retries != expected_task.max_retries:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_TASK_FIELD_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} max_retries "
+                        f"{actual_task.max_retries} != expected "
+                        f"{expected_task.max_retries}"
+                    ),
+                    task_id=task_id,
+                )
+            )
+        if actual_task.priority != expected_task.priority:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_TASK_FIELD_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} priority "
+                        f"{actual_task.priority!r} != expected "
+                        f"{expected_task.priority!r}"
+                    ),
+                    task_id=task_id,
+                )
+            )
+        if actual_task.input_data != expected_task.input_data:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_TASK_FIELD_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} input_data "
+                        f"{actual_task.input_data!r} != expected "
+                        f"{expected_task.input_data!r}"
+                    ),
+                    task_id=task_id,
+                )
+            )
+        if actual_task.user_id != expected_task.user_id:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_TASK_FIELD_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} user_id "
+                        f"{actual_task.user_id!r} != expected "
+                        f"{expected_task.user_id!r}"
+                    ),
+                    task_id=task_id,
+                )
+            )
+        if actual_task.correlation_id != expected_task.correlation_id:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_TASK_FIELD_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} correlation_id "
+                        f"{actual_task.correlation_id!r} != expected "
+                        f"{expected_task.correlation_id!r}"
+                    ),
+                    task_id=task_id,
+                )
+            )
 
         return issues
 

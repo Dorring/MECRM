@@ -155,7 +155,6 @@ def _make_recovery_request(
 ) -> PlanningRequest:
     signals = PlanningSignals(
         domains=frozenset({CUSTOMER_RECOVERY_DOMAIN}),
-        requested_task_types=frozenset({"support_analysis"}),
         objective_kind=CUSTOMER_RECOVERY_OBJECTIVE_KIND,
     )
     return PlanningRequest(

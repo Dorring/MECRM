@@ -728,8 +728,8 @@ class TestMultiAgentGlobalAssignment:
         assert agents1 == agents2
 
     def test_no_feasible_diverse_assignment_fails_closed(self):
-        """Only one agent supports all tasks → multi_agent_too_few_agents
-        (fallback to greedy, Validator rejects)."""
+        """Only one agent supports all tasks → UnsupportedCapabilityError
+        (R3: no greedy fallback; fails before plan creation)."""
         generalist = _make_capability(
             agent_id="generalist",
             domains=frozenset({"support"}),
@@ -752,12 +752,10 @@ class TestMultiAgentGlobalAssignment:
             requested_tasks=[rt_a, rt_b],
         )
         request = _make_request(reg, signals=signals)
-        # Planner will fall back to greedy (single agent), Validator
-        # will reject with multi_agent_too_few_agents, and the planner
-        # raises PlanValidationError.
-        from multi_agent.planning_errors import PlanValidationError
-
-        with pytest.raises(PlanValidationError):
+        # R3: resolve_agent_assignment fails closed with
+        # UnsupportedCapabilityError instead of falling back to a greedy
+        # single-agent assignment that the Validator would reject.
+        with pytest.raises(UnsupportedCapabilityError):
             DeterministicPlanner().create_plan(request, reg)
 
 

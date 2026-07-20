@@ -376,7 +376,7 @@ class TestValidatorComplexityRecompute:
         reg = _make_registry(caps)
         signals = _make_signals(
             domains=frozenset({domain}),
-            requested_task_types=frozenset({"support_analysis"}),
+            requested_task_types=frozenset(),
             objective_kind=CUSTOMER_RECOVERY_OBJECTIVE_KIND,
         )
         request = _make_request(reg, signals=signals)
@@ -1110,7 +1110,7 @@ class TestPlannerErrorMapping:
         reg = _make_registry(caps)
         signals = _make_signals(
             domains=frozenset({domain}),
-            requested_task_types=frozenset({"support_analysis"}),
+            requested_task_types=frozenset(),
             objective_kind=CUSTOMER_RECOVERY_OBJECTIVE_KIND,
         )
         request = _make_request(

@@ -1,8 +1,8 @@
 # Phase 3: Complexity Gate + Planner + Plan Validator
 
-**Status:** Complete (R2)  
+**Status:** Complete (R3)  
 **Branch:** `feat/ma-03-complexity-gate-planner`  
-**Spec version:** ma-03.2.0
+**Spec version:** ma-03.3.0
 
 ---
 
@@ -40,7 +40,7 @@
 2. **最小上下文校验** — `signals.missing_required_context=True` → `InsufficientContextError`
 3. **结构性输入矛盾校验** — `requires_cross_domain=True` 但 effective domains < 2、或 `requires_approval=True` 但无 effective task types → `PlanningInputError`
 4. **固定事件 allowlist** — `event_type in DETERMINISTIC_EVENT_TYPES` → `deterministic_workflow`
-5. **Customer Recovery 模板** — `objective_kind == "customer_recovery"` → `multi_agent`（domains 自动包含 `customer_recovery`）
+5. **Customer Recovery 模板** — `objective_kind == "customer_recovery"` → `multi_agent`（domains 强制为 `["customer_recovery"]`，模板输入互斥校验见 §8.1）
 6. **Multi-agent 触发器** — ≥ 2 effective domains、≥ 2 effective task types、`requires_cross_domain`、`has_conflicting_signals` → `multi_agent`
 7. **Single-agent 默认** — 1 effective domain + 0-1 effective task types + 存在 capable agent → `single_agent`
 
@@ -62,7 +62,7 @@ effective_task_types(signals) =
 
 - 只提供 `requested_tasks` 也能正常决策（不需要同时填 `domains` / `requested_task_types`）
 - 同时提供时，派生集合必须与显式集合完全一致（由 Pydantic 校验保证）
-- Customer Recovery 路由在调用方未提供 domains 时，自动使用 `["customer_recovery"]`
+- Customer Recovery 路由**强制**使用 `["customer_recovery"]`（R3 P0-4 收紧），并执行模板输入互斥校验（§8.1）
 
 **两种冲突信号语义**（修正 4）：
 
@@ -121,26 +121,37 @@ Planner **不调用** `registry.resolve()`（返回 handler 引用）、`registr
 
 **Tool-aware 筛选**（R2 P0-3）：候选列表在排序前先过滤掉不满足 `required_tools` 的 agent。即使存在更便宜的 agent，如果它缺少必需工具，Planner 也会选择更贵但具备工具能力的 agent。
 
-## 7. Multi-Agent 全局确定性分配（R2 P0-4）
+## 7. Multi-Agent 全局确定性分配（R2 P0-4 + R3 P0-2/P1）
 
-multi_agent 路由不能逐任务独立选择后再依赖 Validator 拒绝同一 agent。Planner 必须保证 ≥2 个不同 Agent 的可行组合。
+multi_agent 路由不能逐任务独立选择后再依赖 Validator 拒绝同一 agent。Planner 必须保证 ≥2 个不同 Agent 的可行组合。R3 起，该算法抽取为共享纯函数 `resolve_agent_assignment(request, decision, intents, registry)`，Planner 与 Validator 共同使用（§16）。
 
-### 7.1 算法
+### 7.1 预检（R3 P1）
 
-1. 为每个 Intent 建立完整候选列表（已稳定排序）
-2. 笛卡尔积搜索所有可行组合
-3. 丢弃 distinct agent 数 < 2 的组合
-4. 按以下复合键选择最优组合（升序）：
-   - 总 authority rank（最小权限优先）
-   - 总 cost class rank（最低成本优先）
-   - 总 timeout_ms
-   - agent_id 拼接（字典序）
-   - version 拼接（字典序）
-5. 无可行组合时，回退到逐任务贪心选择，由 Validator 报 `multi_agent_too_few_agents`
+搜索开始前先检查结构性预算，避免在已知不可行时浪费 CPU：
 
-### 7.2 复杂度
+- `len(intents) > budget.max_tasks` → `BudgetExceededPlanningError`
+- `len(intents) > budget.max_agent_calls` → `BudgetExceededPlanningError`
 
-Phase 3 任务数和候选数受 `max_tasks` 约束，笛卡尔积规模可控。第一版不实现复杂优化器。
+### 7.2 算法
+
+1. 为每个 Intent 调用 `resolve_candidate_agents(intent, registry)` 建立候选列表（已稳定排序，含 Tool-aware 过滤）
+2. 任一 Intent 无候选 → `UnsupportedCapabilityError`
+3. `single_agent` 路由或 `len(intents) < 2` → 贪心选择候选列表首位
+4. `multi_agent` 路由 + `len(intents) >= 2`：
+   1. 笛卡尔积搜索所有可行组合
+   2. **搜索空间上限**：`total_combinations > MAX_ASSIGNMENT_COMBINATIONS`（默认 1,000,000）→ `UnsupportedCapabilityError` Fail-Closed（R3 P1）
+   3. 丢弃 distinct agent 数 < 2 的组合
+   4. 按以下复合键选择最优组合（升序）：
+      - 总 authority rank（最小权限优先）
+      - 总 cost class rank（最低成本优先）
+      - 总 timeout_ms
+      - agent_id 拼接（字典序）
+      - version 拼接（字典序）
+   5. **无可行 diverse 组合** → `UnsupportedCapabilityError`（R3 P1，不再回退到必然被 Validator 拒绝的贪心结果）
+
+### 7.3 复杂度
+
+`MAX_ASSIGNMENT_COMBINATIONS` 是硬上限。第一版不实现 Branch-and-Bound 或动态规划优化器，由上限保证 CPU 安全。
 
 ## 8. Customer Recovery Plan 示例
 
@@ -156,7 +167,19 @@ customer_context          (required=True,  READ, crm_reader.get_customers)
 
 五个任务全部生成。`required=False` 仅为后续降级执行提供语义，Phase 3 Planner 不会省略任何任务。
 
-Customer Recovery 路由在调用方未提供 domains 时，自动使用 `["customer_recovery"]`（R2 P1-A），确保 ComplexityDecision.domains 与模板 Domain 一致。
+Customer Recovery 路由**强制**使用 `["customer_recovery"]`（R3 P0-4 收紧），并通过 `_validate_customer_recovery_exclusivity()` 执行模板输入互斥校验，确保 `ComplexityDecision.domains` == Expected Intent domains == PlannedTask domains。
+
+### 8.1 模板输入互斥性（R3 P0-4）
+
+当 `objective_kind == "customer_recovery"` 时，模板独占生成 domains / task_types / tasks。调用方提供的显式信号必须为空或与模板完全一致：
+
+| 字段 | 允许值 |
+|---|---|
+| `signals.requested_tasks` | 必须为空 |
+| `signals.domains` | 空或 `== {"customer_recovery"}` |
+| `signals.requested_task_types` | 空或 `== 模板 5 个 task_type 的集合` |
+
+违反任一规则 → `PlanningInputError`，不静默忽略显式信号。这防止了"Gate 读取显式信号派生 Domain，随后 `resolve_expected_intents()` 又使用固定模板"的不一致路径。
 
 ## 9. Plan DAG
 
@@ -192,32 +215,102 @@ plan_hash    = SHA-256(request_hash, complexity, canonical_tasks, planner_versio
 - 原地修改 task 后 `verify_integrity()` 抛 `PlanIntegrityError`
 - Task 列表顺序变化不改变 `plan_hash`（按 `task_id` 排序后 hash）
 
-### 10.2 Intent Binding 逐字段校验（R2 P0-1）
+### 10.2 Intent Binding 逐字段校验（R2 P0-1，R3 升级为 Canonical Plan Reconstruction）
 
-Hash 能证明"计划没被偷偷修改"，但**不能**证明"计划内容确实来自原始请求"。因此 Validator 通过 `resolve_expected_intents` 重算 Expected Intents，并对每个 `PlannedTask` 逐字段比较：
+Hash 能证明"计划没被偷偷修改"，但**不能**证明"计划内容确实来自原始请求"。R2 通过 `resolve_expected_intents` 重算 Expected Intents 并逐字段比较。
 
-| 字段 | 校验规则 |
-|---|---|
-| `intent_id` | 必须存在于 Expected Intents；不得重复 |
-| `domain` | `== Expected Intent.domain` |
-| `task_type` | `== Expected Intent.task_type` |
-| `objective` | `== Expected Intent.objective` |
-| `preferred_authority` | `== Expected Intent.preferred_authority` |
-| `required_tools` | `== Expected Intent.required_tools` |
-| `estimated_tool_calls` | `== Expected Intent.estimated_tool_calls` |
-| `required` | `== Expected Intent.required` **且** `== AgentTask.required` |
-| `task_id` | `== stable_hash({run_id, intent_id, task_type, agent_id})[:24]` |
-| `idempotency_key` | `== f"{run_id}:{task_id}"` |
+**R3 升级**：R2 的 Intent Binding 只比较"Plan 内容自洽"的字段，仍然允许调用方替换 Agent、降低 timeout、删除依赖后重新计算 `plan_hash` 通过验证。R3 将 Validator 升级为**完整重建 Canonical Plan**（§10.3），覆盖原 Intent Binding 的全部字段，并新增 Dependency / Required Evidence / Capability-derived / Plan-time Lifecycle / Planner Version 校验。
 
-任何不一致返回稳定 Issue Code：
+R2 原有的字段比较仍保留，作为 Canonical Plan Reconstruction 的子集：
 
-| Issue Code | 触发条件 |
-|---|---|
-| `plan_intent_mismatch` | PlannedTask 字段与 Expected Intent 不一致 |
-| `unstable_task_id` | task_id 不符合稳定算法 |
-| `idempotency_key_mismatch` | idempotency_key 不符合 `run_id:task_id` |
-| `planned_task_required_mismatch` | PlannedTask.required != AgentTask.required |
-| `duplicate_intent_id` | 多个 PlannedTask 使用同一 intent_id |
+| 字段 | 校验规则 | Issue Code |
+|---|---|---|
+| `intent_id` | 必须存在于 Expected Intents；不得重复 | `plan_intent_mismatch` / `duplicate_intent_id` |
+| `domain` | `== Expected Intent.domain` | `plan_intent_mismatch` |
+| `task_type` | `== Expected Intent.task_type` | `plan_intent_mismatch` |
+| `objective` | `== Expected Intent.objective` | `plan_intent_mismatch` |
+| `preferred_authority` | `== Expected Intent.preferred_authority` | `plan_intent_mismatch` |
+| `required_tools` | `== Expected Intent.required_tools` | `plan_intent_mismatch` |
+| `estimated_tool_calls` | `== Expected Intent.estimated_tool_calls` | `plan_intent_mismatch` |
+| `required` | `== Expected Intent.required` **且** `== AgentTask.required` | `planned_task_required_mismatch` |
+| `task_id` | `== stable_hash({run_id, intent_id, task_type, agent_id})[:24]` | `unstable_task_id` |
+| `idempotency_key` | `== f"{run_id}:{task_id}"` | `idempotency_key_mismatch` |
+
+### 10.3 Canonical Plan Reconstruction（R3 P0-1/P0-2/P0-3）
+
+R3 起，Validator 不再只做部分字段检查，而是从 `(request, registry)` 完整重建预期 Canonical Plan 并逐字段比较。重建流程：
+
+```
+1. resolve_expected_intents(request, plan.complexity)         # 共享纯函数
+2. resolve_agent_assignment(request, plan.complexity,
+                             expected_intents, registry)      # 共享纯函数
+3. build_expected_planned_tasks(request, expected_intents,
+                                expected_assignment)          # 共享纯函数
+4. 对每个 PlannedTask 逐字段比较 (§10.4)
+```
+
+Validator **不得**调用 `DeterministicPlanner.create_plan()`，否则会产生递归。三个共享纯函数位于 `multi_agent.planning` 模块（§16）。
+
+### 10.4 Canonical AgentTask 字段比较（R3 P0-1/P0-2/P0-3）
+
+Canonical Plan 重建后，Validator 对每个 `PlannedTask` 及其内部 `AgentTask` 逐字段比较。所有字段必须**完全相等**（不是 `<=` 或子集）：
+
+| 字段组 | 字段 | 校验规则 | Issue Code |
+|---|---|---|---|
+| Intent-level | domain / task_type / objective / preferred_authority / required_tools / estimated_tool_calls / required | `== Expected Intent` 对应字段 | `plan_intent_mismatch` |
+| Agent assignment | `agent_id` | `== Expected Capability.agent_id` | `agent_assignment_mismatch` |
+| Agent assignment | `version` | `== Expected Capability.version` | `agent_version_mismatch` |
+| Task identity | `task_id` | `== _stable_task_id(run_id, intent_id, task_type, agent_id)` | `unstable_task_id` |
+| Task identity | `idempotency_key` | `== f"{run_id}:{task_id}"` | `idempotency_key_mismatch` |
+| **Dependencies**（R3 P0-1） | `dependencies` | `== frozenset(expected_task_id_by_intent[dep] for dep in intent.dependencies)` | `dependency_mismatch` |
+| **Required Evidence**（R3 P0-1） | `required_evidence` | `== Expected Intent.required_evidence`（列表相等） | `required_evidence_mismatch` |
+| **Capability-derived**（R3 P0-3） | `timeout_ms` | `== Expected Capability.timeout_ms`（**不可降低**） | `task_field_mismatch` |
+| **Plan-time Lifecycle**（R3 P0-3） | `status` | `== "pending"` | `task_lifecycle_violation` |
+| **Plan-time Lifecycle**（R3 P0-3） | `started_at` | `is None` | `task_lifecycle_violation` |
+| **Plan-time Lifecycle**（R3 P0-3） | `completed_at` | `is None` | `task_lifecycle_violation` |
+| **Fixed Canonical**（R3 P0-3） | `max_retries` | `== 0` | `task_field_mismatch` |
+| **Fixed Canonical**（R3 P0-3） | `priority` | `== "medium"` | `task_field_mismatch` |
+| **Fixed Canonical**（R3 P0-3） | `input_data` | `== {}` | `task_field_mismatch` |
+| **Fixed Canonical**（R3 P0-3） | `user_id` | `is None` | `task_field_mismatch` |
+| **Fixed Canonical**（R3 P0-3） | `correlation_id` | `is None` | `task_field_mismatch` |
+
+`created_at` 不参与 Hash 和语义比较（允许 wall-clock 时间）。
+
+### 10.5 Dependency 语义绑定（R3 P0-1）
+
+Validator 建立 `expected_task_id_by_intent` 映射，将 Intent 空间的依赖转换为 task_id 空间后严格比较：
+
+```python
+expected_task_id_by_intent = {
+    intent.intent_id: _stable_task_id(
+        run_id=request.run_id,
+        intent_id=intent.intent_id,
+        task_type=intent.task_type,
+        agent_id=expected_assignment[intent.intent_id].agent_id,
+    )
+}
+
+expected_dependencies = frozenset(
+    expected_task_id_by_intent[dep]
+    for dep in intent.dependencies
+)
+
+# AgentTask.dependencies 必须完全等于 expected_dependencies
+assert actual_task.dependencies == expected_dependencies
+```
+
+这防止了"删除 Customer Recovery 四条根依赖后重新计算 `plan_hash` 通过验证"的攻击。
+
+### 10.6 Planner Version 校验（R3 P0-5）
+
+`planner_version` 被包含在 `plan_hash` 中，但 R2 Validator 不检查它是否等于当前支持的版本。R3 新增校验：
+
+```python
+if plan.planner_version != PLANNER_VERSION:
+    issue(code="planner_version_mismatch", severity="error")
+```
+
+当前 `PLANNER_VERSION = "ma-03.3.0"`。未来需要支持旧版本时，应使用显式版本 Registry `SUPPORTED_PLANNER_VERSIONS`，不接受任意非空字符串。
 
 ## 11. Budget 校验
 
@@ -263,12 +356,22 @@ if required_tools and estimated_tool_calls < len(required_tools):
 | Registry version 不匹配 | `RegistryVersionMismatchError` | `registry_version_mismatch` |
 | 缺少必要上下文 | `InsufficientContextError` | — |
 | 结构性输入矛盾 | `PlanningInputError` | — |
+| Customer Recovery 模板输入冲突（R3 P0-4） | `PlanningInputError` | — |
 | 无 capable agent（含 EXECUTE-only） | `UnsupportedCapabilityError` | — |
 | 预算超限 | `BudgetExceededPlanningError` / `PlanValidationError` | `*_budget_exceeded` / `deadline_exceeded` |
 | Plan hash 不匹配 | `PlanIntegrityError` / `ValidationError` | `plan_hash_mismatch` / `request_hash_mismatch` |
 | DAG 有环 | `PlanCycleError` | `cycle` |
 | Intent 绑定不一致 | `PlanValidationError` | `plan_intent_mismatch` / `unstable_task_id` / `idempotency_key_mismatch` / `planned_task_required_mismatch` / `duplicate_intent_id` |
 | Multi-agent 不足两个 Agent | `PlanValidationError` | `multi_agent_too_few_agents` |
+| **Agent 分配不一致**（R3 P0-2） | `PlanValidationError` | `agent_assignment_mismatch` / `agent_version_mismatch` |
+| **Dependency 不一致**（R3 P0-1） | `PlanValidationError` | `dependency_mismatch` |
+| **Required Evidence 不一致**（R3 P0-1） | `PlanValidationError` | `required_evidence_mismatch` |
+| **Canonical Task 字段不一致**（R3 P0-3） | `PlanValidationError` | `task_field_mismatch` |
+| **Plan-time 生命周期违规**（R3 P0-3） | `PlanValidationError` | `task_lifecycle_violation` |
+| **Planner Version 不匹配**（R3 P0-5） | `PlanValidationError` | `planner_version_mismatch` |
+| **分配搜索空间超限**（R3 P1） | `UnsupportedCapabilityError` | — |
+| **预算预检失败**（R3 P1） | `BudgetExceededPlanningError` | — |
+| **无可行 diverse 分配**（R3 P1） | `UnsupportedCapabilityError` | — |
 
 ### 12.1 异常处理收紧（R2 P1-B）
 
@@ -319,7 +422,25 @@ Phase 4 Supervisor 将：
 4. **不执行** — Plan 生成后不执行任何 agent handler
 5. **不改 Router** — 现有 Kafka/Router 工作流完全不受影响
 6. **Authority 上限** — Phase 3 最高 `PROPOSE`，不选择 `EXECUTE` agent
-7. **Multi-agent 分配** — 第一版使用笛卡尔积搜索，受 `max_tasks` 约束；不实现复杂优化器
+7. **Multi-agent 分配** — 使用有界笛卡尔积搜索（`MAX_ASSIGNMENT_COMBINATIONS=1,000,000`）；不实现 Branch-and-Bound 或动态规划优化器（R3 P1 更新）
+
+## 16. 共享纯函数（R3）
+
+R3 将 Planner 的核心决策逻辑抽取为无副作用纯函数，位于 `multi_agent.planning` 模块。Planner 和 Validator **共同使用**这些函数，确保两边产生完全相同的 Canonical Plan：
+
+| 函数 | 签名 | 用途 |
+|---|---|---|
+| `resolve_expected_intents` | `(request, decision) -> list[TaskIntent]` | 从 Request + ComplexityDecision 派生 Expected Intents（R2 已有） |
+| `resolve_candidate_agents` | `(intent, registry) -> list[AgentCapability]` | Tool-aware 候选筛选 + 稳定排序（R3 新增） |
+| `resolve_agent_assignment` | `(request, decision, intents, registry) -> dict[str, AgentCapability]` | 全局确定性 Agent 分配 + 有界搜索 + 预检 + Fail-Closed（R3 新增） |
+| `build_expected_planned_tasks` | `(request, intents, assignment) -> list[PlannedTask]` | 构建 Canonical PlannedTask（固定 timeout_ms / max_retries / priority / status / lifecycle 字段）（R3 新增） |
+| `_stable_task_id` | `(*, run_id, intent_id, task_type, agent_id) -> str` | 稳定 task_id 计算（R3 新增，Planner 和 Validator 共享） |
+
+**设计约束**：
+
+- Validator **不得**调用 `DeterministicPlanner.create_plan()`，否则会产生递归
+- 所有纯函数无副作用，不修改 `request` / `registry` / `intent` / `capability`
+- 所有纯函数在相同输入下产生相同输出（确定性）
 
 ---
 
@@ -333,21 +454,24 @@ Phase 4 Supervisor 将：
 | `test_planning_templates.py` | 16 | Customer Recovery 5 任务计划、拓扑序、Fail-Closed 场景 |
 | `test_phase3_r1_review.py` | 29 | R1 反例：request_hash 绑定、Gate 重算、RequestedTask 映射、Authority 层级、依赖 Fail-Closed、Kafka 映射、错误类型映射 |
 | `test_phase3_r2_review.py` | 26 | R2 反例：Intent Binding、requested_tasks 真值来源、Tool-aware 选择、Multi-agent 全局分配、Tool Budget 低报、Customer Recovery Domain、Gate 异常处理 |
-| **Phase 3 合计** | **130** | |
+| `test_phase3_r3_review.py` | 35 | R3 反例：Agent Assignment 篡改、Dependency/Required Evidence 绑定、Canonical Task 字段、Customer Recovery 输入互斥、Planner Version、分配搜索上限、共享纯函数一致性 |
+| **Phase 3 合计** | **165** | |
 | Phase 2 回归 | 168 | 全部通过 |
 | Phase 1 回归 | 76 | 全部通过 |
-| **总计** | **374** | |
+| **总计** | **409** | |
 
 ## 新增文件
 
 ```
 agents/src/multi_agent/
 ├── planning_errors.py          # 10 个错误类型
-├── planning.py                 # 6 个 Contract + hash 计算 + effective_domains/task_types + resolve_expected_intents
-├── complexity_gate.py          # RuleBasedComplexityGate (使用 effective sets)
+├── planning.py                 # Contract + hash + effective sets + resolve_expected_intents
+│                                # + resolve_candidate_agents + resolve_agent_assignment
+│                                # + build_expected_planned_tasks + _stable_task_id (R3)
+├── complexity_gate.py          # RuleBasedComplexityGate (含 Customer Recovery 互斥校验, R3)
 ├── planning_templates.py       # CustomerRecoveryTemplate
-├── plan_validator.py           # PlanValidator (含 Intent Binding 校验)
-└── planner.py                  # DeterministicPlanner (含 tool-aware 选择 + 全局分配)
+├── plan_validator.py           # PlanValidator (含 Canonical Plan Reconstruction, R3)
+└── planner.py                  # DeterministicPlanner (调用共享纯函数, R3)
 
 agents/tests/unit/multi_agent/
 ├── test_complexity_gate.py
@@ -355,7 +479,8 @@ agents/tests/unit/multi_agent/
 ├── test_plan_validator.py
 ├── test_planning_templates.py
 ├── test_phase3_r1_review.py    # R1 反例测试
-└── test_phase3_r2_review.py    # R2 反例测试
+├── test_phase3_r2_review.py    # R2 反例测试
+└── test_phase3_r3_review.py    # R3 反例测试 (35 tests)
 
 docs/multi-agent/
 └── phase-3-complexity-gate-planner.md  (本文件)
@@ -363,4 +488,4 @@ docs/multi-agent/
 
 ## 修改文件
 
-- `agents/src/multi_agent/__init__.py` — 追加 Phase 3 导出 + `effective_domains` / `effective_task_types` / `resolve_expected_intents`
+- `agents/src/multi_agent/__init__.py` — 追加 Phase 3 导出 + `effective_domains` / `effective_task_types` / `resolve_expected_intents` / `MAX_ASSIGNMENT_COMBINATIONS` / `resolve_candidate_agents` / `resolve_agent_assignment` / `build_expected_planned_tasks`（R3）

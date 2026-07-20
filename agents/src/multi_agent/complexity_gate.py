@@ -160,14 +160,16 @@ class RuleBasedComplexityGate:
 
         # Step 5 — Customer Recovery template.
         if signals.objective_kind == CUSTOMER_RECOVERY_OBJECTIVE_KIND:
-            # Customer Recovery always uses the customer_recovery domain,
-            # even when the caller did not provide signals.domains.
-            recovery_domains = (
-                domains_sorted if domains_sorted else [_CUSTOMER_RECOVERY_DOMAIN]
-            )
+            # R3 P0-4 — Customer Recovery is template-exclusive.  The
+            # template owns the domain, task types, and intent list.
+            # Caller-provided signals for these fields must be either
+            # empty or exactly match the template's canonical values;
+            # otherwise the request is structurally contradictory.
+            self._validate_customer_recovery_exclusivity(signals)
+            # Customer Recovery always uses the customer_recovery domain.
             return ComplexityDecision(
                 route="multi_agent",
-                domains=recovery_domains,
+                domains=[_CUSTOMER_RECOVERY_DOMAIN],
                 reasons=[REASON_CUSTOMER_RECOVERY_TEMPLATE],
                 confidence=1.0,
                 requires_human_review=False,
@@ -223,6 +225,56 @@ class RuleBasedComplexityGate:
         )
 
     # -- internal -----------------------------------------------------------
+
+    @staticmethod
+    def _validate_customer_recovery_exclusivity(signals: PlanningSignals) -> None:
+        """R3 P0-4 — Customer Recovery is template-exclusive.
+
+        The template owns the domain, task types, and intent list.
+        Caller-provided signals for these fields must be either empty
+        or exactly match the template's canonical values; otherwise
+        the request is structurally contradictory.
+
+        Rules:
+
+        * ``requested_tasks`` MUST be empty (template owns the intents).
+        * ``domains`` MUST be empty or ``== {"customer_recovery"}``.
+        * ``requested_task_types`` MUST be empty or equal to the
+          template's task-type set.
+        """
+        # requested_tasks must be empty — the template owns the intents.
+        if signals.requested_tasks:
+            raise PlanningInputError(
+                "Customer Recovery objective_kind is template-exclusive; "
+                "signals.requested_tasks must be empty but got "
+                f"{len(signals.requested_tasks)} task(s)"
+            )
+        # domains must be empty or exactly {"customer_recovery"}.
+        if signals.domains and signals.domains != frozenset(
+            {_CUSTOMER_RECOVERY_DOMAIN}
+        ):
+            raise PlanningInputError(
+                "Customer Recovery objective_kind requires signals.domains "
+                f"to be empty or {{'{_CUSTOMER_RECOVERY_DOMAIN}'}}; "
+                f"got {sorted(signals.domains)!r}"
+            )
+        # requested_task_types must be empty or match the template set.
+        if signals.requested_task_types:
+            from multi_agent.planning_templates import (
+                DEFAULT_CUSTOMER_RECOVERY_TEMPLATE,
+            )
+
+            template_types = {
+                intent.task_type
+                for intent in DEFAULT_CUSTOMER_RECOVERY_TEMPLATE.build_intents()
+            }
+            if signals.requested_task_types != frozenset(template_types):
+                raise PlanningInputError(
+                    "Customer Recovery objective_kind requires "
+                    "signals.requested_task_types to be empty or exactly "
+                    f"match the template task types {sorted(template_types)!r}; "
+                    f"got {sorted(signals.requested_task_types)!r}"
+                )
 
     @staticmethod
     def _validate_structural_consistency(signals: PlanningSignals) -> None:
