@@ -28,12 +28,14 @@ from multi_agent.serialization import validate_strict_json
 
 JsonValue = Any
 
-# Sensitive keys rejected from all metadata fields
-_SECRET_KEY_PATTERNS = frozenset(
+# Sensitive keys rejected from all metadata fields.
+# Patterns are pre-normalized at module load so that the comparison is
+# normalization-consistent: both the key under test and the pattern go
+# through the same ``_normalize_sensitive_key`` pipeline.
+_SENSITIVE_KEY_PATTERNS = frozenset(
     {
         "authorization",
         "api_key",
-        "apikey",
         "access_token",
         "refresh_token",
         "client_secret",
@@ -44,15 +46,36 @@ _SECRET_KEY_PATTERNS = frozenset(
 )
 
 
-def _reject_sensitive_keys(metadata: dict[str, Any], field_name: str) -> None:
-    """Reject sensitive keys in metadata dicts (recursive scan)."""
-    for k, v in metadata.items():
-        low = str(k).lower().replace("_", "").replace("-", "")
-        for pattern in _SECRET_KEY_PATTERNS:
-            if pattern in low:
-                raise ValueError(f"{field_name} must not contain sensitive key {k!r}")
-        if isinstance(v, dict):
-            _reject_sensitive_keys(v, f"{field_name}.{k}")
+def _normalize_sensitive_key(value: str) -> str:
+    """Normalize a key for sensitive-pattern comparison.
+
+    Strips every non-alphanumeric character (underscores, hyphens, spaces,
+    dots, …) and lowercases.  This makes ``access_token``, ``access-token``,
+    ``ACCESS_TOKEN`` and ``access token`` all collapse to ``accesstoken``.
+    """
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+_NORMALIZED_SECRET_PATTERNS = frozenset(
+    _normalize_sensitive_key(pattern) for pattern in _SENSITIVE_KEY_PATTERNS
+)
+
+
+def _reject_sensitive_keys(value: JsonValue, path: str) -> None:
+    """Recursively reject sensitive keys in dicts and lists.
+
+    Scans both nested dictionaries and lists so that
+    ``{"providers": [{"access_token": "..."}]}`` is caught.
+    """
+    if isinstance(value, dict):
+        for k, child in value.items():
+            normalized = _normalize_sensitive_key(str(k))
+            if any(pattern in normalized for pattern in _NORMALIZED_SECRET_PATTERNS):
+                raise ValueError(f"{path} contains sensitive key {k!r}")
+            _reject_sensitive_keys(child, f"{path}.{k}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _reject_sensitive_keys(child, f"{path}[{index}]")
 
 
 # ---------------------------------------------------------------------------
@@ -646,7 +669,6 @@ class AgentResult(StrictContract):
                     f"ActionProposal {p.proposal_id!r} references unknown evidence: {missing}"
                 )
         return self
-        return self
 
 
 # ============================================================================
@@ -799,11 +821,24 @@ class MultiAgentState(StrictContract):
                     f"Evidence {ev.evidence_id!r} tenant {ev.tenant_id!r} "
                     f"!= state tenant {self.tenant_id!r}"
                 )
+        # Build the set of evidence IDs available to state-level proposals.
+        # Sources: state.evidence + every result.evidence.
+        available_evidence_ids = {ev.evidence_id for ev in self.evidence}
+        for r in self.agent_results:
+            available_evidence_ids.update(
+                evidence.evidence_id for evidence in r.evidence
+            )
         for p in self.proposed_actions:
             if p.tenant_id != self.tenant_id:
                 raise ValueError(
                     f"Proposal {p.proposal_id!r} tenant {p.tenant_id!r} "
                     f"!= state tenant {self.tenant_id!r}"
+                )
+            missing = sorted(set(p.evidence_ids) - available_evidence_ids)
+            if missing:
+                raise ValueError(
+                    f"ActionProposal {p.proposal_id!r} references missing "
+                    f"evidence: {missing}"
                 )
             p.verify_integrity()
         return self

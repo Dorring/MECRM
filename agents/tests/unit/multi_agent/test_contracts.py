@@ -862,6 +862,76 @@ class TestMetadataSecretKeyRejection:
                 metadata={"password": "1234"},
             )
 
+    # -- R7: normalization consistency --------------------------------------
+
+    def test_access_token_in_metadata_rejected(self):
+        """access_token was previously bypassed because the pattern set
+        stored the un-normalized form while the key under test was
+        normalized to ``accesstoken``."""
+        with pytest.raises(ValidationError):
+            Evidence(
+                evidence_id="ev-1",
+                evidence_type=EvidenceType.TOOL_RESULT,
+                tenant_id="t-1",
+                source_agent="a",
+                metadata={"access_token": "tok-xyz"},
+            )
+
+    def test_refresh_token_in_metadata_rejected(self):
+        with pytest.raises(ValidationError):
+            Evidence(
+                evidence_id="ev-1",
+                evidence_type=EvidenceType.TOOL_RESULT,
+                tenant_id="t-1",
+                source_agent="a",
+                metadata={"refresh_token": "rt-xyz"},
+            )
+
+    def test_hyphenated_access_token_rejected(self):
+        """``access-token`` must collapse to the same normalized form as
+        ``access_token``."""
+        with pytest.raises(ValidationError):
+            Evidence(
+                evidence_id="ev-1",
+                evidence_type=EvidenceType.TOOL_RESULT,
+                tenant_id="t-1",
+                source_agent="a",
+                metadata={"access-token": "tok"},
+            )
+
+    def test_mixed_case_access_token_rejected(self):
+        with pytest.raises(ValidationError):
+            Evidence(
+                evidence_id="ev-1",
+                evidence_type=EvidenceType.TOOL_RESULT,
+                tenant_id="t-1",
+                source_agent="a",
+                metadata={"ACCESS_TOKEN": "tok"},
+            )
+
+    def test_sensitive_key_inside_list_rejected(self):
+        """Sensitive keys inside a list element dict must be caught now
+        that the recursive scan handles lists."""
+        with pytest.raises(ValidationError):
+            AgentExecutionContext(
+                tenant_id="t-1",
+                run_metadata={"providers": [{"access_token": "tok"}]},
+            )
+
+    def test_nested_sensitive_key_inside_list_rejected(self):
+        with pytest.raises(ValidationError):
+            AgentExecutionContext(
+                tenant_id="t-1",
+                run_metadata={
+                    "config": {
+                        "endpoints": [
+                            {"name": "ok", "url": "https://x"},
+                            {"name": "evil", "client_secret": "s"},
+                        ]
+                    }
+                },
+            )
+
 
 # ============================================================================
 # R6: Evidence reference validation
@@ -927,31 +997,129 @@ class TestEvidenceReferenceValidation:
         )
         assert result.status == "completed"
 
-    def test_merge_excludes_proposal_with_missing_evidence(self):
-        """AgentResult construction catches missing evidence references;
-        the merge inherits this safety via MergedState validation."""
-        # This is caught at AgentResult construction time
+    # -- R7: Evidence references can be broken post-construction -------------
+
+    def test_result_evidence_removed_after_construction(self):
+        """AgentResult.evidence is a mutable list.  Clearing it after
+        construction must not silently leave dangling references — but
+        because R6 only validates at construction, the mutation itself
+        succeeds.  This test documents the gap and asserts the proposal
+        still references the now-missing evidence id (the merge/state
+        layers are responsible for catching it)."""
+        ev = Evidence(
+            evidence_id="ev-1",
+            evidence_type=EvidenceType.TOOL_RESULT,
+            tenant_id="t-1",
+            source_agent="agent_a",
+        )
+        p = ActionProposal.create(
+            proposal_id="p-1",
+            tenant_id="t-1",
+            created_by_agent="agent_a",
+            action_type="delete",
+            target_entity="customer",
+            target_id="c1",
+            risk_level=ActionRiskLevel.HIGH,
+            evidence_ids=["ev-1"],
+            requires_approval=True,
+            idempotency_key="ik-1",
+        )
+        result = AgentResult(
+            result_id="r-1",
+            task_id="t-1",
+            agent_id="agent_a",
+            tenant_id="t-1",
+            status="completed",
+            evidence=[ev],
+            action_proposals=[p],
+            completed_at=_utc_now(),
+        )
+        # Mutate: remove all evidence AFTER construction.
+        result.evidence.clear()
+        # The proposal still references ev-1, but the result no longer
+        # carries it.  The merge layer must catch this.
+        assert result.action_proposals[0].evidence_ids == ["ev-1"]
+        assert result.evidence == []
+
+
+# ============================================================================
+# R7: MultiAgentState evidence reference integrity
+# ============================================================================
+
+
+class TestMultiAgentStateEvidenceReference:
+    def _make_proposal(self, evidence_ids: list[str]) -> ActionProposal:
+        return ActionProposal.create(
+            proposal_id="p-state-1",
+            tenant_id="t-1",
+            created_by_agent="agent_a",
+            action_type="delete",
+            target_entity="customer",
+            target_id="c1",
+            risk_level=ActionRiskLevel.HIGH if evidence_ids else ActionRiskLevel.MEDIUM,
+            evidence_ids=evidence_ids,
+            requires_approval=True,
+            idempotency_key="ik-state-1",
+        )
+
+    def _make_evidence(self, evidence_id: str = "ev-state-1") -> Evidence:
+        return Evidence(
+            evidence_id=evidence_id,
+            evidence_type=EvidenceType.TOOL_RESULT,
+            tenant_id="t-1",
+            source_agent="agent_a",
+        )
+
+    def _make_result_with_evidence(self, evidence_id: str) -> AgentResult:
+        return AgentResult(
+            result_id="r-1",
+            task_id="t-1",
+            agent_id="agent_a",
+            tenant_id="t-1",
+            status="completed",
+            evidence=[self._make_evidence(evidence_id)],
+            completed_at=_utc_now(),
+        )
+
+    def test_multi_agent_state_rejects_missing_evidence_reference(self):
+        """State-level proposed_actions referencing evidence that is absent
+        from both state.evidence and all result.evidence must be rejected."""
+        p = self._make_proposal(["ev-missing"])
         with pytest.raises(ValidationError):
-            AgentResult(
-                result_id="r-1",
-                task_id="t-1",
-                agent_id="agent_a",
-                tenant_id="t-001",
-                status="completed",
-                evidence=[],
-                action_proposals=[
-                    ActionProposal.create(
-                        proposal_id="p-1",
-                        tenant_id="t-001",
-                        created_by_agent="agent_a",
-                        action_type="delete",
-                        target_entity="customer",
-                        target_id="c1",
-                        risk_level=ActionRiskLevel.HIGH,
-                        evidence_ids=["ev-missing"],
-                        requires_approval=True,
-                        idempotency_key="ik-1",
-                    )
-                ],
-                completed_at=_utc_now(),
+            MultiAgentState(
+                run_id="run-1",
+                tenant_id="t-1",
+                actor_id="user-1",
+                objective="test",
+                proposed_actions=[p],
             )
+
+    def test_multi_agent_state_accepts_state_level_evidence(self):
+        """Evidence provided at the state level satisfies proposal refs."""
+        ev = self._make_evidence("ev-state-1")
+        p = self._make_proposal(["ev-state-1"])
+        state = MultiAgentState(
+            run_id="run-1",
+            tenant_id="t-1",
+            actor_id="user-1",
+            objective="test",
+            evidence=[ev],
+            proposed_actions=[p],
+        )
+        assert state.proposed_actions[0].evidence_ids == ["ev-state-1"]
+
+    def test_multi_agent_state_accepts_result_level_evidence(self):
+        """Evidence provided inside an AgentResult also satisfies refs on
+        state-level proposals."""
+        ev_id = "ev-result-1"
+        r = self._make_result_with_evidence(ev_id)
+        p = self._make_proposal([ev_id])
+        state = MultiAgentState(
+            run_id="run-1",
+            tenant_id="t-1",
+            actor_id="user-1",
+            objective="test",
+            agent_results=[r],
+            proposed_actions=[p],
+        )
+        assert state.proposed_actions[0].evidence_ids == [ev_id]

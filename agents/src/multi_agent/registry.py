@@ -191,8 +191,7 @@ class AgentRegistry:
             )
         self._validate_tool_authority(capability)
         # Store a deep copy so external mutation cannot change registry state
-        stored = AgentCapability.model_validate(capability.model_dump(mode="json"))
-        self._agents[agent_id] = stored
+        self._agents[agent_id] = self._copy_capability(capability)
         self._handlers[agent_id] = handler
 
     def replace(self, capability: AgentCapability, handler: AgentHandler) -> None:
@@ -202,13 +201,23 @@ class AgentRegistry:
                 f"Agent {agent_id!r} is not registered; use register() for new agents"
             )
         self._validate_tool_authority(capability)
-        stored = AgentCapability.model_validate(capability.model_dump(mode="json"))
-        self._agents[agent_id] = stored
+        self._agents[agent_id] = self._copy_capability(capability)
         self._handlers[agent_id] = handler
 
     def unregister(self, agent_id: str) -> None:
         self._agents.pop(agent_id, None)
         self._handlers.pop(agent_id, None)
+
+    # -- Copy helper --------------------------------------------------------
+
+    @staticmethod
+    def _copy_capability(capability: AgentCapability) -> AgentCapability:
+        """Return a deep copy of *capability* via JSON round-trip.
+
+        All public read APIs funnel through this helper so callers can never
+        obtain a reference to the registry's internal object graph.
+        """
+        return AgentCapability.model_validate(capability.model_dump(mode="json"))
 
     # -- Resolution ---------------------------------------------------------
 
@@ -219,13 +228,11 @@ class AgentRegistry:
         if not cap.enabled:
             raise DisabledAgentError(f"Agent {agent_id!r} is disabled")
         # Return a deep copy so callers cannot mutate registry internals
-        safe = AgentCapability.model_validate(cap.model_dump(mode="json"))
-        return safe, self._handlers[agent_id]
+        return self._copy_capability(cap), self._handlers[agent_id]
 
     def resolve_capability(self, agent_id: str) -> AgentCapability:
         cap, _ = self.resolve(agent_id)
         # Already a deep copy from resolve()
-        return cap
         return cap
 
     def is_registered(self, agent_id: str) -> bool:
@@ -273,23 +280,32 @@ class AgentRegistry:
     # -- Queries ------------------------------------------------------------
 
     def list_by_domain(self, domain: str) -> list[AgentCapability]:
-        return sorted(
-            (c for c in self._agents.values() if c.enabled and domain in c.domains),
-            key=lambda c: c.agent_id,
-        )
+        return [
+            self._copy_capability(c)
+            for c in sorted(
+                (c for c in self._agents.values() if c.enabled and domain in c.domains),
+                key=lambda c: c.agent_id,
+            )
+        ]
 
     def list_by_task(self, task_type: str) -> list[AgentCapability]:
-        return sorted(
-            (
-                c
-                for c in self._agents.values()
-                if c.enabled and task_type in c.supported_tasks
-            ),
-            key=lambda c: c.agent_id,
-        )
+        return [
+            self._copy_capability(c)
+            for c in sorted(
+                (
+                    c
+                    for c in self._agents.values()
+                    if c.enabled and task_type in c.supported_tasks
+                ),
+                key=lambda c: c.agent_id,
+            )
+        ]
 
     def list_all(self) -> list[AgentCapability]:
-        return sorted(self._agents.values(), key=lambda c: c.agent_id)
+        return [
+            self._copy_capability(c)
+            for c in sorted(self._agents.values(), key=lambda c: c.agent_id)
+        ]
 
     # -- Snapshot -----------------------------------------------------------
 
@@ -301,8 +317,7 @@ class AgentRegistry:
         version = content_hash(raw)
         # Return copies so mutation doesn't affect registry
         agents_copy = {
-            aid: AgentCapability.model_validate(cap.model_dump(mode="json"))
-            for aid, cap in self._agents.items()
+            aid: self._copy_capability(cap) for aid, cap in self._agents.items()
         }
         return RegistrySnapshot(
             agents=dict(sorted(agents_copy.items(), key=lambda kv: kv[0])),

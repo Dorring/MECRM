@@ -31,16 +31,16 @@ from multi_agent.serialization import content_hash
 class MergeConflict(StrictContract):
     conflict_type: str
     detail: str = ""
-    conflicting_ids: list[str] = []
+    conflicting_ids: list[str] = Field(default_factory=list)
 
 
 class MergedState(StrictContract):
     model_config = ConfigDict(extra="forbid", revalidate_instances="never")
 
-    results: list[AgentResult] = []
-    merged_evidence: list[Evidence] = []
-    merged_proposals: list[ActionProposal] = []
-    conflicts: list[MergeConflict] = []
+    results: list[AgentResult] = Field(default_factory=list)
+    merged_evidence: list[Evidence] = Field(default_factory=list)
+    merged_proposals: list[ActionProposal] = Field(default_factory=list)
+    conflicts: list[MergeConflict] = Field(default_factory=list)
     merged_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -168,6 +168,51 @@ def merge_parallel_results(
                     conflicting_ids=[prop_id],
                 )
             )
+
+    # -- Evidence reference integrity ----------------------------------------
+    # Proposals that reference evidence IDs which are not present in the
+    # final merged_evidence set (e.g. because the evidence was excluded by
+    # a content_mismatch conflict) must also be excluded.  This runs after
+    # all evidence and proposal conflict resolution so that the available
+    # evidence set reflects the surviving objects only.
+    available_evidence_ids = {ev.evidence_id for ev in merged_evidence}
+    excluded_proposal_ids: set[str] = set()
+    final_proposals: list[ActionProposal] = []
+    for p in merged_proposals:
+        missing = sorted(set(p.evidence_ids) - available_evidence_ids)
+        if missing:
+            excluded_proposal_ids.add(p.proposal_id)
+            conflicts.append(
+                MergeConflict(
+                    conflict_type="proposal_missing_evidence",
+                    detail=(
+                        f"Proposal {p.proposal_id!r} references "
+                        f"missing evidence {missing!r}"
+                    ),
+                    conflicting_ids=[p.proposal_id, *missing],
+                )
+            )
+            continue
+        final_proposals.append(p)
+    merged_proposals = final_proposals
+
+    # Clean up deduped_results: remove excluded proposals from each result so
+    # that MergedState construction does not fail on re-validation of
+    # AgentResult (whose _tenant_homogeneity checks evidence references).
+    # model_copy(update=...) does NOT run validators, so this is safe.
+    if excluded_proposal_ids:
+        cleaned_results: list[AgentResult] = []
+        for r in deduped_results:
+            if any(p.proposal_id in excluded_proposal_ids for p in r.action_proposals):
+                kept = [
+                    p
+                    for p in r.action_proposals
+                    if p.proposal_id not in excluded_proposal_ids
+                ]
+                cleaned_results.append(r.model_copy(update={"action_proposals": kept}))
+            else:
+                cleaned_results.append(r)
+        deduped_results = cleaned_results
 
     return MergedState(
         results=deduped_results,

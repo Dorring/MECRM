@@ -332,3 +332,78 @@ class TestRegistryDeepCopy:
         resolved.metadata["key"] = "v2"
         v2 = reg.snapshot().version
         assert v1 == v2
+
+
+# ============================================================================
+# R7: All read APIs return copies — list_by_domain / list_by_task / list_all
+# ============================================================================
+
+
+class TestRegistryReadApiCopies:
+    def _registry_with_two(self) -> AgentRegistry:
+        reg = AgentRegistry()
+        reg.register(
+            _make_capability(
+                agent_id="aa",
+                domains=frozenset({"support"}),
+                supported_tasks=frozenset({"triage"}),
+                metadata={"key": "original"},
+            ),
+            object(),
+        )
+        reg.register(
+            _make_capability(
+                agent_id="bb",
+                domains=frozenset({"support"}),
+                supported_tasks=frozenset({"triage"}),
+                metadata={"key": "original"},
+            ),
+            object(),
+        )
+        return reg
+
+    def test_list_all_metadata_mutation_does_not_change_registry(self):
+        reg = self._registry_with_two()
+        caps = reg.list_all()
+        assert len(caps) == 2
+        # Mutate returned copies
+        for cap in caps:
+            cap.metadata["key"] = "mutated"
+        # Re-read — registry internals unchanged
+        fresh = reg.list_all()
+        assert all(c.metadata["key"] == "original" for c in fresh)
+
+    def test_list_by_domain_mutation_does_not_change_registry(self):
+        reg = self._registry_with_two()
+        caps = reg.list_by_domain("support")
+        assert len(caps) == 2
+        for cap in caps:
+            cap.metadata["key"] = "mutated"
+        fresh = reg.list_by_domain("support")
+        assert all(c.metadata["key"] == "original" for c in fresh)
+
+    def test_list_by_task_mutation_does_not_change_registry(self):
+        reg = self._registry_with_two()
+        caps = reg.list_by_task("triage")
+        assert len(caps) == 2
+        for cap in caps:
+            cap.metadata["key"] = "mutated"
+        fresh = reg.list_by_task("triage")
+        assert all(c.metadata["key"] == "original" for c in fresh)
+
+    def test_query_result_mutation_does_not_change_snapshot_version(self):
+        """Mutating capabilities returned by list_all / list_by_domain /
+        list_by_task must NOT affect the snapshot version."""
+        reg = self._registry_with_two()
+        v1 = reg.snapshot().version
+
+        # Mutate copies returned by every read API
+        for cap in reg.list_all():
+            cap.metadata["key"] = "v2"
+        for cap in reg.list_by_domain("support"):
+            cap.metadata["key"] = "v3"
+        for cap in reg.list_by_task("triage"):
+            cap.metadata["key"] = "v4"
+
+        v2 = reg.snapshot().version
+        assert v1 == v2

@@ -286,3 +286,94 @@ class TestMergeProposalIntegrity:
         r = _make_result(result_id="r-001", proposals=[p])
         merged = merge_parallel_results([r], expected_tenant_id="t-001")
         assert len(merged.merged_proposals) == 1
+
+
+# ============================================================================
+# R7: Merge excludes proposals that reference missing evidence
+# ============================================================================
+
+
+class TestMergeEvidenceReferenceIntegrity:
+    """Merge must verify that every proposal's evidence_ids reference
+    evidence that actually survives into merged_evidence.  Proposals with
+    dangling references are excluded and recorded as
+    ``proposal_missing_evidence`` conflicts."""
+
+    def test_merge_excludes_proposal_after_evidence_removed(self):
+        """Construct a valid AgentResult (proposal + evidence), then clear
+        the evidence list AFTER construction.  Merge must exclude the
+        proposal because its evidence_id is no longer present."""
+        ev = _make_evidence(evidence_id="ev-1")
+        p = _make_proposal(
+            proposal_id="p-1",
+            evidence_ids=["ev-1"],
+            risk_level=ActionRiskLevel.HIGH,
+        )
+        r = _make_result(result_id="r-001", evidence=[ev], proposals=[p])
+        # Mutate: remove evidence after construction
+        r.evidence.clear()
+
+        merged = merge_parallel_results([r], expected_tenant_id="t-001")
+
+        assert len(merged.merged_proposals) == 0
+        assert any(
+            c.conflict_type == "proposal_missing_evidence" for c in merged.conflicts
+        )
+
+    def test_merge_records_proposal_missing_evidence(self):
+        """The conflict record must include both the proposal id and the
+        missing evidence id in ``conflicting_ids``."""
+        ev = _make_evidence(evidence_id="ev-missing-target")
+        p = _make_proposal(
+            proposal_id="p-orphan",
+            evidence_ids=["ev-missing-target"],
+            risk_level=ActionRiskLevel.HIGH,
+        )
+        r = _make_result(result_id="r-001", evidence=[ev], proposals=[p])
+        r.evidence.clear()
+
+        merged = merge_parallel_results([r], expected_tenant_id="t-001")
+
+        conflict = next(
+            c
+            for c in merged.conflicts
+            if c.conflict_type == "proposal_missing_evidence"
+        )
+        assert "p-orphan" in conflict.conflicting_ids
+        assert "ev-missing-target" in conflict.conflicting_ids
+        assert "ev-missing-target" in conflict.detail
+
+    def test_merge_excludes_proposal_when_evidence_conflicts(self):
+        """When evidence is excluded due to a content_mismatch conflict,
+        any proposal referencing that evidence id must also be excluded."""
+        ev_a = _make_evidence(evidence_id="ev-conflict")
+        ev_b = Evidence(
+            evidence_id="ev-conflict",
+            evidence_type=EvidenceType.CUSTOMER,  # different content
+            tenant_id="t-001",
+            source_agent="a",
+            created_at=_utc_now(),
+        )
+        p = _make_proposal(
+            proposal_id="p-dep",
+            evidence_ids=["ev-conflict"],
+            risk_level=ActionRiskLevel.HIGH,
+        )
+        r1 = _make_result(result_id="r-001", evidence=[ev_a], proposals=[p])
+        r2 = _make_result(result_id="r-002", evidence=[ev_b])
+
+        merged = merge_parallel_results([r1, r2], expected_tenant_id="t-001")
+
+        # Evidence ev-conflict excluded due to content_mismatch
+        assert not any(e.evidence_id == "ev-conflict" for e in merged.merged_evidence)
+        assert any(
+            c.conflict_type == "content_mismatch" and "ev-conflict" in c.conflicting_ids
+            for c in merged.conflicts
+        )
+        # Proposal p-dep excluded because its evidence was excluded
+        assert not any(prop.proposal_id == "p-dep" for prop in merged.merged_proposals)
+        assert any(
+            c.conflict_type == "proposal_missing_evidence"
+            and "p-dep" in c.conflicting_ids
+            for c in merged.conflicts
+        )
