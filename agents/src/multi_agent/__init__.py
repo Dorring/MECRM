@@ -22,7 +22,6 @@ from multi_agent.contracts import (
     ToolAuthority,
     ToolCallRecord,
     ToolDescriptor,
-    _compute_proposal_hash,
     from_crm_writer_proposal,
     from_productivity_proposal,
 )
@@ -41,6 +40,7 @@ from multi_agent.errors import (
     UnknownAgentError,
     UnknownToolError,
 )
+from multi_agent.integrity import compute_proposal_hash
 from multi_agent.registry import (
     AgentHandler,
     AgentRegistry,
@@ -54,6 +54,7 @@ from multi_agent.serialization import (
     serialize_contract,
     serialize_set_for_json,
     stable_hash,
+    validate_json_value,
 )
 from multi_agent.state import MergeConflict, MergedState, merge_parallel_results
 
@@ -98,8 +99,8 @@ __all__ = [
     "UnauthorizedToolError",
     "UnknownAgentError",
     "UnknownToolError",
-    "_compute_proposal_hash",
     "canonicalize",
+    "compute_proposal_hash",
     "content_hash",
     "deserialize_contract",
     "from_crm_writer_proposal",
@@ -108,4 +109,5 @@ __all__ = [
     "serialize_contract",
     "serialize_set_for_json",
     "stable_hash",
+    "validate_json_value",
 ]

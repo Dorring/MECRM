@@ -479,7 +479,8 @@ class TestMultiAgentState:
         state = MultiAgentState(
             run_id="r1",
             tenant_id="t-1",
-            user_id="u1",
+            actor_type="user",
+            actor_id="u1",
             objective="Analyze support tickets",
         )
         assert state.objective == "Analyze support tickets"
@@ -566,3 +567,136 @@ class TestAdapters:
         )
         adapted = from_productivity_proposal(old, evidence_ids=["ev-1"])
         assert adapted.proposal_hash == adapted.compute_hash()
+
+
+# ============================================================================
+# R4: Proposal hash uses shared canonicalizer
+# ============================================================================
+
+
+class TestProposalHashCanonicalizer:
+    def test_proposal_hash_rejects_custom_object(self):
+        class Custom:
+            pass
+
+        with pytest.raises(ValidationError):
+            _make_proposal(payload={"obj": Custom()})  # type: ignore[arg-type]
+
+    def test_proposal_hash_rejects_nan(self):
+        with pytest.raises(ValidationError):
+            _make_proposal(payload={"x": float("nan")})
+
+    def test_proposal_hash_normalizes_utc(self):
+        p1 = _make_proposal(
+            created_at=datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        )
+        assert len(p1.proposal_hash) == 64
+
+    def test_proposal_hash_matches_content_hash(self):
+        from multi_agent.integrity import compute_proposal_hash
+        from multi_agent.serialization import content_hash
+
+        payload = {"a": 1, "b": 2}
+        h1 = compute_proposal_hash(
+            tenant_id="t-1",
+            created_by_agent="a",
+            action_type="create",
+            target_entity="ticket",
+            target_id=None,
+            payload=payload,
+            priority="medium",
+            risk_level="medium",
+            justification=None,
+            evidence_ids=[],
+            requires_approval=True,
+        )
+        h2 = content_hash(
+            {
+                "tenant_id": "t-1",
+                "created_by_agent": "a",
+                "action_type": "create",
+                "target_entity": "ticket",
+                "target_id": None,
+                "payload": payload,
+                "priority": "medium",
+                "risk_level": "medium",
+                "justification": None,
+                "evidence_ids": [],
+                "requires_approval": True,
+            }
+        )
+        assert h1 == h2
+
+
+# ============================================================================
+# R4: Budget None semantics
+# ============================================================================
+
+
+class TestBudgetNoneSemantics:
+    def test_budget_none_means_unlimited(self):
+        b = ExecutionBudget(token_budget=None, cost_budget_usd=None)
+        assert b.token_budget is None
+        assert b.cost_budget_usd is None
+
+    def test_budget_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ExecutionBudget(token_budget=0)
+
+    def test_budget_specific_value_ok(self):
+        from decimal import Decimal
+
+        b = ExecutionBudget(token_budget=5000, cost_budget_usd=Decimal("2.50"))
+        assert b.token_budget == 5000
+        assert b.cost_budget_usd == Decimal("2.50")
+
+
+# ============================================================================
+# R4: AgentResult new statuses
+# ============================================================================
+
+
+class TestAgentResultNewStatuses:
+    def test_agent_result_supports_needs_input(self):
+        r = AgentResult(
+            result_id="r-1",
+            task_id="t-1",
+            agent_id="a1",
+            tenant_id="t-1",
+            status="needs_input",
+            completed_at=_utc_now(),
+        )
+        assert r.status == "needs_input"
+
+    def test_agent_result_supports_skipped(self):
+        r = AgentResult(
+            result_id="r-1",
+            task_id="t-1",
+            agent_id="a1",
+            tenant_id="t-1",
+            status="skipped",
+            completed_at=_utc_now(),
+        )
+        assert r.status == "skipped"
+
+
+# ============================================================================
+# R4: MultiAgentState actor
+# ============================================================================
+
+
+class TestMultiAgentStateActor:
+    def test_actor_type_and_id(self):
+        state = MultiAgentState(
+            run_id="r1",
+            tenant_id="t-1",
+            actor_type="service",
+            actor_id="svc-pipeline",
+            objective="Run pipeline",
+        )
+        assert state.actor_type == "service"
+        assert state.actor_id == "svc-pipeline"
+
+    def test_default_actor_is_user(self):
+        state = MultiAgentState(run_id="r1", tenant_id="t-1", objective="Test")
+        assert state.actor_type == "user"

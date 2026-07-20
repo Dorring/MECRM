@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timezone
 
-from pydantic import Field
+from pydantic import ConfigDict, Field
 
 from multi_agent.contracts import (
     ActionProposal,
@@ -34,6 +34,8 @@ class MergeConflict(StrictContract):
 
 
 class MergedState(StrictContract):
+    model_config = ConfigDict(extra="forbid", revalidate_instances="never")
+
     results: list[AgentResult] = []
     merged_evidence: list[Evidence] = []
     merged_proposals: list[ActionProposal] = []
@@ -93,6 +95,17 @@ def merge_parallel_results(
                 )
         for p in r.action_proposals:
             if p.tenant_id == expected_tenant_id:
+                try:
+                    p.verify_integrity()
+                except Exception:
+                    conflicts.append(
+                        MergeConflict(
+                            conflict_type="proposal_integrity_failure",
+                            detail=f"Proposal {p.proposal_id!r} failed integrity check; excluded",
+                            conflicting_ids=[p.proposal_id],
+                        )
+                    )
+                    continue
                 proposal_groups[p.proposal_id].append(p)
             else:
                 conflicts.append(

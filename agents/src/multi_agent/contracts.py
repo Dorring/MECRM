@@ -1,14 +1,16 @@
-"""Unified multi-agent data contracts — Phase 2 R3.
+"""Unified multi-agent data contracts — Phase 2 R4.
 
 Every contract inherits :class:`StrictContract`.  Field-level validators
 enforce Phase 2 rules; :meth:`ActionProposal.verify_integrity` provides an
 explicit integrity gate for merge and execution paths.
+
+All JSON fields are validated through the shared canonicalizer at
+construction time — arbitrary Python objects, NaN, Infinity, and bytes are
+rejected at the boundary.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -16,16 +18,20 @@ from enum import Enum
 from hmac import compare_digest
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from multi_agent.errors import ProposalHashMismatchError
+from multi_agent.integrity import compute_proposal_hash
+from multi_agent.serialization import validate_json_value
 
-# ---------------------------------------------------------------------------
-# JSON value helper — recursive, no Any escape hatch
-# ---------------------------------------------------------------------------
-
-# Pydantic-compatible JSON value type — use Any to avoid recursion issues
-# in type aliases with Pydantic v2 model validation.
+# Use Any for JSON fields; validation happens at field-validator and
+# verify_integrity() levels.
 JsonValue = Any
 
 # ---------------------------------------------------------------------------
@@ -217,8 +223,6 @@ class Evidence(StrictContract):
 
 
 class ToolDescriptor(StrictContract):
-    """Describes a single tool's authority, contract, and metadata."""
-
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     tool_name: str
@@ -262,57 +266,13 @@ class AgentError(StrictContract):
 # ============================================================================
 
 
-def _compute_proposal_hash(
-    *,
-    tenant_id: str,
-    created_by_agent: str,
-    action_type: str,
-    target_entity: str,
-    target_id: str | None,
-    payload: dict[str, Any],
-    priority: str,
-    risk_level: str,
-    justification: str | None,
-    evidence_ids: list[str],
-    requires_approval: bool,
-) -> str:
-    canonical = _canonical_json(
-        {
-            "tenant_id": tenant_id,
-            "created_by_agent": created_by_agent,
-            "action_type": action_type,
-            "target_entity": target_entity,
-            "target_id": target_id,
-            "payload": payload,
-            "priority": priority,
-            "risk_level": risk_level,
-            "justification": justification,
-            "evidence_ids": sorted(evidence_ids),
-            "requires_approval": requires_approval,
-        }
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _canonical_json(obj: Any) -> str:
-    """Produce deterministic, sorted-key JSON for hashing."""
-    return json.dumps(
-        obj,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-        ensure_ascii=False,
-    )
-
-
 def _scan_payload_for_tenant_override(
     payload: dict[str, Any], path: str = "payload"
 ) -> None:
     for k, v in payload.items():
         if k.lower() in ("tenant_id", "tenantid"):
             raise ValueError(
-                f"ActionProposal.{path} must not contain tenant_id override; "
-                f"found key {k!r}"
+                f"ActionProposal.{path} must not contain tenant_id override; found key {k!r}"
             )
         if isinstance(v, dict):
             _scan_payload_for_tenant_override(v, f"{path}.{k}")
@@ -324,7 +284,7 @@ def _scan_payload_for_tenant_override(
 
 class ActionProposal(StrictContract):
     proposal_id: str
-    proposal_hash: str = ""  # auto-computed in model_validator if empty
+    proposal_hash: str = ""  # auto-computed if empty
     tenant_id: str
     created_by_agent: str
     action_type: str
@@ -350,8 +310,9 @@ class ActionProposal(StrictContract):
 
     @field_validator("payload")
     @classmethod
-    def _no_tenant_override(cls, v: dict[str, Any]) -> dict[str, Any]:
+    def _validate_payload(cls, v: dict[str, Any]) -> dict[str, Any]:
         _scan_payload_for_tenant_override(v)
+        validate_json_value(v)  # reject non-JSON types
         return v
 
     @field_validator("created_at")
@@ -367,7 +328,7 @@ class ActionProposal(StrictContract):
         if isinstance(data, dict):
             if not data.get("proposal_hash"):
                 data = dict(data)
-                data["proposal_hash"] = _compute_proposal_hash_from_data(data)
+                data["proposal_hash"] = cls._compute_hash_from_data(data)
         return data
 
     @model_validator(mode="after")
@@ -394,7 +355,7 @@ class ActionProposal(StrictContract):
     # -- public methods ------------------------------------------------------
 
     def compute_hash(self) -> str:
-        return _compute_proposal_hash(
+        return compute_proposal_hash(
             tenant_id=self.tenant_id,
             created_by_agent=self.created_by_agent,
             action_type=self.action_type,
@@ -409,15 +370,9 @@ class ActionProposal(StrictContract):
         )
 
     def verify_integrity(self) -> None:
-        """Re-validate hash, payload tenant overrides, and risk rules.
-
-        Call this before accepting a proposal from an untrusted source
-        (deserialization, merge, executor).
-        """
         if not compare_digest(self.proposal_hash, self.compute_hash()):
             raise ProposalHashMismatchError(
-                f"Proposal {self.proposal_id!r}: stored hash does not match "
-                f"recomputed content"
+                f"Proposal {self.proposal_id!r}: stored hash does not match recomputed content"
             )
         _scan_payload_for_tenant_override(self.payload)
         if self.risk_level == ActionRiskLevel.HIGH:
@@ -428,32 +383,31 @@ class ActionProposal(StrictContract):
 
     @classmethod
     def create(cls, **data: Any) -> "ActionProposal":
-        """Factory: the canonical way to create a new ActionProposal."""
         data.pop("proposal_hash", None)
         return cls.model_validate(data)
 
+    # -- internal ------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Internal hash helpers (not exported)
-# ---------------------------------------------------------------------------
-
-
-def _compute_proposal_hash_from_data(data: dict[str, Any]) -> str:
-    return _compute_proposal_hash(
-        tenant_id=data.get("tenant_id", ""),
-        created_by_agent=data.get("created_by_agent", ""),
-        action_type=data.get("action_type", ""),
-        target_entity=data.get("target_entity", ""),
-        target_id=data.get("target_id"),
-        payload=data.get("payload", {}),
-        priority=data.get("priority", "medium"),
-        risk_level=data.get("risk_level", "medium")
-        if isinstance(data.get("risk_level"), str)
-        else data.get("risk_level", "medium"),
-        justification=data.get("justification"),
-        evidence_ids=data.get("evidence_ids", []),
-        requires_approval=data.get("requires_approval", True),
-    )
+    @staticmethod
+    def _compute_hash_from_data(data: dict[str, Any]) -> str:
+        try:
+            return compute_proposal_hash(
+                tenant_id=data.get("tenant_id", ""),
+                created_by_agent=data.get("created_by_agent", ""),
+                action_type=data.get("action_type", ""),
+                target_entity=data.get("target_entity", ""),
+                target_id=data.get("target_id"),
+                payload=data.get("payload", {}),
+                priority=data.get("priority", "medium"),
+                risk_level=data.get("risk_level", "medium")
+                if isinstance(data.get("risk_level"), str)
+                else data.get("risk_level", "medium"),
+                justification=data.get("justification"),
+                evidence_ids=data.get("evidence_ids", []),
+                requires_approval=data.get("requires_approval", True),
+            )
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Cannot compute proposal hash: {e}") from e
 
 
 # ============================================================================
@@ -465,7 +419,7 @@ class AgentTask(StrictContract):
     task_id: str
     agent_id: str
     task_type: str
-    objective: str = ""
+    objective: str = "pending"
     priority: Literal["low", "medium", "high", "critical"] = "medium"
     status: Literal[
         "pending",
@@ -494,10 +448,15 @@ class AgentTask(StrictContract):
 
     @field_validator("tenant_id")
     @classmethod
-    def _tenant_required(cls, v: str) -> str:
+    def _tenant_required_task(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("AgentTask must have a tenant_id")
         return v.strip()
+
+    @field_validator("input_data")
+    @classmethod
+    def _validate_input_data(cls, v: dict[str, Any]) -> dict[str, Any]:
+        return validate_json_value(v)  # type: ignore[return-value]
 
     @field_validator("timeout_ms")
     @classmethod
@@ -538,7 +497,9 @@ class AgentResult(StrictContract):
     agent_id: str
     agent_version: str = ""
     tenant_id: str
-    status: Literal["completed", "failed", "degraded", "cancelled"]
+    status: Literal[
+        "completed", "failed", "degraded", "cancelled", "needs_input", "skipped"
+    ]
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     duration_ms: float = Field(default=0.0, ge=0.0)
     summary: str = ""
@@ -570,9 +531,22 @@ class AgentResult(StrictContract):
 
     @field_validator("started_at", "completed_at")
     @classmethod
-    def _utc_aware(cls, v: datetime | None) -> datetime | None:
+    def _utc_aware_result(cls, v: datetime | None) -> datetime | None:
         if v is not None and v.tzinfo is None:
             raise ValueError("datetime fields must be timezone-aware (UTC)")
+        return v
+
+    @field_validator("output")
+    @classmethod
+    def _validate_output(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        if v is not None:
+            validate_json_value(v)
+        return v
+
+    @field_validator("findings")
+    @classmethod
+    def _validate_findings(cls, v: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        validate_json_value(v)
         return v
 
     @model_validator(mode="after")
@@ -608,7 +582,6 @@ class AgentResult(StrictContract):
                     f"ActionProposal {p.proposal_id!r} created_by_agent "
                     f"{p.created_by_agent!r} != result agent_id {self.agent_id!r}"
                 )
-            p.verify_integrity()
         return self
 
 
@@ -636,7 +609,7 @@ class AgentExecutionContext(StrictContract):
 
 
 # ============================================================================
-# PHASE 2 STATE MODELS  (aligned to Phase 3 contract)
+# PHASE 2 STATE MODELS
 # ============================================================================
 
 
@@ -653,8 +626,8 @@ class ExecutionBudget(StrictContract):
     max_agent_calls: int = Field(default=128, ge=1)
     max_tool_calls: int = Field(default=512, ge=1)
     max_iterations: int = Field(default=10, ge=1)
-    token_budget: int = Field(default=0, ge=0)
-    cost_budget_usd: Decimal = Field(default=Decimal("0.00"), ge=0)
+    token_budget: int | None = Field(default=None, gt=0)
+    cost_budget_usd: Decimal | None = Field(default=None, ge=0)
     deadline_ms: int = Field(default=300_000, ge=1)
 
     @model_validator(mode="after")
@@ -693,8 +666,9 @@ RunStatus = Literal[
 class MultiAgentState(StrictContract):
     run_id: str
     tenant_id: str
-    user_id: str | None = None
-    objective: str = ""
+    actor_type: Literal["user", "service"] = "user"
+    actor_id: str = ""
+    objective: str = "pending"
     status: RunStatus = "idle"
     plan: list[str] = Field(default_factory=list)
     tasks: list[AgentTask] = Field(default_factory=list)
@@ -723,8 +697,7 @@ class MultiAgentState(StrictContract):
         return v
 
     @model_validator(mode="after")
-    def _tenant_homogeneity(self) -> "MultiAgentState":
-        """All nested objects must share the state's tenant_id."""
+    def _tenant_homogeneity_and_integrity(self) -> "MultiAgentState":
         for task in self.tasks:
             if task.tenant_id != self.tenant_id:
                 raise ValueError(
@@ -749,6 +722,7 @@ class MultiAgentState(StrictContract):
                     f"Proposal {p.proposal_id!r} tenant {p.tenant_id!r} "
                     f"!= state tenant {self.tenant_id!r}"
                 )
+            p.verify_integrity()
         return self
 
 
@@ -794,8 +768,7 @@ def from_productivity_proposal(
     if evidence_ids is None:
         if proposal.priority == "high":
             raise ValueError(
-                "high-priority productivity proposal requires evidence_ids; "
-                "pass them explicitly"
+                "high-priority productivity proposal requires evidence_ids; pass them explicitly"
             )
         evidence_ids = []
 

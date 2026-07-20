@@ -127,3 +127,15 @@ def serialize_set_for_json(value: set[Any]) -> list[Any]:
 def content_hash(obj: Any) -> str:
     """Return a stable SHA-256 hash of *obj*'s canonical form (full content hash)."""
     return stable_hash(obj)
+
+
+def validate_json_value(value: Any) -> Any:
+    """Validate that *value* is JSON-compatible via the canonicalizer.
+
+    Returns the canonicalized value on success; raises ``TypeError`` or
+    ``ValueError`` for non-JSON types (custom objects, NaN, Infinity, bytes,
+    non-string dict keys, etc.).
+
+    Use this as a Pydantic field validator for JSON fields.
+    """
+    return _canonical_value(value)

@@ -252,3 +252,37 @@ class TestImmutability:
         r1 = _make_result(result_id="r-001", evidence=[ev])
         merge_parallel_results([r1], expected_tenant_id="t-001")
         assert ev.evidence_type == original_type
+
+
+# ============================================================================
+# R4: Merge re-validates proposal integrity
+# ============================================================================
+
+
+class TestMergeProposalIntegrity:
+    def test_mutated_proposal_after_result_rejected_by_merge(self):
+        """Proposal mutated after AgentResult construction is caught by merge."""
+        p = _make_proposal(proposal_id="p-mut", payload={"amount": 100})
+        r = _make_result(result_id="r-001", proposals=[p])
+        p.verify_integrity()  # valid now
+        r.action_proposals[0].payload["amount"] = 999999  # type: ignore[index]
+        merged = merge_parallel_results([r], expected_tenant_id="t-001")
+        assert len(merged.merged_proposals) == 0
+        assert any(
+            c.conflict_type == "proposal_integrity_failure" for c in merged.conflicts
+        )
+
+    def test_integrity_failure_proposal_excluded(self):
+        """Proposal failing integrity is excluded from merge output."""
+        p = _make_proposal(proposal_id="p-bad", payload={"amount": 100})
+        r = _make_result(result_id="r-001", proposals=[p])
+        r.action_proposals[0].payload["amount"] = 999999  # type: ignore[index]
+        merged = merge_parallel_results([r], expected_tenant_id="t-001")
+        assert len(merged.merged_proposals) == 0
+
+    def test_good_proposal_passes_merge(self):
+        """Intact proposal passes merge normally."""
+        p = _make_proposal(proposal_id="p-good")
+        r = _make_result(result_id="r-001", proposals=[p])
+        merged = merge_parallel_results([r], expected_tenant_id="t-001")
+        assert len(merged.merged_proposals) == 1
