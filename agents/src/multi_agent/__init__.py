@@ -127,6 +127,63 @@ from multi_agent.planning_templates import (
 from multi_agent.plan_validator import PlanValidator
 from multi_agent.planner import DeterministicPlanner
 
+# Phase 4 — Supervisor Runtime
+from multi_agent.execution import (
+    ExecutionCancellation,
+    ExecutionTraceEvent,
+    FakeExecutionCancellation,
+    SupervisorConfig,
+    SupervisorRunResult,
+    SupervisorRunStatus,
+    TaskAttemptRecord,
+    TaskExecutionRecord,
+    TRACE_BUDGET_EXCEEDED,
+    TRACE_PLAN_VALIDATED,
+    TRACE_RESULTS_MERGED,
+    TRACE_RUN_CANCELLED,
+    TRACE_RUN_COMPLETED,
+    TRACE_RUN_STARTED,
+    TRACE_TASK_COMPLETED,
+    TRACE_TASK_FAILED,
+    TRACE_TASK_NEEDS_INPUT,
+    TRACE_TASK_READY,
+    TRACE_TASK_RETRYING,
+    TRACE_TASK_SKIPPED,
+    TRACE_TASK_STARTED,
+    TRACE_TASK_TIMED_OUT,
+    build_execution_context,
+    final_status_priority,
+    utc_now,
+    validate_agent_result,
+)
+from multi_agent.execution_errors import (
+    ExecutionUsageUnavailableError,
+    InvalidAgentResultError,
+    RetryableAgentError,
+    RunAlreadyInProgressError,
+    RunPlanConflictError,
+    SupervisorError,
+)
+from multi_agent.invocation import (
+    AgentInvocationReceipt,
+    AgentInvoker,
+    DeterministicFakeInvoker,
+    RegistryAgentInvoker,
+)
+from multi_agent.run_store import (
+    InMemoryRunStore,
+    RunLease,
+    RunStore,
+    defensive_copy_result,
+)
+from multi_agent.scheduler import DagScheduler, TaskOutcome
+from multi_agent.supervisor import SupervisorRuntime
+from multi_agent.supervisor_graph import (
+    FakeSupervisorRuntime,
+    SupervisorGraphState,
+    build_supervisor_graph,
+)
+
 __all__ = [
     # Phase 2
     "ActionProposal",
@@ -244,4 +301,56 @@ __all__ = [
     # Phase 3 — Validator & Planner
     "PlanValidator",
     "DeterministicPlanner",
+    # Phase 4 — Execution Errors
+    "ExecutionUsageUnavailableError",
+    "InvalidAgentResultError",
+    "RetryableAgentError",
+    "RunAlreadyInProgressError",
+    "RunPlanConflictError",
+    "SupervisorError",
+    # Phase 4 — Invocation
+    "AgentInvocationReceipt",
+    "AgentInvoker",
+    "DeterministicFakeInvoker",
+    "RegistryAgentInvoker",
+    # Phase 4 — Execution Contracts
+    "ExecutionCancellation",
+    "ExecutionTraceEvent",
+    "FakeExecutionCancellation",
+    "SupervisorConfig",
+    "SupervisorRunResult",
+    "SupervisorRunStatus",
+    "TaskAttemptRecord",
+    "TaskExecutionRecord",
+    "TRACE_BUDGET_EXCEEDED",
+    "TRACE_PLAN_VALIDATED",
+    "TRACE_RESULTS_MERGED",
+    "TRACE_RUN_CANCELLED",
+    "TRACE_RUN_COMPLETED",
+    "TRACE_RUN_STARTED",
+    "TRACE_TASK_COMPLETED",
+    "TRACE_TASK_FAILED",
+    "TRACE_TASK_NEEDS_INPUT",
+    "TRACE_TASK_READY",
+    "TRACE_TASK_RETRYING",
+    "TRACE_TASK_SKIPPED",
+    "TRACE_TASK_STARTED",
+    "TRACE_TASK_TIMED_OUT",
+    "build_execution_context",
+    "final_status_priority",
+    "utc_now",
+    "validate_agent_result",
+    # Phase 4 — Run Store
+    "InMemoryRunStore",
+    "RunLease",
+    "RunStore",
+    "defensive_copy_result",
+    # Phase 4 — Scheduler & Supervisor
+    "DagScheduler",
+    "TaskOutcome",
+    "SupervisorRuntime",
+    # Phase 4 — LangGraph Adapter
+    "FakeSupervisorRuntime",
+    "SupervisorGraphState",
+    "build_supervisor_graph",
 ]
