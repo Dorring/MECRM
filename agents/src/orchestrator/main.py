@@ -5,6 +5,12 @@ Main entry point for the AI agent layer.
 Consumes events from Kafka and routes them to appropriate agents.
 """
 
+# load_dotenv() MUST run before any project import that reads environment
+# variables (config.py, ai_mode.py, providers.py, etc.).  Without this,
+# .env overrides are invisible to the Settings singleton.
+from dotenv import load_dotenv
+load_dotenv()
+
 import asyncio
 import json
 import re
@@ -38,9 +44,6 @@ from intelligence.compliance.compliance_agent import (
 )
 from intelligence.i18n.graph import process_multilingual_input
 from intelligence.i18n.voice_ingest import AudioFormat
-
-from dotenv import load_dotenv
-load_dotenv()  # Load .env file after all imports
 
 # Configure structured logging
 structlog.configure(
@@ -438,10 +441,15 @@ async def ready_handler(request):
 
     /health only signals process-alive + HTTP reachable.
     /ready signals whether the service can do useful work.
+
+    HTTP 200 — ready
+    HTTP 503 — degraded or unavailable
     """
     meta = provider_metadata()
     health = await provider_health_check()
-    return web.json_response({**meta, **health})
+    status = health.get("status", "unavailable")
+    http_status = 200 if status == "ready" else 503
+    return web.json_response({**meta, **health}, status=http_status)
 
 
 async def metrics_handler(request):

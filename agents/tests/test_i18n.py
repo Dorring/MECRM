@@ -155,12 +155,15 @@ class TestVoiceIngest:
     @pytest.mark.asyncio
     async def test_whisper_stt_init(self):
         """Should initialize WhisperSTT with defaults."""
-        from intelligence.i18n.voice_ingest import WhisperSTT
-        
-        stt = WhisperSTT()
-        
-        assert stt._model == "whisper"
-        assert stt._timeout == 30.0
+        import os
+        os.environ["WHISPER_URL"] = "http://localhost:11434"
+        try:
+            from intelligence.i18n.voice_ingest import WhisperSTT
+            stt = WhisperSTT()
+            assert stt._model == "whisper"
+            assert stt._timeout == 30.0
+        finally:
+            del os.environ["WHISPER_URL"]
 
     @pytest.mark.asyncio
     async def test_whisper_stt_custom_config(self):

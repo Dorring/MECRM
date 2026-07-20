@@ -17,7 +17,10 @@ from typing import Any, Protocol
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from pydantic import SecretStr
 
-from orchestrator.ai_mode import AIMode, AIProvider, resolve_ai_mode, resolve_ai_provider
+from orchestrator.ai_mode import (
+    AIMode, AIProvider, AIConfigurationError,
+    resolve_ai_mode, resolve_ai_provider,
+)
 from orchestrator.config import settings
 
 
@@ -185,24 +188,34 @@ def provider_metadata() -> dict[str, str | bool]:
     """Return safe-to-log provider metadata; never include credentials."""
     mode = resolve_ai_mode()
     provider = resolve_ai_provider(mode)
-    meta: dict[str, str | bool] = {
+
+    if mode is AIMode.DISABLED:
+        chat_model = "disabled"
+        embedding_model = "disabled"
+    elif mode is AIMode.DETERMINISTIC:
+        from intelligence.deterministic_provider import (
+            DeterministicChatProvider,
+            DeterministicEmbeddingsProvider,
+        )
+        chat_model = DeterministicChatProvider.MODEL
+        embedding_model = DeterministicEmbeddingsProvider.MODEL
+    elif provider is AIProvider.NVIDIA_NIM:
+        chat_model = settings.NVIDIA_CHAT_MODEL
+        embedding_model = settings.NVIDIA_EMBED_MODEL
+    elif provider is AIProvider.OLLAMA:
+        chat_model = settings.OLLAMA_MODEL
+        embedding_model = settings.OLLAMA_EMBED_MODEL
+    else:
+        chat_model = "disabled"
+        embedding_model = "disabled"
+
+    return {
         "ai_mode": mode.value,
         "provider": provider.value if provider else "none",
-        "chat_model": (
-            settings.NVIDIA_CHAT_MODEL
-            if provider is AIProvider.NVIDIA_NIM
-            else settings.OLLAMA_MODEL if provider is AIProvider.OLLAMA
-            else "disabled"
-        ),
-        "embedding_model": (
-            settings.NVIDIA_EMBED_MODEL
-            if provider is AIProvider.NVIDIA_NIM
-            else settings.OLLAMA_EMBED_MODEL if provider is AIProvider.OLLAMA
-            else "disabled"
-        ),
+        "chat_model": chat_model,
+        "embedding_model": embedding_model,
         "remote": provider is AIProvider.NVIDIA_NIM,
     }
-    return meta
 
 
 async def provider_health_check() -> dict[str, Any]:
@@ -212,28 +225,48 @@ async def provider_health_check() -> dict[str, Any]:
       - status: "ready" | "degraded" | "unavailable"
       - ai_mode: the resolved AI_MODE
       - provider: the active provider name
-      - checks: per-endpoint health detail (live mode only)
-      - error: present only when a check fails
+      - chat_model: model name (safe, no credentials)
+      - embedding_model: model name (safe, no credentials)
+      - checks: per-endpoint health detail
+      - error: present only when a check fails (safe, no secrets)
 
-    Never returns API keys or secrets.
+    Never returns API keys, Authorization headers, or raw internal exceptions.
     """
     import httpx
 
-    mode = resolve_ai_mode()
-    provider = resolve_ai_provider(mode)
+    def _safe_err(exc: Exception) -> str:
+        """Return a safe error label; never include raw exception internals."""
+        return type(exc).__name__
+
+    try:
+        mode = resolve_ai_mode()
+        provider = resolve_ai_provider(mode)
+    except AIConfigurationError as exc:
+        # Fail-fast validation error → unavailable
+        return {
+            "ai_mode": (settings.AI_MODE or "deterministic"),
+            "provider": (settings.AI_PROVIDER or "none"),
+            "status": "unavailable",
+            "chat_model": "unset",
+            "embedding_model": "unset",
+            "error": str(exc),
+        }
 
     base: dict[str, Any] = {
         "ai_mode": mode.value,
         "provider": provider.value if provider else "none",
     }
 
+    # -- disabled -----------------------------------------------------------
     if mode is AIMode.DISABLED:
         base["status"] = "ready"
-        base["checks"] = {"model": "skipped", "embeddings": "skipped"}
+        base["chat_model"] = "disabled"
+        base["embedding_model"] = "disabled"
+        base["checks"] = {"chat_model": "skipped", "embedding_model": "skipped"}
         return base
 
+    # -- deterministic -----------------------------------------------------
     if mode is AIMode.DETERMINISTIC:
-        # Verify deterministic provider can initialise
         try:
             from intelligence.deterministic_provider import (
                 DeterministicChatProvider,
@@ -241,45 +274,55 @@ async def provider_health_check() -> dict[str, Any]:
             )
             chat = DeterministicChatProvider()
             embed = DeterministicEmbeddingsProvider()
-            # Quick smoke test
             test_vec = await embed.aembed_query("health-check")
             base["status"] = "ready"
+            base["chat_model"] = DeterministicChatProvider.MODEL
+            base["embedding_model"] = DeterministicEmbeddingsProvider.MODEL
             base["checks"] = {
-                "chat": "available",
-                "embeddings": "available",
+                "chat_model": "available",
+                "embedding_model": "available",
                 "embedding_dimension": len(test_vec),
             }
         except Exception as exc:
             base["status"] = "degraded"
-            base["error"] = f"deterministic_provider_init_failed: {exc}"
-            base["checks"] = {"chat": "failed", "embeddings": "failed"}
+            base["chat_model"] = "deterministic-chat-v1"
+            base["embedding_model"] = "deterministic-embed-v1"
+            base["error"] = f"deterministic_provider_init_failed: {_safe_err(exc)}"
+            base["checks"] = {"chat_model": "failed", "embedding_model": "failed"}
         return base
 
-    # AI_MODE=live — check the configured provider
+    # -- live (no provider) ------------------------------------------------
     if provider is None:
         base["status"] = "unavailable"
+        base["chat_model"] = "unset"
+        base["embedding_model"] = "unset"
         base["error"] = (
             "AI_MODE=live requires AI_PROVIDER to be set to "
             "'ollama' or 'nvidia_nim'"
         )
         return base
 
-    checks: dict[str, str] = {}
-    status = "ready"
-
+    # -- live + ollama -----------------------------------------------------
     if provider is AIProvider.OLLAMA:
+        base["chat_model"] = settings.OLLAMA_MODEL
+        base["embedding_model"] = settings.OLLAMA_EMBED_MODEL
+        checks: dict[str, str] = {}
+        status = "ready"
+
+        # 1. Ollama endpoint reachable
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.get(f"{settings.OLLAMA_URL}/api/tags")
                 if resp.status_code == 200:
                     checks["ollama_endpoint"] = "reachable"
                 else:
-                    checks["ollama_endpoint"] = f"unexpected_status_{resp.status_code}"
+                    checks["ollama_endpoint"] = f"http_{resp.status_code}"
                     status = "degraded"
         except Exception as exc:
-            checks["ollama_endpoint"] = f"unreachable: {exc}"
+            checks["ollama_endpoint"] = _safe_err(exc)
             status = "degraded"
-        # Check chat model
+
+        # 2. Chat model available
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.post(
@@ -289,52 +332,127 @@ async def provider_health_check() -> dict[str, Any]:
                 if resp.status_code == 200:
                     checks["chat_model"] = "available"
                 else:
-                    checks["chat_model"] = f"not_found ({settings.OLLAMA_MODEL})"
+                    checks["chat_model"] = f"http_{resp.status_code}"
                     status = "degraded"
         except Exception as exc:
-            checks["chat_model"] = f"check_failed: {exc}"
+            checks["chat_model"] = _safe_err(exc)
             status = "degraded"
 
-    elif provider is AIProvider.NVIDIA_NIM:
+        # 3. Embedding model available (separate model!)
+        if settings.OLLAMA_EMBED_MODEL != settings.OLLAMA_MODEL:
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.post(
+                        f"{settings.OLLAMA_URL}/api/show",
+                        json={"name": settings.OLLAMA_EMBED_MODEL},
+                    )
+                    if resp.status_code == 200:
+                        checks["embedding_model"] = "available"
+                    else:
+                        checks["embedding_model"] = f"http_{resp.status_code}"
+                        status = "degraded"
+            except Exception as exc:
+                checks["embedding_model"] = _safe_err(exc)
+                status = "degraded"
+        else:
+            checks["embedding_model"] = "same_as_chat"
+
+        base["status"] = status
+        base["checks"] = checks
+        return base
+
+    # -- live + nvidia_nim -------------------------------------------------
+    if provider is AIProvider.NVIDIA_NIM:
+        base["chat_model"] = settings.NVIDIA_CHAT_MODEL or "unset"
+        base["embedding_model"] = settings.NVIDIA_EMBED_MODEL or "unset"
+        checks: dict[str, str] = {}
+        status = "ready"
+
+        # Validate config
         try:
             _validate_nvidia("NVIDIA_CHAT_MODEL")
+            _validate_nvidia("NVIDIA_EMBED_MODEL")
             checks["nvidia_config"] = "valid"
         except ProviderConfigurationError as exc:
-            checks["nvidia_config"] = str(exc)
+            checks["nvidia_config"] = _safe_err(exc)
             status = "degraded"
+
+        # Probe endpoint if API key is set
         if settings.NVIDIA_API_KEY:
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     resp = await client.get(
                         f"{settings.NVIDIA_BASE_URL.rstrip('/')}/models",
+                        headers={"Authorization": "Bearer <redacted>"},
+                    )
+                    # Use actual API key internally but never log it
+                    resp = await client.get(
+                        f"{settings.NVIDIA_BASE_URL.rstrip('/')}/models",
                         headers={"Authorization": f"Bearer {settings.NVIDIA_API_KEY}"},
                     )
-                    checks["nvidia_endpoint"] = (
-                        "reachable" if resp.status_code < 500 else f"status_{resp.status_code}"
-                    )
-                    if resp.status_code >= 500:
+                    if resp.status_code == 200:
+                        checks["nvidia_endpoint"] = "reachable"
+                    elif resp.status_code in (401, 403):
+                        checks["nvidia_endpoint"] = f"auth_failed_{resp.status_code}"
+                        status = "degraded"
+                    elif resp.status_code == 404:
+                        checks["nvidia_endpoint"] = "endpoint_not_found"
+                        status = "degraded"
+                    elif resp.status_code >= 500:
+                        checks["nvidia_endpoint"] = f"server_error_{resp.status_code}"
+                        status = "degraded"
+                    else:
+                        checks["nvidia_endpoint"] = f"http_{resp.status_code}"
                         status = "degraded"
             except Exception as exc:
-                checks["nvidia_endpoint"] = f"unreachable: {exc}"
+                checks["nvidia_endpoint"] = _safe_err(exc)
                 status = "degraded"
 
-    base["status"] = status
-    base["checks"] = checks
+        base["status"] = status
+        base["checks"] = checks
+        return base
+
+    # fallback (should be unreachable)
+    base["status"] = "unavailable"
+    base["error"] = "unknown provider"
     return base
 
 
 def vector_collection_name(base_name: str) -> str:
-    """Return a provider-aware Weaviate collection name.
+    """Return a provider-and-model-aware Weaviate collection name.
 
-    Keeps vectors from different embedding providers in separate
-    collections so switching providers does not silently mix vector spaces.
+    Keeps vectors from different embedding providers AND different models
+    in separate collections. Switching embedding models requires re-indexing.
+
+    Naming scheme: {base}_{mode_or_provider}_{model_fingerprint}
     """
+    import hashlib
+
     mode = resolve_ai_mode()
-    if mode is not AIMode.LIVE:
-        return f"{base_name}_{mode.value}"
-    provider = resolve_ai_provider(mode)
-    suffix = provider.value if provider else "unknown"
-    return f"{base_name}_{suffix}"
+
+    if mode is AIMode.DISABLED:
+        return f"{base_name}_disabled"
+
+    if mode is AIMode.DETERMINISTIC:
+        from intelligence.deterministic_provider import DeterministicEmbeddingsProvider
+        ident = DeterministicEmbeddingsProvider.MODEL
+    else:
+        provider = resolve_ai_provider(mode)
+        provider_str = provider.value if provider else "unknown"
+        if provider is AIProvider.OLLAMA:
+            ident = settings.OLLAMA_EMBED_MODEL
+        elif provider is AIProvider.NVIDIA_NIM:
+            ident = settings.NVIDIA_EMBED_MODEL
+        else:
+            ident = "unknown"
+        # Include a short hash of the model to avoid name collisions
+        model_hash = hashlib.sha256(ident.encode()).hexdigest()[:8]
+        ident = f"{provider_str}_{model_hash}"
+
+    # Sanitise: replace chars Weaviate doesn't like in class names
+    safe_name = base_name.replace(" ", "_").replace("-", "_")
+    safe_ident = ident.replace("/", "_").replace("-", "_").replace(".", "_")
+    return f"{safe_name}_{safe_ident}"
 
 
 def _validate_nvidia(required_model_env: str) -> None:

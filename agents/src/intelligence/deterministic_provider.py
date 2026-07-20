@@ -107,22 +107,76 @@ def _stable_float_vector(text: str, dim: int) -> list[float]:
     return vec
 
 
-def _extract_query_text(messages: list[Any]) -> str:
-    """Extract the last human message text from a list of LangChain messages."""
-    texts: list[str] = []
-    for msg in messages:
-        content = getattr(msg, "content", None)
-        if content is None and isinstance(msg, dict):
-            content = msg.get("content")
-        if isinstance(content, str):
-            texts.append(content)
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and "text" in part:
-                    texts.append(part["text"])
-                elif isinstance(part, str):
-                    texts.append(part)
-    return "\n".join(texts)
+def _extract_query_text(input_: Any) -> str:
+    """Extract a stable text representation from any supported input shape.
+
+    Handles:
+      - str
+      - LangChain Message (has .content)
+      - list[Message]
+      - dict with 'content' key
+      - dict with 'messages' key (list of message-like objects)
+      - dict with 'text' key
+      - anything else → str(input_)
+    """
+    # 1. Plain string
+    if isinstance(input_, str):
+        return input_
+
+    # 2. Object with .content attribute (LangChain Message)
+    content_attr = getattr(input_, "content", None)
+    if content_attr is not None and not isinstance(input_, (str, list, dict)):
+        return _extract_query_text(content_attr)
+
+    # 3. List — recurse into each element and join
+    if isinstance(input_, list):
+        parts = [_extract_query_text(item) for item in input_]
+        return "\n".join(p for p in parts if p)
+
+    # 4. Dict
+    if isinstance(input_, dict):
+        # dict with 'messages' key (common chat format)
+        if "messages" in input_:
+            return _extract_query_text(input_["messages"])
+        # dict with 'content' key
+        if "content" in input_:
+            return _extract_query_text(input_["content"])
+        # dict with 'text' key
+        if "text" in input_:
+            return str(input_["text"])
+        # fallback: serialize
+        return json.dumps(input_, sort_keys=True, default=str)
+
+    # 5. Fallback
+    return str(input_)
+
+
+def _flatten_input(input_: Any) -> list[Any]:
+    """Normalise any input shape into a flat message list for ainvoke."""
+    # str → single-element list
+    if isinstance(input_, str):
+        return [{"content": input_}]
+
+    # LangChain Message (has .content, not a str/list/dict)
+    if hasattr(input_, "content") and not isinstance(input_, (str, list, dict)):
+        return [input_]
+
+    # list — already a message list
+    if isinstance(input_, list):
+        return input_
+
+    # dict with 'messages' key
+    if isinstance(input_, dict) and "messages" in input_:
+        msgs = input_["messages"]
+        if isinstance(msgs, list):
+            return msgs
+        return [msgs]
+
+    # dict — wrap as single-element list
+    if isinstance(input_, dict):
+        return [input_]
+
+    return [input_]
 
 
 # ---------------------------------------------------------------------------
@@ -209,9 +263,10 @@ class DeterministicChatProvider:
     ) -> DeterministicResponse:
         """Async entry point matching LangChain's ``ainvoke`` signature.
 
-        *input* is typically a list of LangChain messages or a dict.
+        *input* can be a str, a LangChain Message, a list of Messages,
+        a dict with a ``messages`` key, or a dict with a ``content`` key.
         """
-        messages: list[Any] = input if isinstance(input, list) else [input]
+        messages = _flatten_input(input)
         query_text = _extract_query_text(messages)
 
         started = time.monotonic()

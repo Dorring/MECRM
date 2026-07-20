@@ -212,7 +212,8 @@ services:
       # AI provider credentials are injected only into the server-side agents
       # container. Never add NVIDIA_API_KEY to frontend or gateway services.
       # AI_PROVIDER is only consulted when AI_MODE=live.
-      - AI_PROVIDER=${AI_PROVIDER:-ollama}
+      # No default — must be set explicitly for live mode.
+      - AI_PROVIDER=${AI_PROVIDER:-}
       - AI_REQUEST_TIMEOUT_SECONDS=${AI_REQUEST_TIMEOUT_SECONDS:-30}
       - AI_MAX_RETRIES=${AI_MAX_RETRIES:-2}
       - NVIDIA_BASE_URL=${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}

@@ -52,10 +52,10 @@ class Settings:
     #   supervisor — only supervisor graph path active
     AGENT_ORCHESTRATION_MODE: str = os.getenv("AGENT_ORCHESTRATION_MODE", "legacy").strip().lower()
 
-    # AI inference provider. Ollama remains available for offline/local use,
-    # while NVIDIA NIM is an OpenAI-compatible managed API provider.
+    # AI inference provider. MUST be set explicitly when AI_MODE=live.
+    # No default — an empty value with AI_MODE=live will raise a config error.
     # Only consulted when AI_MODE=live.
-    AI_PROVIDER: str = os.getenv("AI_PROVIDER", "ollama").strip().lower()
+    AI_PROVIDER: str = os.getenv("AI_PROVIDER", "").strip().lower()
     AI_REQUEST_TIMEOUT_SECONDS: float = float(os.getenv("AI_REQUEST_TIMEOUT_SECONDS", "30"))
     AI_MAX_RETRIES: int = int(os.getenv("AI_MAX_RETRIES", "2"))
 

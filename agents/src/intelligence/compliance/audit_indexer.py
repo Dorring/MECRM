@@ -9,7 +9,7 @@ from typing import Any, Optional
 import asyncpg
 import httpx
 import structlog
-from intelligence.providers import create_embeddings
+from intelligence.providers import create_embeddings, vector_collection_name
 
 from orchestrator.config import settings
 
@@ -94,6 +94,7 @@ class AuditIndexer:
     def __init__(self):
         self._pool: Optional[asyncpg.Pool] = None
         self._embeddings = create_embeddings(ollama_url=settings.OLLAMA_URL, embedding_model=settings.OLLAMA_EMBED_MODEL)
+        self._collection = vector_collection_name("AuditEmbedding")
         self._weaviate_url = settings.WEAVIATE_URL.rstrip("/")
         self._running = False
         self._task: asyncio.Task | None = None
@@ -120,7 +121,7 @@ class AuditIndexer:
 
     async def _ensure_schema(self) -> None:
         schema = {
-            "class": "AuditEmbedding",
+            "class": self._collection,
             "description": "Explainability/audit decision embeddings",
             "properties": [
                 {"name": "decision_id", "dataType": ["text"]},
@@ -139,7 +140,7 @@ class AuditIndexer:
                 existing = await client.get(f"{self._weaviate_url}/v1/schema")
                 if existing.status_code == 200:
                     classes = ((existing.json() or {}).get("classes")) or []
-                    if any(isinstance(c, dict) and c.get("class") == "AuditEmbedding" for c in classes):
+                    if any(isinstance(c, dict) and c.get("class") == self._collection for c in classes):
                         return
                 await client.post(f"{self._weaviate_url}/v1/schema", json=schema)
         except Exception:
@@ -233,7 +234,7 @@ class AuditIndexer:
             return
 
         obj = {
-            "class": "AuditEmbedding",
+            "class": self._collection,
             "id": decision_id,
             "properties": {
                 "decision_id": decision_id,

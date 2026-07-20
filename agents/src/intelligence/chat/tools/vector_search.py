@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 import httpx
-from intelligence.providers import create_embeddings
+from intelligence.providers import create_embeddings, vector_collection_name
 
 
 class VectorSearch:
@@ -19,6 +19,8 @@ class VectorSearch:
         self._weaviate_url = weaviate_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
         self._embeddings = create_embeddings(ollama_url=ollama_url, embedding_model=embedding_model)
+        self._crm_collection = vector_collection_name("CrmEntity")
+        self._kb_collection = vector_collection_name("KnowledgeBase")
 
     async def search(
         self,
@@ -59,31 +61,26 @@ class VectorSearch:
         if entity and entity in ("lead", "deal", "ticket", "customer"):
             where["operands"].append({"path": ["entity_type"], "operator": "Equal", "valueText": entity})
 
+        crm_coll = self._crm_collection
         gql = {
-            "query": """
-            query CrmEntitySearch($where:WhereFilter!, $limit:Int!, $vector:[Float!]!) {
-              Get {
-                CrmEntity(
-                  where: $where,
-                  limit: $limit,
-                  nearVector: { vector: $vector }
-                ) {
-                  entity_id
-                  tenant_id
-                  entity_type
-                  title
-                  description
-                  updated_at
-                  metadata
-                  _additional { distance }
-                }
-              }
-            }
-            """,
+            "query": (
+                "query CrmEntitySearch($where:WhereFilter!, $limit:Int!, $vector:[Float!]!) {"
+                "  Get {"
+                f"    {crm_coll}("
+                "      where: $where,"
+                "      limit: $limit,"
+                "      nearVector: { vector: $vector }"
+                "    ) {"
+                "      entity_id tenant_id entity_type title description updated_at"
+                "      metadata _additional { distance }"
+                "    }"
+                "  }"
+                "}"
+            ),
             "variables": {"where": where, "limit": limit, "vector": vector},
         }
         body = await _post_gql(url=self._weaviate_url, timeout=self._timeout_seconds, gql=gql)
-        items = (((body.get("data") or {}).get("Get") or {}).get("CrmEntity")) or []
+        items = (((body.get("data") or {}).get("Get") or {}).get(crm_coll)) or []
         if not isinstance(items, list):
             return []
 
@@ -110,30 +107,26 @@ class VectorSearch:
             "operator": "And",
             "operands": [{"path": ["tenant_id"], "operator": "Equal", "valueText": tenant_id}],
         }
+        kb_coll = self._kb_collection
         gql = {
-            "query": """
-            query KnowledgeSearch($where:WhereFilter!, $limit:Int!, $vector:[Float!]!) {
-              Get {
-                KnowledgeBase(
-                  where: $where,
-                  limit: $limit,
-                  nearVector: { vector: $vector }
-                ) {
-                  article_id
-                  tenant_id
-                  title
-                  content
-                  tags
-                  created_at
-                  _additional { distance }
-                }
-              }
-            }
-            """,
+            "query": (
+                "query KnowledgeSearch($where:WhereFilter!, $limit:Int!, $vector:[Float!]!) {"
+                "  Get {"
+                f"    {kb_coll}("
+                "      where: $where,"
+                "      limit: $limit,"
+                "      nearVector: { vector: $vector }"
+                "    ) {"
+                "      article_id tenant_id title content tags created_at"
+                "      _additional { distance }"
+                "    }"
+                "  }"
+                "}"
+            ),
             "variables": {"where": where, "limit": limit, "vector": vector},
         }
         body = await _post_gql(url=self._weaviate_url, timeout=self._timeout_seconds, gql=gql)
-        items = (((body.get("data") or {}).get("Get") or {}).get("KnowledgeBase")) or []
+        items = (((body.get("data") or {}).get("Get") or {}).get(kb_coll)) or []
         if not isinstance(items, list):
             return []
 

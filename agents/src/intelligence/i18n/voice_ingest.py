@@ -1,7 +1,13 @@
 """Voice Ingest Module.
 
-Speech-to-Text pipeline using Whisper via Ollama or standalone.
+Speech-to-Text pipeline using Whisper or deterministic fixtures.
+
+AI_MODE gating (Phase 1 review):
+  - disabled      → DisabledWhisperSTT (always returns unavailable)
+  - deterministic → DeterministicWhisperSTT (fixed fixture, no network)
+  - live          → WhisperSTT (uses WHISPER_URL, no OLLAMA_URL fallback)
 """
+
 from __future__ import annotations
 
 import base64
@@ -14,6 +20,8 @@ from typing import Literal
 
 import httpx
 
+from orchestrator.ai_mode import AIMode, resolve_ai_mode
+
 logger = logging.getLogger(__name__)
 
 AudioFormat = Literal["webm", "wav", "mp3", "ogg", "flac", "m4a"]
@@ -22,7 +30,7 @@ AudioFormat = Literal["webm", "wav", "mp3", "ogg", "flac", "m4a"]
 @dataclass
 class TranscriptResult:
     """Result of speech-to-text transcription."""
-    
+
     text: str
     language: str | None
     confidence: float
@@ -30,15 +38,78 @@ class TranscriptResult:
     processing_time_ms: float
     model_used: str
     error: str | None = None
-    
+
     @property
     def success(self) -> bool:
         return self.error is None and bool(self.text)
 
 
+# ---------------------------------------------------------------------------
+# Disabled / Deterministic STT providers
+# ---------------------------------------------------------------------------
+
+
+class DisabledWhisperSTT:
+    """STT provider that always returns unavailable (AI_MODE=disabled)."""
+
+    async def transcribe(
+        self,
+        audio_bytes: bytes,
+        *,
+        audio_format: AudioFormat = "webm",
+        language_hint: str | None = None,
+    ) -> TranscriptResult:
+        return TranscriptResult(
+            text="",
+            language=None,
+            confidence=0.0,
+            duration_seconds=0.0,
+            processing_time_ms=0.0,
+            model_used="disabled",
+            error="Voice transcription is not available (AI_MODE=disabled)",
+        )
+
+
+class DeterministicWhisperSTT:
+    """STT provider that returns a fixed fixture (AI_MODE=deterministic).
+
+    Never accesses a network. Used for CI and offline development.
+    """
+
+    # Fixed fixture — deterministic, repeatable output.
+    FIXTURE_TRANSCRIPT = (
+        "This is a deterministic transcription for CI and testing purposes. "
+        "Voice input is not processed by a real speech-to-text model."
+    )
+
+    async def transcribe(
+        self,
+        audio_bytes: bytes,
+        *,
+        audio_format: AudioFormat = "webm",
+        language_hint: str | None = None,
+    ) -> TranscriptResult:
+        return TranscriptResult(
+            text=self.FIXTURE_TRANSCRIPT,
+            language=language_hint or "en",
+            confidence=0.9,
+            duration_seconds=len(audio_bytes) / 16000 / 2 if audio_bytes else 0.0,
+            processing_time_ms=1.0,
+            model_used="deterministic-stt-v1",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Live Whisper STT
+# ---------------------------------------------------------------------------
+
+
 class WhisperSTT:
-    """Speech-to-Text using OpenAI Whisper (via local server or API)."""
-    
+    """Speech-to-Text using OpenAI Whisper via a configurable endpoint.
+
+    Uses WHISPER_URL env var; does NOT fall back to OLLAMA_URL.
+    """
+
     def __init__(
         self,
         *,
@@ -46,16 +117,14 @@ class WhisperSTT:
         model: str = "whisper",
         timeout: float = 30.0,
     ):
-        # WHISPER_URL is the canonical env var for the Whisper endpoint.
-        # OLLAMA_URL fallback is preserved for backward compatibility
-        # (some deployments run Whisper behind the Ollama API endpoint).
         self._whisper_url = whisper_url or os.environ.get(
-            "WHISPER_URL",
-            os.environ.get("OLLAMA_URL", "http://localhost:11434")
+            "WHISPER_URL", ""
         )
-        # TODO Phase 1: WHISPER_URL should not silently fall back to OLLAMA_URL.
-        # In AI_MODE=deterministic or AI_MODE=disabled, voice transcription
-        # should use a deterministic/fake STT provider or return unavailable.
+        if not self._whisper_url:
+            raise RuntimeError(
+                "WHISPER_URL must be set when AI_MODE=live "
+                "and voice transcription is used"
+            )
         self._model = model
         self._timeout = timeout
     
@@ -245,14 +314,24 @@ class WhisperSTT:
             )
 
 
-# Default STT instance
-_default_stt: WhisperSTT | None = None
+# Default STT instance (AI_MODE-aware)
+_default_stt: WhisperSTT | DisabledWhisperSTT | DeterministicWhisperSTT | None = (
+    None
+)
 
 
-def get_stt() -> WhisperSTT:
-    """Get the default STT instance."""
+def get_stt() -> WhisperSTT | DisabledWhisperSTT | DeterministicWhisperSTT:
+    """Get the default STT instance, respecting AI_MODE."""
     global _default_stt
-    if _default_stt is None:
+    if _default_stt is not None:
+        return _default_stt
+
+    mode = resolve_ai_mode()
+    if mode is AIMode.DISABLED:
+        _default_stt = DisabledWhisperSTT()
+    elif mode is AIMode.DETERMINISTIC:
+        _default_stt = DeterministicWhisperSTT()
+    else:
         _default_stt = WhisperSTT()
     return _default_stt
 
@@ -264,14 +343,24 @@ async def transcribe_audio(
     language_hint: str | None = None,
 ) -> TranscriptResult:
     """Convenience function to transcribe audio.
-    
+
     Args:
         audio_bytes: Raw audio data
         audio_format: Audio format
         language_hint: Optional language hint
-        
+
     Returns:
         TranscriptResult with transcript and metadata
     """
+    if not audio_bytes:
+        return TranscriptResult(
+            text="",
+            language=None,
+            confidence=0.0,
+            duration_seconds=0.0,
+            processing_time_ms=0.0,
+            model_used="none",
+            error="Empty audio input",
+        )
     stt = get_stt()
     return await stt.transcribe(audio_bytes, audio_format=audio_format, language_hint=language_hint)
