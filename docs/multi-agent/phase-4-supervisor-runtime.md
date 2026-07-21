@@ -1,36 +1,45 @@
 # Phase 4: Supervisor Runtime + Dependency-Aware DAG Execution
 
 **Status:** Complete  
-**Branch:** `feat/ma-04-supervisor-runtime`  
+**Branch:** `feat/ma-04-supervisor-runtime-r8`  
 **Baseline:** `main` (Phase 3, commit `d586e70`)
 
-> **R7 Revision** — This document reflects the R7 audit fixes (commit `<TBD>`).
+> **R8 Revision** — This document reflects the R8 audit fixes (commit `<TBD>`).
 > R1 baseline: commit `e5ab368`. R2 baseline: commit `64fedd1` (5 P0 + 3 P1
 > fixes, request-changes). R3 baseline: commit `5b9c647` (4 P0 + 3 P1 fixes,
 > request-changes). R4 baseline: commit `bc5abd4` (4 P0 + 2 P1 fixes,
 > request-changes). R5 baseline: commit `f2288f8` (5 P0 + 2 P1 fixes,
 > request-changes). R6 baseline: commit `d5fd130` (5 P0 + 2 P1 fixes,
-> request-changes). R7 addresses 5 P0 and 2 P1 issues from the R6 review,
-> focused on **no-provider-call attestation by a trusted boundary (not Handler
-> omission), per-dimension independent coverage, multi-error retry pairing,
-> async verifier bounded by deadline, and provenance source binding**:
-> `AttemptUsageDisposition` replaces the R6 heuristic that inferred
-> `no_provider_call` from `provider_metadata is None` — Handler can no longer
-> self-attest by omitting a field; `NO_PROVIDER_CALL` requires
-> `can_attest_no_provider_call=True` from a trusted Invoker;
-> `record_usage_unavailable()` is invoked on the invalid-receipt path so Token
-> and Cost are both marked `UNAVAILABLE`; Token and Cost have **independent**
-> coverage denominators (`token_usage_applicable_attempts` /
-> `cost_usage_applicable_attempts`) and per-attempt `AttemptUsageRecord` — a
-> cost-only adapter verifying Attempt B's cost can no longer "offset" Attempt
-> A's missing cost; `should_retry_result()` takes a `Sequence[AgentError]`
-> and pairs `error_code` + `retryable` from the SAME error (no more
-> `errors[0].error_code` + `any(e.retryable)`); `ProviderUsageVerifier.verify()`
-> is `async def` and bounded by `asyncio.wait_for` (task timeout + run deadline
-> + cancellation); `UsageVerificationCapabilities.bound_source_ids` rejects
-> receipts whose `usage_provenance.source_id` is not in the invoker's bound
-> set. P1: legacy `usage_trust` / `UsageTrustLevel` marked DEPRECATED; Phase 3
-> documentation synchronized with the Canonical `RetryPolicy` contract.
+> request-changes). R7 baseline: commit `1483ad4` (5 P0 + 2 P1 fixes,
+> request-changes). R8 addresses 5 P0 and 2 P1 issues from the R7 review,
+> focused on **explicit per-attempt usage attestation, per-dimension verifier
+> trust, per-dimension source binding, atomic usage accounting, and public
+> per-attempt audit records**:
+> `AgentInvocationReceipt` now carries explicit `token_disposition` /
+> `cost_disposition` fields declared by the Invoker boundary — the Accountant
+> only VALIDATES them against Invoker capabilities, no longer infers
+> `NO_PROVIDER_CALL` from `provider_metadata is None`; `VerifiedUsage` uses
+> independent `tokens_verified` / `cost_verified` flags (not a single `verified`
+> bool) with enforced invariants (`tokens_verified=True → tokens_used` non-None);
+> `UsageVerificationCapabilities` has per-dimension `bound_token_source_ids` /
+> `bound_cost_source_ids` with contract invariants (`verifies_tokens=True →
+> bound_token_source_ids` non-empty); `record_receipt()` is refactored into a
+> three-phase atomic commit (`_compute_attempt_usage` →
+> `_validate_attempt_budget` → `_commit_attempt_usage`) — compute and validate
+> are pure, commit is the sole mutation point, so a validation failure cannot
+> leave the accountant half-committed; `TaskAttemptRecord` now carries
+> `token_disposition` / `cost_disposition` / `token_source_id` /
+> `cost_source_id` / `declared_tokens_used` / `declared_cost_usd` — actual
+> `tokens_used` / `cost_usd` are ONLY populated when `VERIFIED`, invalid
+> receipt declared values are stored as untrusted `declared_*` fields;
+> `ExecutionUsage.attempt_usage_records` exposes a defensive deep copy of all
+> per-attempt records for post-run audit; `record_usage_unavailable()` accepts
+> `invoker_capabilities` so a trusted deterministic Invoker's no-receipt path
+> declares `NO_PROVIDER_CALL` instead of `UNAVAILABLE`; legacy `usage_trust` +
+> `usage_provenance` conflict is now a `ValidationError` (no silent override).
+> P1: `ExecutionUsage.attempt_usage_records` enables external per-attempt
+> auditability; legacy `usage_trust` alone is still accepted with a
+> deprecation warning.
 
 ---
 
@@ -1215,6 +1224,169 @@ receipt = AgentInvocationReceipt(
     ),
 )
 ```
+
+R8 进一步收紧：同时提供 `usage_trust` 和 `usage_provenance` 现在是
+`ValidationError`（不再静默覆盖）。仅 `usage_trust` 仍被接受并自动转换，
+但会产生弃用警告。
+
+### R8 P0-1: Explicit Attempt Disposition
+
+R7 的 `AttemptUsageDisposition` 概念存在闭环缺陷：`AgentInvocationReceipt`
+并不包含逐 Attempt 的 Disposition 字段。Accountant 仍根据
+`can_attest_no_provider_call + provider_metadata is None` 自动推导
+`NO_PROVIDER_CALL`。这对纯 Deterministic Invoker 可行，但对 Hybrid Invoker
+（同时支持本地路径和 Provider 路径）不成立——只要 Receipt 因 Bug 漏掉
+Metadata，就会自动获得 `NO_PROVIDER_CALL`。
+
+R8 修改 `AgentInvocationReceipt`，新增显式逐 Attempt Disposition 字段：
+
+```python
+class AgentInvocationReceipt(StrictContract):
+    result: AgentResult
+    token_disposition: AttemptUsageDisposition = UNAVAILABLE
+    cost_disposition: AttemptUsageDisposition = UNAVAILABLE
+    tokens_used: int | None
+    cost_usd: Decimal | None
+    usage_provenance: UsageProvenance
+```
+
+规则：
+
+- **Invoker Capability** 只决定该 Invoker "有权生成" 哪些 Disposition
+- **Receipt Disposition** 明确声明本次 Attempt 实际发生了什么
+- Accountant 只验证，不再通过 Metadata 缺失自行推导
+
+无 Receipt 异常路径也由受信 Invoker 提供 `NO_PROVIDER_CALL` 或
+`UNAVAILABLE`（通过 `record_usage_unavailable(invoker_capabilities=...)`），
+不能一律猜测。
+
+### R8 P0-2: Per-dimension Verifier Result
+
+R7 的 `VerifiedUsage` 使用单一 `verified: bool`。只要 `verified=True`，
+Invoker 就始终生成 `tokens_verified=True`。配置任意 Verifier 后，Invoker
+Capability 直接声明 `verifies_tokens=True, verifies_cost=True`。这会产生
+"Cost-only Verifier → verified=True → tokens_used 默认 0 → Runtime 标记
+tokens_verified=True" 的危险组合。
+
+R8 修改 `VerifiedUsage` 为逐维表达：
+
+```python
+class VerifiedUsage(StrictContract):
+    tokens_verified: bool = False
+    cost_verified: bool = False
+    tokens_used: int | None = None
+    cost_usd: Decimal | None = None
+    token_source_id: str | None = None
+    cost_source_id: str | None = None
+    verified: bool = False  # DEPRECATED, auto-derived
+```
+
+不变量：
+
+- `tokens_verified=True → tokens_used` 非 None
+- `cost_verified=True → cost_usd` 非 None
+
+`ProviderUsageVerifier` Protocol 和 `UsageVerificationCapabilities` 都独立
+声明 `verifies_tokens` / `verifies_cost`，不得用单个 `verified` 布尔值
+认证两个维度。
+
+### R8 P0-3: Per-dimension Source Binding
+
+R7 的 `bound_source_ids` 是单一集合。`record_receipt()` 只要
+`bound_source_ids` 非空就无条件检查 `prov.source_id in bound_source_ids`，
+即使 `tokens_verified=False, cost_verified=False`。这导致未验证 Receipt
+因 Source 不在 Verifier 集合中而被误拒绝。同时，当 `bound_source_ids`
+为空时，任何 Source ID 都被接受。
+
+R8 使用 per-dimension 绑定：
+
+```python
+bound_token_source_ids: frozenset[str]
+bound_cost_source_ids: frozenset[str]
+```
+
+规则：
+
+- `Token VERIFIED → token_source_id` 必须位于 `bound_token_source_ids`
+- `Cost VERIFIED → cost_source_id` 必须位于 `bound_cost_source_ids`
+- Unverified / No-provider-call Receipt **不**因 Source 不在集合中被拒绝
+
+Contract 不变量：
+
+- `verifies_tokens=True → bound_token_source_ids` 非空
+- `verifies_cost=True → bound_cost_source_ids` 非空
+
+### R8 P0-4: Atomic Usage Accounting
+
+R7 的 `record_receipt()` 非原子——检查部分 Trust → 增加 Applicable
+Counters → 可能累计 Token → Token Budget 检查并可能抛错 → 可能累计 Cost →
+Cost Budget 检查并可能抛错 → 最后追加 `AttemptUsageRecord`。异常会留下
+只有 Counter、没有 Record 的半提交状态。
+
+R8 将 `record_receipt()` 拆成三阶段：
+
+1. **`_compute_attempt_usage()`** — 纯计算：验证 Dispositions against
+   Invoker capabilities，构建 `AttemptUsageRecord`。无状态变更。
+2. **`_validate_attempt_budget()`** — 纯验证：检查是否拒绝提交（仅
+   `UNAVAILABLE` + budget configured 或 `VERIFIED` 缺少值时拒绝）。
+   Budget overflow for VERIFIED 不是拒绝——usage IS verified，只是超额，
+   record 仍提交，post-commit 检查标记 `_exceeded`。
+3. **`_commit_attempt_usage()`** — 唯一变更方法：原子提交 counters +
+   accumulated usage + record + exceeded state。
+
+R8 P0-4 不变量：每个已 Commit Agent Call 恰好生成一条
+`AttemptUsageRecord`。无论成功或失败，都不会留下只有 Counter、没有 Record
+的半提交状态。
+
+Trust/Source/Capability 校验失败时，`record_receipt` 抛出
+`ExecutionUsageUnavailableError` 但不变更状态。调用方（`_execute_task`）
+捕获异常后调用 `record_usage_unavailable()` 生成恰好一条 Record。
+
+### R8 P0-5: Trusted vs Declared Attempt Usage
+
+R7 的 Invalid Receipt 路径会将 `receipt_for_record.tokens_used` /
+`cost_usd` 直接写入 `TaskAttemptRecord`，导致同一个 Attempt 同时表示
+Aggregate Usage UNAVAILABLE 和 TaskAttemptRecord 中的实际 Token/Cost 值。
+
+R8 修改 `TaskAttemptRecord`，新增：
+
+```python
+token_disposition: AttemptUsageDisposition
+cost_disposition: AttemptUsageDisposition
+token_source_id: str | None
+cost_source_id: str | None
+declared_tokens_used: int | None  # Untrusted, invalid-receipt only
+declared_cost_usd: Decimal | None  # Untrusted, invalid-receipt only
+```
+
+只有 `VERIFIED` 时才能写入 actual `tokens_used` / `cost_usd`。Invalid
+Receipt 的未验证声明值保存为 `declared_*` 字段，明确标记为 Untrusted。
+
+无 Receipt 路径根据冻结的 Invoker Capability 确定 `NO_PROVIDER_CALL`
+或 `UNAVAILABLE`（而非一律 `UNAVAILABLE`）。
+
+### R8 P1-1: Public Attempt Usage Audit
+
+R7 将 `AttemptUsageRecord` 保存在 `_BudgetAccountant._attempt_records`
+私有属性中，`ExecutionUsage` / `SupervisorRunResult` / Trace 都没有输出
+这些记录。运行结束后调用方无法获得 per-attempt audit。
+
+R8 在 `ExecutionUsage` 中新增：
+
+```python
+attempt_usage_records: list[Any]  # defensive deep copy
+```
+
+返回防御性深拷贝，确保运行结束后可审计。
+
+### R8 P1-2: Legacy Trust Conflict Rejection
+
+R7 允许同时传入 `usage_trust` 和 `usage_provenance`，Provenance 静默覆盖
+Legacy 字段。R8 收紧：
+
+- 仅 `usage_trust` → 兼容转换并标记 Deprecated
+- 仅 `usage_provenance` → 正常
+- 两者同时提供 → `ValidationError`
 
 ---
 

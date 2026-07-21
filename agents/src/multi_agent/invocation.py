@@ -73,7 +73,8 @@ UsageTrustLevel = Literal[
 
 
 class UsageProvenance(StrictContract):
-    """R6 P0-4: Per-dimension usage provenance for a receipt.
+    """R6 P0-4 / R8 P0-3: Per-dimension usage provenance for a
+    receipt.
 
     Replaces the single ``usage_trust: UsageTrustLevel`` field that
     conflated Token and Cost trust into one string.  With
@@ -87,6 +88,12 @@ class UsageProvenance(StrictContract):
       authoritative verifier.  The value in ``receipt.cost_usd`` may
       be trusted for ``cost_budget_usd`` enforcement.
 
+    R8 P0-3: provenance now carries per-dimension ``token_source_id``
+    / ``cost_source_id`` so that source binding is enforced
+    per-dimension.  The legacy single ``source_id`` field is retained
+    for backwards compatibility and is auto-derived as
+    ``token_source_id or cost_source_id or "unverified"``.
+
     The two flags are independent: a verifier that only checks tokens
     sets ``tokens_verified=True, cost_verified=False``, and the
     accountant will record tokens but NOT cost (nor enforce
@@ -95,9 +102,41 @@ class UsageProvenance(StrictContract):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    source_id: str = "unverified"
+    # R8 P0-3: per-dimension source ids.  ``source_id`` (legacy) is
+    # auto-derived in a model_validator so existing callers that only
+    # set ``source_id`` still work — the value is mirrored into both
+    # ``token_source_id`` and ``cost_source_id``.
+    token_source_id: str | None = None
+    cost_source_id: str | None = None
     tokens_verified: bool = False
     cost_verified: bool = False
+    # R8 P0-3: legacy single ``source_id`` — retained for backwards
+    # compatibility.  When set, it mirrors into both per-dimension
+    # fields when those are ``None``.  When both per-dimension fields
+    # are set, ``source_id`` is derived as the token source (or cost
+    # source if token is ``None``).
+    source_id: str = "unverified"
+
+    @model_validator(mode="after")
+    def _sync_source_ids(self) -> "UsageProvenance":
+        # Mirror legacy single ``source_id`` into per-dimension fields
+        # when the caller did not specify them explicitly.
+        token_src = self.token_source_id
+        cost_src = self.cost_source_id
+        legacy = self.source_id
+        if token_src is None and cost_src is None and legacy != "unverified":
+            token_src = legacy
+            cost_src = legacy
+            object.__setattr__(self, "token_source_id", token_src)
+            object.__setattr__(self, "cost_source_id", cost_src)
+        # Derive ``source_id`` from per-dimension fields when it was
+        # not explicitly set (i.e. still "unverified" but per-dim
+        # fields are populated).
+        if legacy == "unverified":
+            derived = token_src or cost_src
+            if derived is not None:
+                object.__setattr__(self, "source_id", derived)
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -134,13 +173,24 @@ class AttemptUsageDisposition(StrEnum):
 
 
 class AttemptUsageRecord(StrictContract):
-    """R7 P0-3: Per-attempt usage record for independent Token/Cost
-    coverage tracking.
+    """R7 P0-3 / R8 P0-3 / R8 P1-1: Per-attempt usage record for
+    independent Token/Cost coverage tracking.
 
     Each committed agent call produces exactly one
     :class:`AttemptUsageRecord`.  Token and Cost dispositions are
     independent — a single attempt can be ``VERIFIED`` for tokens but
     ``UNAVAILABLE`` for cost (or any other combination).
+
+    R8 P0-3: the record carries per-dimension ``token_source_id`` /
+    ``cost_source_id`` for auditing which Verifier/Adapter attested
+    each dimension.  The legacy single ``source_id`` field is retained
+    for backwards compatibility and is auto-derived as
+    ``token_source_id or cost_source_id``.
+
+    R8 P1-1: these records are now exposed via
+    :attr:`ExecutionUsage.attempt_usage_records` (and
+    :attr:`SupervisorRunResult.usage.attempt_usage_records`) so
+    external audit consumers can inspect them after the run finishes.
 
     The ``_BudgetAccountant`` maintains a list of these records and
     computes per-dimension coverage from them:
@@ -163,7 +213,19 @@ class AttemptUsageRecord(StrictContract):
     cost_disposition: AttemptUsageDisposition
     tokens_used: int | None = None
     cost_usd: Decimal | None = None
+    # R8 P0-3: per-dimension source ids for auditing.
+    token_source_id: str | None = None
+    cost_source_id: str | None = None
+    # R8 P0-3: legacy single ``source_id`` — derived as
+    # ``token_source_id or cost_source_id``.
     source_id: str | None = None
+
+    @model_validator(mode="after")
+    def _sync_legacy_source_id(self) -> "AttemptUsageRecord":
+        if self.source_id is None:
+            derived = self.token_source_id or self.cost_source_id
+            object.__setattr__(self, "source_id", derived)
+        return self
 
 
 # Backwards-compatible mapping: old ``usage_trust`` → ``UsageProvenance``.
@@ -211,8 +273,8 @@ def _provenance_to_trust(prov: UsageProvenance) -> UsageTrustLevel:
 
 
 class UsageVerificationCapabilities(StrictContract):
-    """R4 P0-2: Immutable description of what an :class:`AgentInvoker`
-    can *actually* verify about usage.
+    """R4 P0-2 / R8 P0-2 / R8 P0-3: Immutable description of what an
+    :class:`AgentInvoker` can *actually* verify about usage.
 
     R3's ``TrustedUsageInvoker`` marker Protocol was forgeable — any
     custom Invoker could set ``usage_trust="trusted_adapter"`` on its
@@ -234,12 +296,26 @@ class UsageVerificationCapabilities(StrictContract):
       adapters should set this to ``True``.  The default
       :class:`RegistryAgentInvoker` sets it to ``False`` because a
       real Handler can lie by omitting ``provider_metadata``.
-    * ``bound_source_ids`` — R7 P0-6: the set of Verifier/Adapter
-      source identities that this Invoker's receipts may reference in
-      ``usage_provenance.source_id``.  When non-empty, the accountant
-      rejects receipts whose ``source_id`` is not in the set.  This
-      prevents a receipt from claiming verification by an unbound
-      verifier.
+    * ``bound_source_ids`` — R7 P0-6 / R8 P0-3 DEPRECATED: the set
+      of Verifier/Adapter source identities that this Invoker's
+      receipts may reference in ``usage_provenance.source_id``.
+      Retained for backwards compatibility; mirrors into both
+      ``bound_token_source_ids`` and ``bound_cost_source_ids`` when
+      those are empty.
+    * ``bound_token_source_ids`` — R8 P0-3: per-dimension binding for
+      Token provenance.  When non-empty, a receipt may claim
+      ``tokens_verified=True`` only if its ``token_source_id`` is in
+      this set.  Must be non-empty when ``verifies_tokens=True``.
+    * ``bound_cost_source_ids`` — R8 P0-3: per-dimension binding for
+      Cost provenance.  When non-empty, a receipt may claim
+      ``cost_verified=True`` only if its ``cost_source_id`` is in
+      this set.  Must be non-empty when ``verifies_cost=True``.
+
+    R8 P0-2: the two ``verifies_*`` flags are independent — a
+    cost-only verifier sets ``verifies_cost=True,
+    verifies_tokens=False``, and the accountant will reject any
+    receipt that claims ``tokens_verified=True`` from such an
+    Invoker.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -248,7 +324,42 @@ class UsageVerificationCapabilities(StrictContract):
     verifies_cost: bool = False
     source_id: str
     can_attest_no_provider_call: bool = False
+    # R8 P0-3: per-dimension bound source sets.
+    bound_token_source_ids: frozenset[str] = Field(default_factory=frozenset)
+    bound_cost_source_ids: frozenset[str] = Field(default_factory=frozenset)
+    # R7 P0-6 / R8 P0-3 DEPRECATED: legacy single bound set.  When
+    # non-empty and the per-dimension sets are empty, mirrors into
+    # both per-dimension sets.
     bound_source_ids: frozenset[str] = Field(default_factory=frozenset)
+
+    @model_validator(mode="after")
+    def _sync_bound_source_ids(self) -> "UsageVerificationCapabilities":
+        # R8 P0-3: mirror legacy single ``bound_source_ids`` into
+        # per-dimension sets when the caller did not specify them
+        # explicitly.
+        if self.bound_source_ids and not self.bound_token_source_ids:
+            object.__setattr__(self, "bound_token_source_ids", self.bound_source_ids)
+        if self.bound_source_ids and not self.bound_cost_source_ids:
+            object.__setattr__(self, "bound_cost_source_ids", self.bound_source_ids)
+        # R8 P0-2: Contract invariant — declaring ``verifies_*=True``
+        # without any bound source for that dimension is a programming
+        # error.  The Invoker is claiming it can verify a dimension
+        # but has not bound any Verifier/Adapter source for it, so a
+        # receipt could claim verification from an arbitrary source.
+        if self.verifies_tokens and not self.bound_token_source_ids:
+            raise ValueError(
+                "verifies_tokens=True requires a non-empty "
+                "bound_token_source_ids — an Invoker that can verify "
+                "tokens must bind the Verifier/Adapter sources it "
+                "accepts"
+            )
+        if self.verifies_cost and not self.bound_cost_source_ids:
+            raise ValueError(
+                "verifies_cost=True requires a non-empty "
+                "bound_cost_source_ids — an Invoker that can verify "
+                "cost must bind the Verifier/Adapter sources it accepts"
+            )
+        return self
 
 
 _UNVERIFIED_CAPABILITIES = UsageVerificationCapabilities(
@@ -256,6 +367,8 @@ _UNVERIFIED_CAPABILITIES = UsageVerificationCapabilities(
     verifies_cost=False,
     source_id="unverified",
     can_attest_no_provider_call=False,
+    bound_token_source_ids=frozenset(),
+    bound_cost_source_ids=frozenset(),
     bound_source_ids=frozenset(),
 )
 
@@ -295,6 +408,23 @@ class AgentInvocationReceipt(StrictContract):
     compatibility — it is auto-derived from ``usage_provenance`` and
     should not be set directly in new code.
 
+    R8 P0-1: the Receipt now carries per-attempt explicit
+    :class:`AttemptUsageDisposition` fields (``token_disposition`` /
+    ``cost_disposition``) produced by the Invoker boundary — NOT
+    inferred by the Accountant from ``provider_metadata is None``.
+    The Invoker is the trusted boundary that knows whether a Provider
+    call was made; the Accountant only VALIDATES the declared
+    dispositions against Invoker capabilities (e.g. an Invoker with
+    ``can_attest_no_provider_call=False`` may not declare
+    ``NO_PROVIDER_CALL``).
+
+    R8 P1-2: simultaneously providing both ``usage_trust`` (legacy)
+    and ``usage_provenance`` (new) now raises ``ValidationError``
+    instead of silently letting ``usage_provenance`` win.  Callers
+    must migrate to ``usage_provenance``; passing both is a
+    programming error that previously allowed conflicting inputs to
+    silently override each other.
+
     When a budget (``token_budget`` or ``cost_budget_usd``) is
     configured, the Supervisor only accepts receipts where the
     corresponding provenance flag is ``True``; an unverified receipt
@@ -308,32 +438,72 @@ class AgentInvocationReceipt(StrictContract):
     cost_usd: Decimal | None = Field(default=None, ge=0)
     # R6 P0-4: authoritative per-dimension provenance.
     usage_provenance: UsageProvenance = Field(default_factory=UsageProvenance)
-    # R7 P1-1: DEPRECATED — retained for backwards compatibility.
-    # Auto-derived from ``usage_provenance`` via
+    # R8 P0-1: explicit per-attempt dispositions declared by the
+    # Invoker boundary.  Defaults to ``UNAVAILABLE`` so a Receipt
+    # constructed without explicit dispositions (e.g. legacy test
+    # helpers) cannot accidentally claim ``VERIFIED`` or
+    # ``NO_PROVIDER_CALL``.  The Accountant validates these against
+    # Invoker capabilities:
+    #
+    # * ``VERIFIED`` requires ``usage_provenance.{dim}_verified=True``
+    #   AND ``invoker_capabilities.verifies_{dim}=True`` AND (when
+    #   ``bound_{dim}_source_ids`` is non-empty) the corresponding
+    #   ``{dim}_source_id`` must be in the bound set.
+    # * ``NO_PROVIDER_CALL`` requires
+    #   ``invoker_capabilities.can_attest_no_provider_call=True``.
+    # * ``UNAVAILABLE`` is always accepted.
+    token_disposition: AttemptUsageDisposition = AttemptUsageDisposition.UNAVAILABLE
+    cost_disposition: AttemptUsageDisposition = AttemptUsageDisposition.UNAVAILABLE
+    # R7 P1-1 / R8 P1-2: DEPRECATED — retained for backwards
+    # compatibility.  Auto-derived from ``usage_provenance`` via
     # :func:`_provenance_to_trust`.  New code must set
     # ``usage_provenance`` directly and must NOT pass both fields
-    # simultaneously (the ``_sync_trust_provenance`` validator lets
-    # ``usage_provenance`` win when both are provided, but mixing the
-    # two APIs is error-prone and will be removed in the next
-    # incompatible version).  The runtime (Supervisor /
-    # ``_BudgetAccountant``) only reads ``usage_provenance`` — this
-    # field exists solely so legacy receipts constructed with
-    # ``usage_trust=...`` continue to work.
+    # simultaneously — R8 P1-2 makes simultaneous provision a
+    # ``ValidationError`` instead of a silent override.
     usage_trust: UsageTrustLevel = Field(default="unverified")
 
     @model_validator(mode="before")
     @classmethod
     def _sync_trust_provenance(cls, data: Any) -> Any:
-        """R6 P0-4: ensure ``usage_trust`` and ``usage_provenance`` are
-        consistent.  If only ``usage_trust`` is provided (legacy code),
-        derive ``usage_provenance`` from it.  If both are provided,
-        ``usage_provenance`` wins.  If only ``usage_provenance`` is
-        provided, ``usage_trust`` is derived from it.
+        """R6 P0-4 / R8 P1-2: ensure ``usage_trust`` and
+        ``usage_provenance`` are consistent.
+
+        R8 P1-2: simultaneously providing both fields now raises
+        ``ValidationError``.  Callers must migrate to
+        ``usage_provenance``; passing both is a programming error
+        that previously allowed conflicting inputs to silently
+        override each other.
         """
         if not isinstance(data, dict):
             return data
         prov = data.get("usage_provenance")
         trust = data.get("usage_trust")
+        # R8 P1-2: reject simultaneous provision.
+        if prov is not None and trust is not None:
+            # Allow the case where the caller passes the auto-derived
+            # default ``usage_trust="unverified`` together with an
+            # explicit ``usage_provenance`` whose derived trust is
+            # also ``"unverified"`` — this is the common legacy
+            # pattern where ``usage_trust`` was not explicitly set.
+            # We detect this by checking whether the derived trust
+            # matches the provided trust.
+            if isinstance(prov, UsageProvenance):
+                derived = _provenance_to_trust(prov)
+            elif isinstance(prov, dict):
+                derived = _provenance_to_trust(UsageProvenance(**prov))
+            else:
+                derived = "unverified"
+            if derived != trust:
+                raise ValueError(
+                    "AgentInvocationReceipt: simultaneously providing "
+                    "usage_trust and usage_provenance with conflicting "
+                    "values is not allowed — migrate to usage_provenance "
+                    "only (R8 P1-2)."
+                )
+            # Conflicts resolved — drop the legacy field so the
+            # derived value wins.
+            data = dict(data)
+            data.pop("usage_trust", None)
         if prov is not None and trust is None:
             # New code: derive trust from provenance.
             if isinstance(prov, UsageProvenance):
@@ -349,15 +519,6 @@ class AgentInvocationReceipt(StrictContract):
             data["usage_provenance"] = _TRUST_TO_PROVENANCE.get(
                 trust, UsageProvenance(source_id=str(trust))
             )
-        elif prov is not None and trust is not None:
-            # Both provided: provenance wins, override trust.
-            if isinstance(prov, UsageProvenance):
-                data = dict(data)
-                data["usage_trust"] = _provenance_to_trust(prov)
-            elif isinstance(prov, dict):
-                prov_obj = UsageProvenance(**prov)
-                data = dict(data)
-                data["usage_trust"] = _provenance_to_trust(prov_obj)
         return data
 
 
@@ -392,17 +553,61 @@ class AgentInvoker(Protocol):
 
 
 class VerifiedUsage(StrictContract):
-    """R5 P0-5: Result of a Provider Usage Verifier check."""
+    """R5 P0-5 / R8 P0-2: Result of a Provider Usage Verifier check.
+
+    R8 P0-2: the single ``verified: bool`` field is DEPRECATED and
+    replaced by independent per-dimension ``tokens_verified`` /
+    ``cost_verified`` flags.  A cost-only verifier sets
+    ``cost_verified=True, tokens_verified=False`` — the accountant
+    will NOT mark the Token dimension as VERIFIED on the basis of a
+    cost-only verification.  The legacy ``verified`` field is
+    auto-derived as ``tokens_verified or cost_verified`` for backwards
+    compatibility.
+
+    Invariants enforced by a model_validator:
+
+    * ``tokens_verified=True`` → ``tokens_used is not None``
+    * ``cost_verified=True`` → ``cost_usd is not None``
+
+    R8 P0-2: the verifier also exposes per-dimension source ids so
+    the Invoker can bind them in its
+    :class:`UsageVerificationCapabilities`.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    tokens_used: int = Field(default=0, ge=0)
+    tokens_verified: bool = False
+    cost_verified: bool = False
+    tokens_used: int | None = Field(default=None, ge=0)
     cost_usd: Decimal | None = Field(default=None, ge=0)
+    token_source_id: str | None = None
+    cost_source_id: str | None = None
+    # R8 P0-2 DEPRECATED: retained for backwards compatibility.
+    # Auto-derived as ``tokens_verified or cost_verified``.
     verified: bool = False
+
+    @model_validator(mode="after")
+    def _enforce_per_dimension_invariants(self) -> "VerifiedUsage":
+        # R8 P0-2: VERIFIED requires a non-None value for that dim.
+        if self.tokens_verified and self.tokens_used is None:
+            raise ValueError(
+                "VerifiedUsage.tokens_verified=True requires tokens_used to be non-None"
+            )
+        if self.cost_verified and self.cost_usd is None:
+            raise ValueError(
+                "VerifiedUsage.cost_verified=True requires cost_usd to be non-None"
+            )
+        object.__setattr__(
+            self,
+            "verified",
+            self.tokens_verified or self.cost_verified,
+        )
+        return self
 
 
 class ProviderUsageVerifier(Protocol):
-    """R5 P0-5: Authoritative Provider Usage verification boundary.
+    """R5 P0-5 / R8 P0-2: Authoritative Provider Usage verification
+    boundary.
 
     A Provider Usage Verifier is an external adapter that can
     cryptographically or operationally verify that the token/cost
@@ -419,9 +624,19 @@ class ProviderUsageVerifier(Protocol):
     critical safety properties.  Synchronous verifier implementations
     must be wrapped in an async adapter (e.g. via
     ``asyncio.to_thread``) with explicit thread-lifecycle management.
+
+    R8 P0-2: the verifier exposes INDEPENDENT per-dimension
+    capabilities (``verifies_tokens`` / ``verifies_cost``).  A
+    cost-only verifier sets ``verifies_cost=True,
+    verifies_tokens=False`` — its :class:`VerifiedUsage` results must
+    set ``cost_verified=True, tokens_verified=False`` so the Invoker
+    cannot accidentally claim Token verification from a cost-only
+    verifier.
     """
 
     source_id: str
+    verifies_tokens: bool
+    verifies_cost: bool
 
     async def verify(
         self,
@@ -466,6 +681,15 @@ class RegistryAgentInvoker:
     ``verified_provider`` when ``result.provider_metadata`` is present.
     Cost verification also requires the verifier; without it,
     ``cost_budget_usd`` fails closed.
+
+    R8 P0-1: the Invoker now produces explicit per-attempt
+    :class:`AttemptUsageDisposition` fields on the Receipt based on
+    the verifier's per-dimension result.  The Accountant no longer
+    infers ``NO_PROVIDER_CALL`` from ``provider_metadata is None``.
+
+    R8 P0-2: the Invoker's capabilities are derived from the
+    verifier's per-dimension ``verifies_tokens`` / ``verifies_cost``
+    flags — a cost-only verifier no longer elevates Token trust.
     """
 
     def __init__(
@@ -482,11 +706,12 @@ class RegistryAgentInvoker:
 
     @property
     def usage_capabilities(self) -> UsageVerificationCapabilities:
-        """R5 P0-5 + R7 P0-1/P0-6: by default (no ``usage_verifier``)
-        the Invoker cannot verify tokens or cost — the Handler's
-        ``provider_metadata`` is self-attested.  When a
-        :class:`ProviderUsageVerifier` is configured, both tokens and
-        cost are verifiable.
+        """R5 P0-5 + R7 P0-1 + R8 P0-2/P0-3: by default (no
+        ``usage_verifier``) the Invoker cannot verify tokens or cost
+        — the Handler's ``provider_metadata`` is self-attested.  When
+        a :class:`ProviderUsageVerifier` is configured, the
+        per-dimension ``verifies_tokens`` / ``verifies_cost`` flags
+        are taken from the verifier independently.
 
         R7 P0-1: ``can_attest_no_provider_call`` is always ``False``
         for :class:`RegistryAgentInvoker` — a real Handler can lie by
@@ -495,10 +720,10 @@ class RegistryAgentInvoker:
         trusted deterministic invokers (e.g.
         :class:`DeterministicFakeInvoker`) set this to ``True``.
 
-        R7 P0-6: ``bound_source_ids`` contains the verifier's
-        ``source_id`` when a verifier is configured, so the accountant
-        can reject receipts that claim verification by an unbound
-        verifier.
+        R8 P0-2/P0-3: ``bound_token_source_ids`` and
+        ``bound_cost_source_ids`` are populated independently based
+        on the verifier's per-dimension capabilities.  A cost-only
+        verifier only binds its source to the cost dimension.
         """
         if self._usage_verifier is None:
             return UsageVerificationCapabilities(
@@ -506,14 +731,28 @@ class RegistryAgentInvoker:
                 verifies_cost=False,
                 source_id="registry_agent_invoker",
                 can_attest_no_provider_call=False,
+                bound_token_source_ids=frozenset(),
+                bound_cost_source_ids=frozenset(),
                 bound_source_ids=frozenset(),
             )
+        verifier = self._usage_verifier
+        # R8 P0-2: derive per-dimension capabilities from the verifier.
+        verifies_tokens = getattr(verifier, "verifies_tokens", False)
+        verifies_cost = getattr(verifier, "verifies_cost", False)
+        # R8 P0-3: bind the verifier's source_id only to the
+        # dimensions it actually verifies.
+        bound_token = (
+            frozenset({verifier.source_id}) if verifies_tokens else frozenset()
+        )
+        bound_cost = frozenset({verifier.source_id}) if verifies_cost else frozenset()
         return UsageVerificationCapabilities(
-            verifies_tokens=True,
-            verifies_cost=True,
+            verifies_tokens=verifies_tokens,
+            verifies_cost=verifies_cost,
             source_id="registry_agent_invoker+provider_verifier",
             can_attest_no_provider_call=False,
-            bound_source_ids=frozenset({self._usage_verifier.source_id}),
+            bound_token_source_ids=bound_token,
+            bound_cost_source_ids=bound_cost,
+            bound_source_ids=frozenset(),
         )
 
     async def invoke(
@@ -524,14 +763,13 @@ class RegistryAgentInvoker:
     ) -> AgentInvocationReceipt:
         result = await handler.run(task, context)
 
-        # R6 P0-1 + R7 P0-5: Actually call the ProviderUsageVerifier
-        # when one is configured and the Handler returned
-        # provider_metadata.  The verifier's result — not the
-        # verifier's mere existence — determines whether usage is
-        # trusted.  R7 P0-5: the verifier is now async and is awaited
-        # directly (not called synchronously), so it can be bounded by
-        # the outer ``asyncio.wait_for`` and cancelled without blocking
-        # the event loop.
+        # R6 P0-1 + R7 P0-5 + R8 P0-2: Actually call the
+        # ProviderUsageVerifier when one is configured and the Handler
+        # returned provider_metadata.  The verifier's per-dimension
+        # result — not the verifier's mere existence — determines
+        # which dimensions are VERIFIED.  R7 P0-5: the verifier is now
+        # async and is awaited directly.  R8 P0-2: a cost-only
+        # verifier no longer elevates Token trust.
         if self._usage_verifier is not None and result.provider_metadata is not None:
             try:
                 verified = await self._usage_verifier.verify(
@@ -547,37 +785,55 @@ class RegistryAgentInvoker:
                     f"raised {type(exc).__name__}: {exc}"
                 ) from exc
 
-            if not verified.verified:
-                # R6 P0-1: Verifier rejected the usage — fail closed.
+            # R8 P0-2: reject a verifier that returns verified=False
+            # for BOTH dimensions — no usage can be trusted.
+            if not (verified.tokens_verified or verified.cost_verified):
                 raise NonRetryableAgentError(
                     f"ProviderUsageVerifier ({self._usage_verifier.source_id}) "
-                    f"returned verified=False — handler self-reported "
-                    f"usage is not trusted"
+                    f"returned tokens_verified=False AND cost_verified=False "
+                    f"— handler self-reported usage is not trusted"
                 )
 
-            # R6 P0-1 + P0-4: Use the verifier's authoritative values,
-            # not the Handler's self-reported ones.  Cost is only
-            # verified when the verifier returned a non-None cost_usd.
-            cost_verified = verified.cost_usd is not None
+            # R8 P0-2: build per-dimension provenance from the
+            # verifier's independent flags.  A cost-only verifier
+            # produces ``cost_verified=True, tokens_verified=False``.
+            token_disp = (
+                AttemptUsageDisposition.VERIFIED
+                if verified.tokens_verified
+                else AttemptUsageDisposition.UNAVAILABLE
+            )
+            cost_disp = (
+                AttemptUsageDisposition.VERIFIED
+                if verified.cost_verified
+                else AttemptUsageDisposition.UNAVAILABLE
+            )
             return AgentInvocationReceipt(
                 result=result,
                 tool_calls=len(result.tool_calls),
                 tokens_used=verified.tokens_used,
                 cost_usd=verified.cost_usd,
                 usage_provenance=UsageProvenance(
-                    source_id=self._usage_verifier.source_id,
-                    tokens_verified=True,
-                    cost_verified=cost_verified,
+                    token_source_id=(
+                        self._usage_verifier.source_id
+                        if verified.tokens_verified
+                        else None
+                    ),
+                    cost_source_id=(
+                        self._usage_verifier.source_id
+                        if verified.cost_verified
+                        else None
+                    ),
+                    tokens_verified=verified.tokens_verified,
+                    cost_verified=verified.cost_verified,
                 ),
+                token_disposition=token_disp,
+                cost_disposition=cost_disp,
             )
 
         # No verifier or no provider_metadata → unverified.
-        # R7 P0-1: When ``provider_metadata`` is absent, the receipt
-        # carries ``tokens_used=None`` and unverified provenance.  The
-        # accountant determines the disposition: if the Invoker has
-        # ``can_attest_no_provider_call=True`` → NO_PROVIDER_CALL;
-        # otherwise → UNAVAILABLE (fail-closed when a budget is
-        # configured).  :class:`RegistryAgentInvoker` always has
+        # R8 P0-1: the Invoker declares UNAVAILABLE explicitly — the
+        # Accountant no longer infers this from ``provider_metadata
+        # is None``.  :class:`RegistryAgentInvoker` always has
         # ``can_attest_no_provider_call=False``, so a Handler that
         # omits ``provider_metadata`` triggers fail-closed when a
         # budget is configured — it cannot self-attest "no provider
@@ -592,10 +848,13 @@ class RegistryAgentInvoker:
             tokens_used=tokens_used,
             cost_usd=None,
             usage_provenance=UsageProvenance(
-                source_id="registry_agent_invoker",
+                token_source_id=None,
+                cost_source_id=None,
                 tokens_verified=False,
                 cost_verified=False,
             ),
+            token_disposition=AttemptUsageDisposition.UNAVAILABLE,
+            cost_disposition=AttemptUsageDisposition.UNAVAILABLE,
         )
 
 
@@ -651,11 +910,15 @@ class DeterministicFakeInvoker:
             # :class:`RegistryAgentInvoker`, which calls real Handlers
             # that can lie by omitting ``provider_metadata``.
             can_attest_no_provider_call=True,
-            # R7 P0-6: empty ``bound_source_ids`` accepts any
-            # ``source_id`` — the test double does not bind to a
-            # specific verifier.  Tests that need to exercise source
-            # binding pass explicit ``usage_capabilities`` with a
-            # non-empty set.
+            # R8 P0-3: empty per-dimension ``bound_*_source_ids``
+            # accept any ``source_id`` — the test double does not bind
+            # to a specific verifier.  Tests that need to exercise
+            # source binding pass explicit ``usage_capabilities`` with
+            # a non-empty set.  Since ``verifies_tokens=False`` and
+            # ``verifies_cost=False``, the empty sets do not violate
+            # the R8 P0-2 contract invariant.
+            bound_token_source_ids=frozenset(),
+            bound_cost_source_ids=frozenset(),
             bound_source_ids=frozenset(),
         )
         self.invocations: list[tuple[AgentTask, AgentExecutionContext]] = []
@@ -677,11 +940,18 @@ class DeterministicFakeInvoker:
         if self._receipt is not None:
             return self._receipt
         assert self._result is not None
+        # R8 P0-1: the test double explicitly declares
+        # NO_PROVIDER_CALL because it owns its receipts and can
+        # authoritatively attest that no provider call was made
+        # (``can_attest_no_provider_call=True``).  The Accountant
+        # validates this declaration against the Invoker capability.
         return AgentInvocationReceipt(
             result=self._result,
             tool_calls=len(self._result.tool_calls),
             tokens_used=None,
             cost_usd=None,
+            token_disposition=AttemptUsageDisposition.NO_PROVIDER_CALL,
+            cost_disposition=AttemptUsageDisposition.NO_PROVIDER_CALL,
         )
 
 
@@ -779,6 +1049,56 @@ def validate_invocation_receipt(receipt: AgentInvocationReceipt) -> None:
     # The per-dimension cross-check in ``_BudgetAccountant.record_receipt``
     # ensures the receipt's ``cost_verified`` does not exceed the
     # invoker's ``verifies_cost`` capability.
+
+    # R8 P0-1: validate that the explicit per-attempt dispositions on
+    # the Receipt are consistent with the provenance flags.  The
+    # Invoker is the trusted boundary that declares these; the
+    # Accountant validates them against Invoker capabilities.  Here
+    # we only check internal Receipt consistency.
+    if receipt.token_disposition == AttemptUsageDisposition.VERIFIED:
+        if not receipt.usage_provenance.tokens_verified:
+            raise InvalidInvocationReceiptError(
+                "receipt.token_disposition=VERIFIED but "
+                "usage_provenance.tokens_verified=False — a VERIFIED "
+                "disposition requires the corresponding provenance flag"
+            )
+        if receipt.tokens_used is None:
+            raise InvalidInvocationReceiptError(
+                "receipt.token_disposition=VERIFIED but tokens_used is "
+                "None — a VERIFIED token disposition requires a "
+                "non-None tokens_used value"
+            )
+    if receipt.cost_disposition == AttemptUsageDisposition.VERIFIED:
+        if not receipt.usage_provenance.cost_verified:
+            raise InvalidInvocationReceiptError(
+                "receipt.cost_disposition=VERIFIED but "
+                "usage_provenance.cost_verified=False — a VERIFIED "
+                "disposition requires the corresponding provenance flag"
+            )
+        if receipt.cost_usd is None:
+            raise InvalidInvocationReceiptError(
+                "receipt.cost_disposition=VERIFIED but cost_usd is "
+                "None — a VERIFIED cost disposition requires a "
+                "non-None cost_usd value"
+            )
+    # R8 P0-1: NO_PROVIDER_CALL dispositions must not carry usage
+    # values — if no provider call was made, there is no usage to
+    # report.  A Receipt that declares NO_PROVIDER_CALL but also
+    # reports tokens_used/cost_usd is internally inconsistent.
+    if receipt.token_disposition == AttemptUsageDisposition.NO_PROVIDER_CALL:
+        if receipt.tokens_used is not None and receipt.tokens_used != 0:
+            raise InvalidInvocationReceiptError(
+                "receipt.token_disposition=NO_PROVIDER_CALL but "
+                f"tokens_used={receipt.tokens_used} — no provider "
+                "call means no token usage"
+            )
+    if receipt.cost_disposition == AttemptUsageDisposition.NO_PROVIDER_CALL:
+        if receipt.cost_usd is not None and receipt.cost_usd != Decimal("0"):
+            raise InvalidInvocationReceiptError(
+                "receipt.cost_disposition=NO_PROVIDER_CALL but "
+                f"cost_usd={receipt.cost_usd} — no provider call "
+                "means no cost usage"
+            )
 
 
 __all__ = [

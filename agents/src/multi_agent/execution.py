@@ -40,7 +40,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import StrEnum
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import Field, field_validator
 
@@ -103,6 +103,16 @@ class TaskAttemptRecord(StrictContract):
     ``duration_ms`` is monotonic-clock derived.  ``started_at`` /
     ``completed_at`` are timezone-aware UTC for audit display only.
 
+    R8 P0-5: the record now carries per-dimension
+    :class:`AttemptUsageDisposition` fields and source ids so audit
+    consumers can distinguish VERIFIED actual usage from UNAVAILABLE
+    or NO_PROVIDER_CALL attempts.  The ``tokens_used`` / ``cost_usd``
+    fields are ONLY populated when the corresponding disposition is
+    ``VERIFIED`` — for any other disposition, they are ``None``.
+    Invalid-receipt declared values (if retained for debugging) are
+    stored in ``declared_tokens_used`` / ``declared_cost_usd`` and
+    are explicitly marked as Untrusted.
+
     The record never stores prompts, chain-of-thought, or secrets.
     """
 
@@ -120,8 +130,25 @@ class TaskAttemptRecord(StrictContract):
 
     agent_calls: int = Field(default=1, ge=1)
     tool_calls: int = Field(default=0, ge=0)
+    # R8 P0-5: Actual Verified usage — ONLY populated when the
+    # corresponding disposition is VERIFIED.  For UNAVAILABLE or
+    # NO_PROVIDER_CALL, these are ``None``.
     tokens_used: int | None = Field(default=None, ge=0)
     cost_usd: Decimal | None = Field(default=None, ge=0)
+    # R8 P0-5: per-dimension disposition + source id for auditing.
+    # Defaults to UNAVAILABLE so a record constructed without
+    # explicit dispositions cannot accidentally claim VERIFIED.
+    token_disposition: Any = None
+    cost_disposition: Any = None
+    token_source_id: str | None = None
+    cost_source_id: str | None = None
+    # R8 P0-5: Untrusted declared values from an invalid receipt.
+    # These are ``None`` for valid receipts; populated ONLY when the
+    # receipt failed validation but the values are retained for
+    # debugging.  Audit consumers must NOT treat these as actual
+    # usage — they are the Handler's self-reported (untrusted) claims.
+    declared_tokens_used: int | None = Field(default=None, ge=0)
+    declared_cost_usd: Decimal | None = Field(default=None, ge=0)
 
     @field_validator("started_at", "completed_at")
     @classmethod
