@@ -173,10 +173,18 @@ from multi_agent.execution_errors import (
 from multi_agent.invocation import (
     AgentInvocationReceipt,
     AgentInvoker,
+    AttemptUsageDisposition,
+    AttemptUsageRecord,
     DeterministicFakeInvoker,
     ProviderUsageVerifier,
     RegistryAgentInvoker,
     UsageProvenance,
+    # R7 P1-1: DEPRECATED — ``UsageTrustLevel`` is retained for
+    # backwards compatibility but new code must use ``UsageProvenance``
+    # and ``AttemptUsageDisposition``.  The legacy ``usage_trust`` field
+    # on ``AgentInvocationReceipt`` is auto-derived from
+    # ``usage_provenance`` and will be removed in the next incompatible
+    # version.
     UsageTrustLevel,
     UsageVerificationCapabilities,
     VerifiedUsage,
@@ -340,10 +348,13 @@ __all__ = [
     # Phase 4 — Invocation
     "AgentInvocationReceipt",
     "AgentInvoker",
+    "AttemptUsageDisposition",
+    "AttemptUsageRecord",
     "DeterministicFakeInvoker",
     "ProviderUsageVerifier",
     "RegistryAgentInvoker",
     "UsageProvenance",
+    # R7 P1-1: DEPRECATED — use UsageProvenance / AttemptUsageDisposition.
     "UsageTrustLevel",
     "UsageVerificationCapabilities",
     "VerifiedUsage",

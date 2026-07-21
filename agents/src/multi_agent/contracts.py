@@ -881,12 +881,23 @@ class ExecutionUsage(StrictContract):
     cost_usd: Decimal = Field(default=Decimal("0.00"), ge=0)
     cost_usage_available: bool = False
     cost_usage_status: UsageAvailabilityStatus = UsageAvailabilityStatus.UNAVAILABLE
-    # R6 P1: attempt coverage counts so consumers can distinguish
-    # "1 of 3 verified" from "2 of 3 verified" — both are PARTIAL but
-    # have different completeness implications.
-    provider_usage_capable_attempts: int = Field(default=0, ge=0)
+    # R7 P0-3: Token and Cost now have INDEPENDENT coverage
+    # denominators.  A cost-only adapter verifying Attempt B's cost
+    # can no longer "offset" Attempt A's missing cost — the two
+    # dimensions are tracked separately.  The legacy
+    # ``provider_usage_capable_attempts`` is retained as a diagnostic
+    # field (computed as the max of the two independent denominators)
+    # but is no longer used as the coverage denominator for either
+    # dimension.
+    token_usage_applicable_attempts: int = Field(default=0, ge=0)
+    cost_usage_applicable_attempts: int = Field(default=0, ge=0)
     verified_token_attempts: int = Field(default=0, ge=0)
     verified_cost_attempts: int = Field(default=0, ge=0)
+    # R7 P0-3: DEPRECATED — retained for backwards compatibility.
+    # Computed as ``max(token_usage_applicable_attempts,
+    # cost_usage_applicable_attempts)``.  Consumers should use the
+    # per-dimension fields above instead.
+    provider_usage_capable_attempts: int = Field(default=0, ge=0)
     elapsed_ms: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")

@@ -4,30 +4,33 @@
 **Branch:** `feat/ma-04-supervisor-runtime`  
 **Baseline:** `main` (Phase 3, commit `d586e70`)
 
-> **R6 Revision** — This document reflects the R6 audit fixes (commit `<TBD>`).
+> **R7 Revision** — This document reflects the R7 audit fixes (commit `<TBD>`).
 > R1 baseline: commit `e5ab368`. R2 baseline: commit `64fedd1` (5 P0 + 3 P1
 > fixes, request-changes). R3 baseline: commit `5b9c647` (4 P0 + 3 P1 fixes,
 > request-changes). R4 baseline: commit `bc5abd4` (4 P0 + 2 P1 fixes,
 > request-changes). R5 baseline: commit `f2288f8` (5 P0 + 2 P1 fixes,
-> request-changes). R6 addresses 5 P0 and 2 P1 issues from the R5 review,
-> focused on **verified usage actually flowing through the Verifier (not
-> merely trusting a Verifier object's existence), every RetryPolicy field
-> truly influencing execution behavior, and no-receipt attempts failing
-> closed**:
-> `ProviderUsageVerifier` must be invoked on the real `RegistryAgentInvoker.invoke()`
-> path and its returned `VerifiedUsage.verified` flag — not the verifier's
-> mere existence — determines trust; `should_retry()` is a pure function that
-> reads `RetryPolicy` (not `task.max_retries`) and every field
-> (`max_retries`, `retryable_error_codes`) must affect the decision, with
-> `NEVER_RETRYABLE_ERROR_CODES` always winning; a committed agent call that
-> produces no receipt (timeout/exception) must fail-closed when a budget is
-> configured (`record_usage_unavailable()`); per-dimension `UsageProvenance`
-> replaces the single `usage_trust` string so Token and Cost trust are
-> independent — `trusted_adapter` means cost-only (tokens_verified=False); the
-> Cache Hit path must not read Live Invoker Capability (cache path purity);
-> `UsageAvailabilityStatus` is upgraded from boolean to three-state
-> (unavailable/partial/complete); `RetryPolicy.retryable_error_codes` is
-> validated at construction (no blank strings, no never-retryable codes).
+> request-changes). R6 baseline: commit `d5fd130` (5 P0 + 2 P1 fixes,
+> request-changes). R7 addresses 5 P0 and 2 P1 issues from the R6 review,
+> focused on **no-provider-call attestation by a trusted boundary (not Handler
+> omission), per-dimension independent coverage, multi-error retry pairing,
+> async verifier bounded by deadline, and provenance source binding**:
+> `AttemptUsageDisposition` replaces the R6 heuristic that inferred
+> `no_provider_call` from `provider_metadata is None` — Handler can no longer
+> self-attest by omitting a field; `NO_PROVIDER_CALL` requires
+> `can_attest_no_provider_call=True` from a trusted Invoker;
+> `record_usage_unavailable()` is invoked on the invalid-receipt path so Token
+> and Cost are both marked `UNAVAILABLE`; Token and Cost have **independent**
+> coverage denominators (`token_usage_applicable_attempts` /
+> `cost_usage_applicable_attempts`) and per-attempt `AttemptUsageRecord` — a
+> cost-only adapter verifying Attempt B's cost can no longer "offset" Attempt
+> A's missing cost; `should_retry_result()` takes a `Sequence[AgentError]`
+> and pairs `error_code` + `retryable` from the SAME error (no more
+> `errors[0].error_code` + `any(e.retryable)`); `ProviderUsageVerifier.verify()`
+> is `async def` and bounded by `asyncio.wait_for` (task timeout + run deadline
+> + cancellation); `UsageVerificationCapabilities.bound_source_ids` rejects
+> receipts whose `usage_provenance.source_id` is not in the invoker's bound
+> set. P1: legacy `usage_trust` / `UsageTrustLevel` marked DEPRECATED; Phase 3
+> documentation synchronized with the Canonical `RetryPolicy` contract.
 
 ---
 
@@ -461,6 +464,42 @@ def _validate_retryable_error_codes(cls, v: frozenset[str]) -> frozenset[str]:
 
 **保证**：进入 Plan Hash 的每个 `retryable_error_code` 都是 stripped 非空字符串，且不在 never-retry 列表中——misconfiguration 在 planning 时被发现，而非运行时静默忽略。
 
+### R7 P0-4: Multi-error Retry — code and flag from the SAME AgentError
+
+R6 的 `should_retry()` 接受分离的 `error_code: str | None` + `explicitly_retryable: bool`。但 `_execute_task()` 在处理多错误 `AgentResult` 时构造这两个参数来自**不同**的 Error：
+
+```python
+result_retryable = any(err.retryable for err in result.errors)
+error_code = result.errors[0].error_code  # 来自 errors[0]
+explicitly_retryable = result_retryable     # 来自任意 error
+```
+
+如果 Error 1 (`custom_error`, `retryable=False`) 在 allowlist 中，Error 2 (`other_error`, `retryable=True`) 不在 allowlist 中——R6 会传入 `error_code="custom_error"` + `explicitly_retryable=True`，因 `custom_error` 在 allowlist 中而重试，但 `custom_error` 本身标记为不可重试；真正被标为 retryable 的 `other_error` 又不在 allowlist 中。
+
+R7 提取 `should_retry_result()`，接受 `Sequence[AgentError]`：
+
+```python
+def should_retry_result(
+    *,
+    policy: RetryPolicy,
+    attempt_index: int,
+    errors: Sequence[AgentError],
+) -> bool: ...
+```
+
+**决策规则**（按优先级）：
+
+1. `policy.max_retries <= 0` → `False`
+2. `attempt_index >= policy.max_retries` → `False`
+3. 无 errors → `False`
+4. **任一** error 的 `error_code` 在 `NEVER_RETRYABLE_ERROR_CODES` 中 → `False`（始终拒绝）
+5. 过滤出 `retryable=True` 的 errors（code + retryable 来自**同一个** AgentError）
+6. 无 retryable errors → `False`
+7. `policy.retryable_error_codes` 非空 → 至少一个 retryable error 的 `error_code` 在集合中
+8. `policy.retryable_error_codes` 为空 → 至少一个 retryable error 即可
+
+**关键约束**：`error_code` 与 `retryable` 始终来自同一个 `AgentError` 实例——不允许把 Error A 的 code 与 Error B 的 retryable flag 拼接。`_execute_task()` 的 3 个 retry 调用点（结果失败、超时、异常）都改为构造 `AgentError` 列表并调用 `should_retry_result()`。
+
 ### 允许重试的情况
 
 - Handler 抛 `RetryableAgentError`
@@ -646,6 +685,103 @@ AND not verified                   (该维度未被验证)
 | set | `500` | `True` | **enforce**（累计检查上限） |
 
 **保证**：`ExecutionUsageUnavailableError` 被捕获后设置 `error_code='usage_unavailable'`，同时 `_exceeded=True` + `_exceeded_reason='execution_usage_unavailable'`——run 最终状态为 `BUDGET_EXCEEDED`（而非 `FAILED`），因为 budget 配置了但无法测量消耗是一种 budget 级别的 fail-closed。
+
+### R7 P0-1: Trusted No-provider-call — Handler Cannot Self-attest
+
+R6 的 `no_provider_call` disposition 仍由 Handler 通过"省略 `provider_metadata`"自行声明——一个实际调用过 Provider 的 Handler 只要漏填或故意不填 `provider_metadata`，就会被当成 Deterministic、No-provider-call Attempt，从而跳过 Token/Cost Budget 校验。
+
+R7 引入**显式且可信的** `AttemptUsageDisposition`（per-dimension）：
+
+```python
+class AttemptUsageDisposition(StrEnum):
+    VERIFIED = "verified"
+    NO_PROVIDER_CALL = "no_provider_call"
+    UNAVAILABLE = "unavailable"
+```
+
+`UsageVerificationCapabilities` 新增 `can_attest_no_provider_call: bool`。只有受信 Deterministic Invoker 或 Runtime Mode Adapter 可设为 `True`——默认 `RegistryAgentInvoker` 为 `False`（一个真实 Handler 可以通过省略 `provider_metadata` 说谎）。
+
+**`record_receipt()` 中的 disposition 计算规则**（per-dimension）：
+
+```
+if provenance.{dim}_verified:
+    disposition = VERIFIED
+elif can_attest_no_provider_call AND provider_metadata is None:
+    disposition = NO_PROVIDER_CALL
+else:
+    disposition = UNAVAILABLE
+```
+
+**关键变化**：`provider_metadata is None` **不再**自动产生 `NO_PROVIDER_CALL`。当 `can_attest_no_provider_call=False`（默认 `RegistryAgentInvoker`）且 `provider_metadata` 缺失时，disposition 是 `UNAVAILABLE`——配置 Token/Cost Budget 时必须 fail-closed。
+
+| `provider_metadata` | `can_attest_no_provider_call` | `provenance.verified` | disposition |
+|---|---|---|---|
+| None | `True` (deterministic) | False | **NO_PROVIDER_CALL** |
+| None | `False` (registry) | False | **UNAVAILABLE** (fail-closed if budget) |
+| set | any | True | **VERIFIED** |
+| set | any | False | **UNAVAILABLE** (fail-closed if budget) |
+
+### R7 P0-2: Invalid Receipt also Produces Usage Disposition
+
+R6 的 `record_usage_unavailable()` 只位于"原本就没有 receipt"分支中。如果一个已 commit 的 Agent Call 返回了无效 Receipt（`validate_invocation_receipt()` 失败），R6 仅标记 `invalid_receipt` 并继续，但**不**调用 `record_usage_unavailable()`——Token/Cost Usage 不会标记为 Unavailable，配置预算时也不会触发 `execution_usage_unavailable`，独立任务仍可能继续执行。
+
+R7 在 invalid-receipt 路径也调用 `record_usage_unavailable()`：
+
+```python
+# observed tool calls charged BEFORE receipt validation
+accountant.record_observed_tool_calls(observed_tool_calls)
+
+try:
+    validate_invocation_receipt(receipt)
+except InvalidInvocationReceiptError:
+    receipt_for_record = receipt
+    receipt = None
+    # R7 P0-2: invalid receipt → both dimensions UNAVAILABLE
+    accountant.record_usage_unavailable(task_id=task.task_id, attempt=attempt_idx)
+```
+
+**保证**：invalid receipt 时 observed tool calls 仍计入 `max_tool_calls`，但 Token 和 Cost disposition 均为 `UNAVAILABLE`——配置对应预算时触发 `execution_usage_unavailable`，停止 Retry、停止新任务、Run=budget_exceeded。
+
+### R7 P0-3: Per-Dimension Independent Coverage Denominators
+
+R6 的 `provider_usage_capable_attempts` 是 Token 和 Cost 共享的 coverage 分母。一个 Cost-only Adapter 验证 Attempt B 的 Cost 可以错误地"抵消"Attempt A 缺失的 Cost——最终 cost_usage_status 可能被错误标记为 `COMPLETE`。
+
+R7 为 Token 和 Cost 使用**独立分母**：
+
+```python
+token_usage_applicable_attempts: int   # R7 P0-3: per-dimension denominator
+cost_usage_applicable_attempts: int    # R7 P0-3: per-dimension denominator
+verified_token_attempts: int
+verified_cost_attempts: int
+# DEPRECATED (R7): retained only as a diagnostic; computed as
+# max(token_usage_applicable_attempts, cost_usage_applicable_attempts)
+provider_usage_capable_attempts: int
+```
+
+并引入 per-attempt `AttemptUsageRecord`：
+
+```python
+class AttemptUsageRecord(StrictContract):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    task_id: str
+    attempt: int
+    token_disposition: AttemptUsageDisposition
+    cost_disposition: AttemptUsageDisposition
+    tokens_used: int | None = None
+    cost_usd: Decimal | None = None
+    source_id: str | None = None
+```
+
+`_BudgetAccountant` 维护 `_attempt_records: list[AttemptUsageRecord]`，per-dimension coverage 从记录计算：
+
+```
+token_usage_applicable_attempts = count(r for r in records if r.token_disposition != NO_PROVIDER_CALL)
+cost_usage_applicable_attempts  = count(r for r in records if r.cost_disposition != NO_PROVIDER_CALL)
+verified_token_attempts         = count(r for r in records if r.token_disposition == VERIFIED)
+verified_cost_attempts          = count(r for r in records if r.cost_disposition == VERIFIED)
+```
+
+**保证**：`verified_token_attempts <= token_usage_applicable_attempts` 且 `verified_cost_attempts <= cost_usage_applicable_attempts`——一个 Cost-only Adapter 不得补齐另一个 Provider Attempt 缺失的 Cost。
 
 ### R5 P0-4: Usage Recording vs Enforcement 分离
 
@@ -856,6 +992,80 @@ async def invoke(self, handler, task, context) -> AgentInvocationReceipt:
 - Verifier 返回 `verified=True` → 使用 Verifier 的 `tokens_used` / `cost_usd`（**不**使用 Handler 自报值），`cost_verified` 取决于 `verified.cost_usd is not None`
 - 无 Verifier 或无 `provider_metadata` → `UsageProvenance(tokens_verified=False, cost_verified=False)`
 
+### R7 P0-5: Async ProviderUsageVerifier Bounded by Deadline
+
+R6 的 `ProviderUsageVerifier.verify()` 是同步方法，但 `RegistryAgentInvoker.invoke()` 在 async 方法中直接同步调用：
+
+```python
+verified = self._usage_verifier.verify(...)  # 同步调用阻塞事件循环
+```
+
+虽然外层 Invocation 使用 `asyncio.wait_for(invoker.invoke(...))`，但当同步 `verify()` 阻塞线程时：`wait_for` 的 Timeout Callback 无法执行、同波其他 Task 无法调度、Cancellation 无法被轮询、Run Deadline 可以被严重超出。Verifier 的定义允许它是外部、运营或计费 Adapter——不能假定它永远是一个立即返回的纯内存函数。
+
+R7 将 Protocol 改为 `async def`：
+
+```python
+class ProviderUsageVerifier(Protocol):
+    source_id: str
+
+    async def verify(
+        self,
+        *,
+        provider_metadata: ProviderMetadata,
+        token_usage: TokenUsage,
+    ) -> VerifiedUsage: ...
+```
+
+`RegistryAgentInvoker.invoke()` 使用 `await`：
+
+```python
+verified = await self._usage_verifier.verify(...)
+```
+
+Verifier 调用受**剩余 Task Timeout + 剩余 Run Deadline + Cancellation** 约束——`asyncio.wait_for` 的 Timeout Callback 可以正常执行，同波 Task 可以继续调度，Cancellation 可以被及时轮询。
+
+**关键保证**：
+- 慢 Verifier 被 Task Timeout 或 Run Deadline 取消——不会无限运行
+- 一个慢 Verifier 不会阻塞同波其他 Task（事件循环不被阻塞）
+- `invoke()` 协程被 cancel 时，Verifier 也被 cancel——不会遗留后台 Verifier
+- Verifier 超时 → `NonRetryableAgentError`（fail closed）
+- 如果必须兼容同步 Adapter，应通过专用 Adapter 包装（如 `asyncio.to_thread`），并明确其线程生命周期；**不**得在事件循环中直接执行潜在阻塞代码
+
+### R7 P0-6: Provenance Source Binding
+
+R6 的 `UsageVerificationCapabilities` 只检查 `verifies_tokens` / `verifies_cost` 两个 Boolean——一个 Invoker 声明 `verifies_tokens=True` 后，任何 `source_id` 的 Receipt 都会被接受。但 Invoker 应该绑定到**特定** Verifier/Adapter 的 source identity，而不是接受任意 source。
+
+R7 在 `UsageVerificationCapabilities` 新增 `bound_source_ids: frozenset[str]`：
+
+```python
+class UsageVerificationCapabilities(StrictContract):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    verifies_tokens: bool = False
+    verifies_cost: bool = False
+    source_id: str
+    can_attest_no_provider_call: bool = False  # R7 P0-1
+    bound_source_ids: frozenset[str] = Field(default_factory=frozenset)  # R7 P0-6
+```
+
+`record_receipt()` 在处理 Receipt 时执行 source binding 检查：
+
+```python
+if invoker_capabilities.bound_source_ids:
+    if prov.source_id not in invoker_capabilities.bound_source_ids:
+        raise ExecutionUsageUnavailableError(
+            f"receipt.usage_provenance.source_id={prov.source_id!r} "
+            f"is not in the invoker's bound_source_ids — "
+            f"receipt cannot claim provenance from an unbound source"
+        )
+```
+
+**关键保证**：
+- `bound_source_ids` 非空 → Receipt 的 `source_id` 必须在集合中
+- `bound_source_ids` 为空 → 任何 `source_id` 接受（向后兼容）
+- `RegistryAgentInvoker` 配置 Verifier 后，`bound_source_ids = frozenset({verifier.source_id})`
+- `DeterministicFakeInvoker` 默认 `bound_source_ids=frozenset()`（不绑定特定 source）
+- 一个 Receipt 不能声称由 Invoker 未绑定的 Verifier 验证
+
 **Trust 来源**是 Verifier 的 `verify()` 返回值，**不**是 Verifier 对象的存在性。
 
 #### R5 P0-5: Usage Capability Frozen Once Per Run
@@ -972,6 +1182,39 @@ def _compute_usage_status(self, verified: int, capable: int) -> UsageAvailabilit
 ```
 
 **保证**：`PARTIAL` 状态明确告知调用方"部分 usage 数据缺失"，调用方可以据此决定是否信任 `tokens_used` / `cost_usd` 的累计值，而非将其当作完整测量。
+
+### R7 P1-1: Legacy usage_trust / UsageTrustLevel DEPRECATED
+
+R6 的 `AgentInvocationReceipt` 仍公开 `usage_trust: UsageTrustLevel` 并允许旧字符串自动生成新的 `UsageProvenance`。`multi_agent.__init__` 也仍导出了 `UsageTrustLevel`。Capability 交叉校验能阻止部分自我提权，但保留两套公共 Trust API 会使调用者难以判断哪一个才是正式模型。
+
+R7 将 `usage_trust` / `UsageTrustLevel` 标记为 **DEPRECATED**：
+
+- Runtime 内部（`_BudgetAccountant`）**只**读取 `usage_provenance`，**不**读取 `usage_trust`
+- `usage_trust` 字段保留但 auto-derived from `usage_provenance`（通过 `_provenance_to_trust()`）
+- 禁止新代码同时传入两套字段——`_sync_trust_provenance` validator 让 `usage_provenance` 优先，但混用易错
+- `multi_agent.__init__` 中的 `UsageTrustLevel` 导出标注 DEPRECATED 注释
+- 新代码**必须**使用 `UsageProvenance` 和 `AttemptUsageDisposition`
+- 下一次不兼容版本将删除旧字段与导出
+
+**推荐迁移**：
+
+```python
+# DEPRECATED (R7):
+receipt = AgentInvocationReceipt(
+    result=result,
+    usage_trust="verified_provider",  # 旧 API
+)
+
+# RECOMMENDED (R7+):
+receipt = AgentInvocationReceipt(
+    result=result,
+    usage_provenance=UsageProvenance(
+        source_id="provider_verifier",
+        tokens_verified=True,
+        cost_verified=False,
+    ),
+)
+```
 
 ---
 
@@ -1446,7 +1689,8 @@ agents/tests/unit/multi_agent/
 ├── test_supervisor_r3.py                 # R3 regression (P0-1..P0-4, P1-2..P1-3) — 22 tests
 ├── test_supervisor_r4.py                 # R4 regression (P0-1..P0-4, P1-1) — 23 tests
 ├── test_supervisor_r5.py                 # R5 regression (P0-1..P0-5, P1-1..P1-2) — 22 tests
-└── test_supervisor_r6.py                 # R6 regression (P0-1..P0-5, P1-1..P1-2) — verified usage flow + retry policy execution
+├── test_supervisor_r6.py                 # R6 regression (P0-1..P0-5, P1-1..P1-2) — verified usage flow + retry policy execution
+└── test_supervisor_r7.py                 # R7 regression (P0-1..P0-6, P1-1) — trusted no-provider-call + per-dimension coverage + multi-error retry + async verifier + source binding — 33 tests
 ```
 
 Customer Recovery 五任务执行场景（§15）作为集成测试嵌入在 `test_supervisor.py` 中，
@@ -1690,4 +1934,64 @@ NEVER_RETRYABLE_ERROR_CODES: frozenset[str] = frozenset({
     "tenant_mismatch", "agent_identity_mismatch",
     "cancelled", "kill_switch",
 })
+```
+
+### R7 新增 Contract 速查
+
+```python
+# R7 P0-1: Per-dimension Attempt Usage Disposition (replaces R6 heuristic)
+class AttemptUsageDisposition(StrEnum):
+    VERIFIED = "verified"
+    NO_PROVIDER_CALL = "no_provider_call"
+    UNAVAILABLE = "unavailable"
+
+# R7 P0-3: Per-attempt usage record (independent Token/Cost coverage)
+class AttemptUsageRecord(StrictContract):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    task_id: str
+    attempt: int
+    token_disposition: AttemptUsageDisposition
+    cost_disposition: AttemptUsageDisposition
+    tokens_used: int | None = None
+    cost_usd: Decimal | None = None
+    source_id: str | None = None
+
+# R7 P0-1 / P0-6: UsageVerificationCapabilities extended
+class UsageVerificationCapabilities(StrictContract):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    verifies_tokens: bool = False
+    verifies_cost: bool = False
+    source_id: str
+    can_attest_no_provider_call: bool = False  # R7 P0-1
+    bound_source_ids: frozenset[str] = Field(default_factory=frozenset)  # R7 P0-6
+
+# R7 P0-3: ExecutionUsage with per-dimension denominators
+class ExecutionUsage(StrictContract):
+    ...
+    # R7 P0-3: independent per-dimension denominators
+    token_usage_applicable_attempts: int = Field(default=0, ge=0)
+    cost_usage_applicable_attempts: int = Field(default=0, ge=0)
+    verified_token_attempts: int = Field(default=0, ge=0)
+    verified_cost_attempts: int = Field(default=0, ge=0)
+    # DEPRECATED (R7): retained as diagnostic only
+    provider_usage_capable_attempts: int = Field(default=0, ge=0)
+
+# R7 P0-4: Multi-error retry function (code + retryable from same AgentError)
+def should_retry_result(
+    *,
+    policy: RetryPolicy,
+    attempt_index: int,
+    errors: Sequence[AgentError],
+) -> bool: ...
+
+# R7 P0-5: Async ProviderUsageVerifier (bounded by asyncio.wait_for)
+class ProviderUsageVerifier(Protocol):
+    source_id: str
+
+    async def verify(
+        self,
+        *,
+        provider_metadata: ProviderMetadata,
+        token_usage: TokenUsage,
+    ) -> VerifiedUsage: ...
 ```

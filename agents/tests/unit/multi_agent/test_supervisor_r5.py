@@ -555,7 +555,7 @@ class _FakeProviderUsageVerifier:
 
     source_id: str = "fake_provider_verifier"
 
-    def verify(
+    async def verify(
         self,
         *,
         provider_metadata: ProviderMetadata,
@@ -1312,9 +1312,10 @@ class TestProviderUsageVerification:
                     f"got {[a.error_code for a in rec.attempts]}"
                 )
 
-    def test_provider_usage_verifier_protocol_contract(self):
+    @pytest.mark.asyncio
+    async def test_provider_usage_verifier_protocol_contract(self):
         """The ``ProviderUsageVerifier`` Protocol must expose
-        ``source_id`` and a ``verify(*, provider_metadata,
+        ``source_id`` and an async ``verify(*, provider_metadata,
         token_usage)`` method returning ``VerifiedUsage``."""
         verifier = _FakeProviderUsageVerifier()
 
@@ -1322,7 +1323,7 @@ class TestProviderUsageVerification:
         assert isinstance(verifier.source_id, str)
         assert len(verifier.source_id) > 0
 
-        # verify returns a VerifiedUsage.
+        # R7 P0-5: verify is async and returns a VerifiedUsage.
         pm = ProviderMetadata(
             provider="openai",
             chat_model="gpt-4",
@@ -1330,7 +1331,7 @@ class TestProviderUsageVerification:
             ai_mode="live",
         )
         tu = TokenUsage(input_tokens=50, output_tokens=50, total_tokens=100)
-        usage = verifier.verify(provider_metadata=pm, token_usage=tu)
+        usage = await verifier.verify(provider_metadata=pm, token_usage=tu)
         assert isinstance(usage, VerifiedUsage)
         assert usage.tokens_used == 100
         assert usage.verified is True

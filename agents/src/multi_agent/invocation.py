@@ -20,6 +20,7 @@ Supervisor stay unchanged.
 from __future__ import annotations
 
 from decimal import Decimal
+from enum import StrEnum
 from typing import Any, Callable, Literal, Protocol
 
 from pydantic import ConfigDict, Field, model_validator
@@ -99,6 +100,72 @@ class UsageProvenance(StrictContract):
     cost_verified: bool = False
 
 
+# ---------------------------------------------------------------------------
+# R7 P0-1: AttemptUsageDisposition — explicit, trusted declaration of
+# what a committed agent call produced.  Replaces the R6 heuristic that
+# inferred "no provider call" from ``provider_metadata is None`` (which
+# a Handler could lie about by simply omitting the field).
+# ---------------------------------------------------------------------------
+
+
+class AttemptUsageDisposition(StrEnum):
+    """R7 P0-1: Per-dimension usage disposition for a committed attempt.
+
+    * ``VERIFIED`` — the dimension's usage was attested by an
+      authoritative :class:`ProviderUsageVerifier` (or a trusted
+      adapter).  The value in the receipt may be trusted for budget
+      enforcement.
+    * ``NO_PROVIDER_CALL`` — the invoker authoritatively attests that
+      NO provider call was made for this attempt (deterministic mode).
+      This disposition can ONLY be produced by an invoker with
+      ``can_attest_no_provider_call=True`` — it cannot be inferred
+      from ``provider_metadata is None``.
+    * ``UNAVAILABLE`` — the dimension's usage is unknown.  This
+      covers: (a) no receipt at all (timeout / exception), (b) invalid
+      receipt, (c) ``provider_metadata`` absent and the invoker cannot
+      attest no provider call (default ``RegistryAgentInvoker``), (d)
+      ``provider_metadata`` present but the dimension is not verified
+      and a budget is configured.
+    """
+
+    VERIFIED = "verified"
+    NO_PROVIDER_CALL = "no_provider_call"
+    UNAVAILABLE = "unavailable"
+
+
+class AttemptUsageRecord(StrictContract):
+    """R7 P0-3: Per-attempt usage record for independent Token/Cost
+    coverage tracking.
+
+    Each committed agent call produces exactly one
+    :class:`AttemptUsageRecord`.  Token and Cost dispositions are
+    independent — a single attempt can be ``VERIFIED`` for tokens but
+    ``UNAVAILABLE`` for cost (or any other combination).
+
+    The ``_BudgetAccountant`` maintains a list of these records and
+    computes per-dimension coverage from them:
+
+    * ``token_usage_applicable_attempts`` = count where
+      ``token_disposition != NO_PROVIDER_CALL``
+    * ``cost_usage_applicable_attempts`` = count where
+      ``cost_disposition != NO_PROVIDER_CALL``
+    * ``verified_token_attempts`` = count where
+      ``token_disposition == VERIFIED``
+    * ``verified_cost_attempts`` = count where
+      ``cost_disposition == VERIFIED``
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    task_id: str
+    attempt: int
+    token_disposition: AttemptUsageDisposition
+    cost_disposition: AttemptUsageDisposition
+    tokens_used: int | None = None
+    cost_usd: Decimal | None = None
+    source_id: str | None = None
+
+
 # Backwards-compatible mapping: old ``usage_trust`` → ``UsageProvenance``.
 _TRUST_TO_PROVENANCE: dict[str, UsageProvenance] = {
     "verified_provider": UsageProvenance(
@@ -161,6 +228,18 @@ class UsageVerificationCapabilities(StrictContract):
       ``trusted_adapter`` for cost usage.
     * ``source_id`` — stable identifier for diagnostics (e.g.
       ``"registry_agent_invoker"``).
+    * ``can_attest_no_provider_call`` — R7 P0-1: the Invoker can
+      authoritatively attest that NO provider call was made for an
+      attempt.  Only trusted deterministic invokers or runtime-mode
+      adapters should set this to ``True``.  The default
+      :class:`RegistryAgentInvoker` sets it to ``False`` because a
+      real Handler can lie by omitting ``provider_metadata``.
+    * ``bound_source_ids`` — R7 P0-6: the set of Verifier/Adapter
+      source identities that this Invoker's receipts may reference in
+      ``usage_provenance.source_id``.  When non-empty, the accountant
+      rejects receipts whose ``source_id`` is not in the set.  This
+      prevents a receipt from claiming verification by an unbound
+      verifier.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -168,12 +247,16 @@ class UsageVerificationCapabilities(StrictContract):
     verifies_tokens: bool = False
     verifies_cost: bool = False
     source_id: str
+    can_attest_no_provider_call: bool = False
+    bound_source_ids: frozenset[str] = Field(default_factory=frozenset)
 
 
 _UNVERIFIED_CAPABILITIES = UsageVerificationCapabilities(
     verifies_tokens=False,
     verifies_cost=False,
     source_id="unverified",
+    can_attest_no_provider_call=False,
+    bound_source_ids=frozenset(),
 )
 
 
@@ -225,10 +308,17 @@ class AgentInvocationReceipt(StrictContract):
     cost_usd: Decimal | None = Field(default=None, ge=0)
     # R6 P0-4: authoritative per-dimension provenance.
     usage_provenance: UsageProvenance = Field(default_factory=UsageProvenance)
-    # R6 P0-4: legacy field, auto-derived from ``usage_provenance``.
-    # Retained so existing test code that constructs receipts with
-    # ``usage_trust=...`` continues to work.  New code should set
-    # ``usage_provenance`` directly.
+    # R7 P1-1: DEPRECATED — retained for backwards compatibility.
+    # Auto-derived from ``usage_provenance`` via
+    # :func:`_provenance_to_trust`.  New code must set
+    # ``usage_provenance`` directly and must NOT pass both fields
+    # simultaneously (the ``_sync_trust_provenance`` validator lets
+    # ``usage_provenance`` win when both are provided, but mixing the
+    # two APIs is error-prone and will be removed in the next
+    # incompatible version).  The runtime (Supervisor /
+    # ``_BudgetAccountant``) only reads ``usage_provenance`` — this
+    # field exists solely so legacy receipts constructed with
+    # ``usage_trust=...`` continue to work.
     usage_trust: UsageTrustLevel = Field(default="unverified")
 
     @model_validator(mode="before")
@@ -319,11 +409,21 @@ class ProviderUsageVerifier(Protocol):
     usage reported by a Handler's ``provider_metadata`` matches
     the actual Provider billing record.  This cannot be self-attested
     by the Handler.
+
+    R7 P0-5: ``verify()`` is now ``async`` so it can be awaited inside
+    the event loop, bounded by ``asyncio.wait_for`` (task timeout +
+    run deadline), and cancelled without blocking the event loop.  A
+    synchronous verifier that blocks the thread would prevent the
+    scheduler from cancelling sibling tasks, respecting the run
+    deadline, or responding to cancellation — all of which are
+    critical safety properties.  Synchronous verifier implementations
+    must be wrapped in an async adapter (e.g. via
+    ``asyncio.to_thread``) with explicit thread-lifecycle management.
     """
 
     source_id: str
 
-    def verify(
+    async def verify(
         self,
         *,
         provider_metadata: ProviderMetadata,
@@ -382,21 +482,38 @@ class RegistryAgentInvoker:
 
     @property
     def usage_capabilities(self) -> UsageVerificationCapabilities:
-        """R5 P0-5: by default (no ``usage_verifier``) the Invoker
-        cannot verify tokens or cost — the Handler's
+        """R5 P0-5 + R7 P0-1/P0-6: by default (no ``usage_verifier``)
+        the Invoker cannot verify tokens or cost — the Handler's
         ``provider_metadata`` is self-attested.  When a
         :class:`ProviderUsageVerifier` is configured, both tokens and
-        cost are verifiable."""
+        cost are verifiable.
+
+        R7 P0-1: ``can_attest_no_provider_call`` is always ``False``
+        for :class:`RegistryAgentInvoker` — a real Handler can lie by
+        omitting ``provider_metadata``, so the Invoker cannot
+        authoritatively attest that no provider call was made.  Only
+        trusted deterministic invokers (e.g.
+        :class:`DeterministicFakeInvoker`) set this to ``True``.
+
+        R7 P0-6: ``bound_source_ids`` contains the verifier's
+        ``source_id`` when a verifier is configured, so the accountant
+        can reject receipts that claim verification by an unbound
+        verifier.
+        """
         if self._usage_verifier is None:
             return UsageVerificationCapabilities(
                 verifies_tokens=False,
                 verifies_cost=False,
                 source_id="registry_agent_invoker",
+                can_attest_no_provider_call=False,
+                bound_source_ids=frozenset(),
             )
         return UsageVerificationCapabilities(
             verifies_tokens=True,
             verifies_cost=True,
             source_id="registry_agent_invoker+provider_verifier",
+            can_attest_no_provider_call=False,
+            bound_source_ids=frozenset({self._usage_verifier.source_id}),
         )
 
     async def invoke(
@@ -407,13 +524,17 @@ class RegistryAgentInvoker:
     ) -> AgentInvocationReceipt:
         result = await handler.run(task, context)
 
-        # R6 P0-1: Actually call the ProviderUsageVerifier when one is
-        # configured and the Handler returned provider_metadata.  The
-        # verifier's result — not the verifier's mere existence —
-        # determines whether usage is trusted.
+        # R6 P0-1 + R7 P0-5: Actually call the ProviderUsageVerifier
+        # when one is configured and the Handler returned
+        # provider_metadata.  The verifier's result — not the
+        # verifier's mere existence — determines whether usage is
+        # trusted.  R7 P0-5: the verifier is now async and is awaited
+        # directly (not called synchronously), so it can be bounded by
+        # the outer ``asyncio.wait_for`` and cancelled without blocking
+        # the event loop.
         if self._usage_verifier is not None and result.provider_metadata is not None:
             try:
-                verified = self._usage_verifier.verify(
+                verified = await self._usage_verifier.verify(
                     provider_metadata=result.provider_metadata,
                     token_usage=result.token_usage,
                 )
@@ -451,6 +572,16 @@ class RegistryAgentInvoker:
             )
 
         # No verifier or no provider_metadata → unverified.
+        # R7 P0-1: When ``provider_metadata`` is absent, the receipt
+        # carries ``tokens_used=None`` and unverified provenance.  The
+        # accountant determines the disposition: if the Invoker has
+        # ``can_attest_no_provider_call=True`` → NO_PROVIDER_CALL;
+        # otherwise → UNAVAILABLE (fail-closed when a budget is
+        # configured).  :class:`RegistryAgentInvoker` always has
+        # ``can_attest_no_provider_call=False``, so a Handler that
+        # omits ``provider_metadata`` triggers fail-closed when a
+        # budget is configured — it cannot self-attest "no provider
+        # call" by simply leaving the field empty.
         if result.provider_metadata is not None:
             tokens_used: int | None = result.token_usage.total_tokens
         else:
@@ -514,6 +645,18 @@ class DeterministicFakeInvoker:
             verifies_tokens=False,
             verifies_cost=False,
             source_id="deterministic_fake_invoker",
+            # R7 P0-1: a test double owns its receipts and can
+            # authoritatively attest that no provider call was made
+            # (deterministic mode).  This is the semantic opposite of
+            # :class:`RegistryAgentInvoker`, which calls real Handlers
+            # that can lie by omitting ``provider_metadata``.
+            can_attest_no_provider_call=True,
+            # R7 P0-6: empty ``bound_source_ids`` accepts any
+            # ``source_id`` — the test double does not bind to a
+            # specific verifier.  Tests that need to exercise source
+            # binding pass explicit ``usage_capabilities`` with a
+            # non-empty set.
+            bound_source_ids=frozenset(),
         )
         self.invocations: list[tuple[AgentTask, AgentExecutionContext]] = []
 
@@ -641,6 +784,8 @@ def validate_invocation_receipt(receipt: AgentInvocationReceipt) -> None:
 __all__ = [
     "AgentInvocationReceipt",
     "AgentInvoker",
+    "AttemptUsageDisposition",
+    "AttemptUsageRecord",
     "DeterministicFakeInvoker",
     "ProviderUsageVerifier",
     "RegistryAgentInvoker",

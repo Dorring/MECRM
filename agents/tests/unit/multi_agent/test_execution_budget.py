@@ -591,7 +591,12 @@ class TestBudgetEnforcement:
             usage_trust="verified_provider",
         )
         with pytest.raises(Exception, match="token_budget"):
-            acc.record_receipt(receipt, invoker_capabilities=_TRUSTED_TOKEN_CAPS)
+            acc.record_receipt(
+                receipt,
+                invoker_capabilities=_TRUSTED_TOKEN_CAPS,
+                task_id="test_task",
+                attempt=0,
+            )
 
     def test_cost_budget_with_none_usage_fails_closed(self):
         from multi_agent.supervisor import _BudgetAccountant
@@ -605,7 +610,12 @@ class TestBudgetEnforcement:
             usage_trust="trusted_adapter",
         )
         with pytest.raises(Exception, match="cost_budget"):
-            acc.record_receipt(receipt, invoker_capabilities=_TRUSTED_COST_CAPS)
+            acc.record_receipt(
+                receipt,
+                invoker_capabilities=_TRUSTED_COST_CAPS,
+                task_id="test_task",
+                attempt=0,
+            )
 
     def test_max_agent_calls_exceeded(self):
         from multi_agent.supervisor import _BudgetAccountant

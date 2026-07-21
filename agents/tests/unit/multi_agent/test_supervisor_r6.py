@@ -436,7 +436,7 @@ class _TrackingVerifier:
         self.received_provider_metadata: list[ProviderMetadata] = []
         self.received_token_usage: list[TokenUsage] = []
 
-    def verify(
+    async def verify(
         self,
         *,
         provider_metadata: ProviderMetadata,
@@ -453,7 +453,7 @@ class _RejectingVerifier:
 
     source_id: str = "rejecting_verifier"
 
-    def verify(
+    async def verify(
         self,
         *,
         provider_metadata: ProviderMetadata,
@@ -467,7 +467,7 @@ class _RaisingVerifier:
 
     source_id: str = "raising_verifier"
 
-    def verify(
+    async def verify(
         self,
         *,
         provider_metadata: ProviderMetadata,

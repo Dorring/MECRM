@@ -271,7 +271,7 @@ Canonical Plan 重建后，Validator 对每个 `PlannedTask` 及其内部 `Agent
 | **Plan-time Lifecycle**（R3 P0-3） | `status` | `== "pending"` | `task_lifecycle_violation` |
 | **Plan-time Lifecycle**（R3 P0-3） | `started_at` | `is None` | `task_lifecycle_violation` |
 | **Plan-time Lifecycle**（R3 P0-3） | `completed_at` | `is None` | `task_lifecycle_violation` |
-| **Fixed Canonical**（R3 P0-3） | `max_retries` | `== 0` | `task_field_mismatch` |
+| **Fixed Canonical**（R3 P0-3） | `max_retries` | `== 0`（**R5 P0-1 起由 `RetryPolicy.max_retries` 替代**，详见 §10.6） | `task_field_mismatch` |
 | **Fixed Canonical**（R3 P0-3） | `priority` | `== "medium"` | `task_field_mismatch` |
 | **Fixed Canonical**（R3 P0-3） | `input_data` | `== {}` | `task_field_mismatch` |
 | **Fixed Canonical**（R3 P0-3） | `user_id` | `is None` | `task_field_mismatch` |
@@ -673,6 +673,75 @@ requested_tasks 排列不同但语义相同 → 接受
 dependencies 排列不同但语义相同 → 接受
 domain / task_type / objective / budget / actor 真正改变 → 拒绝
 ```
+
+### 10.6 Canonical RetryPolicy Contract（R5 P0-1 + R6 P0-2 + R7 P0-4）
+
+R4 之前，Phase 3 的 `build_expected_planned_tasks` 硬编码 `max_retries=0`，PlanValidator 也会重建并校验该值。因此通过真实 Phase 3 Planner + 真实 PlanValidator 进入 Phase 4 的计划，永远没有重试次数。R5 将 `RetryPolicy` 提升为正式 Canonical Planning Contract，贯穿以下所有阶段：
+
+```
+RequestedTask.retry_policy
+    ↓ (planner)
+TaskIntent.retry_policy
+    ↓ (planner)
+PlannedTask.retry_policy
+    ↓ (build_expected_planned_tasks)
+Canonical Plan Reconstruction
+    ↓ (stable_hash)
+Plan Hash
+    ↓ (PlanValidator._compare_planned_task_fields)
+PlanValidator 比较 retry_policy.max_retries 和 retryable_error_codes
+```
+
+**Contract 定义**（`planning.py`）：
+
+```python
+class RetryPolicy(StrictContract):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    max_retries: int = Field(default=0, ge=0, le=3)
+    retryable_error_codes: frozenset[str] = Field(default_factory=frozenset)
+
+    # R6 P1: 内容校验
+    @field_validator("retryable_error_codes")
+    @classmethod
+    def _validate_retryable_error_codes(cls, v: frozenset[str]) -> frozenset[str]:
+        # 1. strip 空白，拒绝空字符串
+        # 2. 拒绝 NEVER_RETRYABLE_ERROR_CODES 中的 code
+        ...
+```
+
+**Plan Hash 绑定**：`RetryPolicy` 是 `PlannedTask` 的字段，参与 Canonical Plan Reconstruction 和 `compute_plan_hash`。任何对 `max_retries` 或 `retryable_error_codes` 的篡改都会导致 `plan_hash` 不匹配。
+
+**max_retries 上限**：`le=3`——超过 3 的值在 Pydantic 构造时被拒绝。Phase 4 的 `should_retry_result()` 读取 `PlannedTask.retry_policy.max_retries`（而非 `AgentTask.max_retries`），R3 的 `max_retries=0` 固定 Canonical 规则由 `RetryPolicy.max_retries` 表达。
+
+**Error Code Allowlist**：`retryable_error_codes` 是 `frozenset[str]`，非空时只有 allowlist 中的 code 可以触发 retry。空集合表示"任何 retryable=True 的 error 都可重试"。R6 P1 在构造时校验：
+- 拒绝空字符串和纯空白
+- 拒绝 `NEVER_RETRYABLE_ERROR_CODES` 中的 code（运行时始终拒绝）
+
+**`NEVER_RETRYABLE_ERROR_CODES`**（`planning.py`，planning 和 runtime 共享）：
+
+```python
+NEVER_RETRYABLE_ERROR_CODES: frozenset[str] = frozenset({
+    "invalid_receipt", "invalid_result", "usage_unavailable",
+    "non_retryable_error", "run_deadline_exceeded",
+    "tenant_mismatch", "agent_identity_mismatch",
+    "cancelled", "kill_switch",
+})
+```
+
+**Phase 4 执行语义**（详见 Phase 4 文档 §6）：
+
+- R6 P0-2: `should_retry()` 纯函数读取 `RetryPolicy`，**不**读取 `task.max_retries`
+- R7 P0-4: `should_retry_result()` 接受 `Sequence[AgentError]`，`error_code` 与 `retryable` 来自同一个 AgentError（不允许 `errors[0].error_code` + `any(e.retryable)` 拼接）
+- `NEVER_RETRYABLE_ERROR_CODES` 同时用于 PlanValidator（构造时校验）和 runtime `should_retry_result()`（运行时始终拒绝）——确保 Plan Hash 中的 `retryable_error_codes` 和运行时拒绝列表使用同一份规范
+
+**PlanValidator 字段比较**：
+
+| 字段 | 校验规则 | Issue Code |
+|---|---|---|
+| `PlannedTask.retry_policy.max_retries` | `== Expected PlannedTask.retry_policy.max_retries` | `task_field_mismatch` |
+| `PlannedTask.retry_policy.retryable_error_codes` | `== Expected PlannedTask.retry_policy.retryable_error_codes`（frozenset 相等） | `task_field_mismatch` |
+
+**测试要求**：Retry 测试**必须**使用真实 `DeterministicPlanner` + 真实 `PlanValidator` + 真实 `SupervisorRuntime`，**不**得注入 `_AlwaysValidPlanValidator` 或手工篡改 `AgentTask.max_retries`。
 
 ## 11. Budget 校验
 
