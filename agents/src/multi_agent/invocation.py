@@ -20,9 +20,9 @@ Supervisor stay unchanged.
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Callable, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol
 
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, model_validator
 
 from multi_agent.contracts import (
     AgentExecutionContext,
@@ -32,7 +32,10 @@ from multi_agent.contracts import (
     StrictContract,
     TokenUsage,
 )
-from multi_agent.execution_errors import InvalidInvocationReceiptError
+from multi_agent.execution_errors import (
+    InvalidInvocationReceiptError,
+    NonRetryableAgentError,
+)
 from multi_agent.registry import AgentHandler, AgentRegistry
 
 
@@ -57,6 +60,87 @@ UsageTrustLevel = Literal[
     # budget is configured.
     "unverified",
 ]
+
+
+# ---------------------------------------------------------------------------
+# R6 P0-4: Per-dimension Usage Provenance — replaces the single
+# ``usage_trust`` field so Token and Cost trust are expressed
+# independently.  A receipt can now carry verified tokens without
+# verified cost (and vice versa), which the old single-string
+# ``usage_trust`` could not express.
+# ---------------------------------------------------------------------------
+
+
+class UsageProvenance(StrictContract):
+    """R6 P0-4: Per-dimension usage provenance for a receipt.
+
+    Replaces the single ``usage_trust: UsageTrustLevel`` field that
+    conflated Token and Cost trust into one string.  With
+    :class:`UsageProvenance`, a receipt can declare:
+
+    * ``tokens_verified=True`` — the token usage was attested by an
+      authoritative :class:`ProviderUsageVerifier` (or a trusted
+      adapter).  The value in ``receipt.tokens_used`` may be trusted
+      for ``token_budget`` enforcement.
+    * ``cost_verified=True`` — the cost usage was attested by an
+      authoritative verifier.  The value in ``receipt.cost_usd`` may
+      be trusted for ``cost_budget_usd`` enforcement.
+
+    The two flags are independent: a verifier that only checks tokens
+    sets ``tokens_verified=True, cost_verified=False``, and the
+    accountant will record tokens but NOT cost (nor enforce
+    ``cost_budget_usd``).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source_id: str = "unverified"
+    tokens_verified: bool = False
+    cost_verified: bool = False
+
+
+# Backwards-compatible mapping: old ``usage_trust`` → ``UsageProvenance``.
+_TRUST_TO_PROVENANCE: dict[str, UsageProvenance] = {
+    "verified_provider": UsageProvenance(
+        source_id="verified_provider",
+        tokens_verified=True,
+        cost_verified=False,
+    ),
+    # R6 P0-4: ``trusted_adapter`` is primarily about COST trust —
+    # a vetted adapter (e.g. a local billing system) signs its cost
+    # reports.  It does NOT automatically elevate TOKEN trust: tokens
+    # are attested by the LLM provider (``verified_provider``) or by
+    # an explicit :class:`ProviderUsageVerifier`.  Setting
+    # ``tokens_verified=False`` here means a legacy ``trusted_adapter``
+    # receipt without ``provider_metadata`` no longer triggers the
+    # ``tokens_verified=True requires provider_metadata`` check, and
+    # the accountant will record cost but not tokens.
+    "trusted_adapter": UsageProvenance(
+        source_id="trusted_adapter",
+        tokens_verified=False,
+        cost_verified=True,
+    ),
+    "unverified": UsageProvenance(
+        source_id="unverified",
+        tokens_verified=False,
+        cost_verified=False,
+    ),
+}
+
+
+def _provenance_to_trust(prov: UsageProvenance) -> UsageTrustLevel:
+    """Derive the legacy ``usage_trust`` string from provenance.
+
+    R6 P0-4: ``trusted_adapter`` now means "cost verified" (with or
+    without token verification).  A receipt with both tokens and cost
+    verified also maps to ``trusted_adapter`` for backwards
+    compatibility.
+    """
+    if prov.cost_verified:
+        return "trusted_adapter"
+    if prov.tokens_verified:
+        return "verified_provider"
+    return "unverified"
 
 
 class UsageVerificationCapabilities(StrictContract):
@@ -122,21 +206,69 @@ class AgentInvocationReceipt(StrictContract):
     Phase 4 treats a configured budget with ``None`` usage as
     fail-closed rather than substituting a Phase 3 estimate.
 
-    R3 P0-4: ``usage_trust`` declares the provenance of the reported
-    usage.  When a budget (``token_budget`` or ``cost_budget_usd``) is
-    configured, the Supervisor only accepts ``verified_provider`` or
-    ``trusted_adapter`` receipts; an ``unverified`` receipt with zero
-    or None usage fails closed with
-    :class:`ExecutionUsageUnavailableError`.  This prevents a custom
-    Invoker from under-reporting usage (e.g. ``cost_usd=Decimal("0")``)
-    to bypass budget enforcement.
+    R6 P0-4: ``usage_provenance`` replaces the single ``usage_trust``
+    string so Token and Cost trust are expressed independently.  The
+    legacy ``usage_trust`` field is retained for backwards
+    compatibility — it is auto-derived from ``usage_provenance`` and
+    should not be set directly in new code.
+
+    When a budget (``token_budget`` or ``cost_budget_usd``) is
+    configured, the Supervisor only accepts receipts where the
+    corresponding provenance flag is ``True``; an unverified receipt
+    with zero or None usage fails closed with
+    :class:`ExecutionUsageUnavailableError`.
     """
 
     result: AgentResult
     tool_calls: int = Field(default=0, ge=0)
     tokens_used: int | None = Field(default=None, ge=0)
     cost_usd: Decimal | None = Field(default=None, ge=0)
+    # R6 P0-4: authoritative per-dimension provenance.
+    usage_provenance: UsageProvenance = Field(default_factory=UsageProvenance)
+    # R6 P0-4: legacy field, auto-derived from ``usage_provenance``.
+    # Retained so existing test code that constructs receipts with
+    # ``usage_trust=...`` continues to work.  New code should set
+    # ``usage_provenance`` directly.
     usage_trust: UsageTrustLevel = Field(default="unverified")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _sync_trust_provenance(cls, data: Any) -> Any:
+        """R6 P0-4: ensure ``usage_trust`` and ``usage_provenance`` are
+        consistent.  If only ``usage_trust`` is provided (legacy code),
+        derive ``usage_provenance`` from it.  If both are provided,
+        ``usage_provenance`` wins.  If only ``usage_provenance`` is
+        provided, ``usage_trust`` is derived from it.
+        """
+        if not isinstance(data, dict):
+            return data
+        prov = data.get("usage_provenance")
+        trust = data.get("usage_trust")
+        if prov is not None and trust is None:
+            # New code: derive trust from provenance.
+            if isinstance(prov, UsageProvenance):
+                data = dict(data)
+                data["usage_trust"] = _provenance_to_trust(prov)
+            elif isinstance(prov, dict):
+                prov_obj = UsageProvenance(**prov)
+                data = dict(data)
+                data["usage_trust"] = _provenance_to_trust(prov_obj)
+        elif prov is None and trust is not None:
+            # Legacy code: derive provenance from trust.
+            data = dict(data)
+            data["usage_provenance"] = _TRUST_TO_PROVENANCE.get(
+                trust, UsageProvenance(source_id=str(trust))
+            )
+        elif prov is not None and trust is not None:
+            # Both provided: provenance wins, override trust.
+            if isinstance(prov, UsageProvenance):
+                data = dict(data)
+                data["usage_trust"] = _provenance_to_trust(prov)
+            elif isinstance(prov, dict):
+                prov_obj = UsageProvenance(**prov)
+                data = dict(data)
+                data["usage_trust"] = _provenance_to_trust(prov_obj)
+        return data
 
 
 # ---------------------------------------------------------------------------
@@ -274,23 +406,65 @@ class RegistryAgentInvoker:
         context: AgentExecutionContext,
     ) -> AgentInvocationReceipt:
         result = await handler.run(task, context)
+
+        # R6 P0-1: Actually call the ProviderUsageVerifier when one is
+        # configured and the Handler returned provider_metadata.  The
+        # verifier's result — not the verifier's mere existence —
+        # determines whether usage is trusted.
+        if self._usage_verifier is not None and result.provider_metadata is not None:
+            try:
+                verified = self._usage_verifier.verify(
+                    provider_metadata=result.provider_metadata,
+                    token_usage=result.token_usage,
+                )
+            except Exception as exc:
+                # R6 P0-1: Verifier raised — fail closed.  The Handler's
+                # self-reported usage must NOT be trusted when the
+                # authoritative verifier could not confirm it.
+                raise NonRetryableAgentError(
+                    f"ProviderUsageVerifier ({self._usage_verifier.source_id}) "
+                    f"raised {type(exc).__name__}: {exc}"
+                ) from exc
+
+            if not verified.verified:
+                # R6 P0-1: Verifier rejected the usage — fail closed.
+                raise NonRetryableAgentError(
+                    f"ProviderUsageVerifier ({self._usage_verifier.source_id}) "
+                    f"returned verified=False — handler self-reported "
+                    f"usage is not trusted"
+                )
+
+            # R6 P0-1 + P0-4: Use the verifier's authoritative values,
+            # not the Handler's self-reported ones.  Cost is only
+            # verified when the verifier returned a non-None cost_usd.
+            cost_verified = verified.cost_usd is not None
+            return AgentInvocationReceipt(
+                result=result,
+                tool_calls=len(result.tool_calls),
+                tokens_used=verified.tokens_used,
+                cost_usd=verified.cost_usd,
+                usage_provenance=UsageProvenance(
+                    source_id=self._usage_verifier.source_id,
+                    tokens_verified=True,
+                    cost_verified=cost_verified,
+                ),
+            )
+
+        # No verifier or no provider_metadata → unverified.
         if result.provider_metadata is not None:
             tokens_used: int | None = result.token_usage.total_tokens
         else:
             tokens_used = None
-        # R5 P0-5: only claim verified_provider when an authoritative
-        # ProviderUsageVerifier is configured.  Without a verifier the
-        # Handler's provider_metadata is self-attested and untrusted.
-        if self._usage_verifier is not None and result.provider_metadata is not None:
-            usage_trust: UsageTrustLevel = "verified_provider"
-        else:
-            usage_trust = "unverified"
         return AgentInvocationReceipt(
             result=result,
             tool_calls=len(result.tool_calls),
             tokens_used=tokens_used,
             cost_usd=None,
-            usage_trust=usage_trust,
+            usage_provenance=UsageProvenance(
+                source_id="registry_agent_invoker",
+                tokens_verified=False,
+                cost_verified=False,
+            ),
         )
 
 
@@ -400,6 +574,16 @@ def validate_invocation_receipt(receipt: AgentInvocationReceipt) -> None:
     * ``unverified`` is always allowed structurally, but the
       :class:`_BudgetAccountant` rejects it for budget enforcement.
 
+    R6 P0-1 + P0-4: validation now uses per-dimension
+    :class:`UsageProvenance` instead of the legacy ``usage_trust``
+    string.  When ``tokens_verified=True``, the token count is
+    authoritative (came from a :class:`ProviderUsageVerifier`) and
+    may differ from the Handler's self-reported
+    ``result.token_usage.total_tokens`` — so the consistency check
+    is skipped in that case.  When ``tokens_verified=False`` but
+    ``provider_metadata`` is present, the Handler's self-reported
+    tokens must match the receipt (prevents under-reporting).
+
     Cost is intentionally **not** validated here because
     :class:`AgentResult` does not carry a cost field; cost trust is
     solely a property of the chosen Invoker (RegistryAgentInvoker
@@ -415,26 +599,43 @@ def validate_invocation_receipt(receipt: AgentInvocationReceipt) -> None:
             f"len(result.tool_calls)={actual_tool_calls}"
         )
 
-    if result.provider_metadata is not None and receipt.tokens_used is not None:
+    # R6 P0-1: when tokens_verified=True, the verifier's tokens_used
+    # is authoritative and may differ from the Handler's self-reported
+    # total_tokens.  Skip the consistency check in that case.
+    # When tokens_verified=False but provider_metadata is present,
+    # the Handler's self-reported tokens must match the receipt.
+    if (
+        result.provider_metadata is not None
+        and receipt.tokens_used is not None
+        and not receipt.usage_provenance.tokens_verified
+    ):
         actual_tokens = result.token_usage.total_tokens
         if receipt.tokens_used != actual_tokens:
             raise InvalidInvocationReceiptError(
                 f"receipt.tokens_used={receipt.tokens_used} does not "
                 f"match result.token_usage.total_tokens={actual_tokens} "
-                f"(provider_metadata is present, so token usage is "
+                f"(provider_metadata is present and tokens are not "
+                f"verifier-attested, so Handler self-report is "
                 f"authoritative)"
             )
 
-    # R3 P0-4: ``verified_provider`` provenance requires the provider
-    # metadata to actually be present.  A receipt that claims
-    # ``verified_provider`` without ``provider_metadata`` is lying
-    # about its provenance.
-    if receipt.usage_trust == "verified_provider" and result.provider_metadata is None:
+    # R6 P0-4: ``tokens_verified=True`` provenance requires the
+    # provider metadata to actually be present.  A receipt that claims
+    # verified tokens without ``provider_metadata`` is lying about its
+    # provenance — the verifier needs provider metadata to verify.
+    if receipt.usage_provenance.tokens_verified and result.provider_metadata is None:
         raise InvalidInvocationReceiptError(
-            "receipt.usage_trust='verified_provider' but "
+            "receipt.usage_provenance.tokens_verified=True but "
             "result.provider_metadata is None — provider attestation "
-            "is required for verified_provider provenance"
+            "is required for verified token provenance"
         )
+
+    # R6 P0-4: ``cost_verified=True`` provenance does NOT require
+    # ``provider_metadata`` — a trusted adapter (e.g. a local billing
+    # system) can verify cost without the LLM provider's attestation.
+    # The per-dimension cross-check in ``_BudgetAccountant.record_receipt``
+    # ensures the receipt's ``cost_verified`` does not exceed the
+    # invoker's ``verifies_cost`` capability.
 
 
 __all__ = [
@@ -443,6 +644,7 @@ __all__ = [
     "DeterministicFakeInvoker",
     "ProviderUsageVerifier",
     "RegistryAgentInvoker",
+    "UsageProvenance",
     "UsageTrustLevel",
     "UsageVerificationCapabilities",
     "VerifiedUsage",

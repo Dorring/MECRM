@@ -119,6 +119,28 @@ _COST_CLASS_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
 # ---------------------------------------------------------------------------
 
 
+# R6 P1: Error codes that must NEVER be retried, regardless of the
+# RetryPolicy.  This is the canonical source — ``supervisor.py`` imports
+# this frozenset so the planning-layer validator and the runtime
+# ``should_retry()`` function share the same definition.  These represent
+# definite business-domain failures, identity mismatches, or explicit
+# cancellation — retrying them would be semantically incorrect even if
+# the policy's ``retryable_error_codes`` explicitly lists them.
+NEVER_RETRYABLE_ERROR_CODES: frozenset[str] = frozenset(
+    {
+        "invalid_receipt",
+        "invalid_result",
+        "usage_unavailable",
+        "non_retryable_error",
+        "run_deadline_exceeded",
+        "tenant_mismatch",
+        "agent_identity_mismatch",
+        "cancelled",
+        "kill_switch",
+    }
+)
+
+
 class RetryPolicy(StrictContract):
     """Canonical retry policy for a planned task.
 
@@ -136,13 +158,47 @@ class RetryPolicy(StrictContract):
     ``retryable_error_codes`` is a frozenset of error-code strings that
     are eligible for retry.  When empty (default), only
     :class:`RetryableAgentError` and timeout are retried.  When
-    non-empty, :class:`NonRetryableAgentError` /
-    :class:`InvalidInvocationReceiptError` whose ``error_code`` is in
-    the set are also retried.
+    non-empty, only error codes in the set are retried.
+
+    R6 P1 — ``retryable_error_codes`` is validated at construction:
+
+    * Blank / whitespace-only strings are rejected.
+    * Codes in :data:`NEVER_RETRYABLE_ERROR_CODES` are rejected —
+      listing ``invalid_receipt`` or ``non_retryable_error`` in the
+      allowlist would be a no-op at runtime (``should_retry()`` always
+      refuses them), so rejecting them at planning time surfaces the
+      misconfiguration immediately instead of letting a bad policy
+      silently enter the Plan Hash.
     """
 
     max_retries: int = Field(default=0, ge=0, le=3)
     retryable_error_codes: frozenset[str] = Field(default_factory=frozenset)
+
+    @field_validator("retryable_error_codes")
+    @classmethod
+    def _validate_retryable_error_codes(cls, v: frozenset[str]) -> frozenset[str]:
+        """R6 P1: reject blank strings and never-retryable codes.
+
+        A frozenset could otherwise contain ``""``, ``" "``, typos, or
+        codes that :func:`should_retry` would refuse anyway.  Catching
+        these at construction prevents a bad policy from entering the
+        Plan Hash and only being discovered at runtime.
+        """
+        cleaned: set[str] = set()
+        for code in v:
+            stripped = code.strip()
+            if not stripped:
+                raise ValueError("retryable_error_codes must not contain blank strings")
+            if stripped in NEVER_RETRYABLE_ERROR_CODES:
+                raise ValueError(
+                    f"retryable_error_codes must not contain "
+                    f"never-retryable code {stripped!r} — codes in "
+                    f"NEVER_RETRYABLE_ERROR_CODES are always refused by "
+                    f"should_retry(); listing them is a no-op that "
+                    f"indicates a misconfiguration"
+                )
+            cleaned.add(stripped)
+        return frozenset(cleaned)
 
 
 # ---------------------------------------------------------------------------

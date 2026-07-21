@@ -75,6 +75,7 @@ from multi_agent.planning import (
     PlannedTask,
     PlanningRequest,
     PlanningSignals,
+    RetryPolicy,
     compute_request_hash,
 )
 from multi_agent.planning_templates import INTENT_CUSTOMER_CONTEXT
@@ -338,9 +339,18 @@ def _tamper_plan_budget(plan: PlanDraft, **budget_overrides: Any) -> PlanDraft:
 def _tamper_task_max_retries(
     plan: PlanDraft, task_id: str, max_retries: int
 ) -> PlanDraft:
+    # R6: also set RetryPolicy.max_retries because should_retry() reads
+    # from RetryPolicy, not task.max_retries.  RetryPolicy.max_retries
+    # is capped at 3 by its validator, so clamp the value.
+    policy_retries = min(max_retries, 3)
     for pt in plan.tasks:
         if pt.task.task_id == task_id:
             object.__setattr__(pt.task, "max_retries", max_retries)
+            object.__setattr__(
+                pt,
+                "retry_policy",
+                RetryPolicy(max_retries=policy_retries),
+            )
             break
     object.__setattr__(plan, "plan_hash", plan.compute_plan_hash())
     return plan
@@ -1537,10 +1547,15 @@ class TestCostUsageTrustBoundary:
     @pytest.mark.asyncio
     async def test_untrusted_cost_usage_fails_closed(self):
         """When ``cost_budget_usd`` is configured and the invoker
-        reports ``cost_usd=None`` (the default for
-        ``DeterministicFakeInvoker``), the run must fail closed with
-        ``ExecutionUsageUnavailableError`` — the task is marked
-        ``failed`` with ``error_code='usage_unavailable'``."""
+        reports ``cost_usd=None`` with ``provider_metadata`` set (a
+        provider call was made but cost is unverified), the run must
+        fail closed with ``ExecutionUsageUnavailableError`` — the task
+        is marked ``failed`` with ``error_code='usage_unavailable'``.
+
+        R6: the receipt must carry ``provider_metadata`` so the
+        accountant treats it as a provider-usage-capable attempt.
+        A receipt without ``provider_metadata`` (deterministic mode)
+        skips cost enforcement because no provider call was made."""
         reg = _make_registry(_customer_recovery_caps())
         plan = _customer_recovery_plan(
             reg, budget=ExecutionBudget(cost_budget_usd=Decimal("10.00"))
@@ -1551,9 +1566,27 @@ class TestCostUsageTrustBoundary:
             pt.task for pt in plan.tasks if pt.intent_id == INTENT_CUSTOMER_CONTEXT
         )
 
-        # DeterministicFakeInvoker returns cost_usd=None by default.
+        # R6: include provider_metadata so a provider call was made
+        # and cost enforcement applies.
+        provider_meta = ProviderMetadata(
+            provider="openai",
+            chat_model="gpt-4",
+            embedding_model="text-embedding-3-small",
+            ai_mode="live",
+        )
+
+        def factory(
+            task: AgentTask, ctx: AgentExecutionContext
+        ) -> AgentInvocationReceipt:
+            result = _ok_result(task=task, provider_metadata=provider_meta)
+            return AgentInvocationReceipt(
+                result=result,
+                tool_calls=len(result.tool_calls),
+                # cost_usd=None: cost not reported → fail-closed
+            )
+
         runtime = SupervisorRuntime(
-            invoker=_fake_invoker_for_plan(plan),
+            invoker=DeterministicFakeInvoker(factory=factory),
             run_store=InMemoryRunStore(),
             plan_validator=_AlwaysValidPlanValidator(),
         )
@@ -1569,5 +1602,6 @@ class TestCostUsageTrustBoundary:
             f"{[a.error_code for a in root_rec.attempts]}"
         )
 
-        # The run must be FAILED (required root failed).
-        assert result.status == SupervisorRunStatus.FAILED
+        # R6: the run finalises as BUDGET_EXCEEDED (execution_usage_unavailable
+        # sets _exceeded=True so the run fails-closed at the budget level).
+        assert result.status == SupervisorRunStatus.BUDGET_EXCEEDED

@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 from decimal import Decimal
-from enum import Enum
+from enum import Enum, StrEnum
 from hmac import compare_digest
 from typing import Any, Literal
 
@@ -845,20 +845,64 @@ class ExecutionBudget(StrictContract):
         return self
 
 
+class UsageAvailabilityStatus(StrEnum):
+    """R6 P1: Three-state usage availability for a Run.
+
+    Replaces the previous boolean ``tokens_usage_available`` /
+    ``cost_usage_available`` fields that could only express "at least
+    one receipt reported verified usage" — not whether *all* committed
+    attempts that could produce provider usage had verified data.
+
+    * ``UNAVAILABLE`` — no committed attempt produced verified usage
+      (or there were committed attempts with no receipt at all).
+    * ``PARTIAL`` — at least one attempt produced verified usage, but
+      not all provider-usage-capable attempts did.
+    * ``COMPLETE`` — every committed attempt that could produce
+      provider usage has verified data (or there were no
+      provider-usage-capable attempts).
+    """
+
+    UNAVAILABLE = "unavailable"
+    PARTIAL = "partial"
+    COMPLETE = "complete"
+
+
 class ExecutionUsage(StrictContract):
     tasks_dispatched: int = Field(default=0, ge=0)
     agent_calls: int = Field(default=0, ge=0)
     tool_calls: int = Field(default=0, ge=0)
     iterations: int = Field(default=0, ge=0)
     tokens_used: int = Field(default=0, ge=0)
-    tokens_usage_available: bool = (
-        False  # R5 P0-4: True when at least one receipt reported verified tokens
-    )
+    # R6 P1: three-state status replaces the boolean.  The legacy
+    # boolean is retained for backwards compatibility and auto-derived
+    # from the status (True when status != UNAVAILABLE).
+    tokens_usage_available: bool = False
+    tokens_usage_status: UsageAvailabilityStatus = UsageAvailabilityStatus.UNAVAILABLE
     cost_usd: Decimal = Field(default=Decimal("0.00"), ge=0)
-    cost_usage_available: bool = (
-        False  # R5 P0-4: True when at least one receipt reported verified cost
-    )
+    cost_usage_available: bool = False
+    cost_usage_status: UsageAvailabilityStatus = UsageAvailabilityStatus.UNAVAILABLE
+    # R6 P1: attempt coverage counts so consumers can distinguish
+    # "1 of 3 verified" from "2 of 3 verified" — both are PARTIAL but
+    # have different completeness implications.
+    provider_usage_capable_attempts: int = Field(default=0, ge=0)
+    verified_token_attempts: int = Field(default=0, ge=0)
+    verified_cost_attempts: int = Field(default=0, ge=0)
     elapsed_ms: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _sync_usage_status_booleans(self) -> "ExecutionUsage":
+        """R6 P1: derive legacy booleans from the three-state status."""
+        object.__setattr__(
+            self,
+            "tokens_usage_available",
+            self.tokens_usage_status != UsageAvailabilityStatus.UNAVAILABLE,
+        )
+        object.__setattr__(
+            self,
+            "cost_usage_available",
+            self.cost_usage_status != UsageAvailabilityStatus.UNAVAILABLE,
+        )
+        return self
 
 
 RunStatus = Literal[

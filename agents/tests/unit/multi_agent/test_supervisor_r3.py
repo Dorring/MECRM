@@ -1143,7 +1143,9 @@ class TestUsageProvenance:
             f"expected usage_unavailable error_code, got "
             f"{[a.error_code for a in root_rec.attempts]}"
         )
-        assert result.status == SupervisorRunStatus.FAILED
+        # R6: usage_unavailable now sets _exceeded=True so the run
+        # finalises as BUDGET_EXCEEDED (fail-closed at budget level).
+        assert result.status == SupervisorRunStatus.BUDGET_EXCEEDED
 
     @pytest.mark.asyncio
     async def test_untrusted_positive_cost_still_fails_closed(self):

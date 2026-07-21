@@ -1130,7 +1130,13 @@ class TestUsageRecordingVsEnforcement:
         """An ``unverified`` receipt must NOT set
         ``tokens_usage_available`` or ``cost_usage_available`` —
         unverified usage is not trusted and cannot be reported as
-        available in the run usage."""
+        available in the run usage.
+
+        R6: the receipt now carries ``provider_metadata`` so it is
+        counted as a provider-usage-capable attempt.  With 3 capable
+        attempts and 0 verified, the status is ``UNAVAILABLE`` (not
+        the vacuous ``COMPLETE`` that applies when ``capable == 0``).
+        """
         reg = _make_registry(
             _three_independent_caps(), catalog=_three_independent_catalog()
         )
@@ -1139,7 +1145,15 @@ class TestUsageRecordingVsEnforcement:
         def factory(
             task: AgentTask, ctx: AgentExecutionContext
         ) -> AgentInvocationReceipt:
-            result = _ok_result(task=task)
+            result = _ok_result(
+                task=task,
+                provider_metadata=ProviderMetadata(
+                    provider="openai",
+                    chat_model="gpt-4",
+                    embedding_model="text-embedding-3-small",
+                    ai_mode="live",
+                ),
+            )
             return AgentInvocationReceipt(
                 result=result,
                 tool_calls=len(result.tool_calls),

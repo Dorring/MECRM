@@ -58,6 +58,7 @@ from multi_agent.planning import (
     PlanValidationReport,
     PlanningRequest,
     PlanningSignals,
+    RetryPolicy,
     compute_request_hash,
 )
 from multi_agent.planning_templates import (
@@ -338,10 +339,18 @@ def _tamper_task_max_retries(
 
     Recomputes ``plan_hash`` so ``verify_integrity()`` passes.  Caller
     must inject :class:`_AlwaysValidPlanValidator`.
+
+    R6: also sets ``PlannedTask.retry_policy.max_retries`` because R6's
+    ``should_retry()`` reads from ``RetryPolicy``, not ``task.max_retries``.
     """
     for pt in plan.tasks:
         if pt.task.task_id == task_id:
             object.__setattr__(pt.task, "max_retries", max_retries)
+            object.__setattr__(
+                pt,
+                "retry_policy",
+                RetryPolicy(max_retries=max_retries),
+            )
             break
     object.__setattr__(plan, "plan_hash", plan.compute_plan_hash())
     return plan
