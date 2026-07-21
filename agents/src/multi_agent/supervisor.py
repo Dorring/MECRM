@@ -35,6 +35,7 @@ from multi_agent.contracts import (
 )
 from multi_agent.planning import PlannedTask
 from multi_agent.execution import (
+    ExecutionBinding,
     ExecutionCancellation,
     ExecutionTraceEvent,
     FakeExecutionCancellation,
@@ -76,7 +77,7 @@ from multi_agent.invocation import (
 )
 from multi_agent.plan_validator import PlanValidator
 from multi_agent.planning import PlanDraft
-from multi_agent.registry import AgentRegistry
+from multi_agent.registry import AgentHandler, AgentRegistry
 from multi_agent.run_store import InMemoryRunStore, RunLease, RunStore
 from multi_agent.scheduler import DagScheduler, TaskOutcome
 from multi_agent.state import merge_parallel_results
@@ -375,14 +376,52 @@ class SupervisorRuntime:
         start_mono = time.monotonic()
         trace = _TraceBuilder(run_id)
 
+        # R2 P0-1: Cache lookup happens *before* any pre-flight check.
+        # A completed run's cached result must be returned even if the
+        # live Registry has since drifted from ``plan.registry_version``
+        # (e.g. an unrelated agent was registered after the run finished).
+        # The only input to the cache path is ``plan.verify_integrity()``
+        # — we must ensure the caller is not handing us a tampered plan
+        # whose ``plan_hash`` does not match its content.
+        self._validate_plan_integrity(plan)
+
+        cached = await self._run_store.lookup_completed(run_id, plan.plan_hash)
+        if cached is not None:
+            return cached
+
+        # R2 P0-3: Pre-run cancellation check.  If the run is already
+        # cancelled before we acquire the lease, we must NOT consume
+        # an iteration, emit ``task_ready``, or call any Handler.  The
+        # resulting SupervisorRunResult carries ``iterations=0`` and
+        # an empty trace (except for the run_cancelled event).
+        if await canc.is_cancelled(run_id) or await canc.is_kill_switch_active(
+            plan.tenant_id
+        ):
+            return await self._finalize_pre_cancelled(
+                plan=plan,
+                trace=trace,
+                started_at=started_at,
+                start_mono=start_mono,
+                canc=canc,
+            )
+
         # R1 P0-1: Pre-flight validation happens *before* the RunStore
         # lease is acquired.  All of these checks are side-effect-free
         # with respect to the RunStore — an invalid plan must not
         # poison the run_id for a later, valid attempt.
-        self._validate_plan_integrity(plan)
         self._validate_registry_version(plan, registry)
         self._validate_plan_via_validator(plan, registry)
         self._validate_handlers_resolvable(plan, registry)
+
+        # R2 P0-1: Build immutable ExecutionBindings *before* acquiring
+        # the lease.  The bindings capture (capability, handler) for
+        # every task at pre-flight time; the Supervisor never calls
+        # ``registry.resolve()`` again during execution, so a registry
+        # mutation during the run cannot change what Handler actually
+        # runs.  The SupervisorRunResult records ``plan.registry_version``
+        # (not the live registry version) so the cached result is
+        # stable across future cache lookups.
+        bindings, bound_handlers = self._build_execution_bindings(plan, registry)
 
         # Idempotency lease — only acquired after pre-flight passes.
         lease = await self._run_store.begin(run_id, plan.plan_hash)
@@ -413,7 +452,6 @@ class SupervisorRuntime:
                 )
                 return await self._finalize(
                     plan=plan,
-                    registry=registry,
                     task_records=self._seed_skipped_records(
                         tasks, accountant.exceeded_reason or ""
                     ),
@@ -430,10 +468,11 @@ class SupervisorRuntime:
             # Cancellation state shared between run_task and should_stop.
             canc_state = _CancellationState()
 
-            # Build the run_task closure.
+            # Build the run_task closure — uses bound_handlers, NOT
+            # live registry.resolve().
             run_task = self._build_run_task(
                 plan=plan,
-                registry=registry,
+                bound_handlers=bound_handlers,
                 invoker=invoker,
                 accountant=accountant,
                 trace=trace,
@@ -444,7 +483,8 @@ class SupervisorRuntime:
 
             # Schedule.
             scheduler = DagScheduler(cfg)
-            should_stop = self._build_should_stop(accountant, canc_state)
+            should_stop = self._build_should_stop(accountant, canc_state, canc, plan)
+            before_wave = self._build_before_wave(canc, canc_state, plan)
             wave_callbacks = self._build_wave_callbacks(accountant, trace)
 
             task_records = await scheduler.execute(
@@ -454,6 +494,7 @@ class SupervisorRuntime:
                 on_wave_started=wave_callbacks.on_wave_started,
                 on_wave_completed=wave_callbacks.on_wave_completed,
                 on_tasks_skipped=wave_callbacks.on_tasks_skipped,
+                before_wave=before_wave,
             )
 
             # Collect surviving results.
@@ -471,7 +512,6 @@ class SupervisorRuntime:
 
             return await self._finalize(
                 plan=plan,
-                registry=registry,
                 task_records=task_records,
                 valid_results=valid_results,
                 trace=trace,
@@ -491,8 +531,7 @@ class SupervisorRuntime:
             # _finalize, so this is safe even if the failure happened
             # after complete().
             await self._run_store.abort(
-                run_id,
-                plan.plan_hash,
+                lease,
                 error_code=type(exc).__name__,
             )
             raise
@@ -531,13 +570,106 @@ class SupervisorRuntime:
                     f"handler for agent_id={agent_id!r} is not registered"
                 )
 
+    # -- R2 P0-1: Execution Binding -------------------------------------
+
+    @staticmethod
+    def _build_execution_bindings(
+        plan: PlanDraft,
+        registry: AgentRegistry,
+    ) -> tuple[
+        dict[str, "ExecutionBinding"],
+        dict[str, AgentHandler],
+    ]:
+        """Build immutable (capability, handler) bindings for every task.
+
+        Called *after* pre-flight (integrity, registry version,
+        PlanValidator, handler resolvability) passes and *before*
+        ``RunStore.begin()``.  The bindings are the frozen "execution
+        world" for this run — the Supervisor never calls
+        ``registry.resolve()`` again during execution.
+
+        Returns a tuple ``(bindings, bound_handlers)``:
+
+        * ``bindings`` — serialisable :class:`ExecutionBinding` per
+          ``task_id``, carrying a deep-copied :class:`AgentCapability`.
+        * ``bound_handlers`` — non-serialisable ``Mapping[str,
+          AgentHandler]`` kept on the runtime; used by ``run_task``.
+        """
+        bindings: dict[str, ExecutionBinding] = {}
+        bound_handlers: dict[str, AgentHandler] = {}
+        for planned_task in plan.tasks:
+            task = planned_task.task
+            cap, handler = registry.resolve(task.agent_id)
+            bindings[task.task_id] = ExecutionBinding(
+                task_id=task.task_id,
+                agent_id=task.agent_id,
+                capability_snapshot=cap,
+            )
+            bound_handlers[task.task_id] = handler
+        return bindings, bound_handlers
+
+    # -- R2 P0-3: pre-cancelled finalize --------------------------------
+
+    async def _finalize_pre_cancelled(
+        self,
+        *,
+        plan: PlanDraft,
+        trace: _TraceBuilder,
+        started_at: Any,
+        start_mono: float,
+        canc: ExecutionCancellation,
+    ) -> SupervisorRunResult:
+        """Build a cancelled result for a run that was cancelled
+        *before* the lease was acquired.
+
+        R2 P0-3: this path produces ``iterations=0``, no
+        ``task_ready`` events, no ``task_started`` events, and no
+        Handler invocations.  All tasks are marked ``cancelled``.
+        """
+        tasks = plan.build_execution_tasks()
+        task_records = [
+            TaskExecutionRecord(
+                task_id=t.task_id,
+                agent_id=t.agent_id,
+                status="cancelled",
+                skip_reason="cancelled before run started",
+            )
+            for t in tasks
+        ]
+        accountant = _BudgetAccountant(plan.request.budget, start_monotonic=start_mono)
+        trace.emit(
+            TRACE_RUN_CANCELLED,
+            data={"reason": "cancelled before run started"},
+        )
+        # Synthesise a lease so _finalize's complete() call works —
+        # but actually we don't need a lease here because we never
+        # called begin().  Build the result directly and complete it
+        # via a fresh begin/complete cycle.
+        lease = await self._run_store.begin(plan.run_id, plan.plan_hash)
+        try:
+            return await self._finalize(
+                plan=plan,
+                task_records=task_records,
+                valid_results=[],
+                trace=trace,
+                lease=lease,
+                start_mono=start_mono,
+                accountant=accountant,
+                forced_status=SupervisorRunStatus.CANCELLED,
+                canc=canc,
+                started_at=started_at,
+            )
+        except BaseException as exc:
+            await self._run_store.abort(lease, error_code=type(exc).__name__)
+            raise
+
     # -- run_task closure ------------------------------------------------
 
     def _build_run_task(
         self,
         *,
         plan: PlanDraft,
-        registry: AgentRegistry,
+        bound_handlers: dict[str, AgentHandler],
         invoker: AgentInvoker,
         accountant: _BudgetAccountant,
         trace: _TraceBuilder,
@@ -549,7 +681,7 @@ class SupervisorRuntime:
             return await self._execute_task(
                 task=task,
                 plan=plan,
-                registry=registry,
+                bound_handlers=bound_handlers,
                 invoker=invoker,
                 accountant=accountant,
                 trace=trace,
@@ -565,7 +697,7 @@ class SupervisorRuntime:
         *,
         task: AgentTask,
         plan: PlanDraft,
-        registry: AgentRegistry,
+        bound_handlers: dict[str, AgentHandler],
         invoker: AgentInvoker,
         accountant: _BudgetAccountant,
         trace: _TraceBuilder,
@@ -573,7 +705,10 @@ class SupervisorRuntime:
         canc: ExecutionCancellation,
         canc_state: _CancellationState,
     ) -> TaskOutcome:
-        _cap, handler = registry.resolve(task.agent_id)
+        # R2 P0-1: use the pre-flight bound handler, NOT a fresh
+        # registry.resolve().  A registry mutation during the run
+        # cannot change what Handler actually runs.
+        handler = bound_handlers[task.task_id]
 
         attempts: list[TaskAttemptRecord] = []
         max_attempts = 1 + max(0, task.max_retries)
@@ -645,6 +780,16 @@ class SupervisorRuntime:
             # deadline*, not just task.timeout_ms.  This prevents a
             # single Attempt from outliving the Run budget.
             effective_timeout_s = min(task.timeout_ms, remaining_deadline_ms) / 1000.0
+            # R2 P0-4: record whether the effective timeout was capped
+            # by the run deadline.  If so, any TimeoutError is a
+            # deadline-caused timeout — we must not rely on a post-hoc
+            # ``remaining_deadline_ms <= 0`` check because timer
+            # resolution on some platforms (notably Windows) can fire
+            # the timeout a few milliseconds early, leaving a sliver
+            # of remaining time that incorrectly classifies the
+            # timeout as ``task_timeout`` instead of
+            # ``run_deadline_exceeded``.
+            deadline_was_binding = remaining_deadline_ms <= task.timeout_ms
             deadline_caused_timeout = False
 
             try:
@@ -656,10 +801,16 @@ class SupervisorRuntime:
             except asyncio.TimeoutError as exc:
                 attempt_status = "timed_out"
                 # Distinguish run-deadline timeout from task timeout.
-                # If the remaining deadline is now exhausted, the
-                # timeout was caused by the Run budget.
+                # R2 P0-4: if the effective timeout was capped by the
+                # run deadline (``deadline_was_binding``), the timeout
+                # is definitively deadline-caused regardless of timer
+                # jitter.  Otherwise fall back to checking whether the
+                # remaining deadline is now exhausted.
                 post_mono = time.monotonic()
-                if accountant.remaining_deadline_ms(post_mono) <= 0:
+                if (
+                    deadline_was_binding
+                    or accountant.remaining_deadline_ms(post_mono) <= 0
+                ):
                     error_code = "run_deadline_exceeded"
                     deadline_caused_timeout = True
                 else:
@@ -830,7 +981,7 @@ class SupervisorRuntime:
                         attempt=attempt_idx,
                         started_at=attempt_started_at,
                         completed_at=attempt_completed_at,
-                        status="cancelled",
+                        status="skipped",
                         duration_ms=duration_ms,
                         agent_calls=1,
                         tool_calls=receipt.tool_calls,
@@ -927,7 +1078,16 @@ class SupervisorRuntime:
                     agent_id=task.agent_id,
                     data={"next_attempt": attempt_idx + 1},
                 )
-                await self._maybe_sleep(cfg)
+                backoff_result = await self._maybe_sleep(cfg, accountant, canc, plan)
+                if backoff_result == "deadline_exceeded":
+                    final_status = "skipped"
+                    skip_reason = "deadline_exceeded_during_backoff"
+                    break
+                if backoff_result == "cancelled":
+                    canc_state.cancelled = True
+                    final_status = "cancelled"
+                    skip_reason = "cancelled_during_backoff"
+                    break
                 continue
 
             # Handler raised (timeout / RetryableAgentError / other).
@@ -970,7 +1130,16 @@ class SupervisorRuntime:
                     agent_id=task.agent_id,
                     data={"next_attempt": attempt_idx + 1, "reason": "timeout"},
                 )
-                await self._maybe_sleep(cfg)
+                backoff_result = await self._maybe_sleep(cfg, accountant, canc, plan)
+                if backoff_result == "deadline_exceeded":
+                    final_status = "skipped"
+                    skip_reason = "deadline_exceeded_during_backoff"
+                    break
+                if backoff_result == "cancelled":
+                    canc_state.cancelled = True
+                    final_status = "cancelled"
+                    skip_reason = "cancelled_during_backoff"
+                    break
                 continue
 
             # attempt_status == "failed" (raised exception).
@@ -999,7 +1168,16 @@ class SupervisorRuntime:
                 agent_id=task.agent_id,
                 data={"next_attempt": attempt_idx + 1, "reason": "retryable_error"},
             )
-            await self._maybe_sleep(cfg)
+            backoff_result = await self._maybe_sleep(cfg, accountant, canc, plan)
+            if backoff_result == "deadline_exceeded":
+                final_status = "skipped"
+                skip_reason = "deadline_exceeded_during_backoff"
+                break
+            if backoff_result == "cancelled":
+                canc_state.cancelled = True
+                final_status = "cancelled"
+                skip_reason = "cancelled_during_backoff"
+                break
 
         return TaskOutcome(
             task_id=task.task_id,
@@ -1011,16 +1189,101 @@ class SupervisorRuntime:
         )
 
     @staticmethod
-    async def _maybe_sleep(cfg: SupervisorConfig) -> None:
-        if cfg.retry_backoff_ms > 0:
-            await asyncio.sleep(cfg.retry_backoff_ms / 1000.0)
+    async def _maybe_sleep(
+        cfg: SupervisorConfig,
+        accountant: _BudgetAccountant,
+        canc: ExecutionCancellation,
+        plan: PlanDraft,
+    ) -> str | None:
+        """R2 P0-4: Deadline- and cancellation-aware retry backoff.
+
+        Replaces the previous unconstrained ``asyncio.sleep`` that
+        could outlive the Run deadline by several multiples.  The
+        backoff duration is the minimum of:
+
+        * ``cfg.retry_backoff_ms``
+        * remaining run deadline
+
+        If the remaining deadline is already exhausted, the method
+        marks the accountant as ``deadline_exceeded`` and returns
+        ``"deadline_exceeded"`` so the caller can stop retrying.
+
+        The sleep is interruptible by cancellation: we poll the
+        cancellation source at a small bounded interval (default 10ms
+        capped at 100ms) so a cancel/kill-switch event wakes the
+        retry loop promptly.  Tests should inject a
+        :class:`FakeExecutionCancellation` rather than relying on
+        wall-clock timing.
+
+        Returns ``None`` on a clean sleep completion, or one of:
+
+        * ``"deadline_exceeded"`` — the deadline was exhausted before
+          or during the sleep; the caller must not start a new attempt.
+        * ``"cancelled"`` — a cancellation signal interrupted the
+          sleep; the caller must mark the task as cancelled.
+        """
+        if cfg.retry_backoff_ms <= 0:
+            # No backoff configured — still respect cancellation/deadline.
+            if await canc.is_cancelled(plan.run_id) or await canc.is_kill_switch_active(
+                plan.tenant_id
+            ):
+                return "cancelled"
+            now = time.monotonic()
+            if accountant.remaining_deadline_ms(now) <= 0:
+                accountant.mark_deadline_exceeded()
+                return "deadline_exceeded"
+            return None
+
+        now = time.monotonic()
+        remaining_ms = accountant.remaining_deadline_ms(now)
+        if remaining_ms <= 0:
+            accountant.mark_deadline_exceeded()
+            return "deadline_exceeded"
+
+        sleep_ms = min(cfg.retry_backoff_ms, remaining_ms)
+        # Poll cancellation at a bounded small interval so a cancel
+        # signal wakes us promptly without busy-looping.  The poll
+        # interval is 10ms (or the remaining sleep, whichever is
+        # smaller); capped at 100ms to avoid excessive wakeups on
+        # long backoffs.
+        poll_interval_ms = min(100, max(10, sleep_ms // 10))
+        elapsed_ms = 0
+        while elapsed_ms < sleep_ms:
+            # Check cancellation first.
+            if await canc.is_cancelled(plan.run_id) or await canc.is_kill_switch_active(
+                plan.tenant_id
+            ):
+                return "cancelled"
+            # Check deadline.
+            now = time.monotonic()
+            if accountant.remaining_deadline_ms(now) <= 0:
+                accountant.mark_deadline_exceeded()
+                return "deadline_exceeded"
+            step = min(poll_interval_ms, sleep_ms - elapsed_ms)
+            await asyncio.sleep(step / 1000.0)
+            elapsed_ms += step
+        return None
 
     # -- should_stop / wave callbacks -----------------------------------
 
     @staticmethod
     def _build_should_stop(
-        accountant: _BudgetAccountant, canc_state: _CancellationState
+        accountant: _BudgetAccountant,
+        canc_state: _CancellationState,
+        canc: ExecutionCancellation,
+        plan: PlanDraft,
     ):
+        """Sync ``should_stop`` for the Scheduler.
+
+        R2 P0-3: this callback handles *budget* and *local-state*
+        cancellation only.  Async cancellation polling (calling the
+        async :class:`ExecutionCancellation`) is handled by the
+        :meth:`_build_before_wave` hook, which the Scheduler invokes
+        *before* ``should_stop`` would gate a wave.  We deliberately
+        do NOT attempt ``run_until_complete`` from inside the running
+        event loop — that raises ``RuntimeError``.
+        """
+
         def should_stop() -> bool:
             # R1 P0-2: check iteration budget *before* the scheduler
             # enters the next wave.  ``can_start_iteration`` marks the
@@ -1033,6 +1296,31 @@ class SupervisorRuntime:
             return not accountant.can_start_iteration()
 
         return should_stop
+
+    @staticmethod
+    def _build_before_wave(
+        canc: ExecutionCancellation,
+        canc_state: _CancellationState,
+        plan: PlanDraft,
+    ):
+        """R2 P0-3: async hook invoked before each wave is dispatched.
+
+        Polls the async :class:`ExecutionCancellation` source and
+        flips the shared :class:`_CancellationState` flag when a
+        cancel or kill-switch signal is active.  Returning ``True``
+        causes the Scheduler to cancel the wave's ready tasks (no
+        Handler invoked) and stop the loop.
+        """
+
+        async def before_wave(ready_tasks: list[AgentTask]) -> bool:
+            if await canc.is_cancelled(plan.run_id) or await canc.is_kill_switch_active(
+                plan.tenant_id
+            ):
+                canc_state.cancelled = True
+                return True
+            return False
+
+        return before_wave
 
     @staticmethod
     def _build_wave_callbacks(
@@ -1120,7 +1408,6 @@ class SupervisorRuntime:
         self,
         *,
         plan: PlanDraft,
-        registry: AgentRegistry,
         task_records: list[TaskExecutionRecord],
         valid_results: list[AgentResult],
         trace: _TraceBuilder,
@@ -1173,11 +1460,15 @@ class SupervisorRuntime:
             occurred_at=completed_at,
         )
 
-        snapshot = registry.snapshot()
+        # R2 P0-1: record plan.registry_version (frozen at plan time)
+        # NOT the live registry version.  A cached result must remain
+        # stable even if the live registry drifts — otherwise a future
+        # cache lookup for the same (run_id, plan_hash) would see a
+        # mismatched registry_version field despite being a valid hit.
         result = SupervisorRunResult(
             run_id=plan.run_id,
             plan_hash=plan.plan_hash,
-            registry_version=snapshot.version,
+            registry_version=plan.registry_version,
             status=final_status,
             task_records=task_records,
             merged_state=merged_state,
@@ -1188,7 +1479,7 @@ class SupervisorRuntime:
             duration_ms=duration_ms,
         )
 
-        await self._run_store.complete(result)
+        await self._run_store.complete(lease, result)
         return result
 
     @staticmethod
@@ -1199,12 +1490,30 @@ class SupervisorRuntime:
     ) -> SupervisorRunStatus:
         """Compute the final run status from task outcomes.
 
-        Spec §17 Failure Propagation:
+        Spec §17 Failure Propagation (R2 P0-5 refined):
 
         * Required task failed → FAILED
         * Required task needs_input → NEEDS_INPUT
+        * Required task cancelled → CANCELLED
+        * Required task skipped (Handler-returned) → FAILED  (was:
+          partial_success — a Required task cannot be skipped without
+          an explicit failure cause; treating it as partial_success
+          masked required root skips behind a benign-looking status)
+        * Required task skipped (dependency propagation) →
+          transparent; the ancestor's status drives the result
         * Optional task failed/skipped → PARTIAL_SUCCESS
         * All completed → COMPLETED
+
+        Distinguishing Handler-returned ``skipped`` from
+        dependency-propagation ``skipped``: the former has
+        ``skip_reason is None`` (the Handler actively returned
+        ``result.status == "skipped"``); the latter has a
+        ``skip_reason`` set by the Scheduler (e.g.
+        ``"dependency 'X' status='needs_input'"``).  Only
+        Handler-returned skipped on a Required task constitutes a
+        failure — dependency-propagation skipped is a *consequence*
+        of an ancestor's non-completed status, not an independent
+        failure.
 
         Priority (§17): cancelled > budget_exceeded > failed >
         needs_input > partial_success > completed.
@@ -1224,28 +1533,50 @@ class SupervisorRuntime:
             rec.status == "failed" and required_map.get(rec.task_id, True)
             for rec in task_records
         )
+        # R2 P0-5: only Handler-returned skipped (skip_reason is None)
+        # on a Required task triggers FAILED.  Dependency-propagation
+        # skipped (skip_reason set by the Scheduler) is transparent —
+        # the ancestor's status already drives the result, so counting
+        # propagated skips as failures would incorrectly override a
+        # parent's NEEDS_INPUT with FAILED.
+        any_required_handler_skipped = any(
+            rec.status == "skipped"
+            and rec.skip_reason is None
+            and required_map.get(rec.task_id, True)
+            for rec in task_records
+        )
         any_required_needs_input = any(
             rec.status == "needs_input" and required_map.get(rec.task_id, True)
+            for rec in task_records
+        )
+        any_required_cancelled = any(
+            rec.status == "cancelled" and required_map.get(rec.task_id, True)
             for rec in task_records
         )
         any_optional_non_completed = any(
             rec.status != "completed" and not required_map.get(rec.task_id, True)
             for rec in task_records
         )
-        any_skipped = "skipped" in statuses
         all_completed = statuses == {"completed"}
 
         if all_completed:
             return SupervisorRunStatus.COMPLETED
 
+        # R2 P0-5: Required Handler-skipped is a failure (not
+        # partial_success).  Dependency-propagation skipped does NOT
+        # trigger this branch.
+        if any_required_failed or any_required_handler_skipped:
+            # cancelled has higher priority — preserve that.
+            if any_cancelled or any_required_cancelled:
+                return SupervisorRunStatus.CANCELLED
+            return SupervisorRunStatus.FAILED
+
         candidates: list[SupervisorRunStatus] = []
-        if any_cancelled:
+        if any_cancelled or any_required_cancelled:
             candidates.append(SupervisorRunStatus.CANCELLED)
-        if any_required_failed:
-            candidates.append(SupervisorRunStatus.FAILED)
         if any_required_needs_input:
             candidates.append(SupervisorRunStatus.NEEDS_INPUT)
-        if any_optional_non_completed or any_skipped:
+        if any_optional_non_completed:
             candidates.append(SupervisorRunStatus.PARTIAL_SUCCESS)
         if not candidates:
             candidates.append(SupervisorRunStatus.COMPLETED)

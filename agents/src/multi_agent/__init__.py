@@ -129,6 +129,7 @@ from multi_agent.planner import DeterministicPlanner
 
 # Phase 4 — Supervisor Runtime
 from multi_agent.execution import (
+    ExecutionBinding,
     ExecutionCancellation,
     ExecutionTraceEvent,
     FakeExecutionCancellation,
@@ -179,6 +180,7 @@ from multi_agent.run_store import (
     defensive_copy_result,
 )
 from multi_agent.scheduler import (
+    BeforeWave,
     DagScheduler,
     TaskOutcome,
     WaveCallback,
@@ -323,6 +325,7 @@ __all__ = [
     "RegistryAgentInvoker",
     "validate_invocation_receipt",
     # Phase 4 — Execution Contracts
+    "ExecutionBinding",
     "ExecutionCancellation",
     "ExecutionTraceEvent",
     "FakeExecutionCancellation",
@@ -355,6 +358,7 @@ __all__ = [
     "RunStore",
     "defensive_copy_result",
     # Phase 4 — Scheduler & Supervisor
+    "BeforeWave",
     "DagScheduler",
     "TaskOutcome",
     "WaveCallback",

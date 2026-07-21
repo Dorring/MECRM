@@ -45,6 +45,7 @@ from typing import Literal, Protocol
 from pydantic import Field, field_validator
 
 from multi_agent.contracts import (
+    AgentCapability,
     AgentExecutionContext,
     AgentResult,
     AgentTask,
@@ -86,6 +87,13 @@ _TaskAttemptStatus = Literal[
     "needs_input",
     "timed_out",
     "cancelled",
+    # R2 P0-5: explicit ``skipped`` attempt status.  Previously the
+    # supervisor recorded skipped Handler returns as ``cancelled``
+    # which conflated two distinct semantics (user/system cancel vs
+    # Handler-declared skip).  ``skipped`` now has its own bucket so
+    # the final-status election can distinguish Required-skipped
+    # (→ failed) from cancelled (→ cancelled).
+    "skipped",
 ]
 
 
@@ -250,6 +258,34 @@ class SupervisorConfig(StrictContract):
 
     max_concurrency: int = Field(default=4, ge=1, le=32)
     retry_backoff_ms: int = Field(default=0, ge=0)
+
+
+# ---------------------------------------------------------------------------
+# R2 P0-1: Execution Binding — frozen snapshot of one task's Handler + Capability
+# ---------------------------------------------------------------------------
+
+
+class ExecutionBinding(StrictContract):
+    """R2 P0-1: frozen snapshot of one task's agent resolution.
+
+    Built once during pre-flight (after registry version validation)
+    and used for *every* invocation of that task.  The capability is
+    a deep copy taken at pre-flight time, so a registry mutation
+    during the run (registration of an unrelated agent, handler
+    replacement, capability update) cannot change what the Supervisor
+    actually invokes.
+
+    The Handler itself is non-serialisable (it may be a callable or
+    a LangGraph node), so it lives in a separate ``Mapping`` kept on
+    the :class:`SupervisorRuntime`, keyed by ``task_id``.  This contract
+    only carries the *identity* of the binding for audit/validation.
+    """
+
+    model_config = {"extra": "forbid", "frozen": True}
+
+    task_id: str
+    agent_id: str
+    capability_snapshot: AgentCapability
 
 
 # ---------------------------------------------------------------------------

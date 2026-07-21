@@ -66,6 +66,12 @@ TaskRunner = Callable[[AgentTask], Awaitable[TaskOutcome]]
 ShouldStop = Callable[[], bool]
 WaveCallback = Callable[[list[TaskExecutionRecord]], None]
 WaveStartedCallback = Callable[[list[AgentTask]], None]
+# R2 P0-3: async hook called before a wave is dispatched.  The
+# Supervisor uses this to poll the async ExecutionCancellation source
+# (which the sync ``should_stop`` cannot do safely from inside a
+# running event loop).  When the hook returns ``True`` the Scheduler
+# cancels the wave instead of dispatching it.
+BeforeWave = Callable[[list[AgentTask]], Awaitable[bool]]
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +147,7 @@ class DagScheduler:
         on_wave_started: WaveStartedCallback | None = None,
         on_wave_completed: WaveCallback | None = None,
         on_tasks_skipped: WaveCallback | None = None,
+        before_wave: BeforeWave | None = None,
     ) -> list[TaskExecutionRecord]:
         """Execute *tasks* in dependency order.
 
@@ -172,6 +179,15 @@ class DagScheduler:
             R1 P0-2: sync callback invoked when tasks are skipped due
             to dependency failure propagation.  Does NOT consume an
             iteration — state propagation is not execution.
+        before_wave
+            R2 P0-3: async hook called *before* ``on_wave_started``
+            (i.e. before the iteration is reserved and ``task_ready``
+            is emitted).  Used by the Supervisor to poll the async
+            ExecutionCancellation source.  When the hook returns
+            ``True`` the Scheduler cancels the wave's ready tasks
+            (marked ``cancelled``) and stops the loop — no Handler is
+            invoked, no iteration is consumed, no ``task_ready`` is
+            emitted for that wave.
         """
         # Build the initial records map.  We never mutate the input
         # tasks; all state lives in records.
@@ -256,17 +272,61 @@ class DagScheduler:
                 # it does we break to avoid a busy loop.
                 break
 
-            # 4. R1 P0-2: notify the Supervisor that a real Ready-Task
-            #    wave is about to be dispatched.  This is where the
-            #    iteration budget is reserved.
+            # 4. R2 P0-3: async cancellation check BEFORE reserving an
+            #    iteration or emitting task_ready.  The user's spec
+            #    requires the check to happen before:
+            #      - reserve iteration
+            #      - emit task_ready
+            #      - create task
+            #    ``should_stop`` is sync and cannot safely await an
+            #    async ExecutionCancellation source from inside a
+            #    running event loop; ``before_wave`` is the async
+            #    boundary.  When it returns True the wave is cancelled
+            #    (no Handler invoked, no iteration consumed, no
+            #    task_ready emitted) and the loop stops.
+            if before_wave is not None and await before_wave(ready):
+                for task in ready:
+                    rec = records[task.task_id]
+                    records[task.task_id] = TaskExecutionRecord(
+                        task_id=rec.task_id,
+                        agent_id=rec.agent_id,
+                        status="cancelled",
+                        attempts=rec.attempts,
+                        result=rec.result,
+                        skip_reason="cancelled before wave dispatch",
+                    )
+                    pending_ids.discard(task.task_id)
+                # Cancel remaining pending tasks too.
+                for tid in sorted(pending_ids):
+                    rec = records[tid]
+                    records[tid] = TaskExecutionRecord(
+                        task_id=rec.task_id,
+                        agent_id=rec.agent_id,
+                        status="cancelled",
+                        attempts=rec.attempts,
+                        result=rec.result,
+                        skip_reason="run cancelled before dispatch",
+                    )
+                pending_ids.clear()
+                break
+
+            # 4b. R1 P0-2: notify the Supervisor that a real Ready-Task
+            #     wave is about to be dispatched.  This is where the
+            #     iteration budget is reserved and task_ready is emitted.
+            #     Called only after before_wave has confirmed the wave
+            #     should proceed.
             if on_wave_started is not None:
                 on_wave_started(ready)
 
-            # 5. Execute the wave with bounded concurrency.
+            # 5. R2 P0-2: Execute the wave with structured concurrency.
+            #    Replaces the previous ``asyncio.gather()`` which could
+            #    leave sibling coroutines running after one raised.
+            #    We manually create tasks, and on any exception cancel
+            #    every sibling and await them with ``return_exceptions=
+            #    True`` so no Handler continues in the background after
+            #    the Scheduler returns or raises.
             semaphore = asyncio.Semaphore(self._config.max_concurrency)
-            outcomes = await asyncio.gather(
-                *(self._run_with_semaphore(semaphore, run_task, task) for task in ready)
-            )
+            outcomes = await self._run_wave_structured(semaphore, run_task, ready)
 
             # 6. Commit outcomes in task_id order so the wave callback
             #    sees a stable sequence.
@@ -299,8 +359,124 @@ class DagScheduler:
         async with semaphore:
             return await run_task(task)
 
+    @staticmethod
+    async def _run_wave_structured(
+        semaphore: asyncio.Semaphore,
+        run_task: TaskRunner,
+        ready: list[AgentTask],
+    ) -> list[TaskOutcome]:
+        """R2 P0-2: structured concurrency for one wave.
+
+        Replaces the previous ``asyncio.gather(*coros)`` call which
+        could leave sibling coroutines running after one raised.
+        ``asyncio.gather(return_exceptions=True)`` collects all
+        results but does NOT cancel still-running siblings when one
+        task raises — they keep running in the background until they
+        complete, defeating the purpose of structured concurrency.
+
+        The fix uses :func:`asyncio.wait` with
+        ``return_when=FIRST_EXCEPTION``:
+
+        1. Create all tasks explicitly with
+           :func:`asyncio.ensure_future`, keeping a mapping back to
+           the originating :class:`AgentTask` so we can build
+           per-task outcomes after cancellation.
+        2. ``await asyncio.wait(tasks, return_when=FIRST_EXCEPTION)``
+           returns as soon as one task raises (or all complete).
+        3. If any tasks are still pending (a sibling raised), cancel
+           every pending task *immediately* and await them with
+           ``return_exceptions=True`` so they reach a terminal state
+           before this method returns.
+        4. Build outcomes in ``ready`` order.  Cancelled siblings get
+           a synthetic ``cancelled`` outcome; the raising task gets a
+           synthetic ``failed`` outcome.  Re-raise the first exception
+           so the Supervisor's abort path runs.
+
+        This guarantees that when ``_run_wave_structured`` returns or
+        raises, every sibling task has reached a terminal state — no
+        Handler continues in the background after the Scheduler
+        returns or raises.
+        """
+        # Map each asyncio.Task back to its AgentTask so we can
+        # construct per-task outcomes after cancellation.
+        task_to_agent: dict[asyncio.Task[TaskOutcome], AgentTask] = {}
+        asyncio_tasks: list[asyncio.Task[TaskOutcome]] = []
+        for task in ready:
+            at = asyncio.ensure_future(
+                DagScheduler._run_with_semaphore(semaphore, run_task, task)
+            )
+            task_to_agent[at] = task
+            asyncio_tasks.append(at)
+
+        try:
+            done, pending = await asyncio.wait(
+                asyncio_tasks,
+                return_when=asyncio.FIRST_EXCEPTION,
+            )
+        except BaseException:
+            # External cancellation (e.g. asyncio.CancelledError
+            # raised on the coroutine running ``execute``).  Cancel
+            # every task and await them so we don't leak coroutines.
+            for t in asyncio_tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*asyncio_tasks, return_exceptions=True)
+            raise
+
+        # If there are pending tasks, one task raised an exception
+        # (FIRST_EXCEPTION).  Cancel all pending (still-running)
+        # siblings immediately so they don't continue executing
+        # after we return or raise.
+        if pending:
+            for t in pending:
+                t.cancel()
+            # Await cancelled tasks so they reach a terminal state.
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        # Build outcomes in ``ready`` order.  The caller's
+        # ``next(o for o in outcomes if o.task_id == task.task_id)``
+        # lookup requires one outcome per ready task.
+        first_exc: BaseException | None = None
+        outcomes: list[TaskOutcome] = []
+        for agent_task in ready:
+            at = next(
+                t
+                for t in asyncio_tasks
+                if task_to_agent[t].task_id == agent_task.task_id
+            )
+            if at.cancelled():
+                # Sibling was cancelled because another task raised.
+                outcomes.append(
+                    TaskOutcome(
+                        task_id=agent_task.task_id,
+                        agent_id=agent_task.agent_id,
+                        status="cancelled",
+                        skip_reason="sibling wave exception",
+                    )
+                )
+            elif at.exception() is not None:
+                exc = at.exception()
+                if first_exc is None:
+                    first_exc = exc
+                outcomes.append(
+                    TaskOutcome(
+                        task_id=agent_task.task_id,
+                        agent_id=agent_task.agent_id,
+                        status="failed",
+                        skip_reason=f"wave_exception: {type(exc).__name__}",
+                    )
+                )
+            else:
+                outcomes.append(at.result())
+
+        if first_exc is not None:
+            raise first_exc
+
+        return outcomes
+
 
 __all__ = [
+    "BeforeWave",
     "DagScheduler",
     "TaskOutcome",
     "TaskRunner",

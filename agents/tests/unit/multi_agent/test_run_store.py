@@ -125,9 +125,9 @@ class TestCachedResult:
     @pytest.mark.asyncio
     async def test_completed_run_returns_cached_result(self):
         store = InMemoryRunStore()
-        await store.begin("run-001", "a" * 64)
+        lease = await store.begin("run-001", "a" * 64)
         result = _make_result()
-        await store.complete(result)
+        await store.complete(lease, result)
 
         lease = await store.begin("run-001", "a" * 64)
         assert lease.is_cached
@@ -140,9 +140,9 @@ class TestCachedResult:
         """Mutating the original result after ``complete()`` must not
         affect what a later ``begin()`` returns."""
         store = InMemoryRunStore()
-        await store.begin("run-001", "a" * 64)
+        lease = await store.begin("run-001", "a" * 64)
         result = _make_result()
-        await store.complete(result)
+        await store.complete(lease, result)
 
         # Mutate the original result's task_records.
         result.task_records[0].__dict__["status"] = "tampered"
@@ -156,8 +156,8 @@ class TestCachedResult:
         """Mutating the lease's cached_result must not affect the
         store's internal copy."""
         store = InMemoryRunStore()
-        await store.begin("run-001", "a" * 64)
-        await store.complete(_make_result())
+        lease = await store.begin("run-001", "a" * 64)
+        await store.complete(lease, _make_result())
 
         lease1 = await store.begin("run-001", "a" * 64)
         assert lease1.cached_result is not None
@@ -172,9 +172,9 @@ class TestCachedResult:
         """``complete()`` must store a deep copy so the caller cannot
         later mutate the store's internal state."""
         store = InMemoryRunStore()
-        await store.begin("run-001", "a" * 64)
+        lease = await store.begin("run-001", "a" * 64)
         result = _make_result()
-        await store.complete(result)
+        await store.complete(lease, result)
 
         # Mutate the original result's trace.
         result.trace[0].__dict__["event_type"] = "tampered"
@@ -193,8 +193,8 @@ class TestConflictDetection:
     @pytest.mark.asyncio
     async def test_same_run_different_plan_rejected(self):
         store = InMemoryRunStore()
-        await store.begin("run-001", "a" * 64)
-        await store.complete(_make_result(plan_hash="a" * 64))
+        lease = await store.begin("run-001", "a" * 64)
+        await store.complete(lease, _make_result(plan_hash="a" * 64))
 
         with pytest.raises(RunPlanConflictError):
             await store.begin("run-001", "b" * 64)
@@ -210,8 +210,9 @@ class TestConflictDetection:
     @pytest.mark.asyncio
     async def test_complete_without_begin_raises(self):
         store = InMemoryRunStore()
+        lease = RunLease(run_id="run-001", plan_hash="a" * 64)
         with pytest.raises(RunAlreadyInProgressError):
-            await store.complete(_make_result())
+            await store.complete(lease, _make_result())
 
 
 # ---------------------------------------------------------------------------
@@ -225,12 +226,12 @@ class TestIdempotentReComplete:
         """Calling ``complete()`` twice with the same plan_hash is
         idempotent — the second call is silently ignored."""
         store = InMemoryRunStore()
-        await store.begin("run-001", "a" * 64)
+        lease = await store.begin("run-001", "a" * 64)
         result = _make_result()
-        await store.complete(result)
+        await store.complete(lease, result)
 
         # Second complete with the same plan_hash should not raise.
-        await store.complete(result)
+        await store.complete(lease, result)
 
         lease = await store.begin("run-001", "a" * 64)
         assert lease.cached_result is not None
@@ -239,11 +240,12 @@ class TestIdempotentReComplete:
     @pytest.mark.asyncio
     async def test_re_complete_different_plan_rejected(self):
         store = InMemoryRunStore()
-        await store.begin("run-001", "a" * 64)
-        await store.complete(_make_result(plan_hash="a" * 64))
+        lease = await store.begin("run-001", "a" * 64)
+        await store.complete(lease, _make_result(plan_hash="a" * 64))
 
         with pytest.raises(RunPlanConflictError):
-            await store.complete(_make_result(plan_hash="b" * 64))
+            conflicting_lease = RunLease(run_id="run-001", plan_hash="b" * 64)
+            await store.complete(conflicting_lease, _make_result(plan_hash="b" * 64))
 
 
 # ---------------------------------------------------------------------------
@@ -262,24 +264,24 @@ class TestIntrospection:
     @pytest.mark.asyncio
     async def test_is_in_progress(self):
         store = InMemoryRunStore()
-        await store.begin("run-001", "a" * 64)
+        lease = await store.begin("run-001", "a" * 64)
         assert store.is_in_progress("run-001")
-        await store.complete(_make_result())
+        await store.complete(lease, _make_result())
         assert not store.is_in_progress("run-001")
 
     @pytest.mark.asyncio
     async def test_is_completed(self):
         store = InMemoryRunStore()
-        await store.begin("run-001", "a" * 64)
+        lease = await store.begin("run-001", "a" * 64)
         assert not store.is_completed("run-001")
-        await store.complete(_make_result())
+        await store.complete(lease, _make_result())
         assert store.is_completed("run-001")
 
     @pytest.mark.asyncio
     async def test_clear(self):
         store = InMemoryRunStore()
-        await store.begin("run-001", "a" * 64)
-        await store.complete(_make_result())
+        lease = await store.begin("run-001", "a" * 64)
+        await store.complete(lease, _make_result())
         assert store.has_run("run-001")
         store.clear()
         assert not store.has_run("run-001")

@@ -4,6 +4,10 @@
 **Branch:** `feat/ma-04-supervisor-runtime`  
 **Baseline:** `main` (Phase 3, commit `d586e70`)
 
+> **R2 Revision** — This document reflects the R2 audit fixes (commit `<TBD>`).
+> R1 baseline: commit `e5ab368`. R2 addresses 5 P0 and 3 P1 issues found
+> during the R1 combination-path review.
+
 ---
 
 ## 1. Supervisor Runtime 架构
@@ -81,14 +85,18 @@ Phase 4 通过 `plan.build_execution_tasks()` 拿到深拷贝的 `AgentTask` 列
 
 ### Pre-flight 检查（任何 Task 开始前必须完成）
 
-1. `plan.verify_integrity()` — `request_hash` 和 `plan_hash` 一致
-2. `registry.snapshot().version == plan.registry_version` — 版本对齐
-3. `PlanValidator.validate(plan.request, plan, registry).valid` — 重新验证
-4. `RunStore.begin(run_id, plan_hash)` — 幂等检查
-5. 所有 Handler 通过 Registry `resolve()` 可解析
-6. `ExecutionUsage` 初始化为 0
+1. **R2 P0-1** `RunStore.lookup_completed(run_id, plan_hash)` — 缓存命中则直接返回，不检查 live registry 版本
+2. `plan.verify_integrity()` — `request_hash` 和 `plan_hash` 一致
+3. `registry.snapshot().version == plan.registry_version` — 版本对齐
+4. `PlanValidator.validate(plan.request, plan, registry).valid` — 重新验证
+5. **R2 P0-3** Async cancellation pre-check — 如果 Run 已取消或 Kill Switch 激活，直接 finalize 为 `cancelled`（不获取 lease、不预留 iteration）
+6. `RunStore.begin(run_id, plan_hash)` — 幂等检查
+7. **R2 P0-1** `_build_execution_bindings(plan, registry)` — 为每个 Task 一次性解析 `(capability, handler)`，构建不可变 `ExecutionBinding` + `bound_handlers` 映射；执行期间不再调用 `registry.resolve()`
+8. `ExecutionUsage` 初始化为 0
 
 任一检查失败 → 抛 `SupervisorError`，不调用任何 Handler。
+
+> **R2 P0-1 缓存优先**：`lookup_completed` 在所有 pre-flight 检查之前调用。即使 live Registry 已漂移（新增/删除/替换 Agent），只要 `(run_id, plan_hash)` 匹配已缓存的 completed result，就直接返回缓存值——不抛 `SupervisorError`，不重新执行。
 
 ---
 
@@ -128,12 +136,16 @@ class AgentInvoker(Protocol):
 
 ```
 wave 0:
-  ready = [tasks with no dependencies or all deps completed]
-  ready.sort(by task_id)         # 稳定调度
-  async gather(ready, max_concurrency)
+  resolve skip propagation      # 依赖未完成的 pending → skipped
+  should_stop?                  # sync budget/cancel check
+  ready = [tasks with all deps completed]
+  ready.sort(by task_id)        # 稳定调度
+  before_wave(ready)?           # R2 P0-3: async cancel check
+  on_wave_started(ready)        # reserve iteration + emit task_ready
+  _run_wave_structured(ready)   # R2 P0-2: structured concurrency
+  on_wave_completed(records)
 
 wave 1:
-  ready = [tasks whose deps completed in wave 0]
   ...
 ```
 
@@ -145,6 +157,39 @@ wave 1:
 - 未取消、未触发 Kill Switch
 - 预算仍允许至少一次 Agent Call
 
+### R2 P0-2: Structured Concurrency
+
+`_run_wave_structured` 替换了 `asyncio.gather(*coros)`。旧实现使用 `gather(return_exceptions=True)` 会等待所有 Task 完成——但如果一个 Task 抛异常，兄弟姐妹 Task 仍在后台运行，可能导致 lease 释放后 Handler 继续执行（orphan side effects）。
+
+新实现使用 `asyncio.wait(return_when=FIRST_EXCEPTION)`：
+
+1. 为每个 Ready Task 创建 `asyncio.Task`，保留 `task → AgentTask` 映射
+2. `asyncio.wait(tasks, return_when=FIRST_EXCEPTION)` — 任一 Task 抛异常立即返回
+3. 如果有 pending Task（说明有 Task 抛异常），立即 cancel 所有 pending 并 `await gather(pending, return_exceptions=True)` 等待它们终止
+4. 按 `ready` 顺序构建 outcomes：cancelled siblings → `TaskOutcome(status="cancelled")`；异常 Task → `TaskOutcome(status="failed")`；正常完成 → 原 result
+5. 如果有异常，re-raise 第一个异常触发 Supervisor 的 abort 路径
+
+**保证**：`_run_wave_structured` 返回或抛出时，所有 sibling Task 均已到达终态——不会有 Handler 在后台继续执行。
+
+### R2 P0-3: Cancellation Wave Boundary
+
+`before_wave` 是一个 `async` 钩子，在 `on_wave_started` **之前**调用。Scheduler 在调用 `before_wave` 时：
+
+- **不**预留 iteration（`on_wave_started` 尚未调用）
+- **不** emit `task_ready` trace event
+- **不**创建 Task
+
+如果 `before_wave` 返回 `True`（cancel/kill switch 激活）：
+- 当前 wave 的所有 ready Task → `cancelled`
+- 所有剩余 pending Task → `cancelled`
+- 退出 wave 循环
+
+**顺序保证**：
+```
+before_wave(ready)    ← FIRST: async cancellation check
+on_wave_started(ready) ← SECOND: reserve iteration + emit task_ready
+```
+
 ### 稳定性保证
 
 - Ready Queue 按 `task.task_id` 升序排序
@@ -155,6 +200,7 @@ wave 1:
 ### 禁止行为
 
 - 无界 `asyncio.gather()`
+- `gather(return_exceptions=True)` 作为结构化并发替代（不会 cancel siblings）
 - Busy Loop
 - 用 `sleep` 猜测任务完成
 - 修改 PlanDraft 内部 Task
@@ -215,9 +261,10 @@ async def _run_one(task):
 每次 Handler 调用使用 `asyncio.wait_for`:
 
 ```python
+effective_timeout_s = min(task.timeout_ms, remaining_deadline_ms) / 1000.0
 await asyncio.wait_for(
     invoker.invoke(handler, task, ctx),
-    timeout=task.timeout_ms / 1000,
+    timeout=effective_timeout_s,
 )
 ```
 
@@ -228,6 +275,20 @@ await asyncio.wait_for(
 - 开始新 Attempt 前检查剩余时间
 - **不**使用 `datetime.now()` 差值（跨平台不一致）
 - 超过 deadline → 停止调度新 Task，状态置 `budget_exceeded`
+
+### R2 P0-4: Deadline-aware Backoff
+
+`_maybe_sleep` 在 retry backoff 时同时考虑 deadline 和 cancellation：
+
+```python
+sleep_ms = min(cfg.retry_backoff_ms, remaining_deadline_ms)
+```
+
+- 如果 `remaining_deadline_ms <= 0` → 标记 `deadline_exceeded`，返回 `"deadline_exceeded"`，不再 retry
+- 如果 cancellation 激活 → 返回 `"cancelled"`，立即中断 backoff
+- Backoff 期间以 10ms-100ms 间隔轮询 cancellation，确保 cancel 信号能及时唤醒 retry 循环
+
+**R2 P0-4 Timer Jitter Fix**：当 `effective_timeout_s` 被 run deadline 而非 `task.timeout_ms` 限制时（`deadline_was_binding = remaining_deadline_ms <= task.timeout_ms`），任何 `TimeoutError` 都被归类为 `run_deadline_exceeded`——不再依赖 post-hoc `remaining_deadline_ms <= 0` 检查，因为 Windows 等平台的 timer 分辨率可能导致 `wait_for` 提前几毫秒触发，留下微小剩余时间从而错误分类为 `task_timeout`。
 
 ---
 
@@ -318,14 +379,26 @@ Phase 4 **不**实现第二套合并算法。
 ### Required Task failed
 
 - Run 最终状态 = `failed`
-- 所有依赖该 Task 的 Descendant → `skipped`
-- 独立分支可继续执行（`continue_independent_branches=True`）
+- 所有依赖该 Task 的 Descendant → `skipped`（dependency propagation）
+- 独立分支可继续执行
 
 ### Required Task needs_input
 
 - Run 最终状态 = `needs_input`
-- 依赖它的 Descendant → `skipped`
+- 依赖它的 Descendant → `skipped`（dependency propagation）
 - 独立分支可继续执行
+
+### Required Task skipped (Handler-returned)
+
+- **R2 P0-5** Run 最终状态 = `failed`（不再是 `partial_success`）
+- Handler 主动返回 `result.status == "skipped"`，`skip_reason is None`
+- 依赖它的 Descendant → `skipped`（dependency propagation，`skip_reason` 由 Scheduler 设置）
+
+### Required Task skipped (dependency propagation)
+
+- **R2 P0-5** 透明——不独立触发 `failed`
+- `skip_reason` 由 Scheduler 设置（如 `"dependency 'X' status='failed'"`）
+- Run 最终状态由父 Task 的实际状态决定（`failed` / `needs_input` / `cancelled`）
 
 ### Optional Task failed
 
@@ -336,6 +409,15 @@ Phase 4 **不**实现第二套合并算法。
 
 - **不**使 Run failed
 - 若有其他 Required 完成 → `partial_success`
+
+### R2 P0-5: 区分两种 skipped 来源
+
+| 来源 | `skip_reason` | Required Task 影响 |
+|------|---------------|-------------------|
+| Handler-returned | `None` | Run = `FAILED` |
+| Dependency propagation | Scheduler 设置 | 透明（由父 Task 决定） |
+
+**Attempt 级别**：`_TaskAttemptStatus` 新增 `"skipped"` 成员。Handler 返回 `skipped` 时，Attempt 记录 `status="skipped"`（不再是 `cancelled`）。两种状态语义不同：`skipped` = 主动跳过，`cancelled` = 被动终止。
 
 ### Final Status Priority
 
@@ -364,15 +446,25 @@ class ExecutionCancellation(Protocol):
 
 ### 检查时点
 
-- Run 开始前
-- 每一 Scheduler Wave 前
+- **R2 P0-3** Run 开始前（async pre-run check，在 lease 获取之前）
+- **R2 P0-3** 每一 Scheduler Wave 前（`before_wave` async 钩子，在 `on_wave_started` 之前）
 - 每个 Task Invocation 前
-- Retry 前
+- Retry 前（`_maybe_sleep` 内轮询）
+
+### R2 P0-3: Pre-cancelled 路径
+
+如果 Run 在 `execute()` 调用时已取消：
+- **不**获取 lease
+- **不**预留 iteration（`iterations == 0`）
+- **不** emit `task_ready` / `task_started` trace events
+- **不**调用任何 Handler
+- 所有 Task → `cancelled`
+- Run → `cancelled`
 
 ### 触发后行为
 
 - 不再启动新 Task
-- 等待或取消正在运行 Task
+- 等待或取消正在运行 Task（R2 P0-2 结构化并发保证 siblings 被 cancel + await）
 - pending Task → `cancelled`
 - Run → `cancelled`
 
@@ -387,16 +479,26 @@ class ExecutionCancellation(Protocol):
 ```python
 class RunStore(Protocol):
     async def begin(self, run_id: str, plan_hash: str) -> RunLease: ...
-    async def complete(self, result: SupervisorRunResult) -> None: ...
+    async def complete(self, lease: RunLease, result: SupervisorRunResult) -> None: ...
+    async def abort(self, lease: RunLease, *, error_code: str) -> None: ...
+    async def lookup_completed(self, run_id: str, plan_hash: str) -> SupervisorRunResult | None: ...
 ```
 
 ### 行为
 
 | 场景 | 行为 |
 |---|---|
-| 同 `run_id` + 同 `plan_hash` + 已完成 | 返回之前的**深拷贝**结果，不重复调用 Handler |
+| **R2 P0-1** 同 `run_id` + 同 `plan_hash` + 已完成 | `lookup_completed` 返回**深拷贝**结果，不检查 live registry 版本 |
 | 同 `run_id` + 不同 `plan_hash` | `RunPlanConflictError` |
 | 同 `run_id` 正在执行 | `RunAlreadyInProgressError` |
+
+### R2 P1-1: Lease Identity
+
+每个 `RunLease` 携带不可预测的 `lease_id`（`secrets.token_hex(16)`）。`complete` 和 `abort` 都验证 `lease_id`：
+
+- **Stale `complete`**（cancelled coroutine 在 abort 后恢复）→ `SupervisorError("lease_id mismatch")`
+- **Stale `abort`**（旧 lease 尝试删除新 lease）→ `SupervisorError("lease_id mismatch")`
+- **`complete` identity check**：`lease.run_id == result.run_id` 且 `lease.plan_hash == result.plan_hash`，否则 `SupervisorError("identity does not match")`
 
 `InMemoryRunStore` 是 Phase 4 的唯一实现——**不**持久化到数据库。`defensive_copy_result` 使用 `model_validate(model_dump(mode="python"))` 确保 `frozenset`/`Decimal`/`datetime` 类型完整保留。
 
@@ -529,16 +631,27 @@ agents/src/multi_agent/
 ```
 agents/tests/unit/multi_agent/
 ├── test_invocation.py                    # 13 tests — AgentInvoker boundary
-├── test_scheduler.py                     # 11 tests — DAG wave + concurrency
+├── test_scheduler.py                     # 13 tests — DAG wave + concurrency
 ├── test_execution_budget.py              # 27 tests — actual budget enforcement
 ├── test_supervisor.py                    # 23 tests — runtime + customer recovery
 ├── test_run_store.py                     # 18 tests — idempotency + defensive copy
-└── test_supervisor_graph.py              # 8 tests  — LangGraph adapter routing
+├── test_supervisor_graph.py              # 8 tests  — LangGraph adapter routing
+├── test_supervisor_r1.py                 # 23 tests — R1 regression (P0-1..P0-4)
+└── test_supervisor_r2.py                 # 28 tests — R2 regression (P0-1..P0-5, P1-1..P1-2)
 ```
 
 Customer Recovery 五任务执行场景（§15）作为集成测试嵌入在 `test_supervisor.py` 中，
 覆盖：root 先执行、子任务并发、`max_concurrency` 限制、Required failed → `failed`、
 Optional failed → `partial_success`、`needs_input`、timeout、`budget_exceeded`、Kill Switch。
+
+R2 反例测试（`test_supervisor_r2.py`）覆盖：
+- **P0-1** 缓存优先于 registry 版本检查、preflight bound handlers 不可被 registry mutation 替换
+- **P0-2** wave 异常 cancel+await siblings、无 orphan tasks、lease 在 siblings 终止后才 abort
+- **P0-3** pre-cancelled 消费 0 iteration、emit 0 task_ready、between-waves 取消不预留下一轮
+- **P0-4** backoff 被 deadline 封顶、被 cancellation 中断、timer jitter 不再误分类
+- **P0-5** Required Handler-skipped → FAILED、dependency-propagation skipped 透明、attempt 记录真实 skipped
+- **P1-1** stale lease 无法 abort/complete 新 lease、plan_hash identity 校验
+- **P1-2** cost_budget_usd 配置但 invoker 报告 `cost_usd=None` → fail-closed
 
 ### 修改文件
 
@@ -570,8 +683,9 @@ class SupervisorRunStatus(StrEnum):
 class SupervisorConfig(StrictContract):
     max_concurrency: int = Field(default=4, ge=1, le=32)
     retry_backoff_ms: int = Field(default=0, ge=0)
-    continue_independent_branches: bool = True
-    deterministic_mode: bool = True
+    # R1 P1: continue_independent_branches and deterministic_mode
+    # removed (never read by Scheduler/Supervisor; extra='forbid'
+    # rejects them if passed).
 ```
 
 ### Trace Event Types
