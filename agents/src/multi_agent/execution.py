@@ -40,7 +40,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any, Literal, Protocol
+from typing import Literal, Protocol
 
 from pydantic import Field, field_validator
 
@@ -57,6 +57,7 @@ from multi_agent.errors import ProposalHashMismatchError
 from multi_agent.execution_errors import InvalidAgentResultError
 from multi_agent.planning import PlanDraft
 from multi_agent.state import MergedState
+from multi_agent.usage import AttemptUsageDisposition
 
 
 # ---------------------------------------------------------------------------
@@ -129,17 +130,20 @@ class TaskAttemptRecord(StrictContract):
     error_code: str | None = None
 
     agent_calls: int = Field(default=1, ge=1)
-    tool_calls: int = Field(default=0, ge=0)
-    # R8 P0-5: Actual Verified usage — ONLY populated when the
-    # corresponding disposition is VERIFIED.  For UNAVAILABLE or
-    # NO_PROVIDER_CALL, these are ``None``.
+    # R9 Section 2: ``tool_calls`` is ``None`` when the actual count
+    # is UNKNOWN (timeout, exception before any receipt).  The Runtime
+    # treats ``None`` as ``tool_usage_unavailable`` and fails closed.
+    tool_calls: int | None = Field(default=0, ge=0)
+    # R8 P0-5 / R9 Section 4: Actual Verified usage — ONLY populated
+    # when the corresponding disposition is VERIFIED.  For UNAVAILABLE
+    # or NO_PROVIDER_CALL, these are ``None``.
     tokens_used: int | None = Field(default=None, ge=0)
     cost_usd: Decimal | None = Field(default=None, ge=0)
-    # R8 P0-5: per-dimension disposition + source id for auditing.
-    # Defaults to UNAVAILABLE so a record constructed without
-    # explicit dispositions cannot accidentally claim VERIFIED.
-    token_disposition: Any = None
-    cost_disposition: Any = None
+    # R9 Section 4: strictly typed dispositions — no longer ``Any``.
+    # Defaults to UNAVAILABLE so a record constructed without explicit
+    # dispositions cannot accidentally claim VERIFIED.
+    token_disposition: AttemptUsageDisposition = AttemptUsageDisposition.UNAVAILABLE
+    cost_disposition: AttemptUsageDisposition = AttemptUsageDisposition.UNAVAILABLE
     token_source_id: str | None = None
     cost_source_id: str | None = None
     # R8 P0-5: Untrusted declared values from an invalid receipt.

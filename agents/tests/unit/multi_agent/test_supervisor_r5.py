@@ -1044,6 +1044,8 @@ def _verified_provider_receipt(
         tokens_used=tokens_used,
         usage_provenance=UsageProvenance(
             source_id="test_token_verifier",
+            token_source_id="test_token_verifier",
+            cost_source_id=None,
             tokens_verified=True,
             cost_verified=False,
         ),
@@ -1063,6 +1065,8 @@ def _trusted_adapter_cost_receipt(
         cost_usd=cost_usd,
         usage_provenance=UsageProvenance(
             source_id="test_cost_verifier",
+            token_source_id=None,
+            cost_source_id="test_cost_verifier",
             tokens_verified=False,
             cost_verified=True,
         ),

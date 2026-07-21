@@ -172,6 +172,8 @@ from multi_agent.execution_errors import (
 )
 from multi_agent.invocation import (
     AgentInvocationReceipt,
+    AgentInvocationFailure,
+    AgentInvocationOutcome,
     AgentInvoker,
     AttemptUsageDisposition,
     AttemptUsageRecord,
@@ -347,6 +349,8 @@ __all__ = [
     "SupervisorError",
     # Phase 4 — Invocation
     "AgentInvocationReceipt",
+    "AgentInvocationFailure",
+    "AgentInvocationOutcome",
     "AgentInvoker",
     "AttemptUsageDisposition",
     "AttemptUsageRecord",

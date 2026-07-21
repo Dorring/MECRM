@@ -1,45 +1,37 @@
 # Phase 4: Supervisor Runtime + Dependency-Aware DAG Execution
 
 **Status:** Complete  
-**Branch:** `feat/ma-04-supervisor-runtime-r8`  
+**Branch:** `feat/ma-04-supervisor-runtime`  
 **Baseline:** `main` (Phase 3, commit `d586e70`)
 
-> **R8 Revision** — This document reflects the R8 audit fixes (commit `88a5b6d`).
+> **R9 Revision** — This document reflects the R9 audit fixes (Unified
+> Invocation Outcome + Strict Usage Audit).
 > R1 baseline: commit `e5ab368`. R2 baseline: commit `64fedd1` (5 P0 + 3 P1
 > fixes, request-changes). R3 baseline: commit `5b9c647` (4 P0 + 3 P1 fixes,
 > request-changes). R4 baseline: commit `bc5abd4` (4 P0 + 2 P1 fixes,
 > request-changes). R5 baseline: commit `f2288f8` (5 P0 + 2 P1 fixes,
 > request-changes). R6 baseline: commit `d5fd130` (5 P0 + 2 P1 fixes,
 > request-changes). R7 baseline: commit `1483ad4` (5 P0 + 2 P1 fixes,
-> request-changes). R8 addresses 5 P0 and 2 P1 issues from the R7 review,
-> focused on **explicit per-attempt usage attestation, per-dimension verifier
-> trust, per-dimension source binding, atomic usage accounting, and public
-> per-attempt audit records**:
-> `AgentInvocationReceipt` now carries explicit `token_disposition` /
-> `cost_disposition` fields declared by the Invoker boundary — the Accountant
-> only VALIDATES them against Invoker capabilities, no longer infers
-> `NO_PROVIDER_CALL` from `provider_metadata is None`; `VerifiedUsage` uses
-> independent `tokens_verified` / `cost_verified` flags (not a single `verified`
-> bool) with enforced invariants (`tokens_verified=True → tokens_used` non-None);
-> `UsageVerificationCapabilities` has per-dimension `bound_token_source_ids` /
-> `bound_cost_source_ids` with contract invariants (`verifies_tokens=True →
-> bound_token_source_ids` non-empty); `record_receipt()` is refactored into a
-> three-phase atomic commit (`_compute_attempt_usage` →
-> `_validate_attempt_budget` → `_commit_attempt_usage`) — compute and validate
-> are pure, commit is the sole mutation point, so a validation failure cannot
-> leave the accountant half-committed; `TaskAttemptRecord` now carries
-> `token_disposition` / `cost_disposition` / `token_source_id` /
-> `cost_source_id` / `declared_tokens_used` / `declared_cost_usd` — actual
-> `tokens_used` / `cost_usd` are ONLY populated when `VERIFIED`, invalid
-> receipt declared values are stored as untrusted `declared_*` fields;
-> `ExecutionUsage.attempt_usage_records` exposes a defensive deep copy of all
-> per-attempt records for post-run audit; `record_usage_unavailable()` accepts
-> `invoker_capabilities` so a trusted deterministic Invoker's no-receipt path
-> declares `NO_PROVIDER_CALL` instead of `UNAVAILABLE`; legacy `usage_trust` +
-> `usage_provenance` conflict is now a `ValidationError` (no silent override).
-> P1: `ExecutionUsage.attempt_usage_records` enables external per-attempt
-> auditability; legacy `usage_trust` alone is still accepted with a
-> deprecation warning.
+> request-changes). R8 baseline: commit `88a5b6d` (5 P0 + 2 P1 fixes,
+> request-changes). R9 addresses 5 P0 and 3 P1 issues from the R8 review,
+> focused on **unified invocation outcome for success and failure paths,
+> mixed-dimension usage accounting, per-attempt no-provider-call attestation,
+> strict usage audit contracts, and no cross-dimension source fallback**:
+> R9 introduces `AgentInvocationOutcome` / `AgentInvocationFailure` so that
+> BOTH success and failure paths produce a typed outcome with
+> `observed_tool_calls` (None = unknown → fail-closed); `record_receipt()`
+> uses commit-then-check (mixed records with VERIFIED + UNAVAILABLE dimensions
+> are committed, preserving verified usage, THEN `exceeded` is set);
+> `can_attest_no_provider_call` is renamed to `never_calls_provider` (validation
+> only, not inference); shared Usage types are moved to `multi_agent/usage.py`
+> with strict Pydantic types (no `Any`); `AttemptUsageRecord` enforces
+> per-dimension invariants (VERIFIED → value + source_id non-None,
+> NO_PROVIDER_CALL → value None, UNAVAILABLE → value None);
+> per-dimension `token_source_id` / `cost_source_id` are required for VERIFIED
+> with no fallback to legacy `source_id`; legacy `usage_trust` +
+> `usage_provenance` simultaneously is ALWAYS a `ValidationError`; and
+> `VerifiedUsage` no longer carries per-dimension source fields (Choice A —
+> the Invoker uses the Verifier's frozen `source_id`).
 
 ---
 
@@ -1387,6 +1379,142 @@ Legacy 字段。R8 收紧：
 - 仅 `usage_trust` → 兼容转换并标记 Deprecated
 - 仅 `usage_provenance` → 正常
 - 两者同时提供 → `ValidationError`
+
+### R9 P0-1: Mixed-dimension Accounting (Commit-then-check)
+
+R8 的 `record_receipt()` 对整个 `AttemptUsageRecord` 执行全有或全无校验：任一
+维度 `UNAVAILABLE` 就不提交整个 record，调用方捕获异常后又执行
+`record_usage_unavailable()` 将 Token 和 Cost 两个维度都改成 `UNAVAILABLE`，
+已经验证成功的 Token 被抹掉。
+
+R9 改为 **commit-then-check**：
+
+1. **Compute** (`_compute_attempt_usage`) — 纯计算，验证 Trust/Source/Capability
+2. **Commit** (`_commit_attempt_usage`) — 提交全部可信值和 Disposition（包括
+   混合记录，如 Token=VERIFIED + Cost=UNAVAILABLE）
+3. **Post-commit check** (`_check_usage_unavailable`) — 标记
+   `usage_unavailable` / `exceeded`，但不丢弃已提交的记录
+
+混合记录示例：
+
+```
+token_disposition = VERIFIED
+cost_disposition  = UNAVAILABLE
+tokens_used       = 100
+cost_usd          = None
+```
+
+提交后设置 `usage_unavailable=True`、`exceeded=True`、
+`exceeded_reason=execution_usage_unavailable`。
+
+### R9 P0-2: Unified Invocation Outcome
+
+R8 只在成功路径返回 Receipt；Timeout、Handler 异常或 Verifier Timeout 没有
+Receipt 时，`observed_tool_calls=0`，可以绕过 `max_tool_calls`。
+
+R9 新增 `AgentInvocationOutcome` (StrictContract) 和受控异常
+`AgentInvocationFailure`：
+
+```python
+class AgentInvocationOutcome(StrictContract):
+    result: AgentResult | None = None
+    error_code: str | None = None
+    observed_tool_calls: int | None = None
+    token_disposition: AttemptUsageDisposition
+    cost_disposition: AttemptUsageDisposition
+    tokens_used: int | None = None
+    cost_usd: Decimal | None = None
+    token_source_id: str | None = None
+    cost_source_id: str | None = None
+```
+
+成功和失败路径都必须产生 Outcome。`observed_tool_calls=None` 表示工具调用数
+未知，触发 `tool_usage_unavailable` fail-closed（停止 Retry 和新任务）。
+
+### R9 P0-3: Per-attempt No-provider-call Attestation
+
+R8 无 Receipt 路径通过全局 Capability `can_attest_no_provider_call=True`
+自动推导 `NO_PROVIDER_CALL`。这不是逐 Attempt Attestation——一个 Hybrid
+Invoker 只要 Capability 被设为 `True`，其任何失败都会被记成
+`NO_PROVIDER_CALL`。
+
+R9 方案 B（逐 Attempt Outcome）：
+
+- 删除 `can_attest_no_provider_call`，改用 `never_calls_provider: bool`
+- `never_calls_provider` 仅用于 **验证** `NO_PROVIDER_CALL` disposition
+  （不是推导）
+- 无 Receipt 路径仅接受 Invoker 明确返回的 `AgentInvocationOutcome` 中的
+  `NO_PROVIDER_CALL`
+- 无明确 Outcome 时一律 `UNAVAILABLE`
+
+### R9 P0-4: Strict Usage Audit Contracts
+
+R8 的 `ExecutionUsage.attempt_usage_records: list[Any]` 和
+`TaskAttemptRecord.token_disposition: Any = None` 允许任意值绕过 Contract。
+
+R9 将共享 Usage 类型移动到 `multi_agent/usage.py`（无循环依赖）：
+
+```
+AttemptUsageDisposition
+UsageProvenance
+AttemptUsageRecord
+UsageVerificationCapabilities
+VerifiedUsage
+```
+
+严格声明：
+
+```python
+class TaskAttemptRecord(StrictContract):
+    token_disposition: AttemptUsageDisposition
+    cost_disposition: AttemptUsageDisposition
+
+class ExecutionUsage(StrictContract):
+    attempt_usage_records: list[AttemptUsageRecord]
+```
+
+### R9 P0-5: AttemptUsageRecord Per-dimension Invariants
+
+`AttemptUsageRecord` 强制 per-dimension 不变量：
+
+| Disposition | value | source_id |
+|---|---|---|
+| VERIFIED | 非 None | 非 None |
+| NO_PROVIDER_CALL | None | None |
+| UNAVAILABLE | None | None |
+
+Token 与 Cost 分别验证。
+
+### R9 P1-1: No Cross-dimension Source Fallback
+
+R8 的 Accountant 使用 `prov.token_source_id or prov.source_id` 允许一个维度
+借用另一个维度或 Legacy 字段的 Source。
+
+R9 要求：
+
+- Token VERIFIED → `token_source_id` 必填（不得回退到 `source_id`）
+- Cost VERIFIED → `cost_source_id` 必填（不得回退到 `source_id`）
+- Legacy `source_id` 只用于旧输入迁移
+
+### R9 P1-2: Legacy Trust Always Conflict
+
+R8 当 `usage_trust` 和 `usage_provenance` 推导结果一致时仍会接受，并静默删除
+Legacy 字段。
+
+R9 统一为：
+
+- 仅 `usage_trust` → 兼容转换并发出弃用 Warning
+- 仅 `usage_provenance` → 正常
+- 两者同时提供 → **一律** `ValidationError`（即使推导结果一致）
+
+### R9 P1-3: VerifiedUsage Source (Choice A)
+
+R8 的 `VerifiedUsage` 有 `token_source_id` / `cost_source_id` 字段，但
+`RegistryAgentInvoker` 构造 Receipt 时使用的是 `usage_verifier.source_id`，
+两个 per-dimension 字段从未被消费。
+
+R9 Choice A：删除 `VerifiedUsage.token_source_id` /
+`VerifiedUsage.cost_source_id`，只使用冻结的 `ProviderUsageVerifier.source_id`。
 
 ---
 

@@ -574,13 +574,12 @@ class TestFakeExecutionCancellation:
 class TestBudgetEnforcement:
     def test_token_budget_with_none_usage_fails_closed(self):
         """If ``token_budget`` is configured and the receipt reports
-        ``None`` tokens_used, ``record_receipt`` must raise.
+        ``None`` tokens_used, the run must fail closed.
 
-        R4 P0-2: the receipt's ``usage_trust`` is cross-checked
-        against the invoker's capabilities.  To exercise the None
-        branch specifically we pair a ``verified_provider`` receipt
-        with a ``verifies_tokens=True`` invoker so the provenance
-        check passes and the None check fires.
+        R9 Section 1: ``record_receipt`` now uses commit-then-check —
+        the UNAVAILABLE record is committed (preserving any verified
+        dimensions), then ``exceeded`` and ``usage_unavailable`` are
+        set.  No exception is raised.
         """
         from multi_agent.supervisor import _BudgetAccountant
 
@@ -592,15 +591,20 @@ class TestBudgetEnforcement:
             tokens_used=None,  # fail-closed
             usage_trust="verified_provider",
         )
-        with pytest.raises(Exception, match="execution_usage_unavailable"):
-            acc.record_receipt(
-                receipt,
-                invoker_capabilities=_TRUSTED_TOKEN_CAPS,
-                task_id="test_task",
-                attempt=0,
-            )
+        # R9 Section 1: commit-then-check — no exception raised.
+        acc.record_receipt(
+            receipt,
+            invoker_capabilities=_TRUSTED_TOKEN_CAPS,
+            task_id="test_task",
+            attempt=0,
+        )
+        assert acc.exceeded
+        assert acc.usage_unavailable
+        assert acc.exceeded_reason == "execution_usage_unavailable"
 
     def test_cost_budget_with_none_usage_fails_closed(self):
+        """R9 Section 1: commit-then-check — the UNAVAILABLE record is
+        committed, then ``exceeded`` is set."""
         from multi_agent.supervisor import _BudgetAccountant
 
         budget = ExecutionBudget(cost_budget_usd=Decimal("1.00"))
@@ -611,13 +615,15 @@ class TestBudgetEnforcement:
             cost_usd=None,  # fail-closed
             usage_trust="trusted_adapter",
         )
-        with pytest.raises(Exception, match="execution_usage_unavailable"):
-            acc.record_receipt(
-                receipt,
-                invoker_capabilities=_TRUSTED_COST_CAPS,
-                task_id="test_task",
-                attempt=0,
-            )
+        acc.record_receipt(
+            receipt,
+            invoker_capabilities=_TRUSTED_COST_CAPS,
+            task_id="test_task",
+            attempt=0,
+        )
+        assert acc.exceeded
+        assert acc.usage_unavailable
+        assert acc.exceeded_reason == "execution_usage_unavailable"
 
     def test_max_agent_calls_exceeded(self):
         from multi_agent.supervisor import _BudgetAccountant

@@ -1592,15 +1592,12 @@ class TestCostUsageTrustBoundary:
         )
         result = await runtime.execute(plan, reg)
 
-        # The root task must be failed with usage_unavailable.
+        # R9 Section 1 — commit-then-check means the task completes, but
+        # the run is BUDGET_EXCEEDED.
         root_rec = next(
             r for r in result.task_records if r.task_id == root_task.task_id
         )
-        assert root_rec.status == "failed"
-        assert any(a.error_code == "usage_unavailable" for a in root_rec.attempts), (
-            f"expected usage_unavailable error_code, got "
-            f"{[a.error_code for a in root_rec.attempts]}"
-        )
+        assert root_rec.status == "completed"
 
         # R6: the run finalises as BUDGET_EXCEEDED (execution_usage_unavailable
         # sets _exceeded=True so the run fails-closed at the budget level).

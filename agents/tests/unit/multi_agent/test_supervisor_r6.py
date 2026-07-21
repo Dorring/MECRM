@@ -396,6 +396,7 @@ def _verified_provider_receipt(
         tokens_used=tokens_used,
         usage_provenance=UsageProvenance(
             source_id="test_verifier",
+            token_source_id="test_verifier",
             tokens_verified=True,
             cost_verified=False,
         ),
@@ -1179,7 +1180,7 @@ class TestNoReceiptAttemptUsageDisposition:
                     verifies_tokens=False,
                     verifies_cost=False,
                     source_id="deterministic_fake_invoker",
-                    can_attest_no_provider_call=False,
+                    never_calls_provider=False,
                 ),
             ),
             run_store=InMemoryRunStore(),
@@ -1220,7 +1221,7 @@ class TestNoReceiptAttemptUsageDisposition:
                     verifies_tokens=False,
                     verifies_cost=False,
                     source_id="deterministic_fake_invoker",
-                    can_attest_no_provider_call=False,
+                    never_calls_provider=False,
                 ),
             ),
             run_store=InMemoryRunStore(),
@@ -1300,7 +1301,7 @@ class TestNoReceiptAttemptUsageDisposition:
                     verifies_tokens=False,
                     verifies_cost=False,
                     source_id="deterministic_fake_invoker",
-                    can_attest_no_provider_call=False,
+                    never_calls_provider=False,
                 ),
             ),
             run_store=InMemoryRunStore(),
@@ -1388,7 +1389,7 @@ class TestNoReceiptAttemptUsageDisposition:
                     verifies_tokens=False,
                     verifies_cost=False,
                     source_id="deterministic_fake_invoker",
-                    can_attest_no_provider_call=False,
+                    never_calls_provider=False,
                 ),
             ),
             run_store=InMemoryRunStore(),
@@ -1443,6 +1444,8 @@ class TestPerDimensionUsageProvenance:
                 cost_usd=Decimal("0.50"),
                 usage_provenance=UsageProvenance(
                     source_id="test_both_verifier",
+                    token_source_id="test_both_verifier",
+                    cost_source_id="test_both_verifier",
                     tokens_verified=True,
                     cost_verified=True,
                 ),
@@ -1500,6 +1503,7 @@ class TestPerDimensionUsageProvenance:
                 cost_usd=Decimal("0.50"),  # claimed cost, but not verified
                 usage_provenance=UsageProvenance(
                     source_id="token_only_verifier",
+                    token_source_id="token_only_verifier",
                     tokens_verified=True,
                     cost_verified=False,  # cost NOT verified
                 ),
@@ -1551,6 +1555,8 @@ class TestPerDimensionUsageProvenance:
                 cost_usd=Decimal("0.50"),
                 usage_provenance=UsageProvenance(
                     source_id="token_only_invoker",
+                    token_source_id="token_only_invoker",
+                    cost_source_id="token_only_invoker",
                     tokens_verified=True,
                     cost_verified=True,  # LIAR — invoker can't verify cost
                 ),
@@ -1606,6 +1612,8 @@ class TestPerDimensionUsageProvenance:
                 cost_usd=Decimal("0.50"),
                 usage_provenance=UsageProvenance(
                     source_id="cost_only_invoker",
+                    token_source_id="cost_only_invoker",
+                    cost_source_id="cost_only_invoker",
                     tokens_verified=True,  # LIAR — invoker can't verify tokens
                     cost_verified=True,
                 ),
@@ -1667,6 +1675,8 @@ class TestPerDimensionUsageProvenance:
                 cost_usd=Decimal("0.50"),
                 usage_provenance=UsageProvenance(
                     source_id="test_cost_record",
+                    token_source_id="test_cost_record",
+                    cost_source_id="test_cost_record",
                     tokens_verified=True,
                     cost_verified=True,
                 ),
@@ -1964,6 +1974,7 @@ class TestUsageAvailabilityStatus:
                     tokens_used=100,
                     usage_provenance=UsageProvenance(
                         source_id="partial_verifier",
+                        token_source_id="partial_verifier",
                         tokens_verified=True,
                         cost_verified=False,
                     ),
@@ -2034,6 +2045,8 @@ class TestUsageAvailabilityStatus:
                 cost_usd=Decimal("0.10"),
                 usage_provenance=UsageProvenance(
                     source_id="full_verifier",
+                    token_source_id="full_verifier",
+                    cost_source_id="full_verifier",
                     tokens_verified=True,
                     cost_verified=True,
                 ),

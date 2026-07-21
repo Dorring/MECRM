@@ -529,6 +529,8 @@ class _TrustedTokenInvoker:
             tokens_used=self._tokens_used,
             usage_provenance=UsageProvenance(
                 source_id="test_trusted_token_invoker",
+                token_source_id="test_trusted_token_invoker",
+                cost_source_id=None,
                 tokens_verified=True,
                 cost_verified=False,
             ),
@@ -566,6 +568,8 @@ class _TrustedCostAdapterInvoker:
             cost_usd=self._cost_usd,
             usage_provenance=UsageProvenance(
                 source_id="test_trusted_cost_adapter_invoker",
+                token_source_id=None,
+                cost_source_id="test_trusted_cost_adapter_invoker",
                 tokens_verified=False,
                 cost_verified=True,
             ),
@@ -1001,9 +1005,11 @@ class TestUnknownExceptionPropagation:
             plan_validator=_AlwaysValidPlanValidator(),
         )
 
-        # The Run completes as FAILED — the exception is NOT raised.
+        # R9 Section 2 — no receipt means observed_tool_calls=None, which
+        # triggers tool_usage_unavailable fail-closed, so the run finalises
+        # as BUDGET_EXCEEDED (not FAILED).  The task itself still fails.
         result = await runtime.execute(plan, reg)
-        assert result.status == SupervisorRunStatus.FAILED
+        assert result.status == SupervisorRunStatus.BUDGET_EXCEEDED
 
         # The root task's attempt record shows the retryable error.
         root_rec = next(
@@ -1152,11 +1158,9 @@ class TestUsageProvenance:
         root_rec = next(
             r for r in result.task_records if r.task_id == root_task.task_id
         )
-        assert root_rec.status == "failed"
-        assert any(a.error_code == "usage_unavailable" for a in root_rec.attempts), (
-            f"expected usage_unavailable error_code, got "
-            f"{[a.error_code for a in root_rec.attempts]}"
-        )
+        # R9 Section 1 — commit-then-check means the task completes, but
+        # the run is BUDGET_EXCEEDED.
+        assert root_rec.status == "completed"
         # R6: usage_unavailable now sets _exceeded=True so the run
         # finalises as BUDGET_EXCEEDED (fail-closed at budget level).
         assert result.status == SupervisorRunStatus.BUDGET_EXCEEDED
@@ -1187,8 +1191,9 @@ class TestUsageProvenance:
         root_rec = next(
             r for r in result.task_records if r.task_id == root_task.task_id
         )
-        assert root_rec.status == "failed"
-        assert any(a.error_code == "usage_unavailable" for a in root_rec.attempts)
+        # R9 Section 1 — commit-then-check means the task completes, but
+        # the run is BUDGET_EXCEEDED.
+        assert root_rec.status == "completed"
 
     @pytest.mark.asyncio
     async def test_untrusted_zero_tokens_fail_closed(self):
@@ -1213,8 +1218,9 @@ class TestUsageProvenance:
         root_rec = next(
             r for r in result.task_records if r.task_id == root_task.task_id
         )
-        assert root_rec.status == "failed"
-        assert any(a.error_code == "usage_unavailable" for a in root_rec.attempts)
+        # R9 Section 1 — commit-then-check means the task completes, but
+        # the run is BUDGET_EXCEEDED.
+        assert root_rec.status == "completed"
 
     @pytest.mark.asyncio
     async def test_verified_provider_tokens_are_accepted(self):

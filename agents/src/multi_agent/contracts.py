@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum, StrEnum
 from hmac import compare_digest
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -25,6 +25,13 @@ from pydantic import (
 from multi_agent.errors import ProposalHashMismatchError
 from multi_agent.integrity import compute_proposal_hash
 from multi_agent.serialization import validate_strict_json
+
+if TYPE_CHECKING:
+    # R9 Section 4: ``AttemptUsageRecord`` lives in :mod:`multi_agent.usage`
+    # to avoid a circular import.  The forward reference is resolved at
+    # runtime via ``ExecutionUsage.model_rebuild()`` called from
+    # :mod:`multi_agent.usage` after ``AttemptUsageRecord`` is defined.
+    from multi_agent.usage import AttemptUsageRecord
 
 JsonValue = Any
 
@@ -898,16 +905,18 @@ class ExecutionUsage(StrictContract):
     # cost_usage_applicable_attempts)``.  Consumers should use the
     # per-dimension fields above instead.
     provider_usage_capable_attempts: int = Field(default=0, ge=0)
-    # R8 P1-1: per-attempt usage records exposed for external audit.
-    # Typed as ``list[Any]`` to avoid a circular import with
-    # :mod:`multi_agent.invocation` (which imports from this module).
-    # The Supervisor populates this with
-    # :class:`multi_agent.invocation.AttemptUsageRecord` instances
-    # (frozen Pydantic models) — consumers can introspect them via
-    # ``getattr`` or by re-validating against
-    # :class:`AttemptUsageRecord`.  The list is a defensive deep copy
-    # so external mutation cannot corrupt the accountant's state.
-    attempt_usage_records: list[Any] = Field(default_factory=list)
+    # R8 P1-1 / R9 Section 4: per-attempt usage records exposed for
+    # external audit.  R9 removes the ``list[Any]`` escape hatch — the
+    # field is now strictly typed as ``list[AttemptUsageRecord]``.
+    # The forward reference is resolved via ``model_rebuild()`` called
+    # from :mod:`multi_agent.usage` (no circular import at runtime).
+    # The list is a defensive deep copy so external mutation cannot
+    # corrupt the accountant's state.
+    attempt_usage_records: list[AttemptUsageRecord] = Field(default_factory=list)
+    # R9 Section 2: True when any committed attempt's tool-call count
+    # is unknown (timeout/exception before any receipt).  The Runtime
+    # fails closed — stops retries and new tasks.
+    tool_usage_unavailable: bool = False
     elapsed_ms: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")

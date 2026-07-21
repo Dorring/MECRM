@@ -5,7 +5,7 @@ identified in the Phase 4 R8 review:
 
 * **P0-1** — ``NO_PROVIDER_CALL`` disposition must be explicitly
   attested by a trusted Invoker with
-  ``can_attest_no_provider_call=True``.  A hybrid Invoker that
+  ``never_calls_provider=True``.  A hybrid Invoker that
   omits ``provider_metadata`` produces ``UNAVAILABLE``, not
   ``NO_PROVIDER_CALL``.
 * **P0-2** — Per-dimension verifier result: a cost-only verifier
@@ -329,11 +329,11 @@ def _three_independent_plan(
 
 class TestExplicitAttemptDisposition:
     """R8 P0-1: ``NO_PROVIDER_CALL`` must be explicitly attested by a
-    trusted Invoker with ``can_attest_no_provider_call=True``."""
+    trusted Invoker with ``never_calls_provider=True``."""
 
     def test_no_provider_call_requires_explicit_attempt_attestation(self):
         """A receipt with ``token_disposition=NO_PROVIDER_CALL`` but
-        ``invoker_capabilities.can_attest_no_provider_call=False`` must
+        ``invoker_capabilities.never_calls_provider=False`` must
         be rejected — only a trusted deterministic Invoker can attest
         no provider call."""
         budget = ExecutionBudget()
@@ -351,7 +351,7 @@ class TestExplicitAttemptDisposition:
             verifies_tokens=False,
             verifies_cost=False,
             source_id="hybrid_invoker",
-            can_attest_no_provider_call=False,
+            never_calls_provider=False,
         )
         with pytest.raises(ExecutionUsageUnavailableError) as exc_info:
             accountant.record_receipt(
@@ -364,15 +364,21 @@ class TestExplicitAttemptDisposition:
         assert "NO_PROVIDER_CALL" in msg, (
             f"error must mention NO_PROVIDER_CALL, got: {msg}"
         )
-        assert "can_attest" in msg, f"error must mention can_attest, got: {msg}"
+        assert "never_calls_provider" in msg, (
+            f"error must mention never_calls_provider, got: {msg}"
+        )
 
     def test_hybrid_invoker_missing_metadata_is_not_no_provider_call(self):
         """A receipt with NO explicit ``token_disposition`` (defaults to
         ``UNAVAILABLE``) and ``provider_metadata=None`` from a hybrid
-        invoker (``can_attest_no_provider_call=False``) must NOT be
+        invoker (``never_calls_provider=False``) must NOT be
         treated as ``NO_PROVIDER_CALL``.  With a token budget
         configured, the ``UNAVAILABLE`` disposition triggers
-        fail-closed."""
+        fail-closed.
+
+        R9 Section 1: ``record_receipt`` commits the UNAVAILABLE
+        record and then sets ``exceeded`` — no exception is raised.
+        """
         budget = ExecutionBudget(token_budget=1000)
         accountant = _BudgetAccountant(budget, start_monotonic=time.monotonic())
         task = _make_task()
@@ -391,34 +397,44 @@ class TestExplicitAttemptDisposition:
             verifies_tokens=False,
             verifies_cost=False,
             source_id="hybrid_invoker",
-            can_attest_no_provider_call=False,
+            never_calls_provider=False,
         )
-        with pytest.raises(ExecutionUsageUnavailableError):
-            accountant.record_receipt(
-                receipt,
-                invoker_capabilities=caps,
-                task_id=task.task_id,
-                attempt=0,
-            )
+        # R9 Section 1: commit-then-check — the UNAVAILABLE record is
+        # committed, then exceeded is set.
+        accountant.record_receipt(
+            receipt,
+            invoker_capabilities=caps,
+            task_id=task.task_id,
+            attempt=0,
+        )
+        assert accountant.exceeded
+        assert accountant.usage_unavailable
+        assert accountant.exceeded_reason == "execution_usage_unavailable"
+        record = accountant.last_attempt_record
+        assert record is not None
+        assert record.token_disposition == AttemptUsageDisposition.UNAVAILABLE
+        assert record.cost_disposition == AttemptUsageDisposition.UNAVAILABLE
 
     def test_no_receipt_deterministic_attempt_can_attest_no_call(self):
-        """When ``record_usage_unavailable`` is called with
-        ``invoker_capabilities.can_attest_no_provider_call=True``, the
-        dispositions are ``NO_PROVIDER_CALL`` — the Invoker
-        authoritatively knows no provider call was made.  No budget is
-        exceeded."""
+        """R9 Section 3: ``NO_PROVIDER_CALL`` on the no-receipt path
+        requires an explicit :class:`AgentInvocationOutcome` from the
+        Invoker.  The static ``never_calls_provider`` capability is no
+        longer sufficient — the Invoker must explicitly attest it via
+        an Outcome (e.g. via :class:`AgentInvocationFailure`)."""
+        from multi_agent.invocation import AgentInvocationOutcome
+
         budget = ExecutionBudget()
         accountant = _BudgetAccountant(budget, start_monotonic=time.monotonic())
-        caps = UsageVerificationCapabilities(
-            verifies_tokens=False,
-            verifies_cost=False,
-            source_id="deterministic_invoker",
-            can_attest_no_provider_call=True,
+        outcome = AgentInvocationOutcome(
+            error_code="deterministic_error",
+            observed_tool_calls=0,
+            token_disposition=AttemptUsageDisposition.NO_PROVIDER_CALL,
+            cost_disposition=AttemptUsageDisposition.NO_PROVIDER_CALL,
         )
         accountant.record_usage_unavailable(
             task_id="t1",
             attempt=0,
-            invoker_capabilities=caps,
+            outcome=outcome,
         )
         record = accountant.last_attempt_record
         assert record is not None
@@ -818,20 +834,24 @@ class TestAtomicAccounting:
             attempt=0,
         )
 
-        # 2. UNAVAILABLE via record_usage_unavailable (no caps)
+        # 2. UNAVAILABLE via record_usage_unavailable (no outcome)
         accountant.record_usage_unavailable(task_id=task.task_id, attempt=1)
 
-        # 3. NO_PROVIDER_CALL via record_usage_unavailable with attest caps
-        attest_caps = UsageVerificationCapabilities(
-            verifies_tokens=False,
-            verifies_cost=False,
-            source_id="deterministic",
-            can_attest_no_provider_call=True,
+        # 3. NO_PROVIDER_CALL via record_usage_unavailable with an
+        # explicit Outcome (R9 Section 3: capability-based inference
+        # is no longer accepted — only an explicit Outcome attests it).
+        from multi_agent.invocation import AgentInvocationOutcome
+
+        no_call_outcome = AgentInvocationOutcome(
+            error_code="deterministic_skip",
+            observed_tool_calls=0,
+            token_disposition=AttemptUsageDisposition.NO_PROVIDER_CALL,
+            cost_disposition=AttemptUsageDisposition.NO_PROVIDER_CALL,
         )
         accountant.record_usage_unavailable(
             task_id=task.task_id,
             attempt=2,
-            invoker_capabilities=attest_caps,
+            outcome=no_call_outcome,
         )
 
         assert len(accountant._attempt_records) == 3
@@ -928,10 +948,11 @@ class TestTrustedVsDeclaredAudit:
 
 
 class TestLegacyTrustCleanup:
-    """R8 P1-2: Legacy ``usage_trust`` and ``usage_provenance`` cannot
-    be provided simultaneously with conflicting values — the receipt
-    raises ``ValidationError`` instead of silently overriding one with
-    the other."""
+    """R8 P1-2 / R9 Section 7: Legacy ``usage_trust`` and
+    ``usage_provenance`` cannot be provided simultaneously — the
+    receipt raises ``ValidationError`` instead of silently overriding
+    one with the other.  R9 tightens this: ANY simultaneous provision
+    is rejected, even when the derived trust matches."""
 
     def test_legacy_trust_and_provenance_conflict_rejected(self):
         """An ``AgentInvocationReceipt`` constructed with BOTH

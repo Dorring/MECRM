@@ -81,6 +81,8 @@ from multi_agent.execution_errors import (
     SupervisorError,
 )
 from multi_agent.invocation import (
+    AgentInvocationFailure,
+    AgentInvocationOutcome,
     AgentInvocationReceipt,
     AgentInvoker,
     AttemptUsageDisposition,
@@ -338,12 +340,17 @@ class _BudgetAccountant:
         self._exceeded_reason: str | None = None
         # R6 P0-3: fail-closed flag for no-receipt attempts with budget.
         self._usage_unavailable: bool = False
+        # R9 Section 2: fail-closed flag for unknown tool-call counts.
+        # Set when ``record_observed_tool_calls(None)`` is called —
+        # the Runtime cannot account for tool calls that may have
+        # been made before a timeout/exception.
+        self._tool_usage_unavailable: bool = False
         # R7 P0-3: Token and Cost now have INDEPENDENT coverage
         # denominators.  An attempt is "applicable" for a dimension
         # when its disposition is NOT ``NO_PROVIDER_CALL`` — i.e. a
         # provider call was made OR we can't prove it wasn't.  Only
-        # trusted deterministic invokers (``can_attest_no_provider_call
-        # =True``) can produce ``NO_PROVIDER_CALL`` dispositions.
+        # pure deterministic invokers (``never_calls_provider=True``,
+        # R9 Section 3) can produce ``NO_PROVIDER_CALL`` dispositions.
         self._token_usage_applicable_attempts = 0
         self._cost_usage_applicable_attempts = 0
         self._verified_token_attempts = 0
@@ -396,6 +403,12 @@ class _BudgetAccountant:
         return self._usage_unavailable
 
     @property
+    def tool_usage_unavailable(self) -> bool:
+        """R9 Section 2: True when a committed attempt's tool-call
+        count is unknown (timeout/exception before any receipt)."""
+        return self._tool_usage_unavailable
+
+    @property
     def last_attempt_record(self) -> AttemptUsageRecord | None:
         """R8 P0-5: return the most recently committed
         :class:`AttemptUsageRecord`, or ``None`` when no record has
@@ -423,12 +436,12 @@ class _BudgetAccountant:
 
     @property
     def usage(self) -> ExecutionUsage:
-        # R7 P0-3: Token and Cost now use INDEPENDENT coverage
-        # denominators.  An attempt is "applicable" for a dimension when
-        # its disposition is NOT ``NO_PROVIDER_CALL`` — i.e. a provider
-        # call was made OR we cannot prove it wasn't (UNAVAILABLE).
-        # Only trusted deterministic invokers
-        # (``can_attest_no_provider_call=True``) can produce
+        # R7 P0-3 / R9 Section 3: Token and Cost now use INDEPENDENT
+        # coverage denominators.  An attempt is "applicable" for a
+        # dimension when its disposition is NOT ``NO_PROVIDER_CALL`` —
+        # i.e. a provider call was made OR we cannot prove it wasn't
+        # (UNAVAILABLE).  Only pure deterministic invokers
+        # (``never_calls_provider=True``, R9 Section 3) can produce
         # ``NO_PROVIDER_CALL`` dispositions.
         tokens_status = self._compute_usage_status(
             self._verified_token_attempts, self._token_usage_applicable_attempts
@@ -464,6 +477,7 @@ class _BudgetAccountant:
             verified_cost_attempts=self._verified_cost_attempts,
             provider_usage_capable_attempts=deprecated_capable,
             attempt_usage_records=records_copy,
+            tool_usage_unavailable=self._tool_usage_unavailable,
             iterations=self._iterations,
         )
 
@@ -509,9 +523,18 @@ class _BudgetAccountant:
                     "usage_provenance.tokens_verified=False — a VERIFIED "
                     "disposition requires the corresponding provenance flag"
                 )
-            # R8 P0-3: per-dimension source binding.
+            # R8 P0-3 / R9 Section 6: per-dimension source binding.
+            # R9 Section 6: NO fallback to legacy ``prov.source_id`` —
+            # the token dimension must use ``token_source_id`` only.
             if invoker_capabilities.bound_token_source_ids:
-                src = prov.token_source_id or prov.source_id
+                src = prov.token_source_id
+                if src is None:
+                    raise ExecutionUsageUnavailableError(
+                        "receipt token_disposition=VERIFIED but "
+                        "usage_provenance.token_source_id is None — "
+                        "R9 Section 6: token_source_id is required "
+                        "(no fallback to legacy source_id)"
+                    )
                 if src not in invoker_capabilities.bound_token_source_ids:
                     raise ExecutionUsageUnavailableError(
                         f"receipt token_source_id={src!r} is not in the "
@@ -534,9 +557,18 @@ class _BudgetAccountant:
                     "usage_provenance.cost_verified=False — a VERIFIED "
                     "disposition requires the corresponding provenance flag"
                 )
-            # R8 P0-3: per-dimension source binding.
+            # R8 P0-3 / R9 Section 6: per-dimension source binding.
+            # R9 Section 6: NO fallback to legacy ``prov.source_id`` —
+            # the cost dimension must use ``cost_source_id`` only.
             if invoker_capabilities.bound_cost_source_ids:
-                src = prov.cost_source_id or prov.source_id
+                src = prov.cost_source_id
+                if src is None:
+                    raise ExecutionUsageUnavailableError(
+                        "receipt cost_disposition=VERIFIED but "
+                        "usage_provenance.cost_source_id is None — "
+                        "R9 Section 6: cost_source_id is required "
+                        "(no fallback to legacy source_id)"
+                    )
                 if src not in invoker_capabilities.bound_cost_source_ids:
                     raise ExecutionUsageUnavailableError(
                         f"receipt cost_source_id={src!r} is not in the "
@@ -546,23 +578,28 @@ class _BudgetAccountant:
                         f"unbound source"
                     )
         if token_disp == AttemptUsageDisposition.NO_PROVIDER_CALL:
-            if not invoker_capabilities.can_attest_no_provider_call:
+            if not invoker_capabilities.never_calls_provider:
                 raise ExecutionUsageUnavailableError(
                     f"receipt.token_disposition=NO_PROVIDER_CALL but invoker "
                     f"({invoker_capabilities.source_id}) does not have "
-                    f"can_attest_no_provider_call=True — only a trusted "
-                    f"deterministic invoker can attest no provider call"
+                    f"never_calls_provider=True — only a pure "
+                    f"deterministic invoker can attest no provider call "
+                    f"(R9 Section 3)"
                 )
         if cost_disp == AttemptUsageDisposition.NO_PROVIDER_CALL:
-            if not invoker_capabilities.can_attest_no_provider_call:
+            if not invoker_capabilities.never_calls_provider:
                 raise ExecutionUsageUnavailableError(
                     f"receipt.cost_disposition=NO_PROVIDER_CALL but invoker "
                     f"({invoker_capabilities.source_id}) does not have "
-                    f"can_attest_no_provider_call=True — only a trusted "
-                    f"deterministic invoker can attest no provider call"
+                    f"never_calls_provider=True — only a pure "
+                    f"deterministic invoker can attest no provider call "
+                    f"(R9 Section 3)"
                 )
 
         # Build the AttemptUsageRecord (pure — no state mutation).
+        # R9 Section 6: source_id fields come ONLY from the
+        # per-dimension ``token_source_id`` / ``cost_source_id`` — no
+        # fallback to legacy ``prov.source_id``.
         return AttemptUsageRecord(
             task_id=task_id,
             attempt=attempt,
@@ -575,57 +612,54 @@ class _BudgetAccountant:
             if cost_disp == AttemptUsageDisposition.VERIFIED
             else None,
             token_source_id=(
-                prov.token_source_id or prov.source_id
+                prov.token_source_id
                 if token_disp == AttemptUsageDisposition.VERIFIED
                 else None
             ),
             cost_source_id=(
-                prov.cost_source_id or prov.source_id
+                prov.cost_source_id
                 if cost_disp == AttemptUsageDisposition.VERIFIED
                 else None
             ),
         )
 
-    def _validate_attempt_budget(
+    def _check_usage_unavailable(
         self,
         record: AttemptUsageRecord,
         budget: ExecutionBudget,
-    ) -> str | None:
-        """R8 P0-4: PURE VALIDATION phase — check whether committing
-        *record* is PERMITTED.  Returns a non-None ``exceeded_reason``
-        string when the record must be rejected, or ``None`` if the
-        commit is safe.
+    ) -> bool:
+        """R9 Section 1: PURE CHECK — returns ``True`` when the record
+        has any dimension ``UNAVAILABLE`` for which a budget is
+        configured.
 
-        Only rejects records that would leave the Accountant in an
-        UNAVAILABLE state when a budget is configured — i.e. the
-        disposition is ``UNAVAILABLE`` or a ``VERIFIED`` record is
-        missing its verified value.  Budget OVERFLOW for a ``VERIFIED``
-        record is NOT a rejection — the usage IS verified, just over
-        budget; the record is committed and the post-commit check in
-        :meth:`record_receipt` marks ``_exceeded`` so future waves
-        stop.
+        R9 Section 1: unlike the R8 ``_validate_attempt_budget`` which
+        REJECTED mixed records, this method does NOT reject anything.
+        The record is ALWAYS committed (preserving verified dimensions),
+        and the caller (:meth:`record_receipt`) uses this check to
+        mark ``_usage_unavailable`` and ``_exceeded`` AFTER the commit.
 
-        Does NOT mutate any accountant state.
+        This ensures a mixed record (e.g. Token=VERIFIED + Cost=UNAVAILABLE)
+        preserves the verified token usage in the audit trail and
+        accumulated totals, while still failing closed on the cost
+        dimension.
         """
-        # Token dimension — reject only when usage is unavailable.
         if budget.token_budget is not None:
             if record.token_disposition == AttemptUsageDisposition.UNAVAILABLE:
-                return "execution_usage_unavailable"
+                return True
             if (
                 record.token_disposition == AttemptUsageDisposition.VERIFIED
                 and record.tokens_used is None
             ):
-                return "execution_usage_unavailable"
-        # Cost dimension — reject only when usage is unavailable.
+                return True
         if budget.cost_budget_usd is not None:
             if record.cost_disposition == AttemptUsageDisposition.UNAVAILABLE:
-                return "execution_usage_unavailable"
+                return True
             if (
                 record.cost_disposition == AttemptUsageDisposition.VERIFIED
                 and record.cost_usd is None
             ):
-                return "execution_usage_unavailable"
-        return None
+                return True
+        return False
 
     def _commit_attempt_usage(self, record: AttemptUsageRecord) -> None:
         """R8 P0-4: ATOMIC COMMIT phase — apply ALL state mutations
@@ -796,9 +830,9 @@ class _BudgetAccountant:
         permit = self.issue_permit("__legacy__")
         self.commit_agent_call(permit)
 
-    def record_observed_tool_calls(self, observed: int) -> None:
-        """R4 P0-3: charge *observed* tool calls regardless of receipt
-        consistency.
+    def record_observed_tool_calls(self, observed: int | None) -> None:
+        """R4 P0-3 / R9 Section 2: charge *observed* tool calls
+        regardless of receipt consistency.
 
         ``observed`` is ``len(receipt.result.tool_calls)`` — the
         actual number of :class:`ToolCallRecord` entries the Handler
@@ -807,7 +841,20 @@ class _BudgetAccountant:
         already-consumed budget.  If the charge pushes the total past
         ``max_tool_calls``, the accountant marks the budget exceeded
         so the Scheduler stops dispatching new tasks.
+
+        R9 Section 2: when ``observed is None``, the actual tool call
+        count is UNKNOWN (e.g. timeout, exception before any receipt).
+        The accountant marks ``_tool_usage_unavailable=True`` and
+        fails closed (sets ``_exceeded``) — the Runtime cannot safely
+        allow retries or new tasks when it cannot account for tool
+        calls that may have already been made.
         """
+        if observed is None:
+            # R9 Section 2: tool usage is unknown — fail closed.
+            self._tool_usage_unavailable = True
+            self._exceeded = True
+            self._exceeded_reason = "tool_usage_unavailable"
+            return
         self._tool_calls += observed
         if self._tool_calls > self._budget.max_tool_calls:
             self._exceeded = True
@@ -824,20 +871,27 @@ class _BudgetAccountant:
         task_id: str,
         attempt: int,
     ) -> None:
-        """R8 P0-4: Accumulate *actual* token/cost usage from a
-        successful invocation via a three-phase ATOMIC commit:
+        """R8 P0-4 / R9 Section 1: Accumulate *actual* token/cost usage
+        from a successful invocation via a three-phase ATOMIC commit:
 
         1. **Compute** (:meth:`_compute_attempt_usage`) — pure
            function that validates the Receipt's explicit
            :class:`AttemptUsageDisposition` fields against Invoker
            capabilities and builds an :class:`AttemptUsageRecord`.
            No state mutation.
-        2. **Validate** (:meth:`_validate_attempt_budget`) — pure
-           function that checks whether committing the record would
-           breach any configured budget.  No state mutation.
-        3. **Commit** (:meth:`_commit_attempt_usage`) — the ONLY
+        2. **Commit** (:meth:`_commit_attempt_usage`) — the ONLY
            phase that mutates accountant state.  Applies all counters,
            accumulated usage, and appends the record in one step.
+        3. **Post-commit check** (:meth:`_check_usage_unavailable`) —
+           marks ``_usage_unavailable`` / ``_exceeded`` when any
+           dimension is ``UNAVAILABLE`` with a configured budget.
+
+        R9 Section 1 (CRITICAL): mixed-dimension records (e.g.
+        Token=VERIFIED + Cost=UNAVAILABLE) are ALWAYS committed,
+        preserving the verified dimension's usage.  The fail-closed
+        flag is set AFTER the commit, NOT before.  This replaces the
+        R8 behavior which rejected the entire record when any
+        dimension was UNAVAILABLE, erasing the verified dimension.
 
         R8 P0-1: the dispositions are taken from the Receipt's
         explicit ``token_disposition`` / ``cost_disposition`` fields
@@ -845,45 +899,38 @@ class _BudgetAccountant:
         ``provider_metadata is None``.  The Accountant only VALIDATES
         them against Invoker capabilities.
 
-        R8 P0-4: because the compute and validate phases are pure,
-        a validation failure (Trust / Source / Capability / Budget)
-        cannot leave the accountant in a half-committed state.  The
-        ``_commit_attempt_usage`` phase is the single mutation point.
-
-        On any validation failure, the method raises
-        :class:`ExecutionUsageUnavailableError` WITHOUT mutating
-        state.  The caller (:meth:`_execute_task`) is responsible for
-        then calling :meth:`record_usage_unavailable` so the attempt
-        still produces exactly one :class:`AttemptUsageRecord` with
-        ``UNAVAILABLE`` dispositions (R8 P0-4 invariant: every
-        committed agent call produces exactly one record).
+        On Trust/Source/Capability validation failure (compute phase),
+        the method raises :class:`ExecutionUsageUnavailableError`
+        WITHOUT mutating state.  The caller (:meth:`_execute_task`)
+        is responsible for then calling :meth:`record_usage_unavailable`
+        so the attempt still produces exactly one
+        :class:`AttemptUsageRecord` with ``UNAVAILABLE`` dispositions.
         """
-        # Phase 1: compute (pure — raises on validation failure).
+        # Phase 1: compute (pure — raises on Trust/Source/Capability
+        # validation failure only).
         record = self._compute_attempt_usage(
             receipt,
             invoker_capabilities=invoker_capabilities,
             task_id=task_id,
             attempt=attempt,
         )
-        # Phase 2: validate budget (pure — returns exceeded_reason).
-        exceeded_reason = self._validate_attempt_budget(record, self._budget)
-        if exceeded_reason is not None:
-            # R8 P0-4: do NOT commit — raise so the caller records
-            # usage_unavailable for this attempt.
-            if exceeded_reason == "execution_usage_unavailable":
-                self._usage_unavailable = True
-            raise ExecutionUsageUnavailableError(
-                f"attempt budget validation failed: {exceeded_reason} "
-                f"(task_id={task_id}, attempt={attempt}, "
-                f"token_disposition={record.token_disposition}, "
-                f"cost_disposition={record.cost_disposition})"
-            )
-        # Phase 3: atomic commit (single mutation point).
+        # Phase 2: atomic commit (single mutation point).
+        # R9 Section 1: ALWAYS commit — even mixed records.  The
+        # verified dimension's usage is preserved in the audit trail
+        # and accumulated totals.
         self._commit_attempt_usage(record)
-        # R8 P0-4: post-commit budget exceeded check (e.g. the commit
-        # pushed the total past the limit).  This does not raise —
-        # the record is already committed — but marks the accountant
-        # so future waves are stopped.
+        # Phase 3: post-commit fail-closed check.
+        # R9 Section 1: NOW check whether any dimension is UNAVAILABLE
+        # with a configured budget.  This happens AFTER the commit so
+        # the verified dimension is preserved.
+        if self._check_usage_unavailable(record, self._budget):
+            self._usage_unavailable = True
+            self._exceeded = True
+            self._exceeded_reason = "execution_usage_unavailable"
+        # Post-commit budget overflow check (e.g. the commit pushed
+        # the total past the limit).  This does not raise — the record
+        # is already committed — but marks the accountant so future
+        # waves are stopped.
         if (
             self._budget.token_budget is not None
             and self._tokens_used > self._budget.token_budget
@@ -909,27 +956,34 @@ class _BudgetAccountant:
         task_id: str | None = None,
         attempt: int | None = None,
         invoker_capabilities: UsageVerificationCapabilities | None = None,
+        outcome: AgentInvocationOutcome | None = None,
     ) -> None:
-        """R6 P0-3 / R7 P0-2 / R8 P0-4/P0-5: record that a committed
-        agent call produced no usable Usage Receipt (timeout,
-        exception, Handler pre-return error, OR invalid receipt).
+        """R6 P0-3 / R7 P0-2 / R8 P0-4/P0-5 / R9 Section 2/3: record
+        that a committed agent call produced no usable Usage Receipt
+        (timeout, exception, Handler pre-return error, OR invalid
+        receipt).
 
-        R8 P0-4: this method is the ATOMIC commit for the no-receipt
-        / invalid-receipt paths.  It computes the dispositions, builds
-        a single :class:`AttemptUsageRecord`, and commits it in one
-        step — there is no half-committed state.
+        R9 Section 2/3 (CRITICAL): the dispositions are determined as
+        follows:
 
-        R8 P0-5: the dispositions for the no-receipt path are now
-        determined by the frozen Invoker capabilities rather than
-        unconditionally set to ``UNAVAILABLE``:
+        * If the caller provides an :class:`AgentInvocationOutcome`
+          (via the ``outcome`` parameter — e.g. from an
+          :class:`AgentInvocationFailure`), the outcome's explicit
+          ``token_disposition`` / ``cost_disposition`` are used.  This
+          is the ONLY way to record ``NO_PROVIDER_CALL`` on the
+          no-receipt path — the Invoker must explicitly attest it via
+          an Outcome.
+        * If NO outcome is provided (timeout, unknown exception), both
+          dimensions default to ``UNAVAILABLE``.  The Runtime can NO
+          LONGER infer ``NO_PROVIDER_CALL`` from the Invoker's static
+          ``never_calls_provider`` capability alone (R9 Section 3).
 
-        * If the Invoker has ``can_attest_no_provider_call=True`` (a
-          trusted deterministic Invoker that errored before returning
-          a receipt), the dispositions are ``NO_PROVIDER_CALL`` — the
-          Invoker authoritatively knows no provider call was made.
-        * Otherwise, the dispositions are ``UNAVAILABLE`` — the
-          Invoker cannot attest whether a provider call was made, so
-          the Runtime must fail-closed when a budget is configured.
+        The ``invoker_capabilities`` parameter is retained for API
+        compatibility but is NO LONGER used to infer dispositions.
+        R9 Section 3 removed the
+        ``can_attest_no_provider_call``-based inference because a
+        Hybrid Invoker could set the capability to ``True`` while
+        still making a Provider call before erroring.
 
         R7 P0-2: this method is also called for invalid receipts
         (receipts that failed :func:`validate_invocation_receipt`).
@@ -950,21 +1004,16 @@ class _BudgetAccountant:
         ``execution_usage_unavailable`` so the run finalises as
         ``budget_exceeded``.
         """
-        # R8 P0-5: determine dispositions based on Invoker caps.
-        # Default to UNAVAILABLE when caps are not provided (caller
-        # cannot attest anything).
-        if (
-            invoker_capabilities is not None
-            and invoker_capabilities.can_attest_no_provider_call
-        ):
-            # Trusted deterministic Invoker that errored before
-            # returning a receipt — it authoritatively knows no
-            # provider call was made.
-            token_disp = AttemptUsageDisposition.NO_PROVIDER_CALL
-            cost_disp = AttemptUsageDisposition.NO_PROVIDER_CALL
+        # R9 Section 2/3: determine dispositions from the explicit
+        # Outcome when provided.  NO capability-based inference.
+        if outcome is not None:
+            token_disp = outcome.token_disposition
+            cost_disp = outcome.cost_disposition
         else:
-            # Live Invoker or unknown — cannot attest.  Both
-            # dimensions are UNAVAILABLE.
+            # No Outcome available (timeout, unknown exception) —
+            # both dimensions are UNAVAILABLE.  R9 Section 3: the
+            # Runtime does NOT infer NO_PROVIDER_CALL from the
+            # Invoker's static capability.
             token_disp = AttemptUsageDisposition.UNAVAILABLE
             cost_disp = AttemptUsageDisposition.UNAVAILABLE
 
@@ -1647,6 +1696,15 @@ class SupervisorRuntime:
             error_code: str | None = None
             receipt: AgentInvocationReceipt | None = None
             invocation_error: BaseException | None = None
+            # R9 Section 2: when the Invoker raises
+            # :class:`AgentInvocationFailure`, the carried Outcome
+            # provides partial usage info (e.g. observed tool calls
+            # before the exception, or an explicit NO_PROVIDER_CALL
+            # attestation).  When no Outcome is available (timeout,
+            # unknown exception), this stays ``None`` and the Runtime
+            # fails closed with ``UNAVAILABLE`` dispositions and
+            # ``observed_tool_calls=None``.
+            failure_outcome: AgentInvocationOutcome | None = None
             # R1 P0-3: cap the wait_for timeout by the *remaining run
             # deadline*, not just task.timeout_ms.  This prevents a
             # single Attempt from outliving the Run budget.
@@ -1686,6 +1744,18 @@ class SupervisorRuntime:
                     deadline_caused_timeout = True
                 else:
                     error_code = "task_timeout"
+                invocation_error = exc
+                # R9 Section 2: timeout — no Outcome available.  The
+                # actual tool-call count is UNKNOWN (the Handler may
+                # have made tool calls before timing out).  The Runtime
+                # fails closed with ``observed_tool_calls=None``.
+            except AgentInvocationFailure as exc:
+                # R9 Section 2: the Invoker raised a controlled
+                # failure carrying a partial Outcome.  Use the
+                # Outcome's dispositions and observed_tool_calls.
+                failure_outcome = exc.outcome
+                attempt_status = "failed"
+                error_code = failure_outcome.error_code or "invocation_failure"
                 invocation_error = exc
             except RetryableAgentError as exc:
                 attempt_status = "failed"
@@ -1737,6 +1807,12 @@ class SupervisorRuntime:
             # dispositions decided during the atomic commit.
             declared_tokens_used: int | None = None
             declared_cost_usd: Decimal | None = None
+
+            # R9 Section 2: ``observed_tool_calls`` may be a concrete
+            # int (receipt path) or None (failure path with unknown
+            # tool-call count).  Declared up-front with the union type
+            # so mypy can follow the later reassignment.
+            observed_tool_calls: int | None = None
 
             if receipt is not None:
                 # R4 P0-3: charge *observed* tool calls BEFORE receipt
@@ -1814,19 +1890,39 @@ class SupervisorRuntime:
                         )
             else:
                 receipt_for_record = None
-                observed_tool_calls = 0
-                # R8 P0-5: No receipt produced (timeout, exception, or
-                # Handler pre-return error).  Pass the frozen Invoker
-                # capabilities so the Accountant can decide
-                # NO_PROVIDER_CALL vs UNAVAILABLE based on
-                # can_attest_no_provider_call — a trusted deterministic
-                # Invoker that errored before returning a receipt
-                # authoritatively knows no provider call was made.
-                accountant.record_usage_unavailable(
-                    task_id=task.task_id,
-                    attempt=attempt_idx,
-                    invoker_capabilities=invoker_caps,
-                )
+                # R9 Section 2: No receipt produced (timeout, exception,
+                # or Handler pre-return error).  The actual tool-call
+                # count is UNKNOWN — the Handler may have made tool
+                # calls before erroring.  ``observed_tool_calls=None``
+                # triggers ``tool_usage_unavailable`` fail-closed in
+                # :meth:`record_observed_tool_calls`.
+                #
+                # R9 Section 3: the Runtime does NOT infer
+                # ``NO_PROVIDER_CALL`` from the Invoker's static
+                # ``never_calls_provider`` capability.  Only an explicit
+                # :class:`AgentInvocationOutcome` (from
+                # :class:`AgentInvocationFailure`) can attest
+                # ``NO_PROVIDER_CALL`` on the no-receipt path.
+                if failure_outcome is not None:
+                    # R9 Section 2: use the Outcome's observed_tool_calls
+                    # (may be a concrete int from before the exception,
+                    # or None when unknown).
+                    observed_tool_calls = failure_outcome.observed_tool_calls
+                    accountant.record_observed_tool_calls(observed_tool_calls)
+                    accountant.record_usage_unavailable(
+                        task_id=task.task_id,
+                        attempt=attempt_idx,
+                        outcome=failure_outcome,
+                    )
+                else:
+                    # R9 Section 2: no Outcome available (timeout,
+                    # unknown exception).  Tool calls are unknown.
+                    observed_tool_calls = None
+                    accountant.record_observed_tool_calls(None)
+                    accountant.record_usage_unavailable(
+                        task_id=task.task_id,
+                        attempt=attempt_idx,
+                    )
 
             # R8 P0-5: retrieve the explicit dispositions and source ids
             # from the Accountant's last committed AttemptUsageRecord.

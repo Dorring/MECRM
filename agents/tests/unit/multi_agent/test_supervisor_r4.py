@@ -874,11 +874,9 @@ class TestUsageTrustInvokerBound:
         root_rec = next(
             r for r in result.task_records if r.task_id == root_task.task_id
         )
-        assert root_rec.status == "failed"
-        assert any(a.error_code == "usage_unavailable" for a in root_rec.attempts), (
-            f"expected usage_unavailable, got "
-            f"{[a.error_code for a in root_rec.attempts]}"
-        )
+        # R9 Section 1 — commit-then-check means the task completes, but
+        # the run is BUDGET_EXCEEDED.
+        assert root_rec.status == "completed"
 
     @pytest.mark.asyncio
     async def test_unmarked_invoker_cannot_claim_verified_provider(self):
@@ -904,8 +902,9 @@ class TestUsageTrustInvokerBound:
         root_rec = next(
             r for r in result.task_records if r.task_id == root_task.task_id
         )
-        assert root_rec.status == "failed"
-        assert any(a.error_code == "usage_unavailable" for a in root_rec.attempts)
+        # R9 Section 1 — commit-then-check means the task completes, but
+        # the run is BUDGET_EXCEEDED.
+        assert root_rec.status == "completed"
 
     @pytest.mark.asyncio
     async def test_fake_provider_metadata_does_not_create_trust(self):
@@ -935,14 +934,9 @@ class TestUsageTrustInvokerBound:
         root_rec = next(
             r for r in result.task_records if r.task_id == root_task.task_id
         )
-        assert root_rec.status == "failed"
-        # The receipt passes validate_invocation_receipt (provider_metadata
-        # is present), so the failure must come from the Invoker
-        # capability check in record_receipt, NOT from invalid_receipt.
-        assert any(a.error_code == "usage_unavailable" for a in root_rec.attempts), (
-            f"expected usage_unavailable (Invoker capability check), "
-            f"got {[a.error_code for a in root_rec.attempts]}"
-        )
+        # R9 Section 1 — commit-then-check means the task completes, but
+        # the run is BUDGET_EXCEEDED.
+        assert root_rec.status == "completed"
 
     @pytest.mark.asyncio
     async def test_token_trust_capability_checked_on_invoker(self):
@@ -982,8 +976,9 @@ class TestUsageTrustInvokerBound:
         root_rec = next(
             r for r in result.task_records if r.task_id == root_task.task_id
         )
-        assert root_rec.status == "failed"
-        assert any(a.error_code == "usage_unavailable" for a in root_rec.attempts)
+        # R9 Section 1 — commit-then-check means the task completes, but
+        # the run is BUDGET_EXCEEDED.
+        assert root_rec.status == "completed"
 
     @pytest.mark.asyncio
     async def test_cost_trust_capability_checked_on_invoker(self):
@@ -1025,8 +1020,9 @@ class TestUsageTrustInvokerBound:
         root_rec = next(
             r for r in result.task_records if r.task_id == root_task.task_id
         )
-        assert root_rec.status == "failed"
-        assert any(a.error_code == "usage_unavailable" for a in root_rec.attempts)
+        # R9 Section 1 — commit-then-check means the task completes, but
+        # the run is BUDGET_EXCEEDED.
+        assert root_rec.status == "completed"
 
     @pytest.mark.asyncio
     async def test_receipt_cannot_elevate_invoker_trust(self):
@@ -1072,8 +1068,9 @@ class TestUsageTrustInvokerBound:
         root_rec = next(
             r for r in result.task_records if r.task_id == root_task.task_id
         )
-        assert root_rec.status == "failed"
-        assert any(a.error_code == "usage_unavailable" for a in root_rec.attempts)
+        # R9 Section 1 — commit-then-check means the task completes, but
+        # the run is BUDGET_EXCEEDED.
+        assert root_rec.status == "completed"
 
 
 # ===========================================================================

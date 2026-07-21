@@ -244,7 +244,7 @@ _REGISTRY_CAPS = UsageVerificationCapabilities(
     verifies_tokens=False,
     verifies_cost=False,
     source_id="registry_agent_invoker",
-    can_attest_no_provider_call=False,
+    never_calls_provider=False,
     bound_source_ids=frozenset(),
 )
 
@@ -252,7 +252,7 @@ _REGISTRY_CAPS_WITH_VERIFIER = UsageVerificationCapabilities(
     verifies_tokens=True,
     verifies_cost=True,
     source_id="registry_agent_invoker+provider_verifier",
-    can_attest_no_provider_call=False,
+    never_calls_provider=False,
     bound_source_ids=frozenset({"tracking_verifier"}),
 )
 
@@ -260,7 +260,7 @@ _DETERMINISTIC_CAPS = UsageVerificationCapabilities(
     verifies_tokens=False,
     verifies_cost=False,
     source_id="deterministic_fake_invoker",
-    can_attest_no_provider_call=True,
+    never_calls_provider=True,
     bound_source_ids=frozenset({"deterministic_fake_invoker"}),
 )
 
@@ -275,7 +275,7 @@ class TestTrustedNoProviderCall:
     Invoker, not inferred from ``provider_metadata is None``."""
 
     def test_missing_metadata_cannot_attest_no_provider_call(self):
-        """A RegistryAgentInvoker (``can_attest_no_provider_call=False``)
+        """A RegistryAgentInvoker (``never_calls_provider=False``)
         receiving a result without ``provider_metadata`` must produce
         ``UNAVAILABLE`` dispositions, NOT ``NO_PROVIDER_CALL``."""
         budget = ExecutionBudget()
@@ -302,7 +302,14 @@ class TestTrustedNoProviderCall:
 
     def test_live_handler_omission_fails_token_budget(self):
         """A live Handler that omits ``provider_metadata`` must
-        trigger fail-closed when a token budget is configured."""
+        trigger fail-closed when a token budget is configured.
+
+        R9 Section 1: ``record_receipt`` no longer RAISES for
+        UNAVAILABLE dispositions — it commits the record (preserving
+        any verified dimensions) and then marks ``exceeded`` via
+        ``_check_usage_unavailable``.  This is the commit-then-check
+        pattern that replaces R8's validate-then-commit.
+        """
         budget = ExecutionBudget(token_budget=1000)
         accountant = _BudgetAccountant(budget, start_monotonic=time.monotonic())
         task = _make_task()
@@ -312,25 +319,27 @@ class TestTrustedNoProviderCall:
             tokens_used=None,
             cost_usd=None,
         )
-        with pytest.raises(ExecutionUsageUnavailableError):
-            accountant.record_receipt(
-                receipt,
-                invoker_capabilities=_REGISTRY_CAPS,
-                task_id=task.task_id,
-                attempt=0,
-            )
-        # R8 P0-4: record_receipt raises without mutating state.  The
-        # caller must call record_usage_unavailable to produce exactly
-        # one AttemptUsageRecord and set the exceeded flag — this is
-        # what _execute_task does after catching the exception.
-        accountant.record_usage_unavailable(task_id=task.task_id, attempt=0)
+        # R9 Section 1: record_receipt commits the UNAVAILABLE record
+        # and then sets exceeded — no exception is raised.
+        accountant.record_receipt(
+            receipt,
+            invoker_capabilities=_REGISTRY_CAPS,
+            task_id=task.task_id,
+            attempt=0,
+        )
         assert accountant.exceeded
         assert accountant.usage_unavailable
         assert accountant.exceeded_reason == "execution_usage_unavailable"
+        # R9 Section 1: the record was committed (not discarded)
+        assert len(accountant._attempt_records) == 1
 
     def test_live_handler_omission_fails_cost_budget(self):
         """A live Handler that omits ``provider_metadata`` must
-        trigger fail-closed when a cost budget is configured."""
+        trigger fail-closed when a cost budget is configured.
+
+        R9 Section 1: commit-then-check — the record is committed
+        with UNAVAILABLE dispositions, then ``exceeded`` is set.
+        """
         budget = ExecutionBudget(cost_budget_usd=Decimal("1.00"))
         accountant = _BudgetAccountant(budget, start_monotonic=time.monotonic())
         task = _make_task()
@@ -340,22 +349,19 @@ class TestTrustedNoProviderCall:
             tokens_used=None,
             cost_usd=None,
         )
-        with pytest.raises(ExecutionUsageUnavailableError):
-            accountant.record_receipt(
-                receipt,
-                invoker_capabilities=_REGISTRY_CAPS,
-                task_id=task.task_id,
-                attempt=0,
-            )
-        # R8 P0-4: caller must call record_usage_unavailable after
-        # catching the exception — see _execute_task for the pattern.
-        accountant.record_usage_unavailable(task_id=task.task_id, attempt=0)
+        accountant.record_receipt(
+            receipt,
+            invoker_capabilities=_REGISTRY_CAPS,
+            task_id=task.task_id,
+            attempt=0,
+        )
         assert accountant.exceeded
         assert accountant.usage_unavailable
+        assert len(accountant._attempt_records) == 1
 
     def test_trusted_deterministic_no_call_is_accepted(self):
         """A trusted deterministic Invoker
-        (``can_attest_no_provider_call=True``) with no
+        (``never_calls_provider=True``) with no
         ``provider_metadata`` produces ``NO_PROVIDER_CALL`` and does
         NOT fail-closed even when budgets are configured."""
         budget = ExecutionBudget(
@@ -398,7 +404,7 @@ class TestTrustedNoProviderCall:
 
     def test_trusted_deterministic_with_provider_call_is_verified(self):
         """When a trusted deterministic Invoker has
-        ``can_attest_no_provider_call=True`` but the receipt HAS
+        ``never_calls_provider=True`` but the receipt HAS
         ``provider_metadata``, the disposition is ``UNAVAILABLE`` (not
         ``NO_PROVIDER_CALL``) because a provider call was made."""
         budget = ExecutionBudget()
@@ -524,6 +530,7 @@ class TestPerDimensionCoverage:
             cost_usd=None,
             usage_provenance=UsageProvenance(
                 source_id="tracking_verifier",
+                token_source_id="tracking_verifier",
                 tokens_verified=True,
                 cost_verified=False,
             ),
@@ -547,6 +554,7 @@ class TestPerDimensionCoverage:
             cost_usd=Decimal("0.50"),
             usage_provenance=UsageProvenance(
                 source_id="tracking_verifier",
+                cost_source_id="tracking_verifier",
                 tokens_verified=False,
                 cost_verified=True,
             ),
@@ -592,6 +600,7 @@ class TestPerDimensionCoverage:
             cost_usd=None,
             usage_provenance=UsageProvenance(
                 source_id="tracking_verifier",
+                token_source_id="tracking_verifier",
                 tokens_verified=True,
                 cost_verified=False,
             ),
@@ -609,7 +618,7 @@ class TestPerDimensionCoverage:
             verifies_tokens=False,
             verifies_cost=True,
             source_id="cost_only_verifier",
-            can_attest_no_provider_call=False,
+            never_calls_provider=False,
             bound_source_ids=frozenset({"cost_only_verifier"}),
         )
         receipt_b = AgentInvocationReceipt(
@@ -622,6 +631,7 @@ class TestPerDimensionCoverage:
             cost_usd=Decimal("0.50"),
             usage_provenance=UsageProvenance(
                 source_id="cost_only_verifier",
+                cost_source_id="cost_only_verifier",
                 tokens_verified=False,
                 cost_verified=True,
             ),
@@ -659,6 +669,8 @@ class TestPerDimensionCoverage:
             cost_usd=Decimal("0.50"),
             usage_provenance=UsageProvenance(
                 source_id="tracking_verifier",
+                token_source_id="tracking_verifier",
+                cost_source_id="tracking_verifier",
                 tokens_verified=True,
                 cost_verified=True,
             ),
@@ -705,6 +717,8 @@ class TestPerDimensionCoverage:
             cost_usd=Decimal("0.50"),
             usage_provenance=UsageProvenance(
                 source_id="tracking_verifier",
+                token_source_id="tracking_verifier",
+                cost_source_id="tracking_verifier",
                 tokens_verified=True,
                 cost_verified=True,
             ),
@@ -1108,6 +1122,7 @@ class TestProvenanceSourceBinding:
             cost_usd=None,
             usage_provenance=UsageProvenance(
                 source_id="tracking_verifier",
+                token_source_id="tracking_verifier",
                 tokens_verified=True,
                 cost_verified=False,
             ),
@@ -1143,6 +1158,7 @@ class TestProvenanceSourceBinding:
             cost_usd=None,
             usage_provenance=UsageProvenance(
                 source_id="rogue_verifier",
+                token_source_id="rogue_verifier",
                 tokens_verified=True,
                 cost_verified=False,
             ),
@@ -1222,6 +1238,7 @@ class TestLegacyTrustDeprecation:
             cost_usd=None,
             usage_provenance=UsageProvenance(
                 source_id="tracking_verifier",
+                token_source_id="tracking_verifier",
                 tokens_verified=True,
                 cost_verified=False,
             ),
