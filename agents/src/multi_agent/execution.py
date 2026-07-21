@@ -393,6 +393,7 @@ def validate_agent_result(
     *,
     task: AgentTask,
     plan: PlanDraft,
+    binding: ExecutionBinding | None = None,
 ) -> None:
     """Boundary check that *result* must pass before Merge.
 
@@ -412,12 +413,21 @@ def validate_agent_result(
     pass the Supervisor boundary and only be excluded later by
     Phase 2 Merge, leaving the Task marked ``completed``.
 
+    R4 P0-4: when *binding* is provided, the check also verifies
+    ``result.agent_version == binding.capability_snapshot.version``.
+    This prevents a Handler from returning a result stamped with a
+    different agent version than the one bound at pre-flight — the
+    ExecutionBinding is the authoritative capability snapshot for the
+    run, and the result must originate from that exact version.
+
     Checks:
 
     * ``result.task_id == task.task_id``
     * ``result.agent_id == task.agent_id``
     * ``result.tenant_id == plan.tenant_id``
     * ``result.status`` is one of the allowed literals
+    * R4 P0-4: ``result.agent_version == binding.capability_snapshot.version``
+      (when binding is provided)
     * every ``action_proposals[*].proposal_hash`` verifies
     * every ``action_proposals[*].created_by_agent == task.agent_id``
     * every ``action_proposals[*].tenant_id == plan.tenant_id``
@@ -441,6 +451,19 @@ def validate_agent_result(
         raise InvalidAgentResultError(
             f"result.status={result.status!r} is not an allowed value"
         )
+    # R4 P0-4: verify the result's agent_version matches the capability
+    # version bound at pre-flight.  The binding is the authoritative
+    # snapshot — a Handler cannot return a result from a different
+    # version even if the live registry has since drifted.
+    if binding is not None:
+        bound_version = binding.capability_snapshot.version
+        if result.agent_version != bound_version:
+            raise InvalidAgentResultError(
+                f"result.agent_version={result.agent_version!r} != "
+                f"binding.capability_snapshot.version={bound_version!r} "
+                f"— result must originate from the capability version "
+                f"bound at pre-flight"
+            )
 
     known_evidence_ids = {ev.evidence_id for ev in result.evidence}
 

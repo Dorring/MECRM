@@ -22,7 +22,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Callable, Literal, Protocol
 
-from pydantic import Field
+from pydantic import ConfigDict, Field
 
 from multi_agent.contracts import (
     AgentExecutionContext,
@@ -35,7 +35,7 @@ from multi_agent.registry import AgentHandler, AgentRegistry
 
 
 # ---------------------------------------------------------------------------
-# R3 P0-4: Usage Trust Level
+# R3 P0-4 / R4 P0-2: Usage Trust Level + Verification Capabilities
 # ---------------------------------------------------------------------------
 
 
@@ -55,6 +55,55 @@ UsageTrustLevel = Literal[
     # budget is configured.
     "unverified",
 ]
+
+
+class UsageVerificationCapabilities(StrictContract):
+    """R4 P0-2: Immutable description of what an :class:`AgentInvoker`
+    can *actually* verify about usage.
+
+    R3's ``TrustedUsageInvoker`` marker Protocol was forgeable — any
+    custom Invoker could set ``usage_trust="trusted_adapter"`` on its
+    receipts without the Supervisor checking whether the Invoker
+    itself was trusted.  R4 replaces the marker with this capability
+    contract: the Supervisor reads ``invoker.usage_capabilities``
+    (falling back to a fully-unverified default) and cross-checks it
+    against every receipt's ``usage_trust``.
+
+    * ``verifies_tokens=True`` — the Invoker's receipts may claim
+      ``verified_provider`` or ``trusted_adapter`` for token usage.
+    * ``verifies_cost=True`` — the Invoker's receipts may claim
+      ``trusted_adapter`` for cost usage.
+    * ``source_id`` — stable identifier for diagnostics (e.g.
+      ``"registry_agent_invoker"``).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    verifies_tokens: bool = False
+    verifies_cost: bool = False
+    source_id: str
+
+
+_UNVERIFIED_CAPABILITIES = UsageVerificationCapabilities(
+    verifies_tokens=False,
+    verifies_cost=False,
+    source_id="unverified",
+)
+
+
+def get_usage_capabilities(invoker: object) -> UsageVerificationCapabilities:
+    """R4 P0-2: extract :class:`UsageVerificationCapabilities` from
+    *invoker*, defaulting to fully-unverified when the Invoker does
+    not expose the property.
+
+    Using ``getattr`` instead of ``isinstance`` means existing test
+    fakes that don't define ``usage_capabilities`` are automatically
+    treated as unverified — no Protocol conformance breakage.
+    """
+    caps = getattr(invoker, "usage_capabilities", None)
+    if isinstance(caps, UsageVerificationCapabilities):
+        return caps
+    return _UNVERIFIED_CAPABILITIES
 
 
 # ---------------------------------------------------------------------------
@@ -114,21 +163,24 @@ class AgentInvoker(Protocol):
 
 
 class TrustedUsageInvoker(AgentInvoker, Protocol):
-    """R3 P0-4: marker Protocol for Invokers that report *verified*
-    usage.
+    """R3 P0-4 / R4 P0-2: marker Protocol for Invokers that report
+    *verified* usage.
 
-    The Supervisor checks ``isinstance(invoker, TrustedUsageInvoker)``
-    when a budget is configured.  A plain :class:`AgentInvoker` (or a
-    test fake that does not inherit this Protocol) is treated as
-    ``unverified`` and its self-reported usage is rejected for budget
-    enforcement.
+    R4 P0-2: the Supervisor no longer relies solely on this marker.
+    It reads ``invoker.usage_capabilities`` (a
+    :class:`UsageVerificationCapabilities` contract) and cross-checks
+    every receipt's ``usage_trust`` against the Invoker's actual
+    verification capabilities.  This Protocol is kept for documentation
+    and for tests that want to assert an Invoker is trusted, but the
+    runtime enforcement uses :func:`get_usage_capabilities`.
 
-    Concrete implementations must set ``usage_is_verified = True`` and
-    ensure every receipt they produce carries
-    ``usage_trust="verified_provider"`` or ``usage_trust="trusted_adapter"``.
+    Concrete implementations must expose ``usage_capabilities`` with
+    ``verifies_tokens=True`` and/or ``verifies_cost=True`` and ensure
+    every receipt they produce carries ``usage_trust="verified_provider"``
+    or ``usage_trust="trusted_adapter"``.
     """
 
-    usage_is_verified: bool
+    usage_capabilities: UsageVerificationCapabilities
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +218,17 @@ class RegistryAgentInvoker:
     @property
     def registry(self) -> AgentRegistry:
         return self._registry
+
+    @property
+    def usage_capabilities(self) -> UsageVerificationCapabilities:
+        """R4 P0-2: RegistryAgentInvoker can verify tokens (extracted
+        from ``result.provider_metadata``) but NOT cost (AgentResult
+        has no cost field)."""
+        return UsageVerificationCapabilities(
+            verifies_tokens=True,
+            verifies_cost=False,
+            source_id="registry_agent_invoker",
+        )
 
     async def invoke(
         self,
@@ -221,6 +284,7 @@ class DeterministicFakeInvoker:
         receipt: AgentInvocationReceipt | None = None,
         factory: ReceiptFactory | None = None,
         result: AgentResult | None = None,
+        usage_capabilities: UsageVerificationCapabilities | None = None,
     ) -> None:
         provided = sum(1 for x in (receipt, factory, result) if x is not None)
         if provided != 1:
@@ -231,7 +295,16 @@ class DeterministicFakeInvoker:
         self._receipt = receipt
         self._factory = factory
         self._result = result
+        self._usage_capabilities = usage_capabilities or UsageVerificationCapabilities(
+            verifies_tokens=False,
+            verifies_cost=False,
+            source_id="deterministic_fake_invoker",
+        )
         self.invocations: list[tuple[AgentTask, AgentExecutionContext]] = []
+
+    @property
+    def usage_capabilities(self) -> UsageVerificationCapabilities:
+        return self._usage_capabilities
 
     async def invoke(
         self,
@@ -330,5 +403,7 @@ __all__ = [
     "RegistryAgentInvoker",
     "TrustedUsageInvoker",
     "UsageTrustLevel",
+    "UsageVerificationCapabilities",
+    "get_usage_capabilities",
     "validate_invocation_receipt",
 ]

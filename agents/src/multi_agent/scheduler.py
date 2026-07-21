@@ -72,6 +72,14 @@ WaveStartedCallback = Callable[[list[AgentTask]], None]
 # running event loop).  When the hook returns ``True`` the Scheduler
 # cancels the wave instead of dispatching it.
 BeforeWave = Callable[[list[AgentTask]], Awaitable[bool]]
+# R4 P1-1: sync filter called after on_wave_started but before any
+# coroutine is created.  Receives the sorted ready list and returns
+# the subset of tasks that may proceed.  Tasks not in the returned
+# list are marked ``skipped`` with reason ``"agent_call budget
+# exhausted"`` — they never start a Handler.  This makes agent-call
+# budget allocation deterministic (by task_id order) rather than
+# dependent on coroutine scheduling.
+PreDispatch = Callable[[list[AgentTask]], list[AgentTask]]
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +156,7 @@ class DagScheduler:
         on_wave_completed: WaveCallback | None = None,
         on_tasks_skipped: WaveCallback | None = None,
         before_wave: BeforeWave | None = None,
+        pre_dispatch: PreDispatch | None = None,
     ) -> list[TaskExecutionRecord]:
         """Execute *tasks* in dependency order.
 
@@ -318,6 +327,30 @@ class DagScheduler:
             if on_wave_started is not None:
                 on_wave_started(ready)
 
+            # 4c. R4 P1-1: deterministic agent-call budget pre-allocation.
+            #     The ``pre_dispatch`` filter receives the sorted ready
+            #     list and returns the subset that may proceed.  Tasks
+            #     not returned are marked ``skipped`` — they never start
+            #     a Handler.  This makes budget allocation deterministic
+            #     (by task_id order) instead of dependent on coroutine
+            #     scheduling.
+            if pre_dispatch is not None:
+                allowed = set(t.task_id for t in pre_dispatch(ready))
+                denied = [t for t in ready if t.task_id not in allowed]
+                for task in denied:
+                    records[task.task_id] = TaskExecutionRecord(
+                        task_id=task.task_id,
+                        agent_id=task.agent_id,
+                        status="skipped",
+                        skip_reason="agent_call budget exhausted",
+                    )
+                    pending_ids.discard(task.task_id)
+                ready = [t for t in ready if t.task_id in allowed]
+                if not ready:
+                    if on_wave_completed is not None and denied:
+                        on_wave_completed([records[t.task_id] for t in denied])
+                    continue
+
             # 5. R2 P0-2: Execute the wave with structured concurrency.
             #    Replaces the previous ``asyncio.gather()`` which could
             #    leave sibling coroutines running after one raised.
@@ -478,6 +511,7 @@ class DagScheduler:
 __all__ = [
     "BeforeWave",
     "DagScheduler",
+    "PreDispatch",
     "TaskOutcome",
     "TaskRunner",
     "WaveCallback",

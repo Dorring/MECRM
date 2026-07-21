@@ -567,9 +567,12 @@ class TestLookupRunIdentity:
 
     @pytest.mark.asyncio
     async def test_in_progress_different_hash_returns_in_progress(self):
-        """Even if the plan_hash differs, an in-progress run is
-        reported as ``in_progress`` (not ``conflict``) — the caller
-        should raise ``RunAlreadyInProgressError``."""
+        """R4 P0-1: the store reports an in-progress run with a
+        different plan_hash as ``status='in_progress'`` with
+        ``plan_hash_matches=False``.  The Supervisor — not the store
+        — decides to raise :class:`RunPlanConflictError` based on
+        ``plan_hash_matches`` being ``False``; the store itself only
+        reports the raw status."""
         store = InMemoryRunStore()
         await store.begin("run-001", "a" * 64)
 
@@ -618,9 +621,9 @@ class TestLookupRunIdentity:
 
         identity = RunIdentity(
             run_id="run-001",
-            plan_hash="a" * 64,
+            requested_plan_hash="a" * 64,
+            stored_plan_hash="a" * 64,
             status="completed",
-            plan_hash_matches=True,
         )
         with pytest.raises(ValidationError):
             identity.status = "in_progress"  # type: ignore[misc]

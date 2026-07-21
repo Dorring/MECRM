@@ -68,6 +68,7 @@ from multi_agent.execution_errors import (
 from multi_agent.invocation import (
     AgentInvocationReceipt,
     DeterministicFakeInvoker,
+    UsageVerificationCapabilities,
 )
 from multi_agent.planner import DeterministicPlanner
 from multi_agent.planning import (
@@ -484,12 +485,20 @@ def _two_chain_plan(
 
 
 class _TrustedTokenInvoker:
-    """R3 P0-4: an invoker that reports ``verified_provider`` token
-    usage (e.g. from ``result.provider_metadata``).  Implements
-    :class:`TrustedUsageInvoker` so the Supervisor accepts its
-    receipt for ``token_budget`` enforcement."""
+    """R3 P0-4 / R4 P0-2: an invoker that reports ``verified_provider``
+    token usage (e.g. from ``result.provider_metadata``).  Exposes
+    :class:`UsageVerificationCapabilities` with ``verifies_tokens=True``
+    so the Supervisor accepts its receipt for ``token_budget``
+    enforcement — the receipt's ``usage_trust`` is cross-checked
+    against the invoker's capabilities."""
 
-    usage_is_verified: bool = True
+    @property
+    def usage_capabilities(self) -> UsageVerificationCapabilities:
+        return UsageVerificationCapabilities(
+            verifies_tokens=True,
+            verifies_cost=False,
+            source_id="test_trusted_token_invoker",
+        )
 
     def __init__(self, tokens_used: int) -> None:
         self._tokens_used = tokens_used
@@ -520,12 +529,20 @@ class _TrustedTokenInvoker:
 
 
 class _TrustedCostAdapterInvoker:
-    """R3 P0-4: an invoker that reports ``trusted_adapter`` cost
-    usage (e.g. from a vetted cost-reporting middleware).  Implements
-    :class:`TrustedUsageInvoker` so the Supervisor accepts its
-    receipt for ``cost_budget_usd`` enforcement."""
+    """R3 P0-4 / R4 P0-2: an invoker that reports ``trusted_adapter``
+    cost usage (e.g. from a vetted cost-reporting middleware).
+    Exposes :class:`UsageVerificationCapabilities` with
+    ``verifies_cost=True`` so the Supervisor accepts its receipt for
+    ``cost_budget_usd`` enforcement — the receipt's ``usage_trust`` is
+    cross-checked against the invoker's capabilities."""
 
-    usage_is_verified: bool = True
+    @property
+    def usage_capabilities(self) -> UsageVerificationCapabilities:
+        return UsageVerificationCapabilities(
+            verifies_tokens=False,
+            verifies_cost=True,
+            source_id="test_trusted_cost_adapter_invoker",
+        )
 
     def __init__(self, cost_usd: Decimal) -> None:
         self._cost_usd = cost_usd

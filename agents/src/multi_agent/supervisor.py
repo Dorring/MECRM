@@ -70,18 +70,21 @@ from multi_agent.execution_errors import (
     NonRetryableAgentError,
     RetryableAgentError,
     RunAlreadyInProgressError,
+    RunPlanConflictError,
     SupervisorError,
 )
 from multi_agent.invocation import (
     AgentInvocationReceipt,
     AgentInvoker,
+    UsageVerificationCapabilities,
+    get_usage_capabilities,
     validate_invocation_receipt,
 )
 from multi_agent.plan_validator import PlanValidator
 from multi_agent.planning import PlanDraft
 from multi_agent.registry import AgentHandler, AgentRegistry
 from multi_agent.run_store import InMemoryRunStore, RunLease, RunStore
-from multi_agent.scheduler import DagScheduler, TaskOutcome
+from multi_agent.scheduler import DagScheduler, PreDispatch, TaskOutcome
 from multi_agent.state import merge_parallel_results
 
 
@@ -259,6 +262,17 @@ class _BudgetAccountant:
             return False
         return True
 
+    def has_agent_call_budget(self) -> bool:
+        """R4 P1-1: side-effect-free check for agent call budget
+        availability.  Unlike :meth:`can_start_agent_call`, this does
+        NOT set ``_exceeded`` — it is used by the deterministic
+        pre-dispatch filter to decide which tasks may start without
+        poisoning the budget state for retries.
+        """
+        if self._exceeded:
+            return False
+        return self._agent_calls + 1 <= self._budget.max_agent_calls
+
     def reserve_agent_call(self) -> None:
         if not self.can_start_agent_call():
             raise SupervisorError(
@@ -266,8 +280,45 @@ class _BudgetAccountant:
             )
         self._agent_calls += 1
 
-    def record_receipt(self, receipt: AgentInvocationReceipt) -> None:
-        """Accumulate *actual* usage from a successful invocation.
+    def record_observed_tool_calls(self, observed: int) -> None:
+        """R4 P0-3: charge *observed* tool calls regardless of receipt
+        consistency.
+
+        ``observed`` is ``len(receipt.result.tool_calls)`` — the
+        actual number of :class:`ToolCallRecord` entries the Handler
+        returned.  This is charged *before* receipt validation so an
+        invalid receipt (under-reported ``tool_calls``) cannot erase
+        already-consumed budget.  If the charge pushes the total past
+        ``max_tool_calls``, the accountant marks the budget exceeded
+        so the Scheduler stops dispatching new tasks.
+        """
+        self._tool_calls += observed
+        if self._tool_calls > self._budget.max_tool_calls:
+            self._exceeded = True
+            self._exceeded_reason = (
+                f"max_tool_calls exceeded: "
+                f"{self._tool_calls} > {self._budget.max_tool_calls}"
+            )
+
+    def record_receipt(
+        self,
+        receipt: AgentInvocationReceipt,
+        *,
+        invoker_capabilities: UsageVerificationCapabilities,
+    ) -> None:
+        """Accumulate *actual* token/cost usage from a successful
+        invocation.
+
+        R4 P0-2: the receipt's ``usage_trust`` is cross-checked
+        against *invoker_capabilities* — a receipt claiming
+        ``verified_provider`` or ``trusted_adapter`` from an Invoker
+        that does not expose the matching capability is rejected.
+        This prevents a custom Invoker from self-elevating its trust
+        level by simply setting ``usage_trust`` on the receipt.
+
+        R4 P0-3: tool calls are no longer accumulated here — they are
+        charged via :meth:`record_observed_tool_calls` *before* this
+        method runs, so an invalid receipt cannot erase them.
 
         R3 P0-4: when ``token_budget`` or ``cost_budget_usd`` is
         configured, only receipts with ``usage_trust`` of
@@ -278,13 +329,27 @@ class _BudgetAccountant:
         prevents a custom Invoker from under-reporting usage (e.g.
         ``cost_usd=Decimal("0")``) to bypass budget enforcement.
         """
-        self._tool_calls += receipt.tool_calls
-        if self._tool_calls > self._budget.max_tool_calls:
-            self._exceeded = True
-            self._exceeded_reason = (
-                f"max_tool_calls exceeded: "
-                f"{self._tool_calls} > {self._budget.max_tool_calls}"
-            )
+        # R4 P0-2: cross-check receipt trust against invoker capabilities.
+        # A receipt cannot claim a trust level the Invoker cannot back.
+        if receipt.usage_trust == "verified_provider":
+            if not invoker_capabilities.verifies_tokens:
+                raise ExecutionUsageUnavailableError(
+                    f"receipt.usage_trust='verified_provider' but invoker "
+                    f"({invoker_capabilities.source_id}) does not have "
+                    f"verifies_tokens=True — receipt cannot self-elevate "
+                    f"trust above the invoker's capabilities"
+                )
+        elif receipt.usage_trust == "trusted_adapter":
+            if (
+                not invoker_capabilities.verifies_tokens
+                and not invoker_capabilities.verifies_cost
+            ):
+                raise ExecutionUsageUnavailableError(
+                    f"receipt.usage_trust='trusted_adapter' but invoker "
+                    f"({invoker_capabilities.source_id}) has neither "
+                    f"verifies_tokens nor verifies_cost — receipt cannot "
+                    f"self-elevate trust above the invoker's capabilities"
+                )
 
         if self._budget.token_budget is not None:
             # R3 P0-4: provenance check. A custom Invoker that
@@ -300,6 +365,14 @@ class _BudgetAccountant:
                     "receipt carries usage_trust='unverified' — only "
                     "verified_provider or trusted_adapter receipts are "
                     "accepted for token budget enforcement"
+                )
+            # R4 P0-2: invoker must actually be able to verify tokens.
+            if not invoker_capabilities.verifies_tokens:
+                raise ExecutionUsageUnavailableError(
+                    f"token_budget is configured but invoker "
+                    f"({invoker_capabilities.source_id}) does not have "
+                    f"verifies_tokens=True — token budget cannot be "
+                    f"enforced with an untrusted invoker"
                 )
             if receipt.tokens_used is None:
                 raise ExecutionUsageUnavailableError(
@@ -324,6 +397,14 @@ class _BudgetAccountant:
                     "receipt carries usage_trust='unverified' — only "
                     "verified_provider or trusted_adapter receipts are "
                     "accepted for cost budget enforcement"
+                )
+            # R4 P0-2: invoker must actually be able to verify cost.
+            if not invoker_capabilities.verifies_cost:
+                raise ExecutionUsageUnavailableError(
+                    f"cost_budget_usd is configured but invoker "
+                    f"({invoker_capabilities.source_id}) does not have "
+                    f"verifies_cost=True — cost budget cannot be "
+                    f"enforced with an untrusted invoker"
                 )
             if receipt.cost_usd is None:
                 raise ExecutionUsageUnavailableError(
@@ -439,20 +520,32 @@ class SupervisorRuntime:
         # acceptable as a cached ``cancelled`` result.
         self._validate_plan_integrity(plan)
 
-        # R3 P1-1: identity probe replaces lookup_completed + begin
-        # race.  Determines cache/conflict/in-progress status in one
-        # read-only call so the Supervisor can pick the right path
+        # R3 P1-1 / R4 P0-1: identity probe replaces lookup_completed +
+        # begin race.  Determines cache/conflict/in-progress status in
+        # one read-only call so the Supervisor can pick the right path
         # without interleaving with another coroutine's begin().
+        #
+        # R4 P0-1: plan_hash mismatch is checked FIRST — before
+        # status — so a RunPlanConflictError is raised regardless of
+        # whether the stored run is completed or in_progress.  This
+        # prevents a registry version mismatch from masking the real
+        # conflict, and prevents an in_progress run with a different
+        # plan from being misreported as RunAlreadyInProgressError.
         identity = await self._run_store.lookup_run_identity(run_id, plan.plan_hash)
-        if identity is not None and identity.is_completed:
-            assert identity.cached_result is not None
-            return identity.cached_result
-        if identity is not None and identity.status == "in_progress":
-            raise RunAlreadyInProgressError(f"run_id={run_id!r} is already in progress")
-        # identity is None or mismatched-plan: fall through to pre-flight.
-        # (A mismatched-plan identity is rejected by begin() below as
-        #  RunPlanConflictError; we let pre-flight run first so the
-        #  caller sees the *cheapest* rejection.)
+        if identity is not None:
+            if not identity.plan_hash_matches:
+                raise RunPlanConflictError(
+                    f"run_id={run_id!r} is already bound to plan_hash="
+                    f"{identity.stored_plan_hash!r}, cannot accept "
+                    f"plan_hash={identity.requested_plan_hash!r}"
+                )
+            if identity.status == "completed":
+                assert identity.cached_result is not None
+                return identity.cached_result
+            if identity.status == "in_progress":
+                raise RunAlreadyInProgressError(
+                    f"run_id={run_id!r} is already in progress"
+                )
 
         # R1 P0-1: Pre-flight validation happens *before* the RunStore
         # lease is acquired.  All of these checks are side-effect-free
@@ -554,6 +647,12 @@ class SupervisorRuntime:
             should_stop = self._build_should_stop(accountant, canc_state, canc, plan)
             before_wave = self._build_before_wave(canc, canc_state, plan)
             wave_callbacks = self._build_wave_callbacks(accountant, trace)
+            # R4 P1-1: deterministic agent-call budget pre-allocation.
+            # The filter runs after on_wave_started but before any
+            # coroutine is created.  It reserves agent calls in
+            # task_id order so which tasks get the remaining budget
+            # is deterministic, not dependent on coroutine scheduling.
+            pre_dispatch = self._build_pre_dispatch(accountant)
 
             task_records = await scheduler.execute(
                 tasks=tasks,
@@ -563,6 +662,7 @@ class SupervisorRuntime:
                 on_wave_completed=wave_callbacks.on_wave_completed,
                 on_tasks_skipped=wave_callbacks.on_tasks_skipped,
                 before_wave=before_wave,
+                pre_dispatch=pre_dispatch,
             )
 
             # Collect surviving results.
@@ -783,6 +883,11 @@ class SupervisorRuntime:
         # version that was bound at pre-flight time.
         handler = bound_handlers[task.task_id]
 
+        # R4 P0-2: resolve the Invoker's verification capabilities once.
+        # This is used by record_receipt to cross-check the receipt's
+        # usage_trust against what the Invoker can actually verify.
+        invoker_caps = get_usage_capabilities(invoker)
+
         attempts: list[TaskAttemptRecord] = []
         max_attempts = 1 + max(0, task.max_retries)
         final_status: str = "failed"
@@ -819,21 +924,25 @@ class SupervisorRuntime:
                     data={"reason": "deadline_exceeded"},
                 )
                 break
-            if not accountant.can_start_agent_call():
-                final_status = "skipped"
-                skip_reason = (
-                    accountant.exceeded_reason or "agent_call budget exhausted"
-                )
-                if accountant.exceeded:
-                    trace.emit(
-                        TRACE_BUDGET_EXCEEDED,
-                        task_id=task.task_id,
-                        agent_id=task.agent_id,
-                        data={"reason": accountant.exceeded_reason},
+            # R4 P1-1: the first attempt's agent call was already
+            # reserved by the deterministic pre_dispatch filter.  Only
+            # retries (attempt_idx > 0) need to check and reserve here.
+            if attempt_idx > 0:
+                if not accountant.can_start_agent_call():
+                    final_status = "skipped"
+                    skip_reason = (
+                        accountant.exceeded_reason or "agent_call budget exhausted"
                     )
-                break
+                    if accountant.exceeded:
+                        trace.emit(
+                            TRACE_BUDGET_EXCEEDED,
+                            task_id=task.task_id,
+                            agent_id=task.agent_id,
+                            data={"reason": accountant.exceeded_reason},
+                        )
+                    break
 
-            accountant.reserve_agent_call()
+                accountant.reserve_agent_call()
 
             attempt_started_at = utc_now()
             attempt_started_mono = time.monotonic()
@@ -854,6 +963,12 @@ class SupervisorRuntime:
                     "binding_capability_authority": (
                         binding.capability_snapshot.authority.value
                     ),
+                    # R4 P0-4: emit the capability version so the
+                    # trace records exactly which version of the agent
+                    # was bound at pre-flight.  This is the version
+                    # validate_agent_result checks against
+                    # result.agent_version.
+                    "binding_capability_version": (binding.capability_snapshot.version),
                 },
                 occurred_at=attempt_started_at,
             )
@@ -945,9 +1060,18 @@ class SupervisorRuntime:
                 accountant.mark_deadline_exceeded()
 
             if receipt is not None:
+                # R4 P0-3: charge *observed* tool calls BEFORE receipt
+                # validation.  ``observed_tool_calls`` is the actual
+                # number of ToolCallRecord entries the Handler returned
+                # — it is charged regardless of whether the receipt is
+                # consistent, so an under-reporting receipt cannot
+                # erase already-consumed budget.
+                observed_tool_calls = len(receipt.result.tool_calls)
+                accountant.record_observed_tool_calls(observed_tool_calls)
+
                 # R1 P0-4: validate receipt consistency before
-                # recording usage.  A mismatched receipt is treated
-                # as a non-retryable failure.
+                # recording token/cost usage.  A mismatched receipt is
+                # treated as a non-retryable failure.
                 try:
                     validate_invocation_receipt(receipt)
                 except InvalidInvocationReceiptError as exc:
@@ -959,7 +1083,14 @@ class SupervisorRuntime:
                 else:
                     receipt_for_record = receipt
                     try:
-                        accountant.record_receipt(receipt)
+                        # R4 P0-2: pass invoker capabilities so the
+                        # accountant can cross-check the receipt's
+                        # usage_trust against what the Invoker can
+                        # actually verify.
+                        accountant.record_receipt(
+                            receipt,
+                            invoker_capabilities=invoker_caps,
+                        )
                     except ExecutionUsageUnavailableError as exc:
                         attempt_status = "failed"
                         error_code = "usage_unavailable"
@@ -967,6 +1098,7 @@ class SupervisorRuntime:
                         receipt = None
             else:
                 receipt_for_record = None
+                observed_tool_calls = 0
 
             attempt_record = TaskAttemptRecord(
                 task_id=task.task_id,
@@ -978,7 +1110,10 @@ class SupervisorRuntime:
                 duration_ms=duration_ms,
                 error_code=error_code,
                 agent_calls=1,
-                tool_calls=(receipt_for_record.tool_calls if receipt_for_record else 0),
+                # R4 P0-3: use the observed tool call count, not the
+                # receipt's declared count, so an under-reporting
+                # receipt does not produce a misleading audit record.
+                tool_calls=observed_tool_calls,
                 tokens_used=(
                     receipt_for_record.tokens_used if receipt_for_record else None
                 ),
@@ -989,7 +1124,18 @@ class SupervisorRuntime:
             # Successful Handler return.
             if attempt_status == "running" and receipt is not None:
                 try:
-                    validate_agent_result(receipt.result, task=task, plan=plan)
+                    # R4 P0-4: pass the ExecutionBinding so the
+                    # validator can check result.agent_version against
+                    # binding.capability_snapshot.version — a Handler
+                    # cannot return a result from a different
+                    # capability version than the one bound at
+                    # pre-flight.
+                    validate_agent_result(
+                        receipt.result,
+                        task=task,
+                        plan=plan,
+                        binding=binding,
+                    )
                 except InvalidAgentResultError as exc:
                     attempts[-1] = TaskAttemptRecord(
                         task_id=task.task_id,
@@ -1001,7 +1147,7 @@ class SupervisorRuntime:
                         duration_ms=duration_ms,
                         error_code="invalid_result",
                         agent_calls=1,
-                        tool_calls=receipt.tool_calls,
+                        tool_calls=observed_tool_calls,
                         tokens_used=receipt.tokens_used,
                         cost_usd=receipt.cost_usd,
                     )
@@ -1397,6 +1543,38 @@ class SupervisorRuntime:
             return not accountant.can_start_iteration()
 
         return should_stop
+
+    @staticmethod
+    def _build_pre_dispatch(
+        accountant: _BudgetAccountant,
+    ) -> PreDispatch:
+        """R4 P1-1: deterministic agent-call budget pre-allocation.
+
+        Returns a :class:`PreDispatch` filter that iterates the
+        sorted ready list and reserves one agent call per task in
+        ``task_id`` order.  Tasks that cannot get a call slot are
+        excluded from the returned list — the Scheduler marks them
+        ``skipped`` before any coroutine is created.
+
+        Uses :meth:`has_agent_call_budget` (side-effect-free) +
+        :meth:`reserve_agent_call` so the budget state is deterministic
+        and not dependent on coroutine scheduling order.
+
+        Retries (``attempt_idx > 0`` inside ``_execute_task``) still
+        call ``reserve_agent_call`` directly — the pre-dispatch filter
+        only covers the *first* attempt of each task in the wave.
+        """
+
+        def pre_dispatch(ready: list[AgentTask]) -> list[AgentTask]:
+            allowed: list[AgentTask] = []
+            for task in ready:  # already sorted by task_id
+                if not accountant.has_agent_call_budget():
+                    break
+                accountant.reserve_agent_call()
+                allowed.append(task)
+            return allowed
+
+        return pre_dispatch
 
     @staticmethod
     def _build_before_wave(

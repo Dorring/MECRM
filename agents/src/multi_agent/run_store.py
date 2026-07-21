@@ -117,33 +117,47 @@ def _generate_lease_id() -> str:
 # ---------------------------------------------------------------------------
 
 
-RunIdentityStatus = Literal["in_progress", "completed", "conflict"]
+RunIdentityStatus = Literal["in_progress", "completed"]
 
 
 class RunIdentity(StrictContract):
-    """R3 P1-1: identity probe result.
+    """R3 P1-1 / R4 P0-1: identity probe result.
 
     Returned by :meth:`RunStore.lookup_run_identity`.  Encapsulates
     the run's status with respect to a *specific* ``plan_hash`` so
     the Supervisor can pick the right path without calling ``begin()``
     (which has side effects).
 
+    Decision matrix (R4 P0-1 — the Supervisor MUST check
+    ``plan_hash_matches`` *before* checking ``status`` so a plan
+    conflict is never masked by a registry version mismatch or an
+    in-progress error):
+
+    * ``plan_hash_matches == False`` → **conflict** — raise
+      :class:`RunPlanConflictError` regardless of ``status``.
     * ``status == "completed"`` and ``plan_hash_matches == True`` →
       cache hit; ``cached_result`` is a deep copy of the stored
       result.
-    * ``status == "completed"`` and ``plan_hash_matches == False`` →
-      conflict; the caller should raise ``RunPlanConflictError``.
-    * ``status == "in_progress"`` → the caller should raise
-      ``RunAlreadyInProgressError``.
+    * ``status == "in_progress"`` and ``plan_hash_matches == True`` →
+      raise :class:`RunAlreadyInProgressError`.
+
+    R4 P0-1: ``requested_plan_hash`` and ``stored_plan_hash`` are kept
+    as separate fields for safe diagnostics — a conflict identity
+    carries both values so the caller can log exactly which plan_hash
+    was already bound to the run_id.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     run_id: str
-    plan_hash: str
+    requested_plan_hash: str
+    stored_plan_hash: str
     status: RunIdentityStatus
-    plan_hash_matches: bool
     cached_result: SupervisorRunResult | None = None
+
+    @property
+    def plan_hash_matches(self) -> bool:
+        return self.requested_plan_hash == self.stored_plan_hash
 
     @property
     def is_completed(self) -> bool:
@@ -286,7 +300,7 @@ class InMemoryRunStore:
         run_id: str,
         plan_hash: str,
     ) -> RunIdentity | None:
-        """R3 P1-1: read-only identity probe.
+        """R3 P1-1 / R4 P0-1: read-only identity probe.
 
         Determines cache/conflict/in-progress status for *run_id*
         with respect to *plan_hash* in one call, without side effects.
@@ -294,22 +308,22 @@ class InMemoryRunStore:
         entry = self._entries.get(run_id)
         if entry is None:
             return None
+        matches = entry.plan_hash == plan_hash
         if entry.in_progress:
             return RunIdentity(
                 run_id=run_id,
-                plan_hash=plan_hash,
+                requested_plan_hash=plan_hash,
+                stored_plan_hash=entry.plan_hash,
                 status="in_progress",
-                plan_hash_matches=(entry.plan_hash == plan_hash),
                 cached_result=None,
             )
         # Completed run.
         assert entry.result is not None
-        matches = entry.plan_hash == plan_hash
         return RunIdentity(
             run_id=run_id,
-            plan_hash=plan_hash,
+            requested_plan_hash=plan_hash,
+            stored_plan_hash=entry.plan_hash,
             status="completed",
-            plan_hash_matches=matches,
             cached_result=(_deep_copy_result(entry.result) if matches else None),
         )
 

@@ -44,7 +44,10 @@ from multi_agent.execution import (
     validate_agent_result,
 )
 from multi_agent.execution_errors import InvalidAgentResultError
-from multi_agent.invocation import AgentInvocationReceipt
+from multi_agent.invocation import (
+    AgentInvocationReceipt,
+    UsageVerificationCapabilities,
+)
 from multi_agent.planning import PlanDraft, PlanningRequest, PlanningSignals
 from multi_agent.registry import AgentRegistry, ToolCatalog, ToolDescriptor
 
@@ -57,6 +60,24 @@ from multi_agent.contracts import AgentAuthority, AgentCapability, ToolAuthority
 
 
 _FIXED_TS = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+
+# R4 P0-2: capability doubles used by direct ``_BudgetAccountant`` tests.
+_TRUSTED_TOKEN_CAPS = UsageVerificationCapabilities(
+    verifies_tokens=True,
+    verifies_cost=False,
+    source_id="test_trusted_token_invoker",
+)
+_TRUSTED_COST_CAPS = UsageVerificationCapabilities(
+    verifies_tokens=False,
+    verifies_cost=True,
+    source_id="test_trusted_cost_invoker",
+)
+_UNVERIFIED_CAPS = UsageVerificationCapabilities(
+    verifies_tokens=False,
+    verifies_cost=False,
+    source_id="test_unverified_invoker",
+)
 
 
 def _make_proposal(
@@ -551,7 +572,14 @@ class TestFakeExecutionCancellation:
 class TestBudgetEnforcement:
     def test_token_budget_with_none_usage_fails_closed(self):
         """If ``token_budget`` is configured and the receipt reports
-        ``None`` tokens_used, ``record_receipt`` must raise."""
+        ``None`` tokens_used, ``record_receipt`` must raise.
+
+        R4 P0-2: the receipt's ``usage_trust`` is cross-checked
+        against the invoker's capabilities.  To exercise the None
+        branch specifically we pair a ``verified_provider`` receipt
+        with a ``verifies_tokens=True`` invoker so the provenance
+        check passes and the None check fires.
+        """
         from multi_agent.supervisor import _BudgetAccountant
 
         budget = ExecutionBudget(token_budget=1000)
@@ -560,9 +588,10 @@ class TestBudgetEnforcement:
             result=_make_result(),
             tool_calls=0,
             tokens_used=None,  # fail-closed
+            usage_trust="verified_provider",
         )
         with pytest.raises(Exception, match="token_budget"):
-            acc.record_receipt(receipt)
+            acc.record_receipt(receipt, invoker_capabilities=_TRUSTED_TOKEN_CAPS)
 
     def test_cost_budget_with_none_usage_fails_closed(self):
         from multi_agent.supervisor import _BudgetAccountant
@@ -573,9 +602,10 @@ class TestBudgetEnforcement:
             result=_make_result(),
             tool_calls=0,
             cost_usd=None,  # fail-closed
+            usage_trust="trusted_adapter",
         )
         with pytest.raises(Exception, match="cost_budget"):
-            acc.record_receipt(receipt)
+            acc.record_receipt(receipt, invoker_capabilities=_TRUSTED_COST_CAPS)
 
     def test_max_agent_calls_exceeded(self):
         from multi_agent.supervisor import _BudgetAccountant
@@ -590,15 +620,19 @@ class TestBudgetEnforcement:
         assert "max_agent_calls" in (acc.exceeded_reason or "")
 
     def test_max_tool_calls_exceeded(self):
+        """R4 P0-3: tool calls are charged via
+        :meth:`record_observed_tool_calls` *before* receipt validation,
+        so an invalid receipt cannot erase already-consumed budget.
+        ``record_receipt`` no longer accumulates tool calls."""
         from multi_agent.supervisor import _BudgetAccountant
 
         budget = ExecutionBudget(max_tool_calls=2)
         acc = _BudgetAccountant(budget, start_monotonic=0.0)
-        # First receipt with 1 tool call — OK.
-        acc.record_receipt(AgentInvocationReceipt(result=_make_result(), tool_calls=1))
+        # First observed count — OK.
+        acc.record_observed_tool_calls(1)
         assert not acc.exceeded
-        # Second receipt with 2 tool calls — exceeds.
-        acc.record_receipt(AgentInvocationReceipt(result=_make_result(), tool_calls=2))
+        # Second observed count — exceeds.
+        acc.record_observed_tool_calls(2)
         assert acc.exceeded
         assert "max_tool_calls" in (acc.exceeded_reason or "")
 

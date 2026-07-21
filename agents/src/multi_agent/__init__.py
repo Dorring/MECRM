@@ -161,6 +161,7 @@ from multi_agent.execution_errors import (
     ExecutionUsageUnavailableError,
     InvalidAgentResultError,
     InvalidInvocationReceiptError,
+    NonRetryableAgentError,
     RetryableAgentError,
     RunAlreadyInProgressError,
     RunPlanConflictError,
@@ -173,6 +174,8 @@ from multi_agent.invocation import (
     RegistryAgentInvoker,
     TrustedUsageInvoker,
     UsageTrustLevel,
+    UsageVerificationCapabilities,
+    get_usage_capabilities,
     validate_invocation_receipt,
 )
 from multi_agent.run_store import (
@@ -186,6 +189,7 @@ from multi_agent.run_store import (
 from multi_agent.scheduler import (
     BeforeWave,
     DagScheduler,
+    PreDispatch,
     TaskOutcome,
     WaveCallback,
     WaveStartedCallback,
@@ -318,6 +322,7 @@ __all__ = [
     "ExecutionUsageUnavailableError",
     "InvalidAgentResultError",
     "InvalidInvocationReceiptError",
+    "NonRetryableAgentError",
     "RetryableAgentError",
     "RunAlreadyInProgressError",
     "RunPlanConflictError",
@@ -329,6 +334,8 @@ __all__ = [
     "RegistryAgentInvoker",
     "TrustedUsageInvoker",
     "UsageTrustLevel",
+    "UsageVerificationCapabilities",
+    "get_usage_capabilities",
     "validate_invocation_receipt",
     # Phase 4 — Execution Contracts
     "ExecutionBinding",
@@ -368,6 +375,7 @@ __all__ = [
     # Phase 4 — Scheduler & Supervisor
     "BeforeWave",
     "DagScheduler",
+    "PreDispatch",
     "TaskOutcome",
     "WaveCallback",
     "WaveStartedCallback",
