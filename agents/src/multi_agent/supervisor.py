@@ -395,6 +395,20 @@ class _BudgetAccountant:
         and a token/cost budget is configured."""
         return self._usage_unavailable
 
+    @property
+    def last_attempt_record(self) -> AttemptUsageRecord | None:
+        """R8 P0-5: return the most recently committed
+        :class:`AttemptUsageRecord`, or ``None`` when no record has
+        been committed yet.
+
+        Used by :meth:`_execute_task` to retrieve the explicit
+        dispositions and source ids that were frozen during the atomic
+        commit, so the :class:`TaskAttemptRecord` audit fields stay
+        consistent with the Accountant's internal record without
+        duplicating the disposition decision logic.
+        """
+        return self._attempt_records[-1] if self._attempt_records else None
+
     def _compute_usage_status(
         self, verified: int, capable: int
     ) -> UsageAvailabilityStatus:
@@ -431,6 +445,10 @@ class _BudgetAccountant:
             self._token_usage_applicable_attempts,
             self._cost_usage_applicable_attempts,
         )
+        # R8 P1-1: expose per-attempt usage records as a defensive
+        # deep copy so external consumers can audit each attempt's
+        # disposition and source after the run finishes.
+        records_copy = [r.model_copy(deep=True) for r in self._attempt_records]
         return ExecutionUsage(
             agent_calls=self._agent_calls,
             tool_calls=self._tool_calls,
@@ -445,8 +463,204 @@ class _BudgetAccountant:
             verified_token_attempts=self._verified_token_attempts,
             verified_cost_attempts=self._verified_cost_attempts,
             provider_usage_capable_attempts=deprecated_capable,
+            attempt_usage_records=records_copy,
             iterations=self._iterations,
         )
+
+    def _compute_attempt_usage(
+        self,
+        receipt: AgentInvocationReceipt,
+        *,
+        invoker_capabilities: UsageVerificationCapabilities,
+        task_id: str,
+        attempt: int,
+    ) -> AttemptUsageRecord:
+        """R8 P0-4: PURE COMPUTATION phase — compute the
+        :class:`AttemptUsageRecord` and budget deltas WITHOUT
+        mutating any accountant state.
+
+        R8 P0-1: the dispositions are taken from the Receipt's explicit
+        ``token_disposition`` / ``cost_disposition`` fields (declared
+        by the Invoker boundary) — NOT inferred from
+        ``provider_metadata is None``.  The Accountant only VALIDATES
+        them against Invoker capabilities.
+
+        Returns the computed :class:`AttemptUsageRecord`.  Raises
+        :class:`ExecutionUsageUnavailableError` on any validation
+        failure (Trust / Source / Capability mismatch).
+        """
+        prov = receipt.usage_provenance
+        token_disp = receipt.token_disposition
+        cost_disp = receipt.cost_disposition
+
+        # R8 P0-1: VALIDATE the declared dispositions against Invoker
+        # capabilities.
+        if token_disp == AttemptUsageDisposition.VERIFIED:
+            if not invoker_capabilities.verifies_tokens:
+                raise ExecutionUsageUnavailableError(
+                    f"receipt.token_disposition=VERIFIED but invoker "
+                    f"({invoker_capabilities.source_id}) does not have "
+                    f"verifies_tokens=True — receipt cannot self-elevate "
+                    f"token trust above the invoker's capabilities"
+                )
+            if not prov.tokens_verified:
+                raise ExecutionUsageUnavailableError(
+                    "receipt.token_disposition=VERIFIED but "
+                    "usage_provenance.tokens_verified=False — a VERIFIED "
+                    "disposition requires the corresponding provenance flag"
+                )
+            # R8 P0-3: per-dimension source binding.
+            if invoker_capabilities.bound_token_source_ids:
+                src = prov.token_source_id or prov.source_id
+                if src not in invoker_capabilities.bound_token_source_ids:
+                    raise ExecutionUsageUnavailableError(
+                        f"receipt token_source_id={src!r} is not in the "
+                        f"invoker's bound_token_source_ids "
+                        f"({sorted(invoker_capabilities.bound_token_source_ids)}) "
+                        f"— receipt cannot claim token provenance from an "
+                        f"unbound source"
+                    )
+        if cost_disp == AttemptUsageDisposition.VERIFIED:
+            if not invoker_capabilities.verifies_cost:
+                raise ExecutionUsageUnavailableError(
+                    f"receipt.cost_disposition=VERIFIED but invoker "
+                    f"({invoker_capabilities.source_id}) does not have "
+                    f"verifies_cost=True — receipt cannot self-elevate "
+                    f"cost trust above the invoker's capabilities"
+                )
+            if not prov.cost_verified:
+                raise ExecutionUsageUnavailableError(
+                    "receipt.cost_disposition=VERIFIED but "
+                    "usage_provenance.cost_verified=False — a VERIFIED "
+                    "disposition requires the corresponding provenance flag"
+                )
+            # R8 P0-3: per-dimension source binding.
+            if invoker_capabilities.bound_cost_source_ids:
+                src = prov.cost_source_id or prov.source_id
+                if src not in invoker_capabilities.bound_cost_source_ids:
+                    raise ExecutionUsageUnavailableError(
+                        f"receipt cost_source_id={src!r} is not in the "
+                        f"invoker's bound_cost_source_ids "
+                        f"({sorted(invoker_capabilities.bound_cost_source_ids)}) "
+                        f"— receipt cannot claim cost provenance from an "
+                        f"unbound source"
+                    )
+        if token_disp == AttemptUsageDisposition.NO_PROVIDER_CALL:
+            if not invoker_capabilities.can_attest_no_provider_call:
+                raise ExecutionUsageUnavailableError(
+                    f"receipt.token_disposition=NO_PROVIDER_CALL but invoker "
+                    f"({invoker_capabilities.source_id}) does not have "
+                    f"can_attest_no_provider_call=True — only a trusted "
+                    f"deterministic invoker can attest no provider call"
+                )
+        if cost_disp == AttemptUsageDisposition.NO_PROVIDER_CALL:
+            if not invoker_capabilities.can_attest_no_provider_call:
+                raise ExecutionUsageUnavailableError(
+                    f"receipt.cost_disposition=NO_PROVIDER_CALL but invoker "
+                    f"({invoker_capabilities.source_id}) does not have "
+                    f"can_attest_no_provider_call=True — only a trusted "
+                    f"deterministic invoker can attest no provider call"
+                )
+
+        # Build the AttemptUsageRecord (pure — no state mutation).
+        return AttemptUsageRecord(
+            task_id=task_id,
+            attempt=attempt,
+            token_disposition=token_disp,
+            cost_disposition=cost_disp,
+            tokens_used=receipt.tokens_used
+            if token_disp == AttemptUsageDisposition.VERIFIED
+            else None,
+            cost_usd=receipt.cost_usd
+            if cost_disp == AttemptUsageDisposition.VERIFIED
+            else None,
+            token_source_id=(
+                prov.token_source_id or prov.source_id
+                if token_disp == AttemptUsageDisposition.VERIFIED
+                else None
+            ),
+            cost_source_id=(
+                prov.cost_source_id or prov.source_id
+                if cost_disp == AttemptUsageDisposition.VERIFIED
+                else None
+            ),
+        )
+
+    def _validate_attempt_budget(
+        self,
+        record: AttemptUsageRecord,
+        budget: ExecutionBudget,
+    ) -> str | None:
+        """R8 P0-4: PURE VALIDATION phase — check whether committing
+        *record* is PERMITTED.  Returns a non-None ``exceeded_reason``
+        string when the record must be rejected, or ``None`` if the
+        commit is safe.
+
+        Only rejects records that would leave the Accountant in an
+        UNAVAILABLE state when a budget is configured — i.e. the
+        disposition is ``UNAVAILABLE`` or a ``VERIFIED`` record is
+        missing its verified value.  Budget OVERFLOW for a ``VERIFIED``
+        record is NOT a rejection — the usage IS verified, just over
+        budget; the record is committed and the post-commit check in
+        :meth:`record_receipt` marks ``_exceeded`` so future waves
+        stop.
+
+        Does NOT mutate any accountant state.
+        """
+        # Token dimension — reject only when usage is unavailable.
+        if budget.token_budget is not None:
+            if record.token_disposition == AttemptUsageDisposition.UNAVAILABLE:
+                return "execution_usage_unavailable"
+            if (
+                record.token_disposition == AttemptUsageDisposition.VERIFIED
+                and record.tokens_used is None
+            ):
+                return "execution_usage_unavailable"
+        # Cost dimension — reject only when usage is unavailable.
+        if budget.cost_budget_usd is not None:
+            if record.cost_disposition == AttemptUsageDisposition.UNAVAILABLE:
+                return "execution_usage_unavailable"
+            if (
+                record.cost_disposition == AttemptUsageDisposition.VERIFIED
+                and record.cost_usd is None
+            ):
+                return "execution_usage_unavailable"
+        return None
+
+    def _commit_attempt_usage(self, record: AttemptUsageRecord) -> None:
+        """R8 P0-4: ATOMIC COMMIT phase — apply ALL state mutations
+        for a computed :class:`AttemptUsageRecord` in a single step.
+
+        This is the ONLY method that mutates the per-dimension
+        counters, accumulated usage, verified-attempt counters, and
+        the attempt-records list.  Because the compute and validate
+        phases ran without side effects, a validation failure cannot
+        leave the accountant in a half-committed state.
+
+        R8 P0-4 invariant: every committed agent call produces
+        EXACTLY ONE :class:`AttemptUsageRecord` via this method (or
+        via :meth:`record_usage_unavailable` for the no-receipt /
+        invalid-receipt paths).  There is no path that increments
+        counters without also appending a record.
+        """
+        # Per-dimension applicable counters.
+        if record.token_disposition != AttemptUsageDisposition.NO_PROVIDER_CALL:
+            self._token_usage_applicable_attempts += 1
+        if record.cost_disposition != AttemptUsageDisposition.NO_PROVIDER_CALL:
+            self._cost_usage_applicable_attempts += 1
+        # Accumulated VERIFIED usage + verified-attempt counters.
+        if record.token_disposition == AttemptUsageDisposition.VERIFIED:
+            if record.tokens_used is not None:
+                self._tokens_used += record.tokens_used
+                self._tokens_usage_available = True
+                self._verified_token_attempts += 1
+        if record.cost_disposition == AttemptUsageDisposition.VERIFIED:
+            if record.cost_usd is not None:
+                self._cost_usd += record.cost_usd
+                self._cost_usage_available = True
+                self._verified_cost_attempts += 1
+        # Append the record — exactly one per committed call.
+        self._attempt_records.append(record)
 
     def check_max_tasks(self, n_tasks: int) -> None:
         if n_tasks > self._budget.max_tasks:
@@ -610,260 +824,173 @@ class _BudgetAccountant:
         task_id: str,
         attempt: int,
     ) -> None:
-        """Accumulate *actual* token/cost usage from a successful
-        invocation.
+        """R8 P0-4: Accumulate *actual* token/cost usage from a
+        successful invocation via a three-phase ATOMIC commit:
 
-        R7 P0-1: No-provider-call is no longer inferred from
-        ``provider_metadata is None``.  The disposition for each
-        dimension is now computed from the Invoker's
-        :class:`UsageVerificationCapabilities`:
+        1. **Compute** (:meth:`_compute_attempt_usage`) — pure
+           function that validates the Receipt's explicit
+           :class:`AttemptUsageDisposition` fields against Invoker
+           capabilities and builds an :class:`AttemptUsageRecord`.
+           No state mutation.
+        2. **Validate** (:meth:`_validate_attempt_budget`) — pure
+           function that checks whether committing the record would
+           breach any configured budget.  No state mutation.
+        3. **Commit** (:meth:`_commit_attempt_usage`) — the ONLY
+           phase that mutates accountant state.  Applies all counters,
+           accumulated usage, and appends the record in one step.
 
-        * ``VERIFIED`` — ``provenance.{dim}_verified=True`` (after
-          cross-checking against the Invoker's ``verifies_{dim}``
-          capability).
-        * ``NO_PROVIDER_CALL`` — the Invoker has
-          ``can_attest_no_provider_call=True`` AND
-          ``provider_metadata is None``.  Only a trusted deterministic
-          Invoker can attest this — a live Handler that omits
-          ``provider_metadata`` produces ``UNAVAILABLE``, not
-          ``NO_PROVIDER_CALL``.
-        * ``UNAVAILABLE`` — anything else (e.g. a live Handler that
-          omitted ``provider_metadata``, or a verifier that could not
-          measure usage).
+        R8 P0-1: the dispositions are taken from the Receipt's
+        explicit ``token_disposition`` / ``cost_disposition`` fields
+        (declared by the Invoker boundary) — NOT inferred from
+        ``provider_metadata is None``.  The Accountant only VALIDATES
+        them against Invoker capabilities.
 
-        R7 P0-3: Token and Cost now have INDEPENDENT coverage
-        denominators.  An attempt is "applicable" for a dimension when
-        its disposition is NOT ``NO_PROVIDER_CALL``.  A cost-only
-        adapter verifying Attempt B's cost can no longer "offset"
-        Attempt A's missing cost.
+        R8 P0-4: because the compute and validate phases are pure,
+        a validation failure (Trust / Source / Capability / Budget)
+        cannot leave the accountant in a half-committed state.  The
+        ``_commit_attempt_usage`` phase is the single mutation point.
 
-        R7 P0-6: when ``invoker_capabilities.bound_source_ids`` is
-        non-empty, the receipt's ``usage_provenance.source_id`` must
-        be in that set — a receipt cannot claim provenance from a
-        source the Invoker did not bind.
-
-        R5 P0-4: usage *recording* and budget *enforcement* remain
-        separated — trusted usage is ALWAYS recorded regardless of
-        whether the budget is configured.
+        On any validation failure, the method raises
+        :class:`ExecutionUsageUnavailableError` WITHOUT mutating
+        state.  The caller (:meth:`_execute_task`) is responsible for
+        then calling :meth:`record_usage_unavailable` so the attempt
+        still produces exactly one :class:`AttemptUsageRecord` with
+        ``UNAVAILABLE`` dispositions (R8 P0-4 invariant: every
+        committed agent call produces exactly one record).
         """
-        prov = receipt.usage_provenance
-
-        # R7 P0-6: Provenance Source Binding.  When the Invoker has
-        # bound a set of trusted Verifier/Adapter source identities,
-        # the receipt's ``source_id`` must be in that set.  This
-        # prevents a receipt from claiming provenance from an
-        # unbound source.
-        if invoker_capabilities.bound_source_ids:
-            if prov.source_id not in invoker_capabilities.bound_source_ids:
-                raise ExecutionUsageUnavailableError(
-                    f"receipt.usage_provenance.source_id={prov.source_id!r} "
-                    f"is not in the invoker's bound_source_ids "
-                    f"({sorted(invoker_capabilities.bound_source_ids)}) — "
-                    f"receipt cannot claim provenance from an unbound source"
-                )
-
-        # R6 P0-4: cross-check per-dimension provenance against invoker
-        # capabilities.  A receipt cannot claim verified tokens/cost
-        # from an Invoker that does not have the matching capability.
-        if prov.tokens_verified and not invoker_capabilities.verifies_tokens:
-            raise ExecutionUsageUnavailableError(
-                f"receipt.usage_provenance.tokens_verified=True but invoker "
-                f"({invoker_capabilities.source_id}) does not have "
-                f"verifies_tokens=True — receipt cannot self-elevate "
-                f"token trust above the invoker's capabilities"
-            )
-        if prov.cost_verified and not invoker_capabilities.verifies_cost:
-            raise ExecutionUsageUnavailableError(
-                f"receipt.usage_provenance.cost_verified=True but invoker "
-                f"({invoker_capabilities.source_id}) does not have "
-                f"verifies_cost=True — receipt cannot self-elevate "
-                f"cost trust above the invoker's capabilities"
-            )
-
-        # R7 P0-1: compute per-dimension AttemptUsageDisposition.
-        # ``NO_PROVIDER_CALL`` requires the Invoker to explicitly
-        # attest it via ``can_attest_no_provider_call=True`` AND the
-        # receipt to have no ``provider_metadata``.  A live Handler
-        # that omits ``provider_metadata`` produces ``UNAVAILABLE``,
-        # NOT ``NO_PROVIDER_CALL``.
-        provider_call_made = receipt.result.provider_metadata is not None
-        can_attest_no_call = invoker_capabilities.can_attest_no_provider_call
-
-        if prov.tokens_verified:
-            token_disposition = AttemptUsageDisposition.VERIFIED
-        elif can_attest_no_call and not provider_call_made:
-            token_disposition = AttemptUsageDisposition.NO_PROVIDER_CALL
-        else:
-            token_disposition = AttemptUsageDisposition.UNAVAILABLE
-
-        if prov.cost_verified:
-            cost_disposition = AttemptUsageDisposition.VERIFIED
-        elif can_attest_no_call and not provider_call_made:
-            cost_disposition = AttemptUsageDisposition.NO_PROVIDER_CALL
-        else:
-            cost_disposition = AttemptUsageDisposition.UNAVAILABLE
-
-        # R7 P0-3: increment per-dimension applicable counters.  An
-        # attempt is "applicable" for a dimension when its disposition
-        # is NOT ``NO_PROVIDER_CALL``.
-        if token_disposition != AttemptUsageDisposition.NO_PROVIDER_CALL:
-            self._token_usage_applicable_attempts += 1
-        if cost_disposition != AttemptUsageDisposition.NO_PROVIDER_CALL:
-            self._cost_usage_applicable_attempts += 1
-
-        # --- Token: verify → record → enforce ---
-        if token_disposition == AttemptUsageDisposition.VERIFIED:
-            if receipt.tokens_used is not None:
-                self._tokens_used += receipt.tokens_used
-                self._tokens_usage_available = True
-                self._verified_token_attempts += 1
-
-        # R7 P0-1: token budget enforcement.  Fail-closed when the
-        # disposition is ``UNAVAILABLE`` (unknown provider call).  No
-        # enforcement when ``NO_PROVIDER_CALL`` (trusted deterministic).
-        if self._budget.token_budget is not None:
-            if token_disposition == AttemptUsageDisposition.UNAVAILABLE:
-                self._usage_unavailable = True
-                self._exceeded = True
-                self._exceeded_reason = "execution_usage_unavailable"
-                raise ExecutionUsageUnavailableError(
-                    "token_budget is configured but the invocation "
-                    "receipt has token disposition=UNAVAILABLE "
-                    f"(provenance source: {prov.source_id}, "
-                    f"provider_metadata={'present' if provider_call_made else 'absent'}, "
-                    f"can_attest_no_provider_call={can_attest_no_call})"
-                )
-            if token_disposition == AttemptUsageDisposition.VERIFIED:
-                if receipt.tokens_used is None:
-                    self._usage_unavailable = True
-                    self._exceeded = True
-                    self._exceeded_reason = "execution_usage_unavailable"
-                    raise ExecutionUsageUnavailableError(
-                        "token_budget is configured and provenance is "
-                        "tokens_verified=True but the receipt did not "
-                        "report tokens_used"
-                    )
-                if self._tokens_used > self._budget.token_budget:
-                    self._exceeded = True
-                    self._exceeded_reason = (
-                        f"token_budget exceeded: "
-                        f"{self._tokens_used} > {self._budget.token_budget}"
-                    )
-
-        # --- Cost: verify → record → enforce ---
-        if cost_disposition == AttemptUsageDisposition.VERIFIED:
-            if receipt.cost_usd is not None:
-                self._cost_usd += receipt.cost_usd
-                self._cost_usage_available = True
-                self._verified_cost_attempts += 1
-
-        # R7 P0-1: cost budget enforcement.  Fail-closed when the
-        # disposition is ``UNAVAILABLE``.  No enforcement when
-        # ``NO_PROVIDER_CALL`` (trusted deterministic).
-        if self._budget.cost_budget_usd is not None:
-            if cost_disposition == AttemptUsageDisposition.UNAVAILABLE:
-                self._usage_unavailable = True
-                self._exceeded = True
-                self._exceeded_reason = "execution_usage_unavailable"
-                raise ExecutionUsageUnavailableError(
-                    "cost_budget_usd is configured but the invocation "
-                    "receipt has cost disposition=UNAVAILABLE "
-                    f"(provenance source: {prov.source_id}, "
-                    f"provider_metadata={'present' if provider_call_made else 'absent'}, "
-                    f"can_attest_no_provider_call={can_attest_no_call})"
-                )
-            if cost_disposition == AttemptUsageDisposition.VERIFIED:
-                if receipt.cost_usd is None:
-                    self._usage_unavailable = True
-                    self._exceeded = True
-                    self._exceeded_reason = "execution_usage_unavailable"
-                    raise ExecutionUsageUnavailableError(
-                        "cost_budget_usd is configured and provenance is "
-                        "cost_verified=True but the receipt did not "
-                        "report cost_usd"
-                    )
-                if self._cost_usd > self._budget.cost_budget_usd:
-                    self._exceeded = True
-                    self._exceeded_reason = (
-                        f"cost_budget_usd exceeded: "
-                        f"{self._cost_usd} > {self._budget.cost_budget_usd}"
-                    )
-
-        # R7 P0-3: store per-attempt record for auditability.
-        self._attempt_records.append(
-            AttemptUsageRecord(
-                task_id=task_id,
-                attempt=attempt,
-                token_disposition=token_disposition,
-                cost_disposition=cost_disposition,
-                tokens_used=receipt.tokens_used,
-                cost_usd=receipt.cost_usd,
-                source_id=prov.source_id,
-            )
+        # Phase 1: compute (pure — raises on validation failure).
+        record = self._compute_attempt_usage(
+            receipt,
+            invoker_capabilities=invoker_capabilities,
+            task_id=task_id,
+            attempt=attempt,
         )
+        # Phase 2: validate budget (pure — returns exceeded_reason).
+        exceeded_reason = self._validate_attempt_budget(record, self._budget)
+        if exceeded_reason is not None:
+            # R8 P0-4: do NOT commit — raise so the caller records
+            # usage_unavailable for this attempt.
+            if exceeded_reason == "execution_usage_unavailable":
+                self._usage_unavailable = True
+            raise ExecutionUsageUnavailableError(
+                f"attempt budget validation failed: {exceeded_reason} "
+                f"(task_id={task_id}, attempt={attempt}, "
+                f"token_disposition={record.token_disposition}, "
+                f"cost_disposition={record.cost_disposition})"
+            )
+        # Phase 3: atomic commit (single mutation point).
+        self._commit_attempt_usage(record)
+        # R8 P0-4: post-commit budget exceeded check (e.g. the commit
+        # pushed the total past the limit).  This does not raise —
+        # the record is already committed — but marks the accountant
+        # so future waves are stopped.
+        if (
+            self._budget.token_budget is not None
+            and self._tokens_used > self._budget.token_budget
+        ):
+            self._exceeded = True
+            self._exceeded_reason = (
+                f"token_budget exceeded: "
+                f"{self._tokens_used} > {self._budget.token_budget}"
+            )
+        if (
+            self._budget.cost_budget_usd is not None
+            and self._cost_usd > self._budget.cost_budget_usd
+        ):
+            self._exceeded = True
+            self._exceeded_reason = (
+                f"cost_budget_usd exceeded: "
+                f"{self._cost_usd} > {self._budget.cost_budget_usd}"
+            )
 
     def record_usage_unavailable(
         self,
         *,
         task_id: str | None = None,
         attempt: int | None = None,
+        invoker_capabilities: UsageVerificationCapabilities | None = None,
     ) -> None:
-        """R6 P0-3 / R7 P0-2: record that a committed agent call
-        produced no usable Usage Receipt (timeout, exception, Handler
-        pre-return error, OR invalid receipt).
+        """R6 P0-3 / R7 P0-2 / R8 P0-4/P0-5: record that a committed
+        agent call produced no usable Usage Receipt (timeout,
+        exception, Handler pre-return error, OR invalid receipt).
 
-        Every committed agent call must ultimately produce a Usage
-        Disposition per dimension:
+        R8 P0-4: this method is the ATOMIC commit for the no-receipt
+        / invalid-receipt paths.  It computes the dispositions, builds
+        a single :class:`AttemptUsageRecord`, and commits it in one
+        step — there is no half-committed state.
 
-        * ``VERIFIED`` — receipt with verified tokens/cost (handled by
-          :meth:`record_receipt`).
-        * ``NO_PROVIDER_CALL`` — trusted deterministic Invoker attests
-          no provider call was made (handled by :meth:`record_receipt`).
-        * ``UNAVAILABLE`` — no receipt, OR an invalid receipt, OR a
-          live Handler that omitted ``provider_metadata`` (this method
-          for the no-receipt / invalid-receipt case; ``record_receipt``
-          for the omitted-metadata case).
+        R8 P0-5: the dispositions for the no-receipt path are now
+        determined by the frozen Invoker capabilities rather than
+        unconditionally set to ``UNAVAILABLE``:
 
-        R7 P0-2: this method is now also called for invalid receipts
+        * If the Invoker has ``can_attest_no_provider_call=True`` (a
+          trusted deterministic Invoker that errored before returning
+          a receipt), the dispositions are ``NO_PROVIDER_CALL`` — the
+          Invoker authoritatively knows no provider call was made.
+        * Otherwise, the dispositions are ``UNAVAILABLE`` — the
+          Invoker cannot attest whether a provider call was made, so
+          the Runtime must fail-closed when a budget is configured.
+
+        R7 P0-2: this method is also called for invalid receipts
         (receipts that failed :func:`validate_invocation_receipt`).
         An invalid receipt's Token/Cost data cannot be trusted, so
-        both dimensions are marked ``UNAVAILABLE``.  Observed tool
-        calls are still charged (via :meth:`record_observed_tool_calls`)
-        before this method is called.
+        both dimensions are marked ``UNAVAILABLE`` regardless of
+        Invoker capabilities — the receipt existed but was invalid,
+        so the Invoker's attestation cannot be used.  Observed tool
+        calls are still charged (via
+        :meth:`record_observed_tool_calls`) before this method is
+        called.
 
-        R7 P0-3: both Token and Cost dimensions are marked as
-        ``UNAVAILABLE`` and counted as applicable for coverage
-        purposes.  When a token/cost budget is configured, the run
-        must fail-closed: the Provider request may have been sent and
-        consumed tokens/cost, but the Runtime cannot measure it.
+        R7 P0-3: both Token and Cost dimensions are counted as
+        applicable for coverage purposes (when ``UNAVAILABLE``).
+        ``NO_PROVIDER_CALL`` dimensions are NOT counted as applicable.
 
         Sets ``_usage_unavailable=True`` and, when a budget is
         configured, ``_exceeded=True`` with reason
         ``execution_usage_unavailable`` so the run finalises as
         ``budget_exceeded``.
         """
-        # R7 P0-3: both dimensions are UNAVAILABLE — count them as
-        # applicable for per-dimension coverage.
-        self._token_usage_applicable_attempts += 1
-        self._cost_usage_applicable_attempts += 1
-        # R7 P0-3: store per-attempt record for auditability when
-        # task_id/attempt are provided (invalid receipt / no receipt
-        # paths have these available).
+        # R8 P0-5: determine dispositions based on Invoker caps.
+        # Default to UNAVAILABLE when caps are not provided (caller
+        # cannot attest anything).
+        if (
+            invoker_capabilities is not None
+            and invoker_capabilities.can_attest_no_provider_call
+        ):
+            # Trusted deterministic Invoker that errored before
+            # returning a receipt — it authoritatively knows no
+            # provider call was made.
+            token_disp = AttemptUsageDisposition.NO_PROVIDER_CALL
+            cost_disp = AttemptUsageDisposition.NO_PROVIDER_CALL
+        else:
+            # Live Invoker or unknown — cannot attest.  Both
+            # dimensions are UNAVAILABLE.
+            token_disp = AttemptUsageDisposition.UNAVAILABLE
+            cost_disp = AttemptUsageDisposition.UNAVAILABLE
+
+        # R8 P0-4: build and commit the record atomically.
         if task_id is not None and attempt is not None:
-            self._attempt_records.append(
-                AttemptUsageRecord(
-                    task_id=task_id,
-                    attempt=attempt,
-                    token_disposition=AttemptUsageDisposition.UNAVAILABLE,
-                    cost_disposition=AttemptUsageDisposition.UNAVAILABLE,
-                    tokens_used=None,
-                    cost_usd=None,
-                    source_id=None,
-                )
+            record = AttemptUsageRecord(
+                task_id=task_id,
+                attempt=attempt,
+                token_disposition=token_disp,
+                cost_disposition=cost_disp,
+                tokens_used=None,
+                cost_usd=None,
+                token_source_id=None,
+                cost_source_id=None,
             )
+            self._commit_attempt_usage(record)
+
+        # R7 P0-3 / R8 P0-5: fail-closed when a budget is configured
+        # AND any dimension is UNAVAILABLE.  NO_PROVIDER_CALL does
+        # not trigger fail-closed (trusted deterministic).
         if (
             self._budget.token_budget is not None
-            or self._budget.cost_budget_usd is not None
+            and token_disp == AttemptUsageDisposition.UNAVAILABLE
+        ) or (
+            self._budget.cost_budget_usd is not None
+            and cost_disp == AttemptUsageDisposition.UNAVAILABLE
         ):
             self._usage_unavailable = True
             self._exceeded = True
@@ -1602,6 +1729,15 @@ class SupervisorRuntime:
             if deadline_caused_timeout:
                 accountant.mark_deadline_exceeded()
 
+            # R8 P0-5: track untrusted declared values from an invalid
+            # receipt or a receipt whose usage validation failed.  These
+            # are retained for audit ONLY — the actual usage fields are
+            # populated from the Accountant's last committed
+            # AttemptUsageRecord, which carries the explicit
+            # dispositions decided during the atomic commit.
+            declared_tokens_used: int | None = None
+            declared_cost_usd: Decimal | None = None
+
             if receipt is not None:
                 # R4 P0-3: charge *observed* tool calls BEFORE receipt
                 # validation.  ``observed_tool_calls`` is the actual
@@ -1623,12 +1759,18 @@ class SupervisorRuntime:
                     invocation_error = exc
                     receipt_for_record = receipt
                     receipt = None
-                    # R7 P0-2: Invalid Receipt must produce a Usage
-                    # Disposition.  The receipt's Token/Cost data
-                    # cannot be trusted, so both dimensions are marked
-                    # UNAVAILABLE.  Observed tool calls were already
-                    # charged above.  When a token/cost budget is
-                    # configured, this triggers fail-closed.
+                    # R8 P0-5: retain the invalid receipt's declared
+                    # values as UNTRUSTED audit fields.  The actual
+                    # usage fields will be None because the Accountant
+                    # records UNAVAILABLE dispositions for invalid
+                    # receipts.
+                    declared_tokens_used = receipt_for_record.tokens_used
+                    declared_cost_usd = receipt_for_record.cost_usd
+                    # R7 P0-2 / R8 P0-5: Invalid Receipt — both
+                    # dimensions are UNAVAILABLE regardless of Invoker
+                    # capabilities (the receipt existed but was invalid,
+                    # so the Invoker's attestation cannot be used).
+                    # invoker_capabilities is intentionally NOT passed.
                     accountant.record_usage_unavailable(
                         task_id=task.task_id, attempt=attempt_idx
                     )
@@ -1640,6 +1782,8 @@ class SupervisorRuntime:
                         # usage_provenance against what the Invoker can
                         # actually verify.  R7: also pass task_id and
                         # attempt so an AttemptUsageRecord is stored.
+                        # R8 P0-4: record_receipt now uses a three-phase
+                        # atomic commit (compute → validate → commit).
                         accountant.record_receipt(
                             receipt,
                             invoker_capabilities=invoker_caps,
@@ -1650,19 +1794,75 @@ class SupervisorRuntime:
                         attempt_status = "failed"
                         error_code = "usage_unavailable"
                         invocation_error = exc
+                        # R8 P0-4: record_receipt's compute/validate
+                        # phases are pure — no state was mutated.  We
+                        # must call record_usage_unavailable to produce
+                        # exactly one AttemptUsageRecord (R8 P0-4
+                        # invariant: every committed call produces
+                        # exactly one record).  The receipt's declared
+                        # values are retained as untrusted audit fields.
+                        declared_tokens_used = receipt_for_record.tokens_used
+                        declared_cost_usd = receipt_for_record.cost_usd
                         receipt = None
+                        # R8 P0-5: Trust/Source/Capability validation
+                        # failed — both dimensions are UNAVAILABLE.
+                        # invoker_capabilities is intentionally NOT
+                        # passed (the Invoker's attestation was what
+                        # failed validation).
+                        accountant.record_usage_unavailable(
+                            task_id=task.task_id, attempt=attempt_idx
+                        )
             else:
                 receipt_for_record = None
                 observed_tool_calls = 0
-                # R6 P0-3: No receipt produced (timeout, exception, or
-                # Handler pre-return error).  The agent call was already
-                # committed, so we must record a Usage Disposition.
-                # Since we cannot prove no provider call was made, the
-                # disposition is UNAVAILABLE.  When a token/cost budget
-                # is configured, this triggers fail-closed.
+                # R8 P0-5: No receipt produced (timeout, exception, or
+                # Handler pre-return error).  Pass the frozen Invoker
+                # capabilities so the Accountant can decide
+                # NO_PROVIDER_CALL vs UNAVAILABLE based on
+                # can_attest_no_provider_call — a trusted deterministic
+                # Invoker that errored before returning a receipt
+                # authoritatively knows no provider call was made.
                 accountant.record_usage_unavailable(
-                    task_id=task.task_id, attempt=attempt_idx
+                    task_id=task.task_id,
+                    attempt=attempt_idx,
+                    invoker_capabilities=invoker_caps,
                 )
+
+            # R8 P0-5: retrieve the explicit dispositions and source ids
+            # from the Accountant's last committed AttemptUsageRecord.
+            # This ensures the TaskAttemptRecord's audit fields are
+            # consistent with the Accountant's internal state — no
+            # duplicated disposition decision logic.
+            last_usage = accountant.last_attempt_record
+            attempt_token_disp: Any = (
+                last_usage.token_disposition
+                if last_usage
+                else AttemptUsageDisposition.UNAVAILABLE
+            )
+            attempt_cost_disp: Any = (
+                last_usage.cost_disposition
+                if last_usage
+                else AttemptUsageDisposition.UNAVAILABLE
+            )
+            attempt_token_src: str | None = (
+                last_usage.token_source_id if last_usage else None
+            )
+            attempt_cost_src: str | None = (
+                last_usage.cost_source_id if last_usage else None
+            )
+            # R8 P0-5: actual usage values are ONLY populated when the
+            # corresponding disposition is VERIFIED.  For UNAVAILABLE or
+            # NO_PROVIDER_CALL, actual values are None.
+            attempt_actual_tokens: int | None = (
+                last_usage.tokens_used
+                if last_usage and attempt_token_disp == AttemptUsageDisposition.VERIFIED
+                else None
+            )
+            attempt_actual_cost: Decimal | None = (
+                last_usage.cost_usd
+                if last_usage and attempt_cost_disp == AttemptUsageDisposition.VERIFIED
+                else None
+            )
 
             attempt_record = TaskAttemptRecord(
                 task_id=task.task_id,
@@ -1678,10 +1878,19 @@ class SupervisorRuntime:
                 # receipt's declared count, so an under-reporting
                 # receipt does not produce a misleading audit record.
                 tool_calls=observed_tool_calls,
-                tokens_used=(
-                    receipt_for_record.tokens_used if receipt_for_record else None
-                ),
-                cost_usd=(receipt_for_record.cost_usd if receipt_for_record else None),
+                # R8 P0-5: actual VERIFIED usage — None for
+                # UNAVAILABLE / NO_PROVIDER_CALL dispositions.
+                tokens_used=attempt_actual_tokens,
+                cost_usd=attempt_actual_cost,
+                # R8 P0-5: per-dimension disposition + source id.
+                token_disposition=attempt_token_disp,
+                cost_disposition=attempt_cost_disp,
+                token_source_id=attempt_token_src,
+                cost_source_id=attempt_cost_src,
+                # R8 P0-5: untrusted declared values from invalid
+                # receipts — None for valid receipts.
+                declared_tokens_used=declared_tokens_used,
+                declared_cost_usd=declared_cost_usd,
             )
             attempts.append(attempt_record)
 
@@ -1712,8 +1921,14 @@ class SupervisorRuntime:
                         error_code="invalid_result",
                         agent_calls=1,
                         tool_calls=observed_tool_calls,
-                        tokens_used=receipt.tokens_used,
-                        cost_usd=receipt.cost_usd,
+                        tokens_used=attempt_actual_tokens,
+                        cost_usd=attempt_actual_cost,
+                        token_disposition=attempt_token_disp,
+                        cost_disposition=attempt_cost_disp,
+                        token_source_id=attempt_token_src,
+                        cost_source_id=attempt_cost_src,
+                        declared_tokens_used=None,
+                        declared_cost_usd=None,
                     )
                     trace.emit(
                         TRACE_TASK_FAILED,
@@ -1746,8 +1961,14 @@ class SupervisorRuntime:
                         duration_ms=duration_ms,
                         agent_calls=1,
                         tool_calls=receipt.tool_calls,
-                        tokens_used=receipt.tokens_used,
-                        cost_usd=receipt.cost_usd,
+                        tokens_used=attempt_actual_tokens,
+                        cost_usd=attempt_actual_cost,
+                        token_disposition=attempt_token_disp,
+                        cost_disposition=attempt_cost_disp,
+                        token_source_id=attempt_token_src,
+                        cost_source_id=attempt_cost_src,
+                        declared_tokens_used=None,
+                        declared_cost_usd=None,
                     )
                     trace.emit(
                         TRACE_TASK_COMPLETED,
@@ -1771,8 +1992,14 @@ class SupervisorRuntime:
                         duration_ms=duration_ms,
                         agent_calls=1,
                         tool_calls=receipt.tool_calls,
-                        tokens_used=receipt.tokens_used,
-                        cost_usd=receipt.cost_usd,
+                        tokens_used=attempt_actual_tokens,
+                        cost_usd=attempt_actual_cost,
+                        token_disposition=attempt_token_disp,
+                        cost_disposition=attempt_cost_disp,
+                        token_source_id=attempt_token_src,
+                        cost_source_id=attempt_cost_src,
+                        declared_tokens_used=None,
+                        declared_cost_usd=None,
                     )
                     trace.emit(
                         TRACE_TASK_NEEDS_INPUT,
@@ -1796,8 +2023,14 @@ class SupervisorRuntime:
                         duration_ms=duration_ms,
                         agent_calls=1,
                         tool_calls=receipt.tool_calls,
-                        tokens_used=receipt.tokens_used,
-                        cost_usd=receipt.cost_usd,
+                        tokens_used=attempt_actual_tokens,
+                        cost_usd=attempt_actual_cost,
+                        token_disposition=attempt_token_disp,
+                        cost_disposition=attempt_cost_disp,
+                        token_source_id=attempt_token_src,
+                        cost_source_id=attempt_cost_src,
+                        declared_tokens_used=None,
+                        declared_cost_usd=None,
                     )
                     trace.emit(
                         TRACE_TASK_SKIPPED,
@@ -1826,8 +2059,14 @@ class SupervisorRuntime:
                         ),
                         agent_calls=1,
                         tool_calls=receipt.tool_calls,
-                        tokens_used=receipt.tokens_used,
-                        cost_usd=receipt.cost_usd,
+                        tokens_used=attempt_actual_tokens,
+                        cost_usd=attempt_actual_cost,
+                        token_disposition=attempt_token_disp,
+                        cost_disposition=attempt_cost_disp,
+                        token_source_id=attempt_token_src,
+                        cost_source_id=attempt_cost_src,
+                        declared_tokens_used=None,
+                        declared_cost_usd=None,
                     )
                     trace.emit(
                         TRACE_TASK_SKIPPED,

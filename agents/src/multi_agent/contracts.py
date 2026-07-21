@@ -898,6 +898,16 @@ class ExecutionUsage(StrictContract):
     # cost_usage_applicable_attempts)``.  Consumers should use the
     # per-dimension fields above instead.
     provider_usage_capable_attempts: int = Field(default=0, ge=0)
+    # R8 P1-1: per-attempt usage records exposed for external audit.
+    # Typed as ``list[Any]`` to avoid a circular import with
+    # :mod:`multi_agent.invocation` (which imports from this module).
+    # The Supervisor populates this with
+    # :class:`multi_agent.invocation.AttemptUsageRecord` instances
+    # (frozen Pydantic models) — consumers can introspect them via
+    # ``getattr`` or by re-validating against
+    # :class:`AttemptUsageRecord`.  The list is a defensive deep copy
+    # so external mutation cannot corrupt the accountant's state.
+    attempt_usage_records: list[Any] = Field(default_factory=list)
     elapsed_ms: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")

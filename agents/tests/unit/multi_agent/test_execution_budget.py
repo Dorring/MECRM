@@ -67,11 +67,13 @@ _TRUSTED_TOKEN_CAPS = UsageVerificationCapabilities(
     verifies_tokens=True,
     verifies_cost=False,
     source_id="test_trusted_token_invoker",
+    bound_source_ids=frozenset({"test_trusted_token_invoker"}),
 )
 _TRUSTED_COST_CAPS = UsageVerificationCapabilities(
     verifies_tokens=False,
     verifies_cost=True,
     source_id="test_trusted_cost_invoker",
+    bound_source_ids=frozenset({"test_trusted_cost_invoker"}),
 )
 _UNVERIFIED_CAPS = UsageVerificationCapabilities(
     verifies_tokens=False,
@@ -590,7 +592,7 @@ class TestBudgetEnforcement:
             tokens_used=None,  # fail-closed
             usage_trust="verified_provider",
         )
-        with pytest.raises(Exception, match="token_budget"):
+        with pytest.raises(Exception, match="execution_usage_unavailable"):
             acc.record_receipt(
                 receipt,
                 invoker_capabilities=_TRUSTED_TOKEN_CAPS,
@@ -609,7 +611,7 @@ class TestBudgetEnforcement:
             cost_usd=None,  # fail-closed
             usage_trust="trusted_adapter",
         )
-        with pytest.raises(Exception, match="cost_budget"):
+        with pytest.raises(Exception, match="execution_usage_unavailable"):
             acc.record_receipt(
                 receipt,
                 invoker_capabilities=_TRUSTED_COST_CAPS,

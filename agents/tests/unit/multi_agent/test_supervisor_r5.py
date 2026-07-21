@@ -59,8 +59,10 @@ from multi_agent.execution_errors import (
 )
 from multi_agent.invocation import (
     AgentInvocationReceipt,
+    AttemptUsageDisposition,
     DeterministicFakeInvoker,
     RegistryAgentInvoker,
+    UsageProvenance,
     UsageVerificationCapabilities,
     VerifiedUsage,
 )
@@ -554,6 +556,8 @@ class _FakeProviderUsageVerifier:
     """Fake ProviderUsageVerifier for testing."""
 
     source_id: str = "fake_provider_verifier"
+    verifies_tokens: bool = True
+    verifies_cost: bool = True
 
     async def verify(
         self,
@@ -564,7 +568,7 @@ class _FakeProviderUsageVerifier:
         return VerifiedUsage(
             tokens_used=token_usage.total_tokens,
             cost_usd=None,
-            verified=True,
+            tokens_verified=True,
         )
 
 
@@ -588,6 +592,11 @@ class _MutableCapsInvoker:
             verifies_tokens=self._verifies_tokens,
             verifies_cost=False,
             source_id="mutable_caps_invoker",
+            bound_source_ids=(
+                frozenset({"mutable_caps_invoker"})
+                if self._verifies_tokens
+                else frozenset()
+            ),
         )
 
     async def invoke(
@@ -1033,7 +1042,12 @@ def _verified_provider_receipt(
         result=result,
         tool_calls=len(result.tool_calls),
         tokens_used=tokens_used,
-        usage_trust="verified_provider",
+        usage_provenance=UsageProvenance(
+            source_id="test_token_verifier",
+            tokens_verified=True,
+            cost_verified=False,
+        ),
+        token_disposition=AttemptUsageDisposition.VERIFIED,
     )
 
 
@@ -1047,7 +1061,12 @@ def _trusted_adapter_cost_receipt(
         result=result,
         tool_calls=len(result.tool_calls),
         cost_usd=cost_usd,
-        usage_trust="trusted_adapter",
+        usage_provenance=UsageProvenance(
+            source_id="test_cost_verifier",
+            tokens_verified=False,
+            cost_verified=True,
+        ),
+        cost_disposition=AttemptUsageDisposition.VERIFIED,
     )
 
 
@@ -1072,6 +1091,7 @@ class TestUsageRecordingVsEnforcement:
             verifies_tokens=True,
             verifies_cost=False,
             source_id="test_token_verifier",
+            bound_source_ids=frozenset({"test_token_verifier"}),
         )
 
         def factory(
@@ -1106,6 +1126,7 @@ class TestUsageRecordingVsEnforcement:
             verifies_tokens=False,
             verifies_cost=True,
             source_id="test_cost_verifier",
+            bound_source_ids=frozenset({"test_cost_verifier"}),
         )
 
         def factory(
@@ -1189,6 +1210,7 @@ class TestUsageRecordingVsEnforcement:
             verifies_tokens=True,
             verifies_cost=False,
             source_id="test_token_verifier",
+            bound_source_ids=frozenset({"test_token_verifier"}),
         )
 
         def factory(
@@ -1343,7 +1365,8 @@ class TestProviderUsageVerification:
         usage = VerifiedUsage(
             tokens_used=100,
             cost_usd=Decimal("0.05"),
-            verified=True,
+            tokens_verified=True,
+            cost_verified=True,
         )
         assert usage.tokens_used == 100
         assert usage.cost_usd == Decimal("0.05")

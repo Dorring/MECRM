@@ -174,7 +174,7 @@ class _TrackingVerifier:
         self._result = result or VerifiedUsage(
             tokens_used=200,
             cost_usd=None,
-            verified=True,
+            tokens_verified=True,
         )
         self.call_count: int = 0
 
@@ -211,7 +211,7 @@ class _SlowVerifier:
         self.started = True
         await asyncio.sleep(self._delay_s)
         self.completed = True
-        return VerifiedUsage(tokens_used=100, cost_usd=None, verified=True)
+        return VerifiedUsage(tokens_used=100, cost_usd=None, tokens_verified=True)
 
 
 class _CostOnlyVerifier:
@@ -231,7 +231,7 @@ class _CostOnlyVerifier:
         return VerifiedUsage(
             tokens_used=0,
             cost_usd=self._cost_usd,
-            verified=True,
+            cost_verified=True,
         )
 
 
@@ -319,6 +319,11 @@ class TestTrustedNoProviderCall:
                 task_id=task.task_id,
                 attempt=0,
             )
+        # R8 P0-4: record_receipt raises without mutating state.  The
+        # caller must call record_usage_unavailable to produce exactly
+        # one AttemptUsageRecord and set the exceeded flag — this is
+        # what _execute_task does after catching the exception.
+        accountant.record_usage_unavailable(task_id=task.task_id, attempt=0)
         assert accountant.exceeded
         assert accountant.usage_unavailable
         assert accountant.exceeded_reason == "execution_usage_unavailable"
@@ -342,6 +347,9 @@ class TestTrustedNoProviderCall:
                 task_id=task.task_id,
                 attempt=0,
             )
+        # R8 P0-4: caller must call record_usage_unavailable after
+        # catching the exception — see _execute_task for the pattern.
+        accountant.record_usage_unavailable(task_id=task.task_id, attempt=0)
         assert accountant.exceeded
         assert accountant.usage_unavailable
 
@@ -369,6 +377,8 @@ class TestTrustedNoProviderCall:
                 tokens_verified=False,
                 cost_verified=False,
             ),
+            token_disposition=AttemptUsageDisposition.NO_PROVIDER_CALL,
+            cost_disposition=AttemptUsageDisposition.NO_PROVIDER_CALL,
         )
         accountant.record_receipt(
             receipt,
@@ -517,6 +527,7 @@ class TestPerDimensionCoverage:
                 tokens_verified=True,
                 cost_verified=False,
             ),
+            token_disposition=AttemptUsageDisposition.VERIFIED,
         )
         accountant.record_receipt(
             receipt_a,
@@ -539,6 +550,7 @@ class TestPerDimensionCoverage:
                 tokens_verified=False,
                 cost_verified=True,
             ),
+            cost_disposition=AttemptUsageDisposition.VERIFIED,
         )
         accountant.record_receipt(
             receipt_b,
@@ -583,6 +595,7 @@ class TestPerDimensionCoverage:
                 tokens_verified=True,
                 cost_verified=False,
             ),
+            token_disposition=AttemptUsageDisposition.VERIFIED,
         )
         accountant.record_receipt(
             receipt_a,
@@ -612,6 +625,7 @@ class TestPerDimensionCoverage:
                 tokens_verified=False,
                 cost_verified=True,
             ),
+            cost_disposition=AttemptUsageDisposition.VERIFIED,
         )
         accountant.record_receipt(
             receipt_b,
@@ -648,6 +662,8 @@ class TestPerDimensionCoverage:
                 tokens_verified=True,
                 cost_verified=True,
             ),
+            token_disposition=AttemptUsageDisposition.VERIFIED,
+            cost_disposition=AttemptUsageDisposition.VERIFIED,
         )
         accountant.record_receipt(
             receipt,
@@ -692,6 +708,8 @@ class TestPerDimensionCoverage:
                 tokens_verified=True,
                 cost_verified=True,
             ),
+            token_disposition=AttemptUsageDisposition.VERIFIED,
+            cost_disposition=AttemptUsageDisposition.VERIFIED,
         )
         accountant.record_receipt(
             receipt_a,
@@ -1093,6 +1111,7 @@ class TestProvenanceSourceBinding:
                 tokens_verified=True,
                 cost_verified=False,
             ),
+            token_disposition=AttemptUsageDisposition.VERIFIED,
         )
         # bound_source_ids includes "tracking_verifier"
         accountant.record_receipt(
@@ -1127,6 +1146,7 @@ class TestProvenanceSourceBinding:
                 tokens_verified=True,
                 cost_verified=False,
             ),
+            token_disposition=AttemptUsageDisposition.VERIFIED,
         )
         with pytest.raises(ExecutionUsageUnavailableError, match="unbound source"):
             accountant.record_receipt(
@@ -1205,6 +1225,7 @@ class TestLegacyTrustDeprecation:
                 tokens_verified=True,
                 cost_verified=False,
             ),
+            token_disposition=AttemptUsageDisposition.VERIFIED,
         )
         # The auto-derived usage_trust should reflect the provenance
         assert receipt.usage_trust is not None

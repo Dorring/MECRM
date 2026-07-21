@@ -964,6 +964,7 @@ class TestUsageTrustInvokerBound:
             verifies_tokens=False,
             verifies_cost=True,
             source_id="test_cost_only_invoker",
+            bound_source_ids=frozenset({"test_cost_only_invoker"}),
         )
 
         def factory(
@@ -1006,6 +1007,7 @@ class TestUsageTrustInvokerBound:
             verifies_tokens=True,
             verifies_cost=False,
             source_id="test_token_only_invoker",
+            bound_source_ids=frozenset({"test_token_only_invoker"}),
         )
 
         def factory(
@@ -1052,6 +1054,7 @@ class TestUsageTrustInvokerBound:
             verifies_tokens=True,
             verifies_cost=False,
             source_id="test_token_only_invoker",
+            bound_source_ids=frozenset({"test_token_only_invoker"}),
         )
 
         def factory(

@@ -67,7 +67,9 @@ from multi_agent.execution_errors import (
 )
 from multi_agent.invocation import (
     AgentInvocationReceipt,
+    AttemptUsageDisposition,
     DeterministicFakeInvoker,
+    UsageProvenance,
     UsageVerificationCapabilities,
 )
 from multi_agent.planner import DeterministicPlanner
@@ -498,6 +500,7 @@ class _TrustedTokenInvoker:
             verifies_tokens=True,
             verifies_cost=False,
             source_id="test_trusted_token_invoker",
+            bound_source_ids=frozenset({"test_trusted_token_invoker"}),
         )
 
     def __init__(self, tokens_used: int) -> None:
@@ -524,7 +527,12 @@ class _TrustedTokenInvoker:
             result=result,
             tool_calls=len(result.tool_calls),
             tokens_used=self._tokens_used,
-            usage_trust="verified_provider",
+            usage_provenance=UsageProvenance(
+                source_id="test_trusted_token_invoker",
+                tokens_verified=True,
+                cost_verified=False,
+            ),
+            token_disposition=AttemptUsageDisposition.VERIFIED,
         )
 
 
@@ -542,6 +550,7 @@ class _TrustedCostAdapterInvoker:
             verifies_tokens=False,
             verifies_cost=True,
             source_id="test_trusted_cost_adapter_invoker",
+            bound_source_ids=frozenset({"test_trusted_cost_adapter_invoker"}),
         )
 
     def __init__(self, cost_usd: Decimal) -> None:
@@ -555,7 +564,12 @@ class _TrustedCostAdapterInvoker:
             result=result,
             tool_calls=len(result.tool_calls),
             cost_usd=self._cost_usd,
-            usage_trust="trusted_adapter",
+            usage_provenance=UsageProvenance(
+                source_id="test_trusted_cost_adapter_invoker",
+                tokens_verified=False,
+                cost_verified=True,
+            ),
+            cost_disposition=AttemptUsageDisposition.VERIFIED,
         )
 
 

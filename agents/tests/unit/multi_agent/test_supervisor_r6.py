@@ -59,6 +59,7 @@ from multi_agent.execution_errors import (
 )
 from multi_agent.invocation import (
     AgentInvocationReceipt,
+    AttemptUsageDisposition,
     DeterministicFakeInvoker,
     RegistryAgentInvoker,
     UsageProvenance,
@@ -430,7 +431,7 @@ class _TrackingVerifier:
         self._result = result or VerifiedUsage(
             tokens_used=200,
             cost_usd=None,
-            verified=True,
+            tokens_verified=True,
         )
         self.call_count: int = 0
         self.received_provider_metadata: list[ProviderMetadata] = []
@@ -621,7 +622,7 @@ class TestProviderUsageVerifierInvocation:
             result=VerifiedUsage(
                 tokens_used=200,
                 cost_usd=None,
-                verified=True,
+                tokens_verified=True,
             )
         )
         handler = _ProviderResultHandler(tokens=100)
@@ -666,7 +667,8 @@ class TestProviderUsageVerifierInvocation:
             result=VerifiedUsage(
                 tokens_used=150,
                 cost_usd=Decimal("0.25"),
-                verified=True,
+                tokens_verified=True,
+                cost_verified=True,
             )
         )
         handler = _ProviderResultHandler(tokens=150)
@@ -1171,7 +1173,15 @@ class TestNoReceiptAttemptUsageDisposition:
             raise RetryableAgentError("timeout-like failure")
 
         runtime = SupervisorRuntime(
-            invoker=DeterministicFakeInvoker(factory=factory),
+            invoker=DeterministicFakeInvoker(
+                factory=factory,
+                usage_capabilities=UsageVerificationCapabilities(
+                    verifies_tokens=False,
+                    verifies_cost=False,
+                    source_id="deterministic_fake_invoker",
+                    can_attest_no_provider_call=False,
+                ),
+            ),
             run_store=InMemoryRunStore(),
             plan_validator=_AlwaysValidPlanValidator(),
         )
@@ -1204,7 +1214,15 @@ class TestNoReceiptAttemptUsageDisposition:
             raise RetryableAgentError("transient failure")
 
         runtime = SupervisorRuntime(
-            invoker=DeterministicFakeInvoker(factory=factory),
+            invoker=DeterministicFakeInvoker(
+                factory=factory,
+                usage_capabilities=UsageVerificationCapabilities(
+                    verifies_tokens=False,
+                    verifies_cost=False,
+                    source_id="deterministic_fake_invoker",
+                    can_attest_no_provider_call=False,
+                ),
+            ),
             run_store=InMemoryRunStore(),
             plan_validator=_AlwaysValidPlanValidator(),
         )
@@ -1276,7 +1294,15 @@ class TestNoReceiptAttemptUsageDisposition:
             raise RetryableAgentError("fail")
 
         runtime = SupervisorRuntime(
-            invoker=DeterministicFakeInvoker(factory=factory),
+            invoker=DeterministicFakeInvoker(
+                factory=factory,
+                usage_capabilities=UsageVerificationCapabilities(
+                    verifies_tokens=False,
+                    verifies_cost=False,
+                    source_id="deterministic_fake_invoker",
+                    can_attest_no_provider_call=False,
+                ),
+            ),
             run_store=InMemoryRunStore(),
             plan_validator=_AlwaysValidPlanValidator(),
         )
@@ -1314,6 +1340,8 @@ class TestNoReceiptAttemptUsageDisposition:
                 result=result,
                 tool_calls=len(result.tool_calls),
                 # tokens_used=None, no provider_metadata
+                token_disposition=AttemptUsageDisposition.NO_PROVIDER_CALL,
+                cost_disposition=AttemptUsageDisposition.NO_PROVIDER_CALL,
             )
 
         runtime = SupervisorRuntime(
@@ -1354,7 +1382,15 @@ class TestNoReceiptAttemptUsageDisposition:
             raise RetryableAgentError("fail")
 
         runtime = SupervisorRuntime(
-            invoker=DeterministicFakeInvoker(factory=factory),
+            invoker=DeterministicFakeInvoker(
+                factory=factory,
+                usage_capabilities=UsageVerificationCapabilities(
+                    verifies_tokens=False,
+                    verifies_cost=False,
+                    source_id="deterministic_fake_invoker",
+                    can_attest_no_provider_call=False,
+                ),
+            ),
             run_store=InMemoryRunStore(),
             plan_validator=_AlwaysValidPlanValidator(),
         )
@@ -1389,6 +1425,7 @@ class TestPerDimensionUsageProvenance:
             verifies_tokens=True,
             verifies_cost=True,
             source_id="test_both_verifier",
+            bound_source_ids=frozenset({"test_both_verifier"}),
         )
 
         def factory(
@@ -1409,6 +1446,8 @@ class TestPerDimensionUsageProvenance:
                     tokens_verified=True,
                     cost_verified=True,
                 ),
+                token_disposition=AttemptUsageDisposition.VERIFIED,
+                cost_disposition=AttemptUsageDisposition.VERIFIED,
             )
 
         runtime = SupervisorRuntime(
@@ -1443,6 +1482,7 @@ class TestPerDimensionUsageProvenance:
             verifies_tokens=True,
             verifies_cost=False,  # Invoker cannot verify cost
             source_id="token_only_verifier",
+            bound_source_ids=frozenset({"token_only_verifier"}),
         )
 
         def factory(
@@ -1463,6 +1503,7 @@ class TestPerDimensionUsageProvenance:
                     tokens_verified=True,
                     cost_verified=False,  # cost NOT verified
                 ),
+                token_disposition=AttemptUsageDisposition.VERIFIED,
             )
 
         runtime = SupervisorRuntime(
@@ -1492,6 +1533,7 @@ class TestPerDimensionUsageProvenance:
             verifies_tokens=True,
             verifies_cost=False,
             source_id="token_only_invoker",
+            bound_source_ids=frozenset({"token_only_invoker"}),
         )
 
         def factory(
@@ -1512,6 +1554,8 @@ class TestPerDimensionUsageProvenance:
                     tokens_verified=True,
                     cost_verified=True,  # LIAR — invoker can't verify cost
                 ),
+                token_disposition=AttemptUsageDisposition.VERIFIED,
+                cost_disposition=AttemptUsageDisposition.VERIFIED,
             )
 
         runtime = SupervisorRuntime(
@@ -1544,6 +1588,7 @@ class TestPerDimensionUsageProvenance:
             verifies_tokens=False,
             verifies_cost=True,
             source_id="cost_only_invoker",
+            bound_source_ids=frozenset({"cost_only_invoker"}),
         )
 
         def factory(
@@ -1564,6 +1609,8 @@ class TestPerDimensionUsageProvenance:
                     tokens_verified=True,  # LIAR — invoker can't verify tokens
                     cost_verified=True,
                 ),
+                token_disposition=AttemptUsageDisposition.VERIFIED,
+                cost_disposition=AttemptUsageDisposition.VERIFIED,
             )
 
         runtime = SupervisorRuntime(
@@ -1602,6 +1649,7 @@ class TestPerDimensionUsageProvenance:
             verifies_tokens=True,
             verifies_cost=True,
             source_id="test_cost_record",
+            bound_source_ids=frozenset({"test_cost_record"}),
         )
 
         def factory(
@@ -1622,6 +1670,8 @@ class TestPerDimensionUsageProvenance:
                     tokens_verified=True,
                     cost_verified=True,
                 ),
+                token_disposition=AttemptUsageDisposition.VERIFIED,
+                cost_disposition=AttemptUsageDisposition.VERIFIED,
             )
 
         runtime = SupervisorRuntime(
@@ -1892,6 +1942,7 @@ class TestUsageAvailabilityStatus:
             verifies_tokens=True,
             verifies_cost=False,
             source_id="partial_verifier",
+            bound_source_ids=frozenset({"partial_verifier"}),
         )
 
         call_count = {"n": 0}
@@ -1916,6 +1967,7 @@ class TestUsageAvailabilityStatus:
                         tokens_verified=True,
                         cost_verified=False,
                     ),
+                    token_disposition=AttemptUsageDisposition.VERIFIED,
                 )
             # Unverified tokens (provider_metadata present but no
             # verifier attestation — self-reported).
@@ -1964,6 +2016,7 @@ class TestUsageAvailabilityStatus:
             verifies_tokens=True,
             verifies_cost=True,
             source_id="full_verifier",
+            bound_source_ids=frozenset({"full_verifier"}),
         )
 
         def factory(
@@ -1984,6 +2037,8 @@ class TestUsageAvailabilityStatus:
                     tokens_verified=True,
                     cost_verified=True,
                 ),
+                token_disposition=AttemptUsageDisposition.VERIFIED,
+                cost_disposition=AttemptUsageDisposition.VERIFIED,
             )
 
         runtime = SupervisorRuntime(
@@ -2015,6 +2070,8 @@ class TestUsageAvailabilityStatus:
             return AgentInvocationReceipt(
                 result=result,
                 tool_calls=len(result.tool_calls),
+                token_disposition=AttemptUsageDisposition.NO_PROVIDER_CALL,
+                cost_disposition=AttemptUsageDisposition.NO_PROVIDER_CALL,
             )
 
         runtime = SupervisorRuntime(
