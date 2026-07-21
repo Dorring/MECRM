@@ -4,7 +4,7 @@
 **Branch:** `feat/ma-04-supervisor-runtime-r8`  
 **Baseline:** `main` (Phase 3, commit `d586e70`)
 
-> **R8 Revision** — This document reflects the R8 audit fixes (commit `<TBD>`).
+> **R8 Revision** — This document reflects the R8 audit fixes (commit `88a5b6d`).
 > R1 baseline: commit `e5ab368`. R2 baseline: commit `64fedd1` (5 P0 + 3 P1
 > fixes, request-changes). R3 baseline: commit `5b9c647` (4 P0 + 3 P1 fixes,
 > request-changes). R4 baseline: commit `bc5abd4` (4 P0 + 2 P1 fixes,
