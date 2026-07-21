@@ -4,9 +4,14 @@
 **Branch:** `feat/ma-04-supervisor-runtime`  
 **Baseline:** `main` (Phase 3, commit `d586e70`)
 
-> **R2 Revision** — This document reflects the R2 audit fixes (commit `<TBD>`).
-> R1 baseline: commit `e5ab368`. R2 addresses 5 P0 and 3 P1 issues found
-> during the R1 combination-path review.
+> **R3 Revision** — This document reflects the R3 audit fixes (commit `<TBD>`).
+> R1 baseline: commit `e5ab368`. R2 baseline: commit `64fedd1` (5 P0 + 3 P1
+> fixes, request-changes). R3 addresses 4 P0 and 3 P1 issues found during the
+> R2 combination-path review, focused on **execution identity and exception
+> boundaries**: pre-cancelled runs must still pass full pre-flight, unknown
+> exceptions must propagate to the structured-concurrency boundary, RunLease
+> must be a frozen three-part identity contract, and actual Usage must carry
+> trustworthy provenance.
 
 ---
 
@@ -85,18 +90,24 @@ Phase 4 通过 `plan.build_execution_tasks()` 拿到深拷贝的 `AgentTask` 列
 
 ### Pre-flight 检查（任何 Task 开始前必须完成）
 
-1. **R2 P0-1** `RunStore.lookup_completed(run_id, plan_hash)` — 缓存命中则直接返回，不检查 live registry 版本
-2. `plan.verify_integrity()` — `request_hash` 和 `plan_hash` 一致
+**R3 P0-1 + P1-1 调整后顺序**：
+
+1. `plan.verify_integrity()` — `request_hash` 和 `plan_hash` 一致
+2. **R3 P1-1** `RunStore.lookup_run_identity(run_id)` — 只读 Probe，一次确定状态：
+   - 同 `run_id` + 同 `plan_hash` + completed → **cache hit**，直接返回深拷贝
+   - 同 `run_id` + 不同 `plan_hash` → `RunPlanConflictError`（在 Registry Pre-flight 之前，避免被 `RegistryVersionMismatch` 掩盖）
+   - 同 `run_id` + 同 `plan_hash` + running → `RunAlreadyInProgressError`
+   - 未知 → 继续后续 Pre-flight
 3. `registry.snapshot().version == plan.registry_version` — 版本对齐
 4. `PlanValidator.validate(plan.request, plan, registry).valid` — 重新验证
-5. **R2 P0-3** Async cancellation pre-check — 如果 Run 已取消或 Kill Switch 激活，直接 finalize 为 `cancelled`（不获取 lease、不预留 iteration）
-6. `RunStore.begin(run_id, plan_hash)` — 幂等检查
-7. **R2 P0-1** `_build_execution_bindings(plan, registry)` — 为每个 Task 一次性解析 `(capability, handler)`，构建不可变 `ExecutionBinding` + `bound_handlers` 映射；执行期间不再调用 `registry.resolve()`
+5. **R2 P0-1** `_build_execution_bindings(plan, registry)` — 为每个 Task 一次性解析 `(capability, handler)`，构建不可变 `ExecutionBinding` + `bound_handlers` 映射；执行期间不再调用 `registry.resolve()`
+6. **R3 P0-1** Async cancellation / Kill Switch pre-check — **位于 Registry / Validator / Binding 校验之后**。如果 Run 已取消或 Kill Switch 激活，直接 finalize 为 `cancelled`（不获取 lease、不预留 iteration）
+7. `RunStore.begin(run_id, plan_hash)` — 获取 frozen RunLease（含 `lease_id`）
 8. `ExecutionUsage` 初始化为 0
 
 任一检查失败 → 抛 `SupervisorError`，不调用任何 Handler。
 
-> **R2 P0-1 缓存优先**：`lookup_completed` 在所有 pre-flight 检查之前调用。即使 live Registry 已漂移（新增/删除/替换 Agent），只要 `(run_id, plan_hash)` 匹配已缓存的 completed result，就直接返回缓存值——不抛 `SupervisorError`，不重新执行。
+> **R3 P0-1 取消不得使无效 Plan 变成合法缓存**：取消检查移到 Registry/Validator/Binding 之后。一个 Hash 自洽但 Registry 过期 / Handler 不存在 / Validator 失败的 Plan，即使在调用时 Run 已被取消，也**不会**被缓存为 `cancelled` 结果——Pre-flight 先拒绝，再考虑取消路径。缓存命中的 Completed Result 仍可绕过 live Registry 漂移（这是预期的幂等行为）。
 
 ---
 
@@ -120,13 +131,36 @@ class AgentInvoker(Protocol):
 - `tool_calls: int` — 实际工具调用次数
 - `tokens_used: int | None` — 实际 token 使用量（可选）
 - `cost_usd: Decimal | None` — 实际成本（可选）
+- **R3 P0-4** `usage_trust: UsageTrustLevel` — Usage 可信来源（见 §8）
 
 **实现**:
 
-- `RegistryAgentInvoker` — 生产实现，调用 `handler.run(task, context)`
-- `DeterministicFakeInvoker` — 测试 stub，根据 `task.task_id` 返回预设结果
+- `RegistryAgentInvoker` — 生产实现，调用 `handler.run(task, context)`，默认 `usage_trust=VERIFIED_PROVIDER`
+- `DeterministicFakeInvoker` — 测试 stub，根据 `task.task_id` 返回预设结果，默认 `usage_trust=UNVERIFIED`
+- **R3 P0-4** `TrustedUsageInvoker` — 标记 Protocol，实现后 Invoker 的 receipts 默认 `verified_provider`
 
 如果未来 Handler Protocol 改变签名，只需新增 Adapter，**不**批量修改 Specialist。
+
+### R3 P1-3: ExecutionBinding 是 _execute_task 的实际输入
+
+R2 构造了 `ExecutionBinding` 和 `bound_handlers`，但执行过程只使用 `bound_handlers`——`ExecutionBinding.capability_snapshot` 没有传给 Invocation、Result Validation，也没进入 Trace。R2 的 `ExecutionBinding` 是未使用的审计外壳。
+
+R3 选择 **方案 A（真正使用）**：
+
+```python
+class ExecutionBinding(StrictContract):
+    model_config = {"extra": "forbid", "frozen": True}
+    task_id: str
+    agent_id: str
+    capability_snapshot: AgentCapability
+```
+
+- `_build_run_task()` / `_execute_task()` 接受 `bindings: Mapping[task_id, ExecutionBinding]` 参数
+- `_execute_task()` 从 `bindings[task.task_id]` 读取 `agent_id` / `capability_snapshot`，而非重新调用 `registry.resolve()`
+- `TRACE_TASK_STARTED` trace event 携带 `binding_agent_id` / `binding_capability_agent_id` / `binding_capability_authority`，反映 Pre-flight 时的快照
+- 即使 Registry 在 Run 期间漂移（Handler 替换、Capability 更新），Trace 中的 `binding_capability_*` 字段仍反映 Pre-flight 时的版本——审计可追溯
+
+**方案 B（删除公共外壳）** 在 R3 不采用，因为 `ExecutionBinding` 现在已是实际执行的输入。
 
 ---
 
@@ -246,7 +280,26 @@ async def _run_one(task):
 - `needs_input`
 - `cancelled`
 - Kill Switch 激活
+- **R3 P0-2** `NonRetryableAgentError` — 显式 Agent Domain Error，标记 `failed` 并 break（不重试，不传播）
 - 非 retryable error
+
+### R3 P0-2: Exception Classification Boundary
+
+`_execute_task()` 只捕获**明确的 Agent Domain Error**，未知异常**必须**传播到 Scheduler 的结构化并发边界：
+
+| 异常类型 | 处理方式 | Siblings 影响 |
+|---|---|---|
+| `RetryableAgentError` | 转 `TaskExecutionRecord(status="failed", error_code="retryable_error")`，retry loop 继续 | 不取消 |
+| `NonRetryableAgentError` | 转 `TaskExecutionRecord(status="failed", error_code="non_retryable_error")`，retry loop break | 不取消 |
+| `InvalidAgentResultError` | 转 `TaskExecutionRecord(status="failed", error_code="invalid_result")`，不重试 | 不取消 |
+| `InvalidInvocationReceiptError` | 转 `TaskExecutionRecord(status="failed", error_code="invalid_receipt")`，不重试 | 不取消 |
+| `ExecutionUsageUnavailableError` | 转 `TaskExecutionRecord(status="failed", error_code="usage_unavailable")`，不重试 | 不取消 |
+| `asyncio.TimeoutError` | 转 `TaskAttemptRecord(status="timed_out")`，根据剩余 Deadline 决定是否重试 | 不取消 |
+| **`RuntimeError` / `TypeError` / `KeyError` / `AssertionError` / 其他未知异常** | **不捕获**——直接传播到 `_run_wave_structured()` | **取消同波所有 siblings 并 await** |
+
+**关键约束**：
+- **不存在** `except Exception` catch-all。R2 的 catch-all 会把 `RuntimeError` 等编程错误降级为普通 task failure，使 siblings 继续在损坏状态上运行，掩盖真实缺陷。
+- 测试不得用 `BaseException` 绕过 Supervisor 的异常捕获——R3 测试使用 `RuntimeError` / `TypeError` 验证真实传播路径。
 
 ### Agent Call 预算统计
 
@@ -323,6 +376,48 @@ Phase 4 **不**使用 Phase 3 的估算值。所有计数都基于实际 Invocat
 预算已设置但 receipt 无 usage → fail-closed: ExecutionUsageUnavailableError
 预算已设置且有实际 usage    → 累计检查
 ```
+
+### R3 P0-4: Usage Provenance
+
+R2 的 fail-closed 只处理 `receipt.cost_usd is None`，但自定义 Invoker 可以返回 `cost_usd = Decimal("0")` 绕过——系统会把它当成可信实际成本。Token 同理（`tokens_used = 0`）。
+
+R3 为 Receipt 引入 **Usage Trust Level**：
+
+```python
+class UsageTrustLevel(StrEnum):
+    VERIFIED_PROVIDER = "verified_provider"  # LLM Provider 原始返回
+    TRUSTED_ADAPTER   = "trusted_adapter"    # 经审核的中间件
+    UNVERIFIED        = "unverified"         # 自定义 Invoker 自报
+```
+
+`AgentInvocationReceipt` 新增 `usage_trust: UsageTrustLevel` 字段（默认 `UNVERIFIED`）。
+
+`TrustedUsageInvoker` 是一个标记 Protocol：
+
+```python
+class TrustedUsageInvoker(AgentInvoker, Protocol):
+    usage_is_verified: bool  # True → receipts 默认 verified_provider
+```
+
+**强制规则**：
+
+| 配置 | 接受的 `usage_trust` |
+|---|---|
+| 未设置 Token/Cost Budget | 任何（含 `UNVERIFIED`） |
+| 设置 Token/Cost Budget | 仅 `VERIFIED_PROVIDER` 或 `TRUSTED_ADAPTER` |
+
+`_BudgetAccountant.record_receipt()` 在累加前先校验 provenance：
+
+```
+unverified + cost_usd=0        → ExecutionUsageUnavailableError
+unverified + cost_usd=None     → ExecutionUsageUnavailableError
+unverified + cost_usd=正数     → ExecutionUsageUnavailableError（仍 fail-closed）
+unverified + tokens_used=0     → ExecutionUsageUnavailableError
+verified_provider + tokens=N   → 接受并累计
+trusted_adapter + cost=$X      → 接受并累计
+```
+
+`RegistryAgentInvoker` 默认 `usage_trust=VERIFIED_PROVIDER`（因为 Receipt 的 token/cost 来自 `AgentResult.provider_metadata`，由 LLM Provider 原始返回）。`DeterministicFakeInvoker` 默认 `UNVERIFIED`——除非显式实现 `TrustedUsageInvoker`。
 
 ---
 
@@ -421,6 +516,8 @@ Phase 4 **不**实现第二套合并算法。
 
 ### Final Status Priority
 
+**R3 P1-2 修正后顺序**：
+
 ```
 cancelled
 > budget_exceeded
@@ -430,7 +527,13 @@ cancelled
 > completed
 ```
 
-`_compute_final_status` 按 `final_status_priority` 排序所有 candidate，取优先级最高者。
+`_finalize()` 按 R3 修正后的逻辑应用优先级：
+
+1. **先**检查 Run-level Cancellation（`cancelled_during_run`）→ `CANCELLED`
+2. **再**应用 `forced_status`（如 `BUDGET_EXCEEDED`）
+3. **最后**取 `_compute_final_status` 的 computed status
+
+R2 的旧顺序是 `forced_status > cancelled`，导致 max_tasks 超限触发 `forced_status=BUDGET_EXCEEDED` 时，即使 Cancellation 已激活，最终仍是 `BUDGET_EXCEEDED`——违反规范 `cancelled > budget_exceeded`。R3 修正为 Cancellation 永远优先。
 
 ---
 
@@ -482,6 +585,8 @@ class RunStore(Protocol):
     async def complete(self, lease: RunLease, result: SupervisorRunResult) -> None: ...
     async def abort(self, lease: RunLease, *, error_code: str) -> None: ...
     async def lookup_completed(self, run_id: str, plan_hash: str) -> SupervisorRunResult | None: ...
+    # R3 P1-1: read-only identity probe
+    async def lookup_run_identity(self, run_id: str) -> RunIdentity | None: ...
 ```
 
 ### 行为
@@ -492,7 +597,51 @@ class RunStore(Protocol):
 | 同 `run_id` + 不同 `plan_hash` | `RunPlanConflictError` |
 | 同 `run_id` 正在执行 | `RunAlreadyInProgressError` |
 
-### R2 P1-1: Lease Identity
+### R3 P1-1: RunStore Identity Probe
+
+`lookup_run_identity(run_id)` 是只读 Probe，返回 `RunIdentity`（frozen）：
+
+```python
+class RunIdentityStatus(StrEnum):
+    COMPLETED = "completed"
+    IN_PROGRESS = "in_progress"
+
+class RunIdentity(StrictContract):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    run_id: str
+    plan_hash: str
+    status: RunIdentityStatus
+    cached_result: SupervisorRunResult | None = None  # only when COMPLETED
+```
+
+Supervisor 在 Pre-flight 阶段调用一次，确定 cache/conflict/in-progress，**避免**在 Live Registry Pre-flight 之前抛 `RegistryVersionMismatch` 掩盖真实的 `RunPlanConflictError`。
+
+### R3 P0-3: Frozen RunLease + Three-part Identity
+
+R2 的 `RunLease` 是普通可变类，`complete()` 只验证 `lease.lease_id == entry.lease_id`，不验证 `entry.plan_hash == lease.plan_hash`——可以通过 `object.__setattr__` 篡改 `lease.plan_hash` 把原本绑定 `hash-a` 的活动 Lease 完成为 `hash-b`。
+
+R3 将 `RunLease` 改为 `StrictContract` + `ConfigDict(frozen=True, extra="forbid")`：
+
+```python
+class RunLease(StrictContract):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    run_id: str
+    plan_hash: str
+    lease_id: str  # secrets.token_hex(16), generated at begin()
+    cached_result: SupervisorRunResult | None = None
+```
+
+`complete()` 和 `abort()` 都验证**三元身份**：
+
+```
+entry.run_id    == lease.run_id
+entry.plan_hash == lease.plan_hash
+entry.lease_id  == lease.lease_id
+```
+
+任一字段不一致 → `SupervisorError`。`plan_hash` 不再是"仅供参考"。
+
+### R2 P1-1: Lease Identity（保留）
 
 每个 `RunLease` 携带不可预测的 `lease_id`（`secrets.token_hex(16)`）。`complete` 和 `abort` 都验证 `lease_id`：
 
@@ -617,11 +766,11 @@ Phase 4 的所有 Protocol（`AgentInvoker`、`RunStore`、`ExecutionCancellatio
 
 ```
 agents/src/multi_agent/
-├── execution_errors.py     # 6 个错误类
-├── invocation.py           # AgentInvoker Protocol + 2 实现
-├── execution.py            # Contracts + helpers (SupervisorRunStatus, etc.)
+├── execution_errors.py     # 8 个错误类（R3 新增 NonRetryableAgentError）
+├── invocation.py           # AgentInvoker Protocol + 2 实现 + UsageTrustLevel/TrustedUsageInvoker (R3)
+├── execution.py            # Contracts + helpers (SupervisorRunStatus, ExecutionBinding, etc.)
 ├── scheduler.py            # DagScheduler + TaskOutcome
-├── run_store.py            # RunStore Protocol + InMemoryRunStore
+├── run_store.py            # RunStore Protocol + InMemoryRunStore + RunIdentity (R3)
 ├── supervisor.py           # SupervisorRuntime
 └── supervisor_graph.py     # LangGraph Adapter
 ```
@@ -630,14 +779,15 @@ agents/src/multi_agent/
 
 ```
 agents/tests/unit/multi_agent/
-├── test_invocation.py                    # 13 tests — AgentInvoker boundary
-├── test_scheduler.py                     # 13 tests — DAG wave + concurrency
-├── test_execution_budget.py              # 27 tests — actual budget enforcement
-├── test_supervisor.py                    # 23 tests — runtime + customer recovery
-├── test_run_store.py                     # 18 tests — idempotency + defensive copy
-├── test_supervisor_graph.py              # 8 tests  — LangGraph adapter routing
-├── test_supervisor_r1.py                 # 23 tests — R1 regression (P0-1..P0-4)
-└── test_supervisor_r2.py                 # 28 tests — R2 regression (P0-1..P0-5, P1-1..P1-2)
+├── test_invocation.py                    # AgentInvoker boundary
+├── test_scheduler.py                     # DAG wave + concurrency
+├── test_execution_budget.py              # actual budget enforcement
+├── test_supervisor.py                    # runtime + customer recovery
+├── test_run_store.py                     # idempotency + defensive copy + R3 frozen lease + identity probe
+├── test_supervisor_graph.py              # LangGraph adapter routing
+├── test_supervisor_r1.py                 # R1 regression (P0-1..P0-4)
+├── test_supervisor_r2.py                 # R2 regression (P0-1..P0-5, P1-1..P1-2) — BaseException→RuntimeError (R3)
+└── test_supervisor_r3.py                 # R3 regression (P0-1..P0-4, P1-2..P1-3) — 20 tests
 ```
 
 Customer Recovery 五任务执行场景（§15）作为集成测试嵌入在 `test_supervisor.py` 中，
@@ -647,11 +797,21 @@ Optional failed → `partial_success`、`needs_input`、timeout、`budget_exceed
 R2 反例测试（`test_supervisor_r2.py`）覆盖：
 - **P0-1** 缓存优先于 registry 版本检查、preflight bound handlers 不可被 registry mutation 替换
 - **P0-2** wave 异常 cancel+await siblings、无 orphan tasks、lease 在 siblings 终止后才 abort
+  （R3 修正：所有结构化并发测试改用 `RuntimeError` 替代 `BaseException`，验证真实传播路径）
 - **P0-3** pre-cancelled 消费 0 iteration、emit 0 task_ready、between-waves 取消不预留下一轮
 - **P0-4** backoff 被 deadline 封顶、被 cancellation 中断、timer jitter 不再误分类
 - **P0-5** Required Handler-skipped → FAILED、dependency-propagation skipped 透明、attempt 记录真实 skipped
 - **P1-1** stale lease 无法 abort/complete 新 lease、plan_hash identity 校验
 - **P1-2** cost_budget_usd 配置但 invoker 报告 `cost_usd=None` → fail-closed
+
+R3 反例测试（`test_supervisor_r3.py` + `test_run_store.py` 追加）覆盖：
+- **P0-1** 预取消的 Run 仍需通过 Registry/Validator/Binding Pre-flight；Cancelled Result 仅在 Pre-flight 通过后缓存
+- **P0-2** `RuntimeError` / `TypeError` 传播到 Scheduler 并取消 siblings；`NonRetryableAgentError` 被捕获为 task failure 不取消 siblings；未知异常不被降级
+- **P0-3** `RunLease` 是 frozen StrictContract；`complete()` / `abort()` 验证三元身份（run_id + plan_hash + lease_id）
+- **P0-4** unverified receipt 的 0/None/正数 usage 在 budget 配置时 fail-closed；verified_provider / trusted_adapter 接受
+- **P1-1** `lookup_run_identity` 只读 Probe 在 Registry Pre-flight 之前确定 cache/conflict/in-progress
+- **P1-2** Run-level Cancellation 优先于 `forced_status=BUDGET_EXCEEDED`
+- **P1-3** `ExecutionBinding` 传入 `_execute_task`，`TRACE_TASK_STARTED` emit `binding_capability_*`，capability snapshot 不受 registry 漂移影响
 
 ### 修改文件
 
@@ -694,4 +854,66 @@ class SupervisorConfig(StrictContract):
 run_started, plan_validated, task_ready, task_started, task_retrying,
 task_completed, task_failed, task_needs_input, task_timed_out,
 task_skipped, budget_exceeded, run_cancelled, results_merged, run_completed
+```
+
+**R3 P1-3**：`task_started` event 的 `data` 字段新增：
+
+```
+binding_agent_id             — ExecutionBinding.agent_id
+binding_capability_agent_id  — ExecutionBinding.capability_snapshot.agent_id
+binding_capability_authority — ExecutionBinding.capability_snapshot.authority
+```
+
+### Error Hierarchy（R3 更新）
+
+```
+MultiAgentError
+└── SupervisorError                      # Phase 4 base
+    ├── RetryableAgentError              # 可重试的 Agent Domain Error
+    ├── NonRetryableAgentError           # R3 P0-2: 不可重试的 Agent Domain Error（不传播）
+    ├── InvalidAgentResultError          # Result boundary 校验失败
+    ├── InvalidInvocationReceiptError    # Receipt 一致性校验失败
+    ├── ExecutionUsageUnavailableError   # R3 P0-4: Usage provenance/缺失 fail-closed
+    ├── RunPlanConflictError             # 同 run_id 不同 plan_hash
+    └── RunAlreadyInProgressError        # 同 run_id 正在执行
+```
+
+### R3 新增 Contract 速查
+
+```python
+# R3 P0-3: Frozen RunLease
+class RunLease(StrictContract):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    run_id: str
+    plan_hash: str
+    lease_id: str  # secrets.token_hex(16)
+    cached_result: SupervisorRunResult | None = None
+
+# R3 P1-1: RunStore Identity Probe
+class RunIdentityStatus(StrEnum):
+    COMPLETED = "completed"
+    IN_PROGRESS = "in_progress"
+
+class RunIdentity(StrictContract):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    run_id: str
+    plan_hash: str
+    status: RunIdentityStatus
+    cached_result: SupervisorRunResult | None = None
+
+# R3 P0-4: Usage Trust Level
+class UsageTrustLevel(StrEnum):
+    VERIFIED_PROVIDER = "verified_provider"
+    TRUSTED_ADAPTER   = "trusted_adapter"
+    UNVERIFIED        = "unverified"
+
+class TrustedUsageInvoker(AgentInvoker, Protocol):
+    usage_is_verified: bool  # True → receipts 默认 verified_provider
+
+# R3 P1-3: ExecutionBinding（已存在，R3 使其成为 _execute_task 实际输入）
+class ExecutionBinding(StrictContract):
+    model_config = {"extra": "forbid", "frozen": True}
+    task_id: str
+    agent_id: str
+    capability_snapshot: AgentCapability
 ```

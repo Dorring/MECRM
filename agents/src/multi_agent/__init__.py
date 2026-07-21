@@ -171,10 +171,14 @@ from multi_agent.invocation import (
     AgentInvoker,
     DeterministicFakeInvoker,
     RegistryAgentInvoker,
+    TrustedUsageInvoker,
+    UsageTrustLevel,
     validate_invocation_receipt,
 )
 from multi_agent.run_store import (
     InMemoryRunStore,
+    RunIdentity,
+    RunIdentityStatus,
     RunLease,
     RunStore,
     defensive_copy_result,
@@ -323,6 +327,8 @@ __all__ = [
     "AgentInvoker",
     "DeterministicFakeInvoker",
     "RegistryAgentInvoker",
+    "TrustedUsageInvoker",
+    "UsageTrustLevel",
     "validate_invocation_receipt",
     # Phase 4 — Execution Contracts
     "ExecutionBinding",
@@ -354,6 +360,8 @@ __all__ = [
     "validate_agent_result",
     # Phase 4 — Run Store
     "InMemoryRunStore",
+    "RunIdentity",
+    "RunIdentityStatus",
     "RunLease",
     "RunStore",
     "defensive_copy_result",

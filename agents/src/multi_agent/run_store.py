@@ -7,13 +7,12 @@ implementation — database persistence is a Phase 5 concern.
 Contract
 --------
 
-``lookup_completed(run_id, plan_hash) -> SupervisorRunResult | None``
-    R2 P0-1: Called *before* any registry pre-flight.  Returns a
-    deep copy of the stored result when ``run_id`` is already
-    completed with the same ``plan_hash``.  Returns ``None`` for
-    unknown / in-progress / mismatched-plan runs.  This is the cache
-    lookup path — a cached result must be returned even if the live
-    Registry has since drifted from ``plan.registry_version``.
+``lookup_run_identity(run_id, plan_hash) -> RunIdentity | None``
+    R3 P1-1: read-only probe that determines cache/conflict/in-progress
+    status in one call.  Returns ``None`` for unknown runs.  The
+    Supervisor calls this *before* any side-effect-bearing pre-flight
+    so it can pick the right path (cache hit / conflict / in-progress
+    / new run) without interleaving with another coroutine's begin().
 
 ``begin(run_id, plan_hash) -> RunLease``
     Called by :class:`SupervisorRuntime` *after* all side-effect-free
@@ -26,23 +25,22 @@ Contract
       :class:`RunAlreadyInProgressError`.
     * If ``run_id`` is completed with the same ``plan_hash`` → return
       a :class:`RunLease` whose ``cached_result`` is a **deep copy**
-      of the stored result.  (Defensive; ``lookup_completed`` is the
-      preferred cache path.)
+      of the stored result.  (Defensive; ``lookup_run_identity`` is
+      the preferred cache path.)
     * If ``run_id`` is completed with a different ``plan_hash`` →
       raise :class:`RunPlanConflictError`.
 
 ``complete(lease, result) -> None``
-    R2 P1-1: now takes the :class:`RunLease` returned by ``begin``.
-    The store validates ``lease.run_id`` / ``lease.plan_hash`` /
-    ``lease.lease_id`` against the in-progress entry and rejects a
-    ``complete`` call whose lease identity does not match (stale
-    callback after abort, etc.).
+    R3 P0-3: verifies the *three-part* lease identity
+    (``run_id`` + ``plan_hash`` + ``lease_id``) against the in-progress
+    entry.  Any mismatch is rejected — a stale callback cannot corrupt
+    a newer run.
 
 ``abort(lease, *, error_code) -> None``
-    R2 P1-1: now takes the :class:`RunLease` returned by ``begin``.
-    Same identity check as ``complete``.  If the lease is stale (a
-    newer lease has been issued for the same ``run_id``), the abort
-    is rejected so an old callback cannot delete a newer run's lease.
+    R3 P0-3: same three-part identity check as ``complete``.  If the
+    lease is stale (a newer lease has been issued for the same
+    ``run_id``), the abort is rejected so an old callback cannot
+    delete a newer run's lease.
 
 The store is intentionally simple — no TTL, no eviction.  Phase 5
 will add a Postgres-backed implementation with the same Protocol.
@@ -51,8 +49,11 @@ will add a Postgres-backed implementation with the same Protocol.
 from __future__ import annotations
 
 import secrets
-from typing import Protocol
+from typing import Literal, Protocol
 
+from pydantic import ConfigDict, Field
+
+from multi_agent.contracts import StrictContract
 from multi_agent.execution import SupervisorRunResult
 from multi_agent.execution_errors import (
     RunAlreadyInProgressError,
@@ -62,11 +63,11 @@ from multi_agent.execution_errors import (
 
 
 # ---------------------------------------------------------------------------
-# Lease
+# Lease — R3 P0-3: frozen StrictContract
 # ---------------------------------------------------------------------------
 
 
-class RunLease:
+class RunLease(StrictContract):
     """Returned by :meth:`RunStore.begin`.
 
     A lease is either *fresh* (``cached_result is None`` — the caller
@@ -79,22 +80,22 @@ class RunLease:
     *same* lease that ``begin`` issued.  This prevents a stale
     callback (e.g. a cancelled coroutine that resumed after abort)
     from deleting or completing a newer lease for the same run_id.
+
+    R3 P0-3: ``RunLease`` is now a frozen :class:`StrictContract`
+    (``frozen=True``, ``extra='forbid'``).  Previously it was a plain
+    mutable class, which allowed callers to mutate ``lease.plan_hash``
+    after ``begin()`` and trick ``complete()`` into accepting a
+    mismatched result.  The frozen contract makes the three-part
+    identity (``run_id`` + ``plan_hash`` + ``lease_id``) immutable
+    for the lifetime of the lease.
     """
 
-    __slots__ = ("run_id", "plan_hash", "lease_id", "cached_result")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
-    def __init__(
-        self,
-        *,
-        run_id: str,
-        plan_hash: str,
-        lease_id: str | None = None,
-        cached_result: SupervisorRunResult | None = None,
-    ) -> None:
-        self.run_id = run_id
-        self.plan_hash = plan_hash
-        self.lease_id = lease_id or _generate_lease_id()
-        self.cached_result = cached_result
+    run_id: str
+    plan_hash: str
+    lease_id: str = Field(default_factory=lambda: _generate_lease_id())
+    cached_result: SupervisorRunResult | None = None
 
     @property
     def is_cached(self) -> bool:
@@ -112,6 +113,44 @@ def _generate_lease_id() -> str:
 
 
 # ---------------------------------------------------------------------------
+# RunIdentity — R3 P1-1: read-only probe result
+# ---------------------------------------------------------------------------
+
+
+RunIdentityStatus = Literal["in_progress", "completed", "conflict"]
+
+
+class RunIdentity(StrictContract):
+    """R3 P1-1: identity probe result.
+
+    Returned by :meth:`RunStore.lookup_run_identity`.  Encapsulates
+    the run's status with respect to a *specific* ``plan_hash`` so
+    the Supervisor can pick the right path without calling ``begin()``
+    (which has side effects).
+
+    * ``status == "completed"`` and ``plan_hash_matches == True`` →
+      cache hit; ``cached_result`` is a deep copy of the stored
+      result.
+    * ``status == "completed"`` and ``plan_hash_matches == False`` →
+      conflict; the caller should raise ``RunPlanConflictError``.
+    * ``status == "in_progress"`` → the caller should raise
+      ``RunAlreadyInProgressError``.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    run_id: str
+    plan_hash: str
+    status: RunIdentityStatus
+    plan_hash_matches: bool
+    cached_result: SupervisorRunResult | None = None
+
+    @property
+    def is_completed(self) -> bool:
+        return self.status == "completed" and self.plan_hash_matches
+
+
+# ---------------------------------------------------------------------------
 # Protocol
 # ---------------------------------------------------------------------------
 
@@ -119,16 +158,19 @@ def _generate_lease_id() -> str:
 class RunStore(Protocol):
     """Idempotency boundary for :class:`SupervisorRuntime`."""
 
-    async def lookup_completed(
+    async def lookup_run_identity(
         self,
         run_id: str,
         plan_hash: str,
-    ) -> SupervisorRunResult | None:
-        """R2 P0-1: cache lookup path.
+    ) -> RunIdentity | None:
+        """R3 P1-1: read-only identity probe.
 
-        Returns a deep copy of the stored result when ``run_id`` is
-        completed with the same ``plan_hash``; ``None`` otherwise.
-        Must NOT raise for in-progress or mismatched-plan runs.
+        Returns ``None`` for unknown runs.  For known runs, returns a
+        :class:`RunIdentity` describing the run's status with respect
+        to the given ``plan_hash``.  Must NOT raise and must NOT
+        mutate the store — this is the cache/conflict/in-progress
+        determination step that runs *before* any side-effect-bearing
+        pre-flight.
         """
 
     async def begin(
@@ -149,7 +191,6 @@ class RunStore(Protocol):
         *,
         error_code: str,
     ) -> None: ...
-
 
 
 # ---------------------------------------------------------------------------
@@ -240,25 +281,37 @@ class InMemoryRunStore:
 
     # -- Protocol ---------------------------------------------------------
 
-    async def lookup_completed(
+    async def lookup_run_identity(
         self,
         run_id: str,
         plan_hash: str,
-    ) -> SupervisorRunResult | None:
-        """R2 P0-1: cache lookup path.
+    ) -> RunIdentity | None:
+        """R3 P1-1: read-only identity probe.
 
-        Returns a deep copy of the stored result when the run is
-        completed with the same ``plan_hash``.  Returns ``None`` for
-        unknown, in-progress, or mismatched-plan runs — no exceptions
-        raised, so callers can use this before any pre-flight check.
+        Determines cache/conflict/in-progress status for *run_id*
+        with respect to *plan_hash* in one call, without side effects.
         """
         entry = self._entries.get(run_id)
-        if entry is None or entry.in_progress:
+        if entry is None:
             return None
+        if entry.in_progress:
+            return RunIdentity(
+                run_id=run_id,
+                plan_hash=plan_hash,
+                status="in_progress",
+                plan_hash_matches=(entry.plan_hash == plan_hash),
+                cached_result=None,
+            )
+        # Completed run.
         assert entry.result is not None
-        if entry.plan_hash != plan_hash:
-            return None
-        return _deep_copy_result(entry.result)
+        matches = entry.plan_hash == plan_hash
+        return RunIdentity(
+            run_id=run_id,
+            plan_hash=plan_hash,
+            status="completed",
+            plan_hash_matches=matches,
+            cached_result=(_deep_copy_result(entry.result) if matches else None),
+        )
 
     async def begin(
         self,
@@ -301,9 +354,10 @@ class InMemoryRunStore:
         lease: RunLease,
         result: SupervisorRunResult,
     ) -> None:
-        # R2 P1-1: verify lease identity before mutating the entry.
-        # A stale ``complete`` (e.g. from a cancelled coroutine that
-        # resumed after abort) must not corrupt a newer run.
+        # R3 P0-3: verify three-part lease identity (run_id +
+        # plan_hash + lease_id) against the in-progress entry.
+        # Any mismatch is rejected so a stale or tampered lease
+        # cannot corrupt a newer run.
         if lease.run_id != result.run_id or lease.plan_hash != result.plan_hash:
             raise SupervisorError(
                 "complete() called with a lease whose identity does "
@@ -319,11 +373,23 @@ class InMemoryRunStore:
                 f"complete() called for run_id={result.run_id!r} "
                 f"but no begin() lease exists"
             )
-        if entry.in_progress and entry.lease_id != lease.lease_id:
+        # R3 P0-3: verify entry.plan_hash matches lease.plan_hash.
+        # Previously only lease_id was checked, allowing a caller to
+        # mutate lease.plan_hash after begin() and trick complete()
+        # into accepting a result with a different plan_hash.
+        if entry.in_progress and (
+            entry.lease_id != lease.lease_id
+            or entry.plan_hash != lease.plan_hash
+            or entry.run_id != lease.run_id
+        ):
             raise SupervisorError(
-                f"complete() rejected: lease_id={lease.lease_id[:12]!r} "
-                f"does not match in-progress entry lease_id="
-                f"{entry.lease_id[:12]!r} for run_id={result.run_id!r}"
+                f"complete() rejected: lease identity "
+                f"(run_id={lease.run_id!r}, "
+                f"plan_hash={lease.plan_hash[:12]!r}, "
+                f"lease_id={lease.lease_id[:12]!r}) does not match "
+                f"in-progress entry (run_id={entry.run_id!r}, "
+                f"plan_hash={entry.plan_hash[:12]!r}, "
+                f"lease_id={entry.lease_id[:12]!r})"
             )
         if not entry.in_progress:
             # Idempotent re-complete with the same result is allowed;
@@ -355,7 +421,8 @@ class InMemoryRunStore:
         *,
         error_code: str,
     ) -> None:
-        """R2 P1-1: Release an in-progress lease.
+        """R3 P0-3: Release an in-progress lease with three-part
+        identity verification.
 
         Behaviour:
 
@@ -363,28 +430,36 @@ class InMemoryRunStore:
         * If the run is completed → no-op (a cached result wins;
           aborting cannot revoke a completed run).  We still record
           the error_code for test introspection.
-        * If the run is in-progress with a *matching* ``lease_id`` →
-          drop the entry entirely so a later ``begin`` succeeds.
-        * If the run is in-progress with a *mismatched* ``lease_id``
-          → reject the abort so a stale callback cannot delete a
+        * If the run is in-progress with a *matching* three-part
+          identity → drop the entry entirely so a later ``begin``
+          succeeds.
+        * If the run is in-progress with a *mismatched* identity →
+          reject the abort so a stale callback cannot delete a
           newer run's lease.
 
-        ``plan_hash`` is informational — we do not enforce a match
-        because the abort path is reached after a failure and tests
-        may tamper with the plan.  ``lease_id`` is the authoritative
-        identity check.
+        R3 P0-3: ``plan_hash`` is no longer informational — it is
+        part of the authoritative identity check alongside
+        ``run_id`` and ``lease_id``.
         """
         entry = self._entries.get(lease.run_id)
         if entry is None or not entry.in_progress:
             # No-op: nothing to release.
             self._aborts[lease.run_id] = error_code
             return
-        if entry.lease_id != lease.lease_id:
+        if (
+            entry.lease_id != lease.lease_id
+            or entry.plan_hash != lease.plan_hash
+            or entry.run_id != lease.run_id
+        ):
             raise SupervisorError(
-                f"abort() rejected: lease_id={lease.lease_id[:12]!r} "
-                f"does not match in-progress entry lease_id="
-                f"{entry.lease_id[:12]!r} for run_id={lease.run_id!r}; "
-                f"a newer lease has been issued — refusing to delete it"
+                f"abort() rejected: lease identity "
+                f"(run_id={lease.run_id!r}, "
+                f"plan_hash={lease.plan_hash[:12]!r}, "
+                f"lease_id={lease.lease_id[:12]!r}) does not match "
+                f"in-progress entry (run_id={entry.run_id!r}, "
+                f"plan_hash={entry.plan_hash[:12]!r}, "
+                f"lease_id={entry.lease_id[:12]!r}); a newer lease "
+                f"has been issued — refusing to delete it"
             )
         # Drop the in-progress entry.  A subsequent begin() with the
         # same run_id will create a fresh lease.
@@ -405,6 +480,8 @@ def defensive_copy_result(result: SupervisorRunResult) -> SupervisorRunResult:
 
 __all__ = [
     "InMemoryRunStore",
+    "RunIdentity",
+    "RunIdentityStatus",
     "RunLease",
     "RunStore",
     "defensive_copy_result",

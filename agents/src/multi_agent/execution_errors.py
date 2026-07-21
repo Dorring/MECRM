@@ -35,6 +35,24 @@ class RetryableAgentError(SupervisorError):
     """
 
 
+class NonRetryableAgentError(SupervisorError):
+    """R3 P0-2: Raised by a Handler when the failure is a definite
+    business-domain error that cannot be retried, but is still an
+    *expected* Agent Domain Error rather than a programming error.
+
+    The task is marked ``failed`` with ``error_code=non_retryable_error``
+    and the run continues — siblings are NOT cancelled (contrast with
+    an unknown ``RuntimeError`` / ``TypeError`` which propagates to
+    the Scheduler's structured-concurrency boundary).
+
+    Rationale: R2 used a broad ``except Exception`` catch-all that
+    downgraded every unknown error (including programming bugs) to a
+    plain task failure.  R3 splits the boundary — Handlers that want
+    a non-retryable task failure must raise this explicit type so
+    generic programming errors are no longer silently swallowed.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Result validation
 # ---------------------------------------------------------------------------
@@ -109,6 +127,7 @@ __all__ = [
     "ExecutionUsageUnavailableError",
     "InvalidAgentResultError",
     "InvalidInvocationReceiptError",
+    "NonRetryableAgentError",
     "RetryableAgentError",
     "RunAlreadyInProgressError",
     "RunPlanConflictError",

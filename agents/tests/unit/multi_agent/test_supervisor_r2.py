@@ -731,7 +731,7 @@ class TestStructuredConcurrency:
 
     @pytest.mark.asyncio
     async def test_wave_exception_cancels_and_awaits_siblings(self):
-        """Two parallel tasks: A raises a BaseException immediately,
+        """Two parallel tasks: A raises a RuntimeError immediately,
         B sleeps.  B must be cancelled — the Scheduler must not
         return or raise until B has terminated."""
         reg = _make_registry(_two_chain_caps(), catalog=_two_chain_catalog())
@@ -748,7 +748,7 @@ class TestStructuredConcurrency:
                 if task.task_id == "task_a":
                     # Signal that B is running, then raise.
                     b_was_running["v"] = True
-                    raise BaseException("infrastructure explosion")
+                    raise RuntimeError("infrastructure explosion")
                 # task_b: sleep so we can prove it's cancelled.
                 try:
                     await asyncio.sleep(5.0)
@@ -764,8 +764,8 @@ class TestStructuredConcurrency:
             plan_validator=_AlwaysValidPlanValidator(),
         )
 
-        # The Supervisor must propagate the BaseException.
-        with pytest.raises(BaseException, match="infrastructure explosion"):
+        # The Supervisor must propagate the RuntimeError.
+        with pytest.raises(RuntimeError, match="infrastructure explosion"):
             await runtime.execute(plan, reg)
 
         # B must NOT have completed — it was cancelled.
@@ -788,7 +788,7 @@ class TestStructuredConcurrency:
                 self, handler: Any, task: AgentTask, ctx: AgentExecutionContext
             ) -> AgentInvocationReceipt:
                 if task.task_id == "task_a":
-                    raise BaseException("boom")
+                    raise RuntimeError("boom")
                 # task_b: if not cancelled, writes a side effect after
                 # a delay.
                 try:
@@ -805,7 +805,7 @@ class TestStructuredConcurrency:
             plan_validator=_AlwaysValidPlanValidator(),
         )
 
-        with pytest.raises(BaseException, match="boom"):
+        with pytest.raises(RuntimeError, match="boom"):
             await runtime.execute(plan, reg)
 
         # Yield control so any leaked coroutine would have a chance
@@ -827,7 +827,7 @@ class TestStructuredConcurrency:
                 self, handler: Any, task: AgentTask, ctx: AgentExecutionContext
             ) -> AgentInvocationReceipt:
                 if task.task_id == "task_a":
-                    raise BaseException("orphan test")
+                    raise RuntimeError("orphan test")
                 await asyncio.sleep(5.0)
                 return AgentInvocationReceipt(result=_ok_result(task=task))
 
@@ -837,7 +837,7 @@ class TestStructuredConcurrency:
             plan_validator=_AlwaysValidPlanValidator(),
         )
 
-        with pytest.raises(BaseException, match="orphan test"):
+        with pytest.raises(RuntimeError, match="orphan test"):
             await runtime.execute(plan, reg)
 
         # After the Supervisor returns, yield control and check that
@@ -875,7 +875,7 @@ class TestStructuredConcurrency:
                 self, handler: Any, task: AgentTask, ctx: AgentExecutionContext
             ) -> AgentInvocationReceipt:
                 if task.task_id == "task_a":
-                    raise BaseException("lease order test")
+                    raise RuntimeError("lease order test")
                 try:
                     await asyncio.sleep(0.2)
                 except asyncio.CancelledError:
@@ -890,7 +890,7 @@ class TestStructuredConcurrency:
             plan_validator=_AlwaysValidPlanValidator(),
         )
 
-        with pytest.raises(BaseException, match="lease order test"):
+        with pytest.raises(RuntimeError, match="lease order test"):
             await runtime.execute(plan, reg)
 
         # The abort must have been called (lease released).

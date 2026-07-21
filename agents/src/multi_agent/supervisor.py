@@ -67,7 +67,9 @@ from multi_agent.execution_errors import (
     ExecutionUsageUnavailableError,
     InvalidAgentResultError,
     InvalidInvocationReceiptError,
+    NonRetryableAgentError,
     RetryableAgentError,
+    RunAlreadyInProgressError,
     SupervisorError,
 )
 from multi_agent.invocation import (
@@ -265,7 +267,17 @@ class _BudgetAccountant:
         self._agent_calls += 1
 
     def record_receipt(self, receipt: AgentInvocationReceipt) -> None:
-        """Accumulate *actual* usage from a successful invocation."""
+        """Accumulate *actual* usage from a successful invocation.
+
+        R3 P0-4: when ``token_budget`` or ``cost_budget_usd`` is
+        configured, only receipts with ``usage_trust`` of
+        ``verified_provider`` or ``trusted_adapter`` are accepted.
+        An ``unverified`` receipt fails closed with
+        :class:`ExecutionUsageUnavailableError` regardless of whether
+        the self-reported value is ``None``, ``0``, or positive — this
+        prevents a custom Invoker from under-reporting usage (e.g.
+        ``cost_usd=Decimal("0")``) to bypass budget enforcement.
+        """
         self._tool_calls += receipt.tool_calls
         if self._tool_calls > self._budget.max_tool_calls:
             self._exceeded = True
@@ -275,6 +287,20 @@ class _BudgetAccountant:
             )
 
         if self._budget.token_budget is not None:
+            # R3 P0-4: provenance check. A custom Invoker that
+            # self-reports tokens_used=0 or tokens_used=None with
+            # usage_trust="unverified" cannot be trusted to enforce
+            # the token_budget — only verified_provider (LLM-attested)
+            # or trusted_adapter (vetted middleware) receipts are
+            # accepted.  The check runs *before* the None check so a
+            # zero/positive unverified value is also rejected.
+            if receipt.usage_trust == "unverified":
+                raise ExecutionUsageUnavailableError(
+                    "token_budget is configured but the invocation "
+                    "receipt carries usage_trust='unverified' — only "
+                    "verified_provider or trusted_adapter receipts are "
+                    "accepted for token budget enforcement"
+                )
             if receipt.tokens_used is None:
                 raise ExecutionUsageUnavailableError(
                     "token_budget is configured but the invocation "
@@ -289,6 +315,16 @@ class _BudgetAccountant:
                 )
 
         if self._budget.cost_budget_usd is not None:
+            # R3 P0-4: same provenance check as token_budget. A custom
+            # Invoker that self-reports cost_usd=Decimal("0") with
+            # usage_trust="unverified" cannot bypass cost enforcement.
+            if receipt.usage_trust == "unverified":
+                raise ExecutionUsageUnavailableError(
+                    "cost_budget_usd is configured but the invocation "
+                    "receipt carries usage_trust='unverified' — only "
+                    "verified_provider or trusted_adapter receipts are "
+                    "accepted for cost budget enforcement"
+                )
             if receipt.cost_usd is None:
                 raise ExecutionUsageUnavailableError(
                     "cost_budget_usd is configured but the invocation "
@@ -376,34 +412,47 @@ class SupervisorRuntime:
         start_mono = time.monotonic()
         trace = _TraceBuilder(run_id)
 
-        # R2 P0-1: Cache lookup happens *before* any pre-flight check.
-        # A completed run's cached result must be returned even if the
-        # live Registry has since drifted from ``plan.registry_version``
-        # (e.g. an unrelated agent was registered after the run finished).
-        # The only input to the cache path is ``plan.verify_integrity()``
-        # — we must ensure the caller is not handing us a tampered plan
-        # whose ``plan_hash`` does not match its content.
+        # R3 P0-1: Pre-flight order — cancellation must NOT bypass
+        # Registry/Validator/Handler resolution.  The previous R2 order
+        # allowed a pre-cancelled run with an invalid plan (registry
+        # mismatch, missing handler, validator failure) to be cached
+        # as ``cancelled`` — poisoning the run_id so a later valid
+        # attempt would hit the cache and never re-validate.
+        #
+        # Correct order:
+        #   1. plan.verify_integrity()              (no side effects)
+        #   2. RunStore identity probe              (read-only)
+        #       - same run + same plan + completed  → cache hit, return
+        #       - same run + different plan          → RunPlanConflictError
+        #       - same run + same plan + running     → RunAlreadyInProgressError
+        #   3. Registry Version                      (no side effects)
+        #   4. PlanValidator                         (no side effects)
+        #   5. Execution Bindings (handler resolve)  (no side effects)
+        #   6. Cancellation / Kill Switch            (read-only)
+        #   7. RunStore.begin()                      (mutates store)
+        #   8. Dispatch or finalize as cancelled
+        #
+        # Step 6 (cancellation) is intentionally *after* the
+        # side-effect-free pre-flight checks so that a cancelled run
+        # still has a valid plan.  The cancellation only prevents
+        # Handler invocation — it does not make an invalid plan
+        # acceptable as a cached ``cancelled`` result.
         self._validate_plan_integrity(plan)
 
-        cached = await self._run_store.lookup_completed(run_id, plan.plan_hash)
-        if cached is not None:
-            return cached
-
-        # R2 P0-3: Pre-run cancellation check.  If the run is already
-        # cancelled before we acquire the lease, we must NOT consume
-        # an iteration, emit ``task_ready``, or call any Handler.  The
-        # resulting SupervisorRunResult carries ``iterations=0`` and
-        # an empty trace (except for the run_cancelled event).
-        if await canc.is_cancelled(run_id) or await canc.is_kill_switch_active(
-            plan.tenant_id
-        ):
-            return await self._finalize_pre_cancelled(
-                plan=plan,
-                trace=trace,
-                started_at=started_at,
-                start_mono=start_mono,
-                canc=canc,
-            )
+        # R3 P1-1: identity probe replaces lookup_completed + begin
+        # race.  Determines cache/conflict/in-progress status in one
+        # read-only call so the Supervisor can pick the right path
+        # without interleaving with another coroutine's begin().
+        identity = await self._run_store.lookup_run_identity(run_id, plan.plan_hash)
+        if identity is not None and identity.is_completed:
+            assert identity.cached_result is not None
+            return identity.cached_result
+        if identity is not None and identity.status == "in_progress":
+            raise RunAlreadyInProgressError(f"run_id={run_id!r} is already in progress")
+        # identity is None or mismatched-plan: fall through to pre-flight.
+        # (A mismatched-plan identity is rejected by begin() below as
+        #  RunPlanConflictError; we let pre-flight run first so the
+        #  caller sees the *cheapest* rejection.)
 
         # R1 P0-1: Pre-flight validation happens *before* the RunStore
         # lease is acquired.  All of these checks are side-effect-free
@@ -422,6 +471,22 @@ class SupervisorRuntime:
         # (not the live registry version) so the cached result is
         # stable across future cache lookups.
         bindings, bound_handlers = self._build_execution_bindings(plan, registry)
+
+        # R3 P0-1: Cancellation check now happens *after* pre-flight.
+        # A pre-cancelled run with a valid plan produces a cached
+        # ``cancelled`` result; a pre-cancelled run with an invalid
+        # plan raises the appropriate SupervisorError *before* reaching
+        # this point, so the run_id is not poisoned.
+        if await canc.is_cancelled(run_id) or await canc.is_kill_switch_active(
+            plan.tenant_id
+        ):
+            return await self._finalize_pre_cancelled(
+                plan=plan,
+                trace=trace,
+                started_at=started_at,
+                start_mono=start_mono,
+                canc=canc,
+            )
 
         # Idempotency lease — only acquired after pre-flight passes.
         lease = await self._run_store.begin(run_id, plan.plan_hash)
@@ -469,9 +534,12 @@ class SupervisorRuntime:
             canc_state = _CancellationState()
 
             # Build the run_task closure — uses bound_handlers, NOT
-            # live registry.resolve().
+            # live registry.resolve().  R3 P1-3: bindings are passed
+            # through so _execute_task can emit the capability
+            # snapshot into the trace for audit correlation.
             run_task = self._build_run_task(
                 plan=plan,
+                bindings=bindings,
                 bound_handlers=bound_handlers,
                 invoker=invoker,
                 accountant=accountant,
@@ -669,6 +737,7 @@ class SupervisorRuntime:
         self,
         *,
         plan: PlanDraft,
+        bindings: dict[str, ExecutionBinding],
         bound_handlers: dict[str, AgentHandler],
         invoker: AgentInvoker,
         accountant: _BudgetAccountant,
@@ -681,6 +750,7 @@ class SupervisorRuntime:
             return await self._execute_task(
                 task=task,
                 plan=plan,
+                binding=bindings[task.task_id],
                 bound_handlers=bound_handlers,
                 invoker=invoker,
                 accountant=accountant,
@@ -697,6 +767,7 @@ class SupervisorRuntime:
         *,
         task: AgentTask,
         plan: PlanDraft,
+        binding: ExecutionBinding,
         bound_handlers: dict[str, AgentHandler],
         invoker: AgentInvoker,
         accountant: _BudgetAccountant,
@@ -705,9 +776,11 @@ class SupervisorRuntime:
         canc: ExecutionCancellation,
         canc_state: _CancellationState,
     ) -> TaskOutcome:
-        # R2 P0-1: use the pre-flight bound handler, NOT a fresh
-        # registry.resolve().  A registry mutation during the run
-        # cannot change what Handler actually runs.
+        # R3 P1-3: ExecutionBinding is the authoritative input — it
+        # carries the pre-flight capability snapshot AND the handler.
+        # The capability_snapshot is emitted into the trace so audit
+        # consumers can correlate the executed task with the capability
+        # version that was bound at pre-flight time.
         handler = bound_handlers[task.task_id]
 
         attempts: list[TaskAttemptRecord] = []
@@ -768,7 +841,20 @@ class SupervisorRuntime:
                 TRACE_TASK_STARTED,
                 task_id=task.task_id,
                 agent_id=task.agent_id,
-                data={"attempt": attempt_idx},
+                data={
+                    "attempt": attempt_idx,
+                    # R3 P1-3: emit the pre-flight capability snapshot
+                    # version so audit consumers can correlate the
+                    # executed task with the capability bound at
+                    # pre-flight time, not the live registry version.
+                    "binding_agent_id": binding.agent_id,
+                    "binding_capability_agent_id": (
+                        binding.capability_snapshot.agent_id
+                    ),
+                    "binding_capability_authority": (
+                        binding.capability_snapshot.authority.value
+                    ),
+                },
                 occurred_at=attempt_started_at,
             )
 
@@ -820,6 +906,16 @@ class SupervisorRuntime:
                 attempt_status = "failed"
                 error_code = "retryable_error"
                 invocation_error = exc
+            except NonRetryableAgentError as exc:
+                # R3 P0-2: explicit non-retryable Agent Domain Error.
+                # The task is marked ``failed`` and the retry loop
+                # breaks (see the ``isinstance(invocation_error,
+                # RetryableAgentError)`` guard below).  Siblings are
+                # NOT cancelled — this is a business-domain failure,
+                # not a programming/infrastructure error.
+                attempt_status = "failed"
+                error_code = "non_retryable_error"
+                invocation_error = exc
             except InvalidAgentResultError as exc:
                 attempt_status = "failed"
                 error_code = "invalid_result"
@@ -829,10 +925,15 @@ class SupervisorRuntime:
                 attempt_status = "failed"
                 error_code = "invalid_receipt"
                 invocation_error = exc
-            except Exception as exc:  # noqa: BLE001
-                attempt_status = "failed"
-                error_code = type(exc).__name__
-                invocation_error = exc
+            # R3 P0-2: NO ``except Exception`` catch-all.  Unknown
+            # errors (RuntimeError, TypeError, KeyError, AssertionError,
+            # etc.) are programming/infrastructure failures that must
+            # propagate to the Scheduler's structured-concurrency
+            # boundary so sibling tasks are cancelled and awaited.
+            # Downgrading them to a plain task failure would let
+            # siblings continue running on a corrupted state, and
+            # would hide the real defect behind a generic
+            # ``error_code=RuntimeError`` record.
 
             attempt_completed_at = utc_now()
             attempt_completed_mono = time.monotonic()
@@ -1426,14 +1527,22 @@ class SupervisorRuntime:
             task_records, accountant, plan.tasks
         )
 
-        if forced_status is not None:
-            final_status = forced_status
-        elif cancelled_during_run:
+        # R3 P1-2: Run-level Cancellation has the highest priority —
+        # it must override ``forced_status`` (e.g. budget_exceeded)
+        # and the computed status.  Spec §17 priority:
+        #   cancelled > budget_exceeded > failed > needs_input >
+        #   partial_success > completed
+        # The previous order let a ``forced_status=BUDGET_EXCEEDED``
+        # (from max_tasks check) mask an active cancellation, violating
+        # the spec.
+        if cancelled_during_run:
             final_status = SupervisorRunStatus.CANCELLED
             trace.emit(
                 TRACE_RUN_CANCELLED,
                 data={"reason": "cancellation active at finalize"},
             )
+        elif forced_status is not None:
+            final_status = forced_status
         elif accountant.exceeded:
             final_status = SupervisorRunStatus.BUDGET_EXCEEDED
         else:

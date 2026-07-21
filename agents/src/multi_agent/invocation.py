@@ -20,7 +20,7 @@ Supervisor stay unchanged.
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Callable, Protocol
+from typing import Callable, Literal, Protocol
 
 from pydantic import Field
 
@@ -32,6 +32,29 @@ from multi_agent.contracts import (
 )
 from multi_agent.execution_errors import InvalidInvocationReceiptError
 from multi_agent.registry import AgentHandler, AgentRegistry
+
+
+# ---------------------------------------------------------------------------
+# R3 P0-4: Usage Trust Level
+# ---------------------------------------------------------------------------
+
+
+UsageTrustLevel = Literal[
+    # ``verified_provider`` — usage came from the LLM provider's
+    # authoritative response (``result.provider_metadata`` is set and
+    # ``result.token_usage`` reflects the real billing counter).  This
+    # is the only level accepted for token_budget enforcement.
+    "verified_provider",
+    # ``trusted_adapter`` — usage came from a vetted adapter (e.g. a
+    # future cost-reporting middleware that signs its reports).  This
+    # is the only level accepted for cost_budget_usd enforcement.
+    "trusted_adapter",
+    # ``unverified`` — usage is self-reported by the Invoker with no
+    # cryptographic or provider-level attestation.  Values of 0 or
+    # None are treated as "no usage reported" and fail closed when a
+    # budget is configured.
+    "unverified",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -47,12 +70,22 @@ class AgentInvocationReceipt(StrictContract):
     the Handler did not report real usage (e.g. deterministic mode) —
     Phase 4 treats a configured budget with ``None`` usage as
     fail-closed rather than substituting a Phase 3 estimate.
+
+    R3 P0-4: ``usage_trust`` declares the provenance of the reported
+    usage.  When a budget (``token_budget`` or ``cost_budget_usd``) is
+    configured, the Supervisor only accepts ``verified_provider`` or
+    ``trusted_adapter`` receipts; an ``unverified`` receipt with zero
+    or None usage fails closed with
+    :class:`ExecutionUsageUnavailableError`.  This prevents a custom
+    Invoker from under-reporting usage (e.g. ``cost_usd=Decimal("0")``)
+    to bypass budget enforcement.
     """
 
     result: AgentResult
     tool_calls: int = Field(default=0, ge=0)
     tokens_used: int | None = Field(default=None, ge=0)
     cost_usd: Decimal | None = Field(default=None, ge=0)
+    usage_trust: UsageTrustLevel = Field(default="unverified")
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +113,24 @@ class AgentInvoker(Protocol):
     ) -> AgentInvocationReceipt: ...
 
 
+class TrustedUsageInvoker(AgentInvoker, Protocol):
+    """R3 P0-4: marker Protocol for Invokers that report *verified*
+    usage.
+
+    The Supervisor checks ``isinstance(invoker, TrustedUsageInvoker)``
+    when a budget is configured.  A plain :class:`AgentInvoker` (or a
+    test fake that does not inherit this Protocol) is treated as
+    ``unverified`` and its self-reported usage is rejected for budget
+    enforcement.
+
+    Concrete implementations must set ``usage_is_verified = True`` and
+    ensure every receipt they produce carries
+    ``usage_trust="verified_provider"`` or ``usage_trust="trusted_adapter"``.
+    """
+
+    usage_is_verified: bool
+
+
 # ---------------------------------------------------------------------------
 # RegistryAgentInvoker
 # ---------------------------------------------------------------------------
@@ -99,6 +150,14 @@ class RegistryAgentInvoker:
       carry a cost field.  A configured ``cost_budget_usd`` therefore
       fails closed unless a future ``AgentResult`` extension reports
       cost.
+
+    R3 P0-4: ``usage_trust`` is set to ``verified_provider`` when
+    ``result.provider_metadata`` is present (the LLM provider
+    attested the token usage); ``unverified`` otherwise.  Cost is
+    always ``unverified`` because :class:`AgentResult` has no cost
+    field — a configured ``cost_budget_usd`` fails closed unless the
+    caller uses a :class:`TrustedUsageInvoker` that reports
+    ``cost_usd`` with ``usage_trust="trusted_adapter"``.
     """
 
     def __init__(self, registry: AgentRegistry) -> None:
@@ -115,16 +174,19 @@ class RegistryAgentInvoker:
         context: AgentExecutionContext,
     ) -> AgentInvocationReceipt:
         result = await handler.run(task, context)
-        tokens_used: int | None
         if result.provider_metadata is not None:
-            tokens_used = result.token_usage.total_tokens
+            tokens_used: int | None = result.token_usage.total_tokens
+            # Provider attested token usage — verified.
+            usage_trust: UsageTrustLevel = "verified_provider"
         else:
             tokens_used = None
+            usage_trust = "unverified"
         return AgentInvocationReceipt(
             result=result,
             tool_calls=len(result.tool_calls),
             tokens_used=tokens_used,
             cost_usd=None,
+            usage_trust=usage_trust,
         )
 
 
@@ -216,6 +278,14 @@ def validate_invocation_receipt(receipt: AgentInvocationReceipt) -> None:
       custom Invoker from under-reporting tokens while the Result
       carries authoritative provider usage.
 
+    R3 P0-4: ``usage_trust`` provenance is validated against the
+    receipt contents:
+
+    * ``verified_provider`` requires ``result.provider_metadata`` to
+      be present (the LLM provider attested the usage).
+    * ``unverified`` is always allowed structurally, but the
+      :class:`_BudgetAccountant` rejects it for budget enforcement.
+
     Cost is intentionally **not** validated here because
     :class:`AgentResult` does not carry a cost field; cost trust is
     solely a property of the chosen Invoker (RegistryAgentInvoker
@@ -241,11 +311,24 @@ def validate_invocation_receipt(receipt: AgentInvocationReceipt) -> None:
                 f"authoritative)"
             )
 
+    # R3 P0-4: ``verified_provider`` provenance requires the provider
+    # metadata to actually be present.  A receipt that claims
+    # ``verified_provider`` without ``provider_metadata`` is lying
+    # about its provenance.
+    if receipt.usage_trust == "verified_provider" and result.provider_metadata is None:
+        raise InvalidInvocationReceiptError(
+            "receipt.usage_trust='verified_provider' but "
+            "result.provider_metadata is None — provider attestation "
+            "is required for verified_provider provenance"
+        )
+
 
 __all__ = [
     "AgentInvocationReceipt",
     "AgentInvoker",
     "DeterministicFakeInvoker",
     "RegistryAgentInvoker",
+    "TrustedUsageInvoker",
+    "UsageTrustLevel",
     "validate_invocation_receipt",
 ]

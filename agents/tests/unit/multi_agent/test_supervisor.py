@@ -43,6 +43,7 @@ from multi_agent.execution import (
     SupervisorRunStatus,
 )
 from multi_agent.execution_errors import (
+    NonRetryableAgentError,
     RetryableAgentError,
     RunPlanConflictError,
     SupervisorError,
@@ -762,8 +763,12 @@ class TestRetryTimeout:
         ) -> AgentInvocationReceipt:
             if task.task_id == ctx_task.task_id:
                 call_count["n"] += 1
-                # Generic ValueError — non-retryable.
-                raise ValueError("boom")
+                # R3 P0-2: NonRetryableAgentError is the explicit
+                # Agent Domain Error for a definite business failure
+                # that must not be retried but should NOT propagate to
+                # the Scheduler (siblings are not cancelled).  A
+                # generic ValueError would now propagate per R3.
+                raise NonRetryableAgentError("boom")
             return AgentInvocationReceipt(result=_ok_result(task=task))
 
         runtime = SupervisorRuntime(
