@@ -41,7 +41,9 @@ from __future__ import annotations
 import asyncio
 from typing import Awaitable, Callable
 
-from multi_agent.contracts import AgentTask
+from pydantic import ConfigDict, Field
+
+from multi_agent.contracts import AgentTask, StrictContract
 from multi_agent.execution import (
     SupervisorConfig,
     TaskExecutionRecord,
@@ -72,14 +74,72 @@ WaveStartedCallback = Callable[[list[AgentTask]], None]
 # running event loop).  When the hook returns ``True`` the Scheduler
 # cancels the wave instead of dispatching it.
 BeforeWave = Callable[[list[AgentTask]], Awaitable[bool]]
-# R4 P1-1: sync filter called after on_wave_started but before any
-# coroutine is created.  Receives the sorted ready list and returns
-# the subset of tasks that may proceed.  Tasks not in the returned
-# list are marked ``skipped`` with reason ``"agent_call budget
-# exhausted"`` — they never start a Handler.  This makes agent-call
-# budget allocation deterministic (by task_id order) rather than
-# dependent on coroutine scheduling.
-PreDispatch = Callable[[list[AgentTask]], list[AgentTask]]
+
+
+# ---------------------------------------------------------------------------
+# R5 P0-3: AgentCallPermit — a dispatch permit that is NOT an actual
+# agent call.  Pre-dispatch issues permits deterministically (by task_id
+# order), but the actual ``agent_calls`` counter is only incremented when
+# the permit is *committed* — i.e. right before ``invoker.invoke()`` is
+# called.  If the task is cancelled or deadline-exceeded before
+# invocation, the permit is *released* and does not enter
+# ``ExecutionUsage.agent_calls``.
+# ---------------------------------------------------------------------------
+
+
+class AgentCallPermit(StrictContract):
+    """R5 P0-3: a dispatch permit for an agent call.
+
+    Issued by the pre-dispatch filter (deterministic, by task_id order).
+    Committed by ``_execute_task`` right before ``invoker.invoke()``.
+    Released if the task exits before invocation (cancellation,
+    deadline, sibling cancellation).
+
+    Guarantees that ``usage.agent_calls`` equals the number of times
+    the Invoker was actually invoked, not the number of tasks that
+    received a dispatch slot.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    task_id: str
+    permit_sequence: int = Field(ge=0)
+
+
+# ---------------------------------------------------------------------------
+# R5 P0-2: DispatchDecision — the result of the pre-dispatch filter.
+# Replaces the previous ``list[AgentTask]`` return type so the Scheduler
+# can distinguish "denied due to budget exhaustion" (which must set
+# ``accountant.exceeded`` and finalise the run as ``budget_exceeded``)
+# from "denied for other reasons".
+# ---------------------------------------------------------------------------
+
+
+class DispatchDecision(StrictContract):
+    """R5 P0-2: decision returned by the pre-dispatch filter.
+
+    ``allowed_task_ids`` — tasks that may proceed (permits issued).
+    ``denied_task_ids`` — tasks that were denied a call slot.
+    ``denial_reason`` — why tasks were denied (``None`` if none denied).
+    ``budget_exhausted`` — ``True`` when denial was caused by agent-call
+    budget exhaustion.  The Supervisor uses this to set
+    ``accountant.exceeded`` so the run finalises as ``budget_exceeded``
+    rather than ``completed``.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    allowed_task_ids: tuple[str, ...] = Field(default_factory=tuple)
+    denied_task_ids: tuple[str, ...] = Field(default_factory=tuple)
+    denial_reason: str | None = None
+    budget_exhausted: bool = False
+
+
+# R5 P1-1 + P0-2: the pre-dispatch filter now runs BEFORE
+# ``on_wave_started`` (so a wave with no allowed tasks does not consume
+# an iteration or emit ``task_ready``) and returns a
+# :class:`DispatchDecision` instead of a plain list.
+PreDispatch = Callable[[list[AgentTask]], DispatchDecision]
 
 
 # ---------------------------------------------------------------------------
@@ -319,37 +379,45 @@ class DagScheduler:
                 pending_ids.clear()
                 break
 
-            # 4b. R1 P0-2: notify the Supervisor that a real Ready-Task
-            #     wave is about to be dispatched.  This is where the
-            #     iteration budget is reserved and task_ready is emitted.
-            #     Called only after before_wave has confirmed the wave
-            #     should proceed.
-            if on_wave_started is not None:
-                on_wave_started(ready)
-
-            # 4c. R4 P1-1: deterministic agent-call budget pre-allocation.
-            #     The ``pre_dispatch`` filter receives the sorted ready
-            #     list and returns the subset that may proceed.  Tasks
-            #     not returned are marked ``skipped`` — they never start
-            #     a Handler.  This makes budget allocation deterministic
-            #     (by task_id order) instead of dependent on coroutine
-            #     scheduling.
+            # 4b. R5 P1-1: pre-dispatch filter runs BEFORE on_wave_started
+            #     so that a wave with no allowed tasks does not consume
+            #     an iteration or emit task_ready.  The filter receives
+            #     the sorted ready list and returns a DispatchDecision
+            #     indicating which tasks may proceed and whether budget
+            #     was exhausted.
             if pre_dispatch is not None:
-                allowed = set(t.task_id for t in pre_dispatch(ready))
-                denied = [t for t in ready if t.task_id not in allowed]
+                decision = pre_dispatch(ready)
+                allowed_set = set(decision.allowed_task_ids)
+                denied = [t for t in ready if t.task_id not in allowed_set]
                 for task in denied:
                     records[task.task_id] = TaskExecutionRecord(
                         task_id=task.task_id,
                         agent_id=task.agent_id,
                         status="skipped",
-                        skip_reason="agent_call budget exhausted",
+                        skip_reason=decision.denial_reason
+                        or "agent_call budget exhausted",
                     )
                     pending_ids.discard(task.task_id)
-                ready = [t for t in ready if t.task_id in allowed]
+                ready = [t for t in ready if t.task_id in allowed_set]
                 if not ready:
+                    # All tasks were denied — do NOT consume an iteration
+                    # or emit task_ready.  If budget was exhausted, the
+                    # Supervisor's pre_dispatch filter has already set
+                    # accountant.exceeded, which will cause should_stop
+                    # to fire on the next loop and finalise the run as
+                    # budget_exceeded.
                     if on_wave_completed is not None and denied:
                         on_wave_completed([records[t.task_id] for t in denied])
                     continue
+
+            # 4c. R1 P0-2: notify the Supervisor that a real Ready-Task
+            #     wave is about to be dispatched.  This is where the
+            #     iteration budget is reserved and task_ready is emitted.
+            #     Called only after before_wave has confirmed the wave
+            #     should proceed AND pre_dispatch has confirmed at least
+            #     one task has a call slot (R5 P1-1).
+            if on_wave_started is not None:
+                on_wave_started(ready)
 
             # 5. R2 P0-2: Execute the wave with structured concurrency.
             #    Replaces the previous ``asyncio.gather()`` which could
@@ -509,8 +577,10 @@ class DagScheduler:
 
 
 __all__ = [
+    "AgentCallPermit",
     "BeforeWave",
     "DagScheduler",
+    "DispatchDecision",
     "PreDispatch",
     "TaskOutcome",
     "TaskRunner",

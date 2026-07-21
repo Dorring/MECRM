@@ -28,7 +28,9 @@ from multi_agent.contracts import (
     AgentExecutionContext,
     AgentResult,
     AgentTask,
+    ProviderMetadata,
     StrictContract,
+    TokenUsage,
 )
 from multi_agent.execution_errors import InvalidInvocationReceiptError
 from multi_agent.registry import AgentHandler, AgentRegistry
@@ -162,25 +164,39 @@ class AgentInvoker(Protocol):
     ) -> AgentInvocationReceipt: ...
 
 
-class TrustedUsageInvoker(AgentInvoker, Protocol):
-    """R3 P0-4 / R4 P0-2: marker Protocol for Invokers that report
-    *verified* usage.
+# ---------------------------------------------------------------------------
+# R5 P0-5: Provider Usage Verifier
+# ---------------------------------------------------------------------------
 
-    R4 P0-2: the Supervisor no longer relies solely on this marker.
-    It reads ``invoker.usage_capabilities`` (a
-    :class:`UsageVerificationCapabilities` contract) and cross-checks
-    every receipt's ``usage_trust`` against the Invoker's actual
-    verification capabilities.  This Protocol is kept for documentation
-    and for tests that want to assert an Invoker is trusted, but the
-    runtime enforcement uses :func:`get_usage_capabilities`.
 
-    Concrete implementations must expose ``usage_capabilities`` with
-    ``verifies_tokens=True`` and/or ``verifies_cost=True`` and ensure
-    every receipt they produce carries ``usage_trust="verified_provider"``
-    or ``usage_trust="trusted_adapter"``.
+class VerifiedUsage(StrictContract):
+    """R5 P0-5: Result of a Provider Usage Verifier check."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    tokens_used: int = Field(default=0, ge=0)
+    cost_usd: Decimal | None = Field(default=None, ge=0)
+    verified: bool = False
+
+
+class ProviderUsageVerifier(Protocol):
+    """R5 P0-5: Authoritative Provider Usage verification boundary.
+
+    A Provider Usage Verifier is an external adapter that can
+    cryptographically or operationally verify that the token/cost
+    usage reported by a Handler's ``provider_metadata`` matches
+    the actual Provider billing record.  This cannot be self-attested
+    by the Handler.
     """
 
-    usage_capabilities: UsageVerificationCapabilities
+    source_id: str
+
+    def verify(
+        self,
+        *,
+        provider_metadata: ProviderMetadata,
+        token_usage: TokenUsage,
+    ) -> VerifiedUsage: ...
 
 
 # ---------------------------------------------------------------------------
@@ -207,13 +223,26 @@ class RegistryAgentInvoker:
     ``result.provider_metadata`` is present (the LLM provider
     attested the token usage); ``unverified`` otherwise.  Cost is
     always ``unverified`` because :class:`AgentResult` has no cost
-    field — a configured ``cost_budget_usd`` fails closed unless the
-    caller uses a :class:`TrustedUsageInvoker` that reports
-    ``cost_usd`` with ``usage_trust="trusted_adapter"``.
+    field — a configured ``cost_budget_usd`` fails closed unless a
+    future trusted Invoker reports ``cost_usd`` with
+    ``usage_trust="trusted_adapter"``.
+
+    R5 P0-5: by default (no ``usage_verifier``), ``usage_trust`` is
+    always ``unverified`` — the Handler's ``provider_metadata`` is
+    self-attested and cannot be trusted.  When an authoritative
+    :class:`ProviderUsageVerifier` is configured, ``usage_trust`` is
+    ``verified_provider`` when ``result.provider_metadata`` is present.
+    Cost verification also requires the verifier; without it,
+    ``cost_budget_usd`` fails closed.
     """
 
-    def __init__(self, registry: AgentRegistry) -> None:
+    def __init__(
+        self,
+        registry: AgentRegistry,
+        usage_verifier: ProviderUsageVerifier | None = None,
+    ) -> None:
         self._registry = registry
+        self._usage_verifier = usage_verifier
 
     @property
     def registry(self) -> AgentRegistry:
@@ -221,13 +250,21 @@ class RegistryAgentInvoker:
 
     @property
     def usage_capabilities(self) -> UsageVerificationCapabilities:
-        """R4 P0-2: RegistryAgentInvoker can verify tokens (extracted
-        from ``result.provider_metadata``) but NOT cost (AgentResult
-        has no cost field)."""
+        """R5 P0-5: by default (no ``usage_verifier``) the Invoker
+        cannot verify tokens or cost — the Handler's
+        ``provider_metadata`` is self-attested.  When a
+        :class:`ProviderUsageVerifier` is configured, both tokens and
+        cost are verifiable."""
+        if self._usage_verifier is None:
+            return UsageVerificationCapabilities(
+                verifies_tokens=False,
+                verifies_cost=False,
+                source_id="registry_agent_invoker",
+            )
         return UsageVerificationCapabilities(
             verifies_tokens=True,
-            verifies_cost=False,
-            source_id="registry_agent_invoker",
+            verifies_cost=True,
+            source_id="registry_agent_invoker+provider_verifier",
         )
 
     async def invoke(
@@ -239,10 +276,14 @@ class RegistryAgentInvoker:
         result = await handler.run(task, context)
         if result.provider_metadata is not None:
             tokens_used: int | None = result.token_usage.total_tokens
-            # Provider attested token usage — verified.
-            usage_trust: UsageTrustLevel = "verified_provider"
         else:
             tokens_used = None
+        # R5 P0-5: only claim verified_provider when an authoritative
+        # ProviderUsageVerifier is configured.  Without a verifier the
+        # Handler's provider_metadata is self-attested and untrusted.
+        if self._usage_verifier is not None and result.provider_metadata is not None:
+            usage_trust: UsageTrustLevel = "verified_provider"
+        else:
             usage_trust = "unverified"
         return AgentInvocationReceipt(
             result=result,
@@ -400,10 +441,11 @@ __all__ = [
     "AgentInvocationReceipt",
     "AgentInvoker",
     "DeterministicFakeInvoker",
+    "ProviderUsageVerifier",
     "RegistryAgentInvoker",
-    "TrustedUsageInvoker",
     "UsageTrustLevel",
     "UsageVerificationCapabilities",
+    "VerifiedUsage",
     "get_usage_capabilities",
     "validate_invocation_receipt",
 ]

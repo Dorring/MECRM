@@ -851,7 +851,13 @@ class ExecutionUsage(StrictContract):
     tool_calls: int = Field(default=0, ge=0)
     iterations: int = Field(default=0, ge=0)
     tokens_used: int = Field(default=0, ge=0)
+    tokens_usage_available: bool = (
+        False  # R5 P0-4: True when at least one receipt reported verified tokens
+    )
     cost_usd: Decimal = Field(default=Decimal("0.00"), ge=0)
+    cost_usage_available: bool = (
+        False  # R5 P0-4: True when at least one receipt reported verified cost
+    )
     elapsed_ms: int = Field(default=0, ge=0)
 
 

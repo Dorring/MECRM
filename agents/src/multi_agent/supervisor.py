@@ -84,7 +84,13 @@ from multi_agent.plan_validator import PlanValidator
 from multi_agent.planning import PlanDraft
 from multi_agent.registry import AgentHandler, AgentRegistry
 from multi_agent.run_store import InMemoryRunStore, RunLease, RunStore
-from multi_agent.scheduler import DagScheduler, PreDispatch, TaskOutcome
+from multi_agent.scheduler import (
+    AgentCallPermit,
+    DagScheduler,
+    DispatchDecision,
+    PreDispatch,
+    TaskOutcome,
+)
 from multi_agent.state import merge_parallel_results
 
 
@@ -179,9 +185,15 @@ class _BudgetAccountant:
         self._budget = budget
         self._start_monotonic = start_monotonic
         self._agent_calls = 0
+        self._permits_outstanding = (
+            0  # R5 P0-3: permits issued but not committed/released
+        )
+        self._permit_counter = 0  # R5 P0-3: monotonic permit sequence
         self._tool_calls = 0
         self._tokens_used = 0
+        self._tokens_usage_available = False
         self._cost_usd = Decimal("0.00")
+        self._cost_usage_available = False
         self._iterations = 0
         self._exceeded: bool = False
         self._exceeded_reason: str | None = None
@@ -199,8 +211,16 @@ class _BudgetAccountant:
         return self._tokens_used
 
     @property
+    def tokens_usage_available(self) -> bool:
+        return self._tokens_usage_available
+
+    @property
     def cost_usd(self) -> Decimal:
         return self._cost_usd
+
+    @property
+    def cost_usage_available(self) -> bool:
+        return self._cost_usage_available
 
     @property
     def iterations(self) -> int:
@@ -220,7 +240,9 @@ class _BudgetAccountant:
             agent_calls=self._agent_calls,
             tool_calls=self._tool_calls,
             tokens_used=self._tokens_used,
+            tokens_usage_available=self._tokens_usage_available,
             cost_usd=self._cost_usd,
+            cost_usage_available=self._cost_usage_available,
             iterations=self._iterations,
         )
 
@@ -251,34 +273,112 @@ class _BudgetAccountant:
         self._exceeded_reason = "deadline_exceeded"
 
     def can_start_agent_call(self) -> bool:
+        """R5 P0-3: check whether a new agent call can be committed.
+
+        Accounts for both actual calls and outstanding permits.
+        Sets ``_exceeded`` when the budget would be breached.
+        """
         if self._exceeded:
             return False
+        if (
+            self._agent_calls + self._permits_outstanding + 1
+            > self._budget.max_agent_calls
+        ):
+            self._exceeded = True
+            self._exceeded_reason = (
+                f"max_agent_calls exceeded: "
+                f"{self._agent_calls + self._permits_outstanding + 1} > "
+                f"{self._budget.max_agent_calls}"
+            )
+            return False
+        return True
+
+    def has_agent_call_budget(self) -> bool:
+        """R5 P0-3: side-effect-free check for agent call budget
+        availability.  Accounts for both actual calls and outstanding
+        permits.  Does NOT set ``_exceeded``.
+        """
+        if self._exceeded:
+            return False
+        return (
+            self._agent_calls + self._permits_outstanding + 1
+            <= self._budget.max_agent_calls
+        )
+
+    def issue_permit(self, task_id: str) -> AgentCallPermit:
+        """R5 P0-3: issue a dispatch permit without incrementing
+        ``agent_calls``.
+
+        The permit reserves a slot in the budget (via
+        ``_permits_outstanding``) so that subsequent ``has_agent_call_budget``
+        checks account for it.  The actual ``agent_calls`` counter is
+        only incremented when :meth:`commit_agent_call` is called —
+        right before ``invoker.invoke()``.
+
+        If the task is cancelled or deadline-exceeded before
+        invocation, :meth:`release_permit` must be called so the slot
+        is freed for future waves.
+        """
+        if not self.has_agent_call_budget():
+            raise SupervisorError(
+                self._exceeded_reason or "agent_call budget exhausted"
+            )
+        self._permit_counter += 1
+        self._permits_outstanding += 1
+        return AgentCallPermit(task_id=task_id, permit_sequence=self._permit_counter)
+
+    def commit_agent_call(self, permit: AgentCallPermit) -> None:
+        """R5 P0-3: commit a permit into an actual agent call.
+
+        Called right before ``invoker.invoke()``.  Increments
+        ``agent_calls`` and decrements ``_permits_outstanding``.
+        If committing would exceed ``max_agent_calls``, sets
+        ``_exceeded`` and raises ``SupervisorError``.
+
+        R5 P0-2: does NOT check the general ``_exceeded`` flag.
+        The permit was already issued (which checked budget
+        availability), so the commit must succeed.  The
+        ``_exceeded`` flag may have been set by
+        :meth:`mark_budget_exhausted` during pre_dispatch when OTHER
+        tasks were denied — that flag stops future waves via
+        ``should_stop``, not the current wave's already-permitted
+        tasks.
+        """
         if self._agent_calls + 1 > self._budget.max_agent_calls:
             self._exceeded = True
             self._exceeded_reason = (
                 f"max_agent_calls exceeded: "
                 f"{self._agent_calls + 1} > {self._budget.max_agent_calls}"
             )
-            return False
-        return True
+            raise SupervisorError(self._exceeded_reason)
+        self._agent_calls += 1
+        self._permits_outstanding = max(0, self._permits_outstanding - 1)
 
-    def has_agent_call_budget(self) -> bool:
-        """R4 P1-1: side-effect-free check for agent call budget
-        availability.  Unlike :meth:`can_start_agent_call`, this does
-        NOT set ``_exceeded`` — it is used by the deterministic
-        pre-dispatch filter to decide which tasks may start without
-        poisoning the budget state for retries.
+    def release_permit(self, permit: AgentCallPermit) -> None:
+        """R5 P0-3: release an unused permit without charging an
+        agent call.
+
+        Called when a task is cancelled or deadline-exceeded before
+        ``invoker.invoke()`` is called.  The slot is freed for future
+        waves.
         """
-        if self._exceeded:
-            return False
-        return self._agent_calls + 1 <= self._budget.max_agent_calls
+        self._permits_outstanding = max(0, self._permits_outstanding - 1)
+
+    def mark_budget_exhausted(self, reason: str) -> None:
+        """R5 P0-2: mark the budget as exhausted due to pre-dispatch
+        denial.  Used when a Ready Task is denied a call slot so the
+        run finalises as ``budget_exceeded`` rather than ``completed``.
+        """
+        self._exceeded = True
+        self._exceeded_reason = reason
 
     def reserve_agent_call(self) -> None:
-        if not self.can_start_agent_call():
-            raise SupervisorError(
-                self._exceeded_reason or "agent_call budget exhausted"
-            )
-        self._agent_calls += 1
+        """R5 P0-3: legacy method — issues and immediately commits a
+        permit.  Kept for retry compatibility.  Prefer
+        :meth:`issue_permit` + :meth:`commit_agent_call` for new code.
+        """
+        permit = self.issue_permit("__legacy__")
+        self.commit_agent_call(permit)
 
     def record_observed_tool_calls(self, observed: int) -> None:
         """R4 P0-3: charge *observed* tool calls regardless of receipt
@@ -328,6 +428,15 @@ class _BudgetAccountant:
         the self-reported value is ``None``, ``0``, or positive — this
         prevents a custom Invoker from under-reporting usage (e.g.
         ``cost_usd=Decimal("0")``) to bypass budget enforcement.
+
+        R5 P0-4: usage *recording* and budget *enforcement* are now
+        separated.  Trusted usage is ALWAYS accumulated into the
+        running totals (and flagged via ``tokens_usage_available`` /
+        ``cost_usage_available``) regardless of whether the
+        corresponding budget is configured — so ``SupervisorRunResult``
+        reports real consumption even when no limit was set.  Budget
+        configuration only determines whether the limit check is
+        applied.
         """
         # R4 P0-2: cross-check receipt trust against invoker capabilities.
         # A receipt cannot claim a trust level the Invoker cannot back.
@@ -351,35 +460,51 @@ class _BudgetAccountant:
                     f"self-elevate trust above the invoker's capabilities"
                 )
 
+        # R5 P0-4: Usage Recording vs Budget Enforcement separation.
+        # Trusted usage is ALWAYS recorded, regardless of whether the
+        # corresponding budget is configured.  Budget configuration only
+        # determines whether enforcement (limit check) is applied.
+
+        # --- Token Usage Recording ---
+        if receipt.usage_trust in ("verified_provider", "trusted_adapter"):
+            if receipt.tokens_used is not None:
+                # R5 P0-4: verified_provider requires verifies_tokens.
+                # trusted_adapter with verifies_tokens can also report tokens.
+                if receipt.usage_trust == "verified_provider":
+                    if not invoker_capabilities.verifies_tokens:
+                        raise ExecutionUsageUnavailableError(
+                            "receipt.usage_trust='verified_provider' but invoker "
+                            f"({invoker_capabilities.source_id}) does not have "
+                            "verifies_tokens=True"
+                        )
+                    self._tokens_used += receipt.tokens_used
+                    self._tokens_usage_available = True
+                elif (
+                    receipt.usage_trust == "trusted_adapter"
+                    and invoker_capabilities.verifies_tokens
+                ):
+                    self._tokens_used += receipt.tokens_used
+                    self._tokens_usage_available = True
+                # trusted_adapter without verifies_tokens: tokens not recorded
+
+        # R5 P0-4: Token Budget Enforcement (only when budget is configured)
         if self._budget.token_budget is not None:
-            # R3 P0-4: provenance check. A custom Invoker that
-            # self-reports tokens_used=0 or tokens_used=None with
-            # usage_trust="unverified" cannot be trusted to enforce
-            # the token_budget — only verified_provider (LLM-attested)
-            # or trusted_adapter (vetted middleware) receipts are
-            # accepted.  The check runs *before* the None check so a
-            # zero/positive unverified value is also rejected.
             if receipt.usage_trust == "unverified":
                 raise ExecutionUsageUnavailableError(
                     "token_budget is configured but the invocation "
-                    "receipt carries usage_trust='unverified' — only "
-                    "verified_provider or trusted_adapter receipts are "
-                    "accepted for token budget enforcement"
+                    "receipt carries usage_trust='unverified'"
                 )
-            # R4 P0-2: invoker must actually be able to verify tokens.
             if not invoker_capabilities.verifies_tokens:
                 raise ExecutionUsageUnavailableError(
                     f"token_budget is configured but invoker "
                     f"({invoker_capabilities.source_id}) does not have "
-                    f"verifies_tokens=True — token budget cannot be "
-                    f"enforced with an untrusted invoker"
+                    f"verifies_tokens=True"
                 )
             if receipt.tokens_used is None:
                 raise ExecutionUsageUnavailableError(
                     "token_budget is configured but the invocation "
                     "receipt did not report tokens_used"
                 )
-            self._tokens_used += receipt.tokens_used
             if self._tokens_used > self._budget.token_budget:
                 self._exceeded = True
                 self._exceeded_reason = (
@@ -387,31 +512,36 @@ class _BudgetAccountant:
                     f"{self._tokens_used} > {self._budget.token_budget}"
                 )
 
+        # --- Cost Usage Recording ---
+        if receipt.usage_trust == "trusted_adapter":
+            if receipt.cost_usd is not None:
+                if not invoker_capabilities.verifies_cost:
+                    raise ExecutionUsageUnavailableError(
+                        "receipt.usage_trust='trusted_adapter' but invoker "
+                        f"({invoker_capabilities.source_id}) does not have "
+                        "verifies_cost=True"
+                    )
+                self._cost_usd += receipt.cost_usd
+                self._cost_usage_available = True
+
+        # R5 P0-4: Cost Budget Enforcement (only when budget is configured)
         if self._budget.cost_budget_usd is not None:
-            # R3 P0-4: same provenance check as token_budget. A custom
-            # Invoker that self-reports cost_usd=Decimal("0") with
-            # usage_trust="unverified" cannot bypass cost enforcement.
             if receipt.usage_trust == "unverified":
                 raise ExecutionUsageUnavailableError(
                     "cost_budget_usd is configured but the invocation "
-                    "receipt carries usage_trust='unverified' — only "
-                    "verified_provider or trusted_adapter receipts are "
-                    "accepted for cost budget enforcement"
+                    "receipt carries usage_trust='unverified'"
                 )
-            # R4 P0-2: invoker must actually be able to verify cost.
             if not invoker_capabilities.verifies_cost:
                 raise ExecutionUsageUnavailableError(
                     f"cost_budget_usd is configured but invoker "
                     f"({invoker_capabilities.source_id}) does not have "
-                    f"verifies_cost=True — cost budget cannot be "
-                    f"enforced with an untrusted invoker"
+                    f"verifies_cost=True"
                 )
             if receipt.cost_usd is None:
                 raise ExecutionUsageUnavailableError(
                     "cost_budget_usd is configured but the invocation "
                     "receipt did not report cost_usd"
                 )
-            self._cost_usd += receipt.cost_usd
             if self._cost_usd > self._budget.cost_budget_usd:
                 self._exceeded = True
                 self._exceeded_reason = (
@@ -426,9 +556,15 @@ class _BudgetAccountant:
         would exceed ``max_iterations``.  The check is made *before*
         the wave is dispatched so a violated budget stops new work
         immediately rather than after the wave completes.
+
+        R5 P0-2: does NOT check the general ``_exceeded`` flag — that
+        flag may have been set by pre_dispatch (agent_call budget
+        exhaustion) during the CURRENT wave's pre-dispatch phase.
+        The ``should_stop`` callback checks ``_exceeded`` at the TOP
+        of the next loop iteration and prevents future waves.  But
+        the current wave's iteration must still be reserved so its
+        already-permitted tasks can run.
         """
-        if self._exceeded:
-            return False
         if self._iterations + 1 > self._budget.max_iterations:
             self._exceeded = True
             self._exceeded_reason = (
@@ -487,6 +623,14 @@ class SupervisorRuntime:
             from multi_agent.invocation import RegistryAgentInvoker
 
             invoker = RegistryAgentInvoker(registry)
+
+        # R5 P0-5: freeze the Invoker's Usage Verification Capability
+        # once at pre-flight time.  This prevents a mutable Invoker
+        # from changing its ``usage_capabilities`` mid-run (e.g. after
+        # a Handler returns provider_metadata that self-attests trust).
+        # The frozen capability is passed to every _execute_task call
+        # and used by record_receipt to cross-check receipt trust.
+        invoker_caps = get_usage_capabilities(invoker)
 
         run_id = plan.run_id
         started_at = utc_now()
@@ -626,6 +770,15 @@ class SupervisorRuntime:
             # Cancellation state shared between run_task and should_stop.
             canc_state = _CancellationState()
 
+            # R5 P0-3: permits dict shared between pre_dispatch and
+            # _execute_task.  pre_dispatch issues an AgentCallPermit
+            # per allowed task (deterministic, by task_id order);
+            # _execute_task pops the permit and commits it right
+            # before invoker.invoke().  If the task exits before
+            # invocation (cancellation / deadline), the permit is
+            # released so the slot is available for future waves.
+            permits: dict[str, AgentCallPermit] = {}
+
             # Build the run_task closure — uses bound_handlers, NOT
             # live registry.resolve().  R3 P1-3: bindings are passed
             # through so _execute_task can emit the capability
@@ -640,6 +793,8 @@ class SupervisorRuntime:
                 cfg=cfg,
                 canc=canc,
                 canc_state=canc_state,
+                permits=permits,
+                invoker_caps=invoker_caps,
             )
 
             # Schedule.
@@ -647,12 +802,15 @@ class SupervisorRuntime:
             should_stop = self._build_should_stop(accountant, canc_state, canc, plan)
             before_wave = self._build_before_wave(canc, canc_state, plan)
             wave_callbacks = self._build_wave_callbacks(accountant, trace)
-            # R4 P1-1: deterministic agent-call budget pre-allocation.
-            # The filter runs after on_wave_started but before any
-            # coroutine is created.  It reserves agent calls in
-            # task_id order so which tasks get the remaining budget
-            # is deterministic, not dependent on coroutine scheduling.
-            pre_dispatch = self._build_pre_dispatch(accountant)
+            # R5 P0-2 + P0-3 + P1-1: deterministic agent-call budget
+            # pre-allocation via permit-based dispatch.  The filter
+            # runs BEFORE on_wave_started (so a wave with no allowed
+            # tasks does not consume an iteration or emit task_ready)
+            # and issues AgentCallPermits (NOT actual agent calls) in
+            # task_id order.  Denied tasks are marked skipped with
+            # ``budget_exhausted`` so the run finalises as
+            # ``budget_exceeded`` rather than ``completed``.
+            pre_dispatch = self._build_pre_dispatch(accountant, permits)
 
             task_records = await scheduler.execute(
                 tasks=tasks,
@@ -845,6 +1003,8 @@ class SupervisorRuntime:
         cfg: SupervisorConfig,
         canc: ExecutionCancellation,
         canc_state: _CancellationState,
+        permits: dict[str, AgentCallPermit],
+        invoker_caps: UsageVerificationCapabilities,
     ):
         async def run_task(task: AgentTask) -> TaskOutcome:
             return await self._execute_task(
@@ -858,6 +1018,8 @@ class SupervisorRuntime:
                 cfg=cfg,
                 canc=canc,
                 canc_state=canc_state,
+                permits=permits,
+                invoker_caps=invoker_caps,
             )
 
         return run_task
@@ -875,6 +1037,8 @@ class SupervisorRuntime:
         cfg: SupervisorConfig,
         canc: ExecutionCancellation,
         canc_state: _CancellationState,
+        permits: dict[str, AgentCallPermit],
+        invoker_caps: UsageVerificationCapabilities,
     ) -> TaskOutcome:
         # R3 P1-3: ExecutionBinding is the authoritative input — it
         # carries the pre-flight capability snapshot AND the handler.
@@ -883,10 +1047,10 @@ class SupervisorRuntime:
         # version that was bound at pre-flight time.
         handler = bound_handlers[task.task_id]
 
-        # R4 P0-2: resolve the Invoker's verification capabilities once.
-        # This is used by record_receipt to cross-check the receipt's
-        # usage_trust against what the Invoker can actually verify.
-        invoker_caps = get_usage_capabilities(invoker)
+        # R5 P0-5: invoker_caps was frozen once at pre-flight time in
+        # execute() and passed through _build_run_task.  This prevents
+        # a mutable Invoker from changing its usage_capabilities
+        # mid-run.  Do NOT call get_usage_capabilities(invoker) here.
 
         attempts: list[TaskAttemptRecord] = []
         max_attempts = 1 + max(0, task.max_retries)
@@ -895,40 +1059,38 @@ class SupervisorRuntime:
         skip_reason: str | None = None
 
         for attempt_idx in range(max_attempts):
-            # Pre-attempt cancellation check — flips the shared flag
-            # so the Scheduler's ``should_stop`` stops dispatching
-            # the next wave.
-            if await canc.is_cancelled(plan.run_id) or await canc.is_kill_switch_active(
-                plan.tenant_id
-            ):
-                canc_state.cancelled = True
-                final_status = "cancelled"
-                skip_reason = "cancelled before attempt"
-                break
-
-            # Pre-attempt budget checks.
-            now_mono = time.monotonic()
-            remaining_deadline_ms = accountant.remaining_deadline_ms(now_mono)
-            if remaining_deadline_ms <= 0:
-                # R1 P0-3: deadline exhausted before this attempt.
-                # Mark the Run as budget_exceeded (reason=
-                # deadline_exceeded) and skip the task — it cannot
-                # run without time.
-                accountant.mark_deadline_exceeded()
-                final_status = "skipped"
-                skip_reason = "deadline_exceeded"
-                trace.emit(
-                    TRACE_BUDGET_EXCEEDED,
-                    task_id=task.task_id,
-                    agent_id=task.agent_id,
-                    data={"reason": "deadline_exceeded"},
-                )
-                break
-            # R4 P1-1: the first attempt's agent call was already
-            # reserved by the deterministic pre_dispatch filter.  Only
-            # retries (attempt_idx > 0) need to check and reserve here.
-            if attempt_idx > 0:
-                if not accountant.can_start_agent_call():
+            # R5 P0-3: obtain a Call Permit for this attempt.
+            #
+            # First attempt (attempt_idx == 0): the permit was issued
+            # deterministically by the pre_dispatch filter and stored
+            # in the shared ``permits`` dict.  We pop it here — the
+            # permit reserves a budget slot but does NOT increment
+            # ``agent_calls``.
+            #
+            # Retry attempts (attempt_idx > 0): issue a new permit
+            # directly.  If the budget cannot accommodate another call,
+            # the task is skipped (not retried).
+            #
+            # The permit is committed into an actual agent call ONLY
+            # when we are about to call ``invoker.invoke()``.  If the
+            # task exits before invocation (cancellation, deadline
+            # exhaustion), the permit is released so the slot is
+            # available for future waves.
+            if attempt_idx == 0:
+                permit = permits.pop(task.task_id, None)
+                if permit is None:
+                    # Defensive — pre_dispatch should have issued one
+                    # for every allowed task.  If the task reaches
+                    # _execute_task, it was in the allowed set.  Issue
+                    # one as a fallback (shouldn't happen in practice).
+                    permit = accountant.issue_permit(task.task_id)
+            else:
+                # Retry: check budget and issue a new permit.
+                if not accountant.has_agent_call_budget():
+                    if not accountant.exceeded:
+                        accountant.mark_budget_exhausted(
+                            "agent_call budget exhausted during retry"
+                        )
                     final_status = "skipped"
                     skip_reason = (
                         accountant.exceeded_reason or "agent_call budget exhausted"
@@ -941,8 +1103,51 @@ class SupervisorRuntime:
                             data={"reason": accountant.exceeded_reason},
                         )
                     break
+                permit = accountant.issue_permit(task.task_id)
 
-                accountant.reserve_agent_call()
+            # Pre-attempt cancellation check — flips the shared flag
+            # so the Scheduler's ``should_stop`` stops dispatching
+            # the next wave.  R5 P0-3: release the permit so the
+            # slot is not consumed by a task that never invoked.
+            if await canc.is_cancelled(plan.run_id) or await canc.is_kill_switch_active(
+                plan.tenant_id
+            ):
+                canc_state.cancelled = True
+                accountant.release_permit(permit)
+                final_status = "cancelled"
+                skip_reason = "cancelled before attempt"
+                break
+
+            # Pre-attempt deadline check.  R5 P0-3: release the
+            # permit — the task cannot run without time, so the
+            # slot must be freed for future waves.
+            now_mono = time.monotonic()
+            remaining_deadline_ms = accountant.remaining_deadline_ms(now_mono)
+            if remaining_deadline_ms <= 0:
+                # R1 P0-3: deadline exhausted before this attempt.
+                # Mark the Run as budget_exceeded (reason=
+                # deadline_exceeded) and skip the task — it cannot
+                # run without time.
+                accountant.release_permit(permit)
+                accountant.mark_deadline_exceeded()
+                final_status = "skipped"
+                skip_reason = "deadline_exceeded"
+                trace.emit(
+                    TRACE_BUDGET_EXCEEDED,
+                    task_id=task.task_id,
+                    agent_id=task.agent_id,
+                    data={"reason": "deadline_exceeded"},
+                )
+                break
+
+            # R5 P0-3: commit the permit into an actual agent call
+            # right before invocation.  This is the point of no
+            # return — after this, ``agent_calls`` is incremented
+            # and the call is counted regardless of what the Handler
+            # returns or whether it times out.  ``commit_agent_call``
+            # decrements ``_permits_outstanding`` so the slot is
+            # transferred from "reserved" to "used".
+            accountant.commit_agent_call(permit)
 
             attempt_started_at = utc_now()
             attempt_started_mono = time.monotonic()
@@ -1547,32 +1752,61 @@ class SupervisorRuntime:
     @staticmethod
     def _build_pre_dispatch(
         accountant: _BudgetAccountant,
+        permits: dict[str, AgentCallPermit],
     ) -> PreDispatch:
-        """R4 P1-1: deterministic agent-call budget pre-allocation.
+        """R5 P1-1 + P0-2 + P0-3: deterministic agent-call budget
+        pre-allocation with permit-based dispatch.
 
         Returns a :class:`PreDispatch` filter that iterates the
-        sorted ready list and reserves one agent call per task in
-        ``task_id`` order.  Tasks that cannot get a call slot are
-        excluded from the returned list — the Scheduler marks them
-        ``skipped`` before any coroutine is created.
+        sorted ready list and issues one :class:`AgentCallPermit` per
+        task in ``task_id`` order.  Tasks that cannot get a permit are
+        denied — the Scheduler marks them ``skipped`` before any
+        coroutine is created.
 
-        Uses :meth:`has_agent_call_budget` (side-effect-free) +
-        :meth:`reserve_agent_call` so the budget state is deterministic
-        and not dependent on coroutine scheduling order.
+        R5 P0-3: permits are NOT actual agent calls.  The actual
+        ``agent_calls`` counter is only incremented when
+        :meth:`_BudgetAccountant.commit_agent_call` is called inside
+        ``_execute_task`` — right before ``invoker.invoke()``.
 
-        Retries (``attempt_idx > 0`` inside ``_execute_task``) still
-        call ``reserve_agent_call`` directly — the pre-dispatch filter
-        only covers the *first* attempt of each task in the wave.
+        R5 P0-2: returns a :class:`DispatchDecision` so the Scheduler
+        can distinguish budget-exhaustion denials from other reasons.
+        When ``budget_exhausted=True``, the accountant is marked as
+        exceeded so the run finalises as ``budget_exceeded``.
+
+        R5 P1-1: this filter now runs BEFORE ``on_wave_started`` so
+        a wave with no allowed tasks does not consume an iteration
+        or emit ``task_ready``.
+
+        Retries (``attempt_idx > 0`` inside ``_execute_task``) issue
+        their own permits directly via :meth:`issue_permit`.
         """
 
-        def pre_dispatch(ready: list[AgentTask]) -> list[AgentTask]:
-            allowed: list[AgentTask] = []
+        def pre_dispatch(ready: list[AgentTask]) -> DispatchDecision:
+            allowed_ids: list[str] = []
+            denied_ids: list[str] = []
+            budget_exhausted = False
+
             for task in ready:  # already sorted by task_id
                 if not accountant.has_agent_call_budget():
-                    break
-                accountant.reserve_agent_call()
-                allowed.append(task)
-            return allowed
+                    budget_exhausted = True
+                    denied_ids.append(task.task_id)
+                    continue
+                permit = accountant.issue_permit(task.task_id)
+                permits[task.task_id] = permit
+                allowed_ids.append(task.task_id)
+
+            if budget_exhausted:
+                accountant.mark_budget_exhausted(
+                    f"max_agent_calls exhausted during pre-dispatch: "
+                    f"denied {len(denied_ids)} task(s)"
+                )
+
+            return DispatchDecision(
+                allowed_task_ids=tuple(allowed_ids),
+                denied_task_ids=tuple(denied_ids),
+                denial_reason="agent_call budget exhausted" if denied_ids else None,
+                budget_exhausted=budget_exhausted,
+            )
 
         return pre_dispatch
 
@@ -1723,6 +1957,19 @@ class SupervisorRuntime:
             final_status = forced_status
         elif accountant.exceeded:
             final_status = SupervisorRunStatus.BUDGET_EXCEEDED
+            # R5 P0-2: emit TRACE_BUDGET_EXCEEDED when the accountant
+            # was marked exceeded by pre_dispatch denial (or any other
+            # non-forced path).  When forced_status=BUDGET_EXCEEDED
+            # (max_tasks check), the trace event was already emitted
+            # in execute() before _finalize was called, so we only
+            # emit here — this branch is only reached when
+            # forced_status is None.
+            trace.emit(
+                TRACE_BUDGET_EXCEEDED,
+                data={
+                    "reason": accountant.exceeded_reason or "budget exceeded",
+                },
+            )
         else:
             final_status = computed_status
 
