@@ -16,6 +16,11 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 
+# The runner only needs `node` to execute the standalone Next.js server.
+# Remove npm (and its transitive deps including tar@7.5.16) to eliminate
+# CVE-2026-59873 from the runtime image.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
+
 RUN addgroup --system --gid 1001 nodejs && \
     adduser --system --uid 1001 nextjs
 
