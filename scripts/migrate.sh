@@ -281,8 +281,8 @@ run_prisma_migrate() {
   # Prefer the locally-installed prisma binary (no npm/npx needed at runtime,
   # which avoids shipping npm's transitive deps incl. tar in the Docker image).
   local prisma_bin="${GATEWAY_DIR}/node_modules/.bin/prisma"
-  if [[ -x "${prisma_bin}" ]]; then
-    ( cd "${GATEWAY_DIR}" && "${prisma_bin}" migrate deploy )
+  if [[ -e "${prisma_bin}" ]] && [[ -e "${GATEWAY_DIR}/node_modules/prisma/build/index.js" ]]; then
+    ( cd "${GATEWAY_DIR}" && node node_modules/prisma/build/index.js migrate deploy )
   elif command -v npx >/dev/null 2>&1; then
     ( cd "${GATEWAY_DIR}" && npx prisma migrate deploy )
   else
@@ -454,7 +454,11 @@ fi
 
 acquire_and_hold_lock
 
-[[ ${SKIP_PRISMA} -eq 0 ]] && run_prisma_migrate || warn "skipping Prisma step (--skip-prisma)"
+if [[ ${SKIP_PRISMA} -eq 0 ]]; then
+  run_prisma_migrate
+else
+  warn "skipping Prisma step (--skip-prisma)"
+fi
 run_sql_migrations
 sync_crm_app_password
 detect_drift
