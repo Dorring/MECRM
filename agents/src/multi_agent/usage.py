@@ -195,11 +195,16 @@ def validate_usage_dimension(
     :class:`AgentInvocationReceipt`, and :class:`TaskAttemptRecord` so
     the four contracts cannot drift.
 
-    Strict rules (R10 — the R9 ``value == 0`` carve-out is REMOVED):
+    Strict rules (R10 — the R9 ``value == 0`` carve-out is REMOVED;
 
-    * ``VERIFIED`` → ``value`` is non-None AND ``source_id`` is non-None.
-      ``0`` is a legitimate verified value (e.g. a cached call that the
-      Verifier confirmed cost nothing) and is accepted here.
+    R10.1 P0-2 — VERIFIED values are also checked for non-negativity):
+
+    * ``VERIFIED`` → ``value`` is non-None AND ``source_id`` is non-None
+      AND ``value`` is non-negative.  ``0`` is a legitimate verified
+      value (e.g. a cached call that the Verifier confirmed cost
+      nothing) and is accepted here.  Negative values are rejected so
+      the function is the COMPLETE common authority for all four
+      Contracts.
     * ``NO_PROVIDER_CALL`` → ``value`` is None AND ``source_id`` is None.
       A numeric ``0`` is NOT accepted — if no provider call was made,
       there is no usage to report, not even zero.
@@ -220,6 +225,17 @@ def validate_usage_dimension(
             raise ValueError(
                 f"{dim}_disposition=VERIFIED but {dim}_source_id is None — "
                 f"VERIFIED requires a non-None source_id (R10 P0-5)"
+            )
+        # R10.1 P0-2: defensive non-negative check.  The Pydantic
+        # ``ge=0`` constraint on individual Contract fields already
+        # rejects negatives at construction time, but this function is
+        # the shared authority for ALL four Contracts — adding the
+        # check here makes it impossible for a non-Pydantic call path
+        # to bypass it.
+        if isinstance(value, (int, float, Decimal)) and value < 0:
+            raise ValueError(
+                f"{dim}_disposition=VERIFIED but {dim}_value={value} is "
+                f"negative — usage values must be non-negative (R10.1 P0-2)"
             )
     elif disposition == AttemptUsageDisposition.NO_PROVIDER_CALL:
         if value is not None:
@@ -450,6 +466,18 @@ class VerifiedUsage(StrictContract):
 
     * ``tokens_verified=True`` → ``tokens_used is not None``
     * ``cost_verified=True`` → ``cost_usd is not None``
+    * ``tokens_verified=False`` → ``tokens_used is None`` (R10.1 P1-1)
+    * ``cost_verified=False`` → ``cost_usd is None`` (R10.1 P1-1)
+
+    R10.1 P1-1: the symmetric invariants (``verified=False → value=None``)
+    are now enforced.  Previously, a Verifier could return
+    ``VerifiedUsage(tokens_verified=False, tokens_used=100)`` — an
+    unverified dimension carrying a numeric value.  The Invoker would
+    then pass that value to the Receipt, which would later fail at the
+    Receipt boundary with an uncontrolled ``ValidationError`` (because
+    ``UNAVAILABLE`` disposition requires ``value=None``).  Rejecting
+    this at the :class:`VerifiedUsage` boundary ensures the error is
+    surfaced at the Verifier, not downstream at the Accountant.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -470,6 +498,23 @@ class VerifiedUsage(StrictContract):
         if self.cost_verified and self.cost_usd is None:
             raise ValueError(
                 "VerifiedUsage.cost_verified=True requires cost_usd to be non-None"
+            )
+        # R10.1 P1-1: symmetric invariants — an unverified dimension
+        # MUST NOT carry a numeric value.  This prevents a Verifier
+        # from returning ``tokens_verified=False, tokens_used=100``
+        # which would later cause an uncontrolled ValidationError at
+        # the Receipt boundary.
+        if not self.tokens_verified and self.tokens_used is not None:
+            raise ValueError(
+                "VerifiedUsage.tokens_verified=False but tokens_used="
+                f"{self.tokens_used} is not None — an unverified "
+                f"dimension must not carry a value (R10.1 P1-1)"
+            )
+        if not self.cost_verified and self.cost_usd is not None:
+            raise ValueError(
+                "VerifiedUsage.cost_verified=False but cost_usd="
+                f"{self.cost_usd} is not None — an unverified "
+                f"dimension must not carry a value (R10.1 P1-1)"
             )
         object.__setattr__(
             self,

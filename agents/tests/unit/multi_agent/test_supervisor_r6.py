@@ -461,7 +461,9 @@ class _RejectingVerifier:
         provider_metadata: ProviderMetadata,
         token_usage: TokenUsage,
     ) -> VerifiedUsage:
-        return VerifiedUsage(tokens_used=0, cost_usd=None, verified=False)
+        # R10.1 P1-1: VerifiedUsage now enforces symmetric invariants —
+        # tokens_verified=False requires tokens_used=None.
+        return VerifiedUsage(tokens_used=None, cost_usd=None, verified=False)
 
 
 class _RaisingVerifier:

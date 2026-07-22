@@ -94,6 +94,7 @@ from multi_agent.planning import (
 )
 from multi_agent.registry import AgentRegistry, ToolCatalog, ToolDescriptor
 from multi_agent.run_store import InMemoryRunStore
+from multi_agent.serialization import deserialize_contract, serialize_contract
 from multi_agent.state import MergedState
 from multi_agent.supervisor import _BudgetAccountant
 from multi_agent.supervisor_graph import (
@@ -107,6 +108,7 @@ from multi_agent.usage import (
     AttemptUsageRecord,
     UsageProvenance,
     UsageVerificationCapabilities,
+    VerifiedUsage,
     validate_usage_dimension,
 )
 
@@ -451,10 +453,11 @@ class TestFailureToolUsageValidation:
             )
         assert "observed_tool_calls" in str(exc_info.value)
 
-    def test_failure_outcome_none_tool_calls_with_result_is_allowed(self):
-        """When a Result is present but ``observed_tool_calls`` is
-        ``None`` (unknown), the constraint is NOT triggered — ``None``
-        means "unknown" and is always valid."""
+    def test_failure_outcome_none_tool_calls_with_result_is_rejected(self):
+        """R10.1 P1-3: when a Result is present, ``observed_tool_calls``
+        MUST be non-None.  ``None`` (unknown) is no longer accepted
+        when the Result is available — the Invoker MUST report the
+        exact count from ``len(result.tool_calls)``."""
         task = _make_task()
         result = _ok_result(
             task=task,
@@ -465,14 +468,14 @@ class TestFailureToolUsageValidation:
                 ),
             ],
         )
-        outcome = AgentInvocationOutcome(
-            result=result,
-            error_code="failure",
-            observed_tool_calls=None,
-            token_disposition=AttemptUsageDisposition.UNAVAILABLE,
-            cost_disposition=AttemptUsageDisposition.UNAVAILABLE,
-        )
-        assert outcome.observed_tool_calls is None
+        with pytest.raises(ValidationError, match="observed_tool_calls is None"):
+            AgentInvocationOutcome(
+                result=result,
+                error_code="failure",
+                observed_tool_calls=None,
+                token_disposition=AttemptUsageDisposition.UNAVAILABLE,
+                cost_disposition=AttemptUsageDisposition.UNAVAILABLE,
+            )
 
     def test_hidden_failure_tool_calls_cannot_preserve_budget(self):
         """A failure Outcome with ``observed_tool_calls=0`` but a Result
@@ -1676,3 +1679,425 @@ class TestLangGraphAdapterPropagation:
         state = SupervisorGraphState(plan=plan, registry=registry)
         await graph.ainvoke(state)
         assert len(runtime.calls) == 1
+
+
+# ===========================================================================
+# R10.1 P0-1: Receipt Serialization Round-trip
+# ===========================================================================
+
+
+class TestReceiptSerializationRoundTrip:
+    """R10.1 P0-1: ``AgentInvocationReceipt`` must survive a full
+    serialization round-trip via ``model_dump()``, ``model_dump_json()``,
+    and :func:`serialize_contract` / :func:`deserialize_contract`.
+
+    The root cause was that ``usage_trust`` (legacy, auto-derived) was
+    included in the serialized form alongside ``usage_provenance``.  On
+    deserialization, the ``_sync_trust_provenance`` validator rejected
+    the simultaneous presence of both fields — even though ``usage_trust``
+    was internally derived, not explicitly provided by the caller.
+
+    Fix: ``usage_trust`` now has ``exclude=True`` so it never appears
+    in ``model_dump()`` / ``model_dump_json()`` / canonical serialization.
+    """
+
+    def _make_receipt(self) -> AgentInvocationReceipt:
+        task = _make_task()
+        result = _ok_result(task=task)
+        return AgentInvocationReceipt(
+            result=result,
+            tool_calls=0,
+            tokens_used=None,
+            cost_usd=None,
+            usage_provenance=UsageProvenance(),
+            token_disposition=AttemptUsageDisposition.UNAVAILABLE,
+            cost_disposition=AttemptUsageDisposition.UNAVAILABLE,
+        )
+
+    def test_receipt_model_dump_round_trip(self):
+        """``model_dump()`` → ``model_validate()`` succeeds."""
+        receipt = self._make_receipt()
+        restored = AgentInvocationReceipt.model_validate(
+            receipt.model_dump(mode="python")
+        )
+        assert restored == receipt
+
+    def test_receipt_model_dump_json_round_trip(self):
+        """``model_dump_json()`` → ``model_validate_json()`` succeeds."""
+        receipt = self._make_receipt()
+        restored = AgentInvocationReceipt.model_validate_json(receipt.model_dump_json())
+        assert restored == receipt
+
+    def test_receipt_serialize_contract_round_trip(self):
+        """``serialize_contract()`` → ``deserialize_contract()`` succeeds."""
+        receipt = self._make_receipt()
+        raw = serialize_contract(receipt)
+        restored = deserialize_contract(raw, AgentInvocationReceipt)
+        assert restored == receipt
+
+    def test_legacy_trust_not_serialized(self):
+        """``usage_trust`` does NOT appear in any serialization output."""
+        receipt = self._make_receipt()
+        dump = receipt.model_dump(mode="python")
+        assert "usage_trust" not in dump
+        json_str = receipt.model_dump_json()
+        assert "usage_trust" not in json_str
+        canonical = serialize_contract(receipt)
+        assert "usage_trust" not in canonical
+
+    def test_explicit_legacy_and_provenance_conflict_rejected(self):
+        """Explicitly providing BOTH ``usage_trust`` and
+        ``usage_provenance`` is still a ``ValidationError`` — the
+        ``exclude=True`` fix does NOT weaken the input validation."""
+        task = _make_task()
+        result = _ok_result(task=task)
+        with pytest.raises(ValidationError, match="simultaneously providing"):
+            AgentInvocationReceipt(
+                result=result,
+                tool_calls=0,
+                usage_trust="unverified",
+                usage_provenance=UsageProvenance(),
+            )
+
+    def test_legacy_trust_input_still_works(self):
+        """Providing ONLY ``usage_trust`` (legacy input) is still
+        accepted — the field is excluded from OUTPUT, not from INPUT."""
+        task = _make_task()
+        result = _ok_result(task=task)
+        receipt = AgentInvocationReceipt(
+            result=result,
+            tool_calls=0,
+            usage_trust="unverified",
+        )
+        # The attribute is accessible.
+        assert receipt.usage_trust == "unverified"
+        # But it is NOT in the serialized form.
+        assert "usage_trust" not in receipt.model_dump(mode="python")
+
+    def test_verified_receipt_round_trip(self):
+        """A Receipt with VERIFIED usage also survives round-trip."""
+        task = _make_task()
+        result = _ok_result(
+            task=task,
+            provider_metadata=_provider_meta(),
+            token_usage=TokenUsage(total_tokens=100),
+        )
+        receipt = AgentInvocationReceipt(
+            result=result,
+            tool_calls=0,
+            tokens_used=100,
+            cost_usd=None,
+            usage_provenance=UsageProvenance(
+                token_source_id="verifier",
+                cost_source_id=None,
+                tokens_verified=True,
+                cost_verified=False,
+            ),
+            token_disposition=AttemptUsageDisposition.VERIFIED,
+            cost_disposition=AttemptUsageDisposition.UNAVAILABLE,
+        )
+        raw = serialize_contract(receipt)
+        restored = deserialize_contract(raw, AgentInvocationReceipt)
+        assert restored == receipt
+        assert restored.tokens_used == 100
+        assert restored.token_disposition == AttemptUsageDisposition.VERIFIED
+
+
+# ===========================================================================
+# R10.1 P0-2: Negative Failure Outcome Usage Rejected
+# ===========================================================================
+
+
+class TestNegativeOutcomeUsageRejected:
+    """R10.1 P0-2: ``AgentInvocationOutcome`` rejects negative
+    ``tokens_used`` / ``cost_usd`` at construction time via ``ge=0``.
+
+    The shared :func:`validate_usage_dimension` also defensively
+    rejects negative VERIFIED values so it is the complete common
+    authority for all four Contracts.
+    """
+
+    def test_outcome_rejects_negative_verified_tokens(self):
+        """Negative ``tokens_used`` with VERIFIED disposition is
+        rejected at the Outcome boundary — NOT at the Accountant."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentInvocationOutcome(
+                error_code="failure",
+                observed_tool_calls=None,
+                token_disposition=AttemptUsageDisposition.VERIFIED,
+                cost_disposition=AttemptUsageDisposition.UNAVAILABLE,
+                tokens_used=-1,
+                cost_usd=None,
+                token_source_id="verifier",
+                cost_source_id=None,
+            )
+        assert "tokens_used" in str(exc_info.value).lower()
+
+    def test_outcome_rejects_negative_verified_cost(self):
+        """Negative ``cost_usd`` with VERIFIED disposition is rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentInvocationOutcome(
+                error_code="failure",
+                observed_tool_calls=None,
+                token_disposition=AttemptUsageDisposition.UNAVAILABLE,
+                cost_disposition=AttemptUsageDisposition.VERIFIED,
+                tokens_used=None,
+                cost_usd=Decimal("-0.01"),
+                token_source_id=None,
+                cost_source_id="cost_verifier",
+            )
+        assert "cost_usd" in str(exc_info.value).lower()
+
+    def test_negative_usage_never_reaches_accountant(self):
+        """A negative-value Outcome cannot be constructed, so it never
+        reaches ``record_invocation_outcome`` — the error is surfaced
+        at the Outcome boundary, not as an infrastructure exception
+        inside the Accountant."""
+        budget = ExecutionBudget(cost_budget_usd=Decimal("1.00"))
+        accountant = _BudgetAccountant(budget, start_monotonic=time.monotonic())
+        # The Outcome itself rejects the negative value — we never
+        # get to call record_invocation_outcome.
+        with pytest.raises(ValidationError):
+            AgentInvocationOutcome(
+                error_code="failure",
+                observed_tool_calls=None,
+                token_disposition=AttemptUsageDisposition.VERIFIED,
+                cost_disposition=AttemptUsageDisposition.UNAVAILABLE,
+                tokens_used=-100,
+                cost_usd=None,
+                token_source_id="verifier",
+                cost_source_id=None,
+            )
+        # Accountant state is untouched — no record was committed.
+        assert len(accountant._attempt_records) == 0
+
+    def test_validate_usage_dimension_rejects_negative_verified(self):
+        """The shared :func:`validate_usage_dimension` function also
+        defensively rejects negative VERIFIED values — it is the
+        COMPLETE common authority for all four Contracts."""
+        from multi_agent.usage import validate_usage_dimension
+
+        with pytest.raises(ValueError, match="negative"):
+            validate_usage_dimension(
+                "token",
+                AttemptUsageDisposition.VERIFIED,
+                -1,
+                "verifier",
+            )
+        with pytest.raises(ValueError, match="negative"):
+            validate_usage_dimension(
+                "cost",
+                AttemptUsageDisposition.VERIFIED,
+                Decimal("-0.01"),
+                "cost_verifier",
+            )
+
+    def test_zero_verified_value_is_accepted(self):
+        """Zero is a legitimate VERIFIED value (e.g. a cached call that
+        the Verifier confirmed cost nothing) — it must NOT be rejected."""
+        outcome = AgentInvocationOutcome(
+            error_code="failure",
+            observed_tool_calls=None,
+            token_disposition=AttemptUsageDisposition.VERIFIED,
+            cost_disposition=AttemptUsageDisposition.UNAVAILABLE,
+            tokens_used=0,
+            cost_usd=None,
+            token_source_id="verifier",
+            cost_source_id=None,
+        )
+        assert outcome.tokens_used == 0
+
+
+# ===========================================================================
+# R10.1 P1-1: VerifiedUsage Symmetric Invariants
+# ===========================================================================
+
+
+class TestVerifiedUsageSymmetricInvariants:
+    """R10.1 P1-1: :class:`VerifiedUsage` now enforces SYMMETRIC
+    invariants — ``verified=False`` requires ``value=None`` for BOTH
+    dimensions.
+
+    Previously, only the forward direction was checked
+    (``verified=True → value is not None``).  This allowed a Verifier
+    to return ``tokens_verified=False, tokens_used=100`` — an
+    unverified dimension carrying a numeric value.  The Invoker would
+    then pass that value to the Receipt, which would fail at the
+    Receipt boundary with an uncontrolled ``ValidationError`` because
+    ``UNAVAILABLE`` disposition requires ``value=None``.
+    """
+
+    def test_unverified_tokens_with_value_rejected(self):
+        """``tokens_verified=False, tokens_used=100`` is rejected."""
+        with pytest.raises(ValidationError, match="tokens_verified=False"):
+            VerifiedUsage(
+                tokens_verified=False,
+                tokens_used=100,
+            )
+
+    def test_unverified_cost_with_value_rejected(self):
+        """``cost_verified=False, cost_usd=Decimal('2.00')`` is rejected."""
+        with pytest.raises(ValidationError, match="cost_verified=False"):
+            VerifiedUsage(
+                cost_verified=False,
+                cost_usd=Decimal("2.00"),
+            )
+
+    def test_both_unverified_with_values_rejected(self):
+        """Both dimensions unverified but carrying values is rejected."""
+        with pytest.raises(ValidationError):
+            VerifiedUsage(
+                tokens_verified=False,
+                cost_verified=False,
+                tokens_used=100,
+                cost_usd=Decimal("1.00"),
+            )
+
+    def test_unverified_with_none_values_accepted(self):
+        """Both dimensions unverified with ``None`` values is the
+        correct default and must be accepted."""
+        v = VerifiedUsage(
+            tokens_verified=False,
+            cost_verified=False,
+            tokens_used=None,
+            cost_usd=None,
+        )
+        assert v.tokens_used is None
+        assert v.cost_usd is None
+        assert v.verified is False
+
+    def test_verified_with_values_accepted(self):
+        """Both dimensions verified with non-None values is accepted."""
+        v = VerifiedUsage(
+            tokens_verified=True,
+            cost_verified=True,
+            tokens_used=100,
+            cost_usd=Decimal("1.50"),
+        )
+        assert v.tokens_used == 100
+        assert v.cost_usd == Decimal("1.50")
+        assert v.verified is True
+
+    def test_mixed_verified_unverified_accepted(self):
+        """Token verified with value + Cost unverified with None is
+        the valid mixed case."""
+        v = VerifiedUsage(
+            tokens_verified=True,
+            cost_verified=False,
+            tokens_used=200,
+            cost_usd=None,
+        )
+        assert v.tokens_verified is True
+        assert v.cost_verified is False
+        assert v.verified is True
+
+
+# ===========================================================================
+# R10.1 P1-3: Result Requires observed_tool_calls Alignment
+# ===========================================================================
+
+
+class TestResultRequiresToolCountAlignment:
+    """R10.1 P1-3: when ``result`` is present on an
+    :class:`AgentInvocationOutcome`, ``observed_tool_calls`` MUST be
+    non-None AND equal ``len(result.tool_calls)``.
+
+    Previously, ``observed_tool_calls=None`` was accepted even when a
+    Result was present, which misclassified a call with a complete
+    Result as ``tool_usage_unavailable``.
+    """
+
+    def test_result_with_none_tool_calls_rejected(self):
+        """``result`` present + ``observed_tool_calls=None`` is rejected."""
+        task = _make_task()
+        result = _ok_result(
+            task=task,
+            tool_calls=[
+                ToolCallRecord(
+                    tool_name="tool.read",
+                    authority=ToolAuthority.READ,
+                ),
+            ],
+        )
+        with pytest.raises(ValidationError, match="observed_tool_calls is None"):
+            AgentInvocationOutcome(
+                result=result,
+                error_code="failure",
+                observed_tool_calls=None,
+                token_disposition=AttemptUsageDisposition.UNAVAILABLE,
+                cost_disposition=AttemptUsageDisposition.UNAVAILABLE,
+            )
+
+    def test_result_with_matching_tool_calls_accepted(self):
+        """``result`` present + ``observed_tool_calls=len(tool_calls)``
+        is accepted."""
+        task = _make_task()
+        result = _ok_result(
+            task=task,
+            tool_calls=[
+                ToolCallRecord(
+                    tool_name="tool.read",
+                    authority=ToolAuthority.READ,
+                ),
+                ToolCallRecord(
+                    tool_name="tool.read",
+                    authority=ToolAuthority.READ,
+                ),
+            ],
+        )
+        outcome = AgentInvocationOutcome(
+            result=result,
+            error_code="failure",
+            observed_tool_calls=2,
+            token_disposition=AttemptUsageDisposition.UNAVAILABLE,
+            cost_disposition=AttemptUsageDisposition.UNAVAILABLE,
+        )
+        assert outcome.observed_tool_calls == 2
+
+    def test_result_with_mismatched_tool_calls_rejected(self):
+        """``result`` present + ``observed_tool_calls != len(tool_calls)``
+        is rejected."""
+        task = _make_task()
+        result = _ok_result(
+            task=task,
+            tool_calls=[
+                ToolCallRecord(
+                    tool_name="tool.read",
+                    authority=ToolAuthority.READ,
+                ),
+            ],
+        )
+        with pytest.raises(ValidationError, match="does not match"):
+            AgentInvocationOutcome(
+                result=result,
+                error_code="failure",
+                observed_tool_calls=5,
+                token_disposition=AttemptUsageDisposition.UNAVAILABLE,
+                cost_disposition=AttemptUsageDisposition.UNAVAILABLE,
+            )
+
+    def test_no_result_with_none_tool_calls_accepted(self):
+        """No Result + ``observed_tool_calls=None`` is still accepted —
+        ``None`` means "unknown" and is valid when no Result is
+        available (e.g. timeout, exception before any receipt)."""
+        outcome = AgentInvocationOutcome(
+            result=None,
+            error_code="timeout",
+            observed_tool_calls=None,
+            token_disposition=AttemptUsageDisposition.UNAVAILABLE,
+            cost_disposition=AttemptUsageDisposition.UNAVAILABLE,
+        )
+        assert outcome.observed_tool_calls is None
+
+    def test_no_result_with_concrete_tool_calls_accepted(self):
+        """No Result + ``observed_tool_calls=3`` is accepted — the
+        Invoker may attest a concrete count even without a Result
+        (e.g. it observed 3 tool calls before the exception)."""
+        outcome = AgentInvocationOutcome(
+            result=None,
+            error_code="partial_failure",
+            observed_tool_calls=3,
+            token_disposition=AttemptUsageDisposition.UNAVAILABLE,
+            cost_disposition=AttemptUsageDisposition.UNAVAILABLE,
+        )
+        assert outcome.observed_tool_calls == 3

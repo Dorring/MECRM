@@ -1,9 +1,44 @@
 # Phase 4: Supervisor Runtime + Dependency-Aware DAG Execution
 
-**Status:** Complete (R10)  
-**Revision:** R10  
+**Status:** Complete (R10.1)  
+**Revision:** R10.1  
 **Branch:** `feat/ma-04-supervisor-runtime`  
 **Baseline:** `main` (Phase 3, commit `d586e70`)
+
+> **R10.1 Revision** — This document reflects the R10.1 Contract Round-trip
+> Hotfix.  R10.1 closes two P0 Contract vulnerabilities and three P1
+> consistency items from the R10 review:
+>
+> * **P0-1**: `AgentInvocationReceipt.usage_trust` (legacy, auto-derived) now
+>   has `exclude=True` so it NEVER appears in `model_dump()` /
+>   `model_dump_json()` / canonical serialization.  Previously, the serialized
+>   form contained BOTH `usage_trust` and `usage_provenance`, causing a
+>   `ValidationError` on round-trip because the `_sync_trust_provenance`
+>   validator rejects simultaneous provision.  The field is still accepted as
+>   INPUT (for legacy callers) and accessible as an attribute — it is simply
+>   never serialized.
+> * **P0-2**: `AgentInvocationOutcome.tokens_used` / `cost_usd` are constrained
+>   to `ge=0` — negative usage values are rejected at the Outcome boundary,
+>   NOT at the Accountant.  The shared `validate_usage_dimension()` also
+>   defensively rejects negative VERIFIED values so it is the COMPLETE common
+>   authority for all four Contracts.
+> * **P1-1**: `VerifiedUsage` enforces SYMMETRIC invariants —
+>   `verified=False → value=None` for BOTH dimensions.  Previously, only the
+>   forward direction was checked (`verified=True → value is not None`), which
+>   allowed a Verifier to return unverified-but-carrying-value results that
+>   later caused uncontrolled `ValidationError` at the Receipt boundary.
+> * **P1-2**: Infrastructure exception audit is documented as a KNOWN
+>   LIMITATION of the In-memory Runtime — the local `AttemptUsageRecord` and
+>   trace events are NOT returned to the caller when `RunStore.abort()` destroys
+>   the run entry.  See §17 for details.
+> * **P1-3**: When `result` is present on `AgentInvocationOutcome`,
+>   `observed_tool_calls` MUST be non-None AND equal `len(result.tool_calls)`.
+>   Previously, `None` (unknown) was accepted even with a Result, which
+>   misclassified a call with a complete Result as `tool_usage_unavailable`.
+>
+> R10.1 does NOT modify `PLANNER_VERSION`, Supervisor architecture, Scheduler,
+> or Accounting architecture — R10.1 changes Phase 4 Contract serialization,
+> Outcome value constraints, and VerifiedUsage invariants only.
 
 > **R10 Revision** — This document reflects the R10 Unified Outcome Validation
 > Hotfix.  R10 closes five P0 Contract vulnerabilities and two P1 cleanup items
@@ -1961,6 +1996,7 @@ Phase 4 的核心边界是**执行 Agent Task**，**不**执行业务副作用�
 6. **Token/Cost 依赖 Receipt** — 若 Handler 不报告 usage 且 budget 已设置，会 fail-closed。
 7. **R5 P0-5 / R6 P0-1 ProviderUsageVerifier 默认未配置** — 默认 `RegistryAgentInvoker` 不声明能够验证 Provider Usage（`verifies_tokens=False, verifies_cost=False`）。生产部署需要显式配置权威 Provider Usage Adapter——R6 P0-1 确保配置后 `verify()` 会在真实 `invoke()` 路径被调用，其返回值（而非 Verifier 对象存在性）决定 trust。
 8. **R6 P0-4 trusted_adapter 语义收窄** — R6 将 `trusted_adapter` 从"token+cost 都验证"收窄为"仅 cost 验证"（`tokens_verified=False`）。依赖旧语义（`trusted_adapter` receipt 自动获得 token trust）的部署需要显式配置同时验证 token 的 `ProviderUsageVerifier`。
+9. **R10.1 P1-2 基础设施异常审计不可外部观察（In-memory Runtime 限制）** — 当未知基础设施异常（`RuntimeError`、`TypeError` 等）在 `_execute_task` 中被捕获时，Supervisor 会在重新抛出前尽力记录一条 UNAVAILABLE `AttemptUsageRecord` 和 `task_failed` Trace 事件。但外层随后调用 `RunStore.abort()` 会删除运行 Entry，只保留一个简单的 Error Code。最终：没有 `SupervisorRunResult` 返回给调用方；局部 `AttemptUsageRecord` 不会通过 `SupervisorRunResult.usage` 返回；Trace 不会返回；RunStore 中也没有结构化的 Partial Audit。该审计目前仅存在于即将销毁的局部对象中。Phase 5 的持久化 RunStore（Postgres 实现）或携带 `partial_usage` / `partial_trace` / `task_records` 的 `SupervisorExecutionError` 可以解决此限制。当前阶段不得表述为"基础设施异常已经具备完整外部可审计性"。
 
 ---
 
@@ -2494,6 +2530,145 @@ run_store + graph: 45 passed
 collect-only:    879 tests collected
 ruff check:      All checks passed
 ruff format:     R10 files formatted (134 pre-existing files unchanged)
+compileall:      Success
+mypy:            Success, no issues in 21 source files
+```
+
+---
+
+## 附录 D: R10.1 Contract Round-trip Hotfix
+
+### D.1 Receipt Serialization Round-trip (P0-1)
+
+`AgentInvocationReceipt.usage_trust` is a DEPRECATED legacy field that is
+auto-derived from `usage_provenance` via `_provenance_to_trust()`.  R9 Section 7
+made the simultaneous provision of BOTH `usage_trust` and `usage_provenance` a
+`ValidationError` — even when the derived trust matches.
+
+This created a serialization round-trip defect: `model_dump()` and
+`serialize_contract()` output BOTH fields (because `usage_trust` was a regular
+Pydantic field), but `model_validate()` / `deserialize_contract()` rejected the
+simultaneous presence on input.
+
+```python
+# R10.1 P0-1 fix: exclude the legacy field from serialization output.
+usage_trust: UsageTrustLevel = Field(default="unverified", exclude=True)
+```
+
+The field is still:
+* accepted as INPUT (legacy callers passing `usage_trust="unverified"` still work, with a `DeprecationWarning`);
+* accessible as an attribute (`receipt.usage_trust` returns the derived value);
+* the simultaneous provision of BOTH fields on input is STILL a `ValidationError`.
+
+The field is NO LONGER:
+* included in `model_dump(mode="python")`;
+* included in `model_dump_json()`;
+* included in `serialize_contract()` canonical output.
+
+This ensures a full round-trip:
+
+```python
+raw = serialize_contract(receipt)
+restored = deserialize_contract(raw, AgentInvocationReceipt)
+assert restored == receipt  # succeeds
+```
+
+### D.2 Negative Outcome Usage Rejection (P0-2)
+
+`AgentInvocationOutcome.tokens_used` and `cost_usd` now have `ge=0`:
+
+```python
+class AgentInvocationOutcome(StrictContract):
+    tokens_used: int | None = Field(default=None, ge=0)
+    cost_usd: Decimal | None = Field(default=None, ge=0)
+```
+
+Previously, negative values were accepted at the Outcome boundary and only
+rejected later when `record_invocation_outcome()` tried to construct an
+`AttemptUsageRecord` — the error was an uncontrolled Pydantic `ValidationError`,
+not the controlled `ExecutionUsageUnavailableError` that the Runtime expects.
+
+The shared `validate_usage_dimension()` function also defensively rejects
+negative VERIFIED values, making it the COMPLETE common authority:
+
+```python
+if disposition == VERIFIED:
+    if isinstance(value, (int, float, Decimal)) and value < 0:
+        raise ValueError(f"... is negative — usage values must be non-negative (R10.1 P0-2)")
+```
+
+### D.3 VerifiedUsage Symmetric Invariants (P1-1)
+
+`VerifiedUsage` now enforces BOTH directions:
+
+```python
+# Forward (existing): verified=True → value is not None
+# Symmetric (R10.1 P1-1): verified=False → value is None
+if not self.tokens_verified and self.tokens_used is not None:
+    raise ValueError("... an unverified dimension must not carry a value (R10.1 P1-1)")
+if not self.cost_verified and self.cost_usd is not None:
+    raise ValueError("... an unverified dimension must not carry a value (R10.1 P1-1)")
+```
+
+This prevents a Verifier from returning
+`VerifiedUsage(tokens_verified=False, tokens_used=100)` — an unverified
+dimension carrying a numeric value that would later cause an uncontrolled
+`ValidationError` at the Receipt boundary (because `UNAVAILABLE` disposition
+requires `value=None`).
+
+### D.4 Result Requires observed_tool_calls Alignment (P1-3)
+
+When `result` is present on `AgentInvocationOutcome`, `observed_tool_calls`
+MUST be non-None:
+
+```python
+if self.result is not None and self.observed_tool_calls is None:
+    raise ValueError(
+        "AgentInvocationOutcome.observed_tool_calls is None but "
+        "result is present — when a Result is available, the tool "
+        "call count MUST be reported (R10.1 P1-3)"
+    )
+```
+
+Previously, `None` (unknown) was accepted even when a Result was present, which
+misclassified a call with a complete Result as `tool_usage_unavailable` and
+triggered fail-closed unnecessarily.
+
+### D.5 Infrastructure Exception Audit — Known Limitation (P1-2)
+
+The R10 P1-1 infrastructure exception audit records an UNAVAILABLE
+`AttemptUsageRecord` and emits a `task_failed` trace event before re-raising.
+However, the outer Supervisor then calls `RunStore.abort()`, which destroys the
+run entry — the local audit records are NOT returned to the caller.
+
+This is a KNOWN LIMITATION of the In-memory Runtime (see §17.9).  Phase 5's
+persistent RunStore (Postgres) or a `SupervisorExecutionError` carrying
+`partial_usage` / `partial_trace` / `task_records` will resolve this.
+
+### D.6 R10.1 Test Coverage
+
+`test_supervisor_r10.py` adds 23 R10.1 tests across 4 groups:
+
+| Group | Tests | Coverage |
+|-------|-------|----------|
+| P0-1 Receipt Round-trip | 7 | `model_dump`, `model_dump_json`, `serialize_contract`, legacy exclusion, conflict rejection, legacy input, verified round-trip |
+| P0-2 Negative Outcome Usage | 5 | Negative tokens, negative cost, never reaches Accountant, `validate_usage_dimension` rejection, zero accepted |
+| P1-1 VerifiedUsage Symmetric | 6 | Unverified tokens with value, unverified cost with value, both unverified, None accepted, verified accepted, mixed accepted |
+| P1-3 Result/Tool Count Alignment | 5 | None rejected, matching accepted, mismatched rejected, no-result None accepted, no-result concrete accepted |
+
+Pre-existing test fixes:
+* `test_supervisor_r6.py`: `_RejectingVerifier` — `tokens_used=0` → `tokens_used=None` (R10.1 P1-1)
+* `test_supervisor_r7.py`: `_CostOnlyVerifier` — `tokens_used=0` → `tokens_used=None` (R10.1 P1-1)
+* `test_supervisor_r10.py`: `test_failure_outcome_none_tool_calls_with_result_is_allowed` → renamed to `_is_rejected` (R10.1 P1-3)
+
+### D.7 R10.1 Final Test Results
+
+```text
+multi_agent:     826 passed (803 R10 + 23 R10.1)
+ai_mode:          76 passed
+run_store + graph: 45 passed
+ruff check:      All checks passed
+ruff format:     R10.1 files formatted
 compileall:      Success
 mypy:            Success, no issues in 21 source files
 ```

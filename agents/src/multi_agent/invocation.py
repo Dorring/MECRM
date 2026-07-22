@@ -102,6 +102,17 @@ class AgentInvocationOutcome(StrictContract):
     :func:`validate_usage_dimension` function — the SAME authority used
     by :class:`AttemptUsageRecord`, :class:`AgentInvocationReceipt`,
     and :class:`TaskAttemptRecord`.
+
+    R10.1 P0-2: ``tokens_used`` and ``cost_usd`` are constrained to
+    ``ge=0`` — negative usage values are rejected at the Outcome
+    boundary, NOT at the Accountant boundary.  This prevents an
+    invalid failure Outcome from being constructed and later causing
+    an uncontrolled ``ValidationError`` inside ``record_invocation_outcome``.
+
+    R10.1 P1-3: when ``result`` is present, ``observed_tool_calls`` MUST
+    be non-None.  A Result already carries ``tool_calls``, so the
+    Invoker MUST report the exact count — ``None`` (unknown) is no
+    longer accepted when the Result is available.
     """
 
     result: AgentResult | None = None
@@ -112,18 +123,30 @@ class AgentInvocationOutcome(StrictContract):
     token_disposition: AttemptUsageDisposition = AttemptUsageDisposition.UNAVAILABLE
     cost_disposition: AttemptUsageDisposition = AttemptUsageDisposition.UNAVAILABLE
 
-    tokens_used: int | None = None
-    cost_usd: Decimal | None = None
+    tokens_used: int | None = Field(default=None, ge=0)
+    cost_usd: Decimal | None = Field(default=None, ge=0)
 
     token_source_id: str | None = None
     cost_source_id: str | None = None
 
     @model_validator(mode="after")
     def _enforce_outcome_invariants(self) -> "AgentInvocationOutcome":
-        # R10 P0-2: when a Result is present, observed_tool_calls MUST
-        # match len(result.tool_calls).  A failure Outcome cannot
-        # under-report or hide tool calls that are visible in the
-        # Result — the Invoker boundary is the trusted source.
+        # R10.1 P1-3: when a Result is present, observed_tool_calls
+        # MUST be non-None.  The Result already carries its
+        # ``tool_calls`` list, so the Invoker MUST report the exact
+        # count — ``None`` (unknown) is no longer accepted when the
+        # Result is available.  Previously, ``None`` was allowed even
+        # with a Result, which misclassified a call with a complete
+        # Result as ``tool_usage_unavailable``.
+        if self.result is not None and self.observed_tool_calls is None:
+            raise ValueError(
+                "AgentInvocationOutcome.observed_tool_calls is None but "
+                "result is present — when a Result is available, the tool "
+                "call count MUST be reported and match len(result.tool_calls) "
+                "(R10.1 P1-3)"
+            )
+        # R10 P0-2 / R10.1 P1-3: when a Result is present,
+        # observed_tool_calls MUST match len(result.tool_calls).
         if self.result is not None and self.observed_tool_calls is not None:
             actual = len(self.result.tool_calls)
             if self.observed_tool_calls != actual:
@@ -249,7 +272,17 @@ class AgentInvocationReceipt(StrictContract):
     # ``usage_provenance`` directly and must NOT pass both fields
     # simultaneously — R9 Section 7 makes ANY simultaneous provision a
     # ``ValidationError`` (even when the derived trust matches).
-    usage_trust: UsageTrustLevel = Field(default="unverified")
+    #
+    # R10.1 P0-1: ``exclude=True`` so the legacy field is NOT included
+    # in ``model_dump()`` / ``model_dump_json()`` / canonical
+    # serialization.  Without this, a round-trip through
+    # ``serialize_contract`` → ``deserialize_contract`` fails because
+    # the serialized form contains BOTH ``usage_trust`` and
+    # ``usage_provenance``, which the ``_sync_trust_provenance``
+    # validator rejects.  The field is still accepted as INPUT (for
+    # legacy callers) and accessible as an attribute — it is simply
+    # never serialized.
+    usage_trust: UsageTrustLevel = Field(default="unverified", exclude=True)
 
     @model_validator(mode="after")
     def _enforce_receipt_dimension_invariants(self) -> "AgentInvocationReceipt":

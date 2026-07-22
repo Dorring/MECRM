@@ -228,8 +228,10 @@ class _CostOnlyVerifier:
         provider_metadata: ProviderMetadata,
         token_usage: TokenUsage,
     ) -> VerifiedUsage:
+        # R10.1 P1-1: VerifiedUsage now enforces symmetric invariants —
+        # tokens_verified=False (default) requires tokens_used=None.
         return VerifiedUsage(
-            tokens_used=0,
+            tokens_used=None,
             cost_usd=self._cost_usd,
             cost_verified=True,
         )
