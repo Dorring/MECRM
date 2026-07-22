@@ -33,6 +33,11 @@ COPY prisma ./prisma/
 COPY prisma.config.ts ./
 RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev
 
+# The gateway runner only needs `node` to execute dist/index.js.
+# Remove npm (and its transitive deps including tar@7.5.16) to eliminate
+# CVE-2026-59873 from the runtime image.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
+
 COPY --from=builder /app/dist ./dist
 
 # Ensure the node user can read the app directory

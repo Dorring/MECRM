@@ -43,7 +43,7 @@ from multi_agent.serialization import canonicalize, stable_hash
 # Planner version — bumped whenever the planner algorithm changes.
 # ---------------------------------------------------------------------------
 
-PLANNER_VERSION = "ma-03.6.0"
+PLANNER_VERSION = "ma-03.7.0"
 
 #: R3 P1 — upper bound on the number of cartesian-product combinations
 #: the global multi-agent assignment search will evaluate before
@@ -111,6 +111,97 @@ _COST_CLASS_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
 
 
 # ---------------------------------------------------------------------------
+# R5 P0-1 — RetryPolicy: Canonical retry contract shared by RequestedTask,
+# TaskIntent, PlannedTask, Canonical Plan Reconstruction, Plan Hash, and
+# PlanValidator.  Previously ``max_retries=0`` was hardcoded in
+# ``build_expected_planned_tasks``, making retry untestable through the
+# real Phase 3 → Phase 4 boundary.
+# ---------------------------------------------------------------------------
+
+
+# R6 P1: Error codes that must NEVER be retried, regardless of the
+# RetryPolicy.  This is the canonical source — ``supervisor.py`` imports
+# this frozenset so the planning-layer validator and the runtime
+# ``should_retry()`` function share the same definition.  These represent
+# definite business-domain failures, identity mismatches, or explicit
+# cancellation — retrying them would be semantically incorrect even if
+# the policy's ``retryable_error_codes`` explicitly lists them.
+NEVER_RETRYABLE_ERROR_CODES: frozenset[str] = frozenset(
+    {
+        "invalid_receipt",
+        "invalid_result",
+        "usage_unavailable",
+        "non_retryable_error",
+        "run_deadline_exceeded",
+        "tenant_mismatch",
+        "agent_identity_mismatch",
+        "cancelled",
+        "kill_switch",
+    }
+)
+
+
+class RetryPolicy(StrictContract):
+    """Canonical retry policy for a planned task.
+
+    R5 P0-1 — replaces the hardcoded ``max_retries=0`` in
+    :func:`build_expected_planned_tasks` with a first-class planning
+    contract.  The policy travels through:
+
+    ``RequestedTask`` → ``TaskIntent`` → ``PlannedTask`` →
+    Canonical Plan Reconstruction → Plan Hash → PlanValidator.
+
+    Both Planner and Validator call the same
+    :func:`build_expected_planned_tasks`, so any tampered ``max_retries``
+    value is detected by the Canonical Plan comparison.
+
+    ``retryable_error_codes`` is a frozenset of error-code strings that
+    are eligible for retry.  When empty (default), only
+    :class:`RetryableAgentError` and timeout are retried.  When
+    non-empty, only error codes in the set are retried.
+
+    R6 P1 — ``retryable_error_codes`` is validated at construction:
+
+    * Blank / whitespace-only strings are rejected.
+    * Codes in :data:`NEVER_RETRYABLE_ERROR_CODES` are rejected —
+      listing ``invalid_receipt`` or ``non_retryable_error`` in the
+      allowlist would be a no-op at runtime (``should_retry()`` always
+      refuses them), so rejecting them at planning time surfaces the
+      misconfiguration immediately instead of letting a bad policy
+      silently enter the Plan Hash.
+    """
+
+    max_retries: int = Field(default=0, ge=0, le=3)
+    retryable_error_codes: frozenset[str] = Field(default_factory=frozenset)
+
+    @field_validator("retryable_error_codes")
+    @classmethod
+    def _validate_retryable_error_codes(cls, v: frozenset[str]) -> frozenset[str]:
+        """R6 P1: reject blank strings and never-retryable codes.
+
+        A frozenset could otherwise contain ``""``, ``" "``, typos, or
+        codes that :func:`should_retry` would refuse anyway.  Catching
+        these at construction prevents a bad policy from entering the
+        Plan Hash and only being discovered at runtime.
+        """
+        cleaned: set[str] = set()
+        for code in v:
+            stripped = code.strip()
+            if not stripped:
+                raise ValueError("retryable_error_codes must not contain blank strings")
+            if stripped in NEVER_RETRYABLE_ERROR_CODES:
+                raise ValueError(
+                    f"retryable_error_codes must not contain "
+                    f"never-retryable code {stripped!r} — codes in "
+                    f"NEVER_RETRYABLE_ERROR_CODES are always refused by "
+                    f"should_retry(); listing them is a no-op that "
+                    f"indicates a misconfiguration"
+                )
+            cleaned.add(stripped)
+        return frozenset(cleaned)
+
+
+# ---------------------------------------------------------------------------
 # PlanningSignals
 # ---------------------------------------------------------------------------
 
@@ -138,6 +229,9 @@ class RequestedTask(StrictContract):
     preferred_authority: AgentAuthority = AgentAuthority.READ
     required_tools: frozenset[str] = Field(default_factory=frozenset)
     estimated_tool_calls: int = Field(default=0, ge=0)
+
+    # R5 P0-1 — retry policy is now a first-class planning contract.
+    retry_policy: RetryPolicy = Field(default_factory=RetryPolicy)
 
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
 
@@ -413,6 +507,9 @@ class TaskIntent(StrictContract):
     required_tools: frozenset[str] = Field(default_factory=frozenset)
     estimated_tool_calls: int = Field(default=0, ge=0)
 
+    # R5 P0-1 — retry policy propagated from RequestedTask.
+    retry_policy: RetryPolicy = Field(default_factory=RetryPolicy)
+
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
 
     @field_validator("intent_id")
@@ -513,6 +610,7 @@ def task_intent_from_requested_task(rt: RequestedTask) -> TaskIntent:
         preferred_authority=rt.preferred_authority,
         required_tools=rt.required_tools,
         estimated_tool_calls=rt.estimated_tool_calls,
+        retry_policy=rt.retry_policy,
         metadata=dict(rt.metadata),
     )
 
@@ -1164,7 +1262,8 @@ def build_expected_planned_tasks(
     * ``required`` = ``intent.required``
     * ``required_evidence`` = ``list(intent.required_evidence)``
     * ``timeout_ms`` = ``cap.timeout_ms``  (R3 P0-3 — not lowerable)
-    * ``max_retries`` = ``0``  (Phase 3 default, not configurable)
+    * ``max_retries`` = ``intent.retry_policy.max_retries``  (R5 P0-1 —
+      configurable via :class:`RetryPolicy`, default 0)
     * ``idempotency_key`` = ``f"{run_id}:{task_id}"``
     * ``priority`` = ``"medium"``  (Phase 3 default)
     * ``status`` = ``"pending"``  (R3 P0-3 — Plan-time invariant)
@@ -1217,7 +1316,7 @@ def build_expected_planned_tasks(
             required=intent.required,
             required_evidence=list(intent.required_evidence),
             timeout_ms=cap.timeout_ms,
-            max_retries=0,
+            max_retries=intent.retry_policy.max_retries,
             idempotency_key=f"{request.run_id}:{task_id}",
             priority="medium",
             status="pending",
@@ -1236,6 +1335,7 @@ def build_expected_planned_tasks(
                 estimated_tool_calls=intent.estimated_tool_calls,
                 required=intent.required,
                 planning_metadata=dict(intent.metadata),
+                retry_policy=intent.retry_policy,
                 task=task,
             )
         )
@@ -1271,6 +1371,12 @@ class PlannedTask(StrictContract):
     # recover template phase / context information, and so a tampered
     # plan cannot silently drop or alter metadata.
     planning_metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+    # R5 P0-1 — retry_policy is copied verbatim from
+    # TaskIntent.retry_policy by build_expected_planned_tasks.  It
+    # enters the Plan Hash and the Canonical Plan comparison so a
+    # tampered plan cannot silently change the retry configuration.
+    retry_policy: RetryPolicy = Field(default_factory=RetryPolicy)
 
     task: AgentTask
 

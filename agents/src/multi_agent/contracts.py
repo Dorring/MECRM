@@ -10,9 +10,9 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 from decimal import Decimal
-from enum import Enum
+from enum import Enum, StrEnum
 from hmac import compare_digest
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -25,6 +25,13 @@ from pydantic import (
 from multi_agent.errors import ProposalHashMismatchError
 from multi_agent.integrity import compute_proposal_hash
 from multi_agent.serialization import validate_strict_json
+
+if TYPE_CHECKING:
+    # R9 Section 4: ``AttemptUsageRecord`` lives in :mod:`multi_agent.usage`
+    # to avoid a circular import.  The forward reference is resolved at
+    # runtime via ``ExecutionUsage.model_rebuild()`` called from
+    # :mod:`multi_agent.usage` after ``AttemptUsageRecord`` is defined.
+    from multi_agent.usage import AttemptUsageRecord
 
 JsonValue = Any
 
@@ -845,14 +852,87 @@ class ExecutionBudget(StrictContract):
         return self
 
 
+class UsageAvailabilityStatus(StrEnum):
+    """R6 P1: Three-state usage availability for a Run.
+
+    Replaces the previous boolean ``tokens_usage_available`` /
+    ``cost_usage_available`` fields that could only express "at least
+    one receipt reported verified usage" — not whether *all* committed
+    attempts that could produce provider usage had verified data.
+
+    * ``UNAVAILABLE`` — no committed attempt produced verified usage
+      (or there were committed attempts with no receipt at all).
+    * ``PARTIAL`` — at least one attempt produced verified usage, but
+      not all provider-usage-capable attempts did.
+    * ``COMPLETE`` — every committed attempt that could produce
+      provider usage has verified data (or there were no
+      provider-usage-capable attempts).
+    """
+
+    UNAVAILABLE = "unavailable"
+    PARTIAL = "partial"
+    COMPLETE = "complete"
+
+
 class ExecutionUsage(StrictContract):
     tasks_dispatched: int = Field(default=0, ge=0)
     agent_calls: int = Field(default=0, ge=0)
     tool_calls: int = Field(default=0, ge=0)
     iterations: int = Field(default=0, ge=0)
     tokens_used: int = Field(default=0, ge=0)
+    # R6 P1: three-state status replaces the boolean.  The legacy
+    # boolean is retained for backwards compatibility and auto-derived
+    # from the status (True when status != UNAVAILABLE).
+    tokens_usage_available: bool = False
+    tokens_usage_status: UsageAvailabilityStatus = UsageAvailabilityStatus.UNAVAILABLE
     cost_usd: Decimal = Field(default=Decimal("0.00"), ge=0)
+    cost_usage_available: bool = False
+    cost_usage_status: UsageAvailabilityStatus = UsageAvailabilityStatus.UNAVAILABLE
+    # R7 P0-3: Token and Cost now have INDEPENDENT coverage
+    # denominators.  A cost-only adapter verifying Attempt B's cost
+    # can no longer "offset" Attempt A's missing cost — the two
+    # dimensions are tracked separately.  The legacy
+    # ``provider_usage_capable_attempts`` is retained as a diagnostic
+    # field (computed as the max of the two independent denominators)
+    # but is no longer used as the coverage denominator for either
+    # dimension.
+    token_usage_applicable_attempts: int = Field(default=0, ge=0)
+    cost_usage_applicable_attempts: int = Field(default=0, ge=0)
+    verified_token_attempts: int = Field(default=0, ge=0)
+    verified_cost_attempts: int = Field(default=0, ge=0)
+    # R7 P0-3: DEPRECATED — retained for backwards compatibility.
+    # Computed as ``max(token_usage_applicable_attempts,
+    # cost_usage_applicable_attempts)``.  Consumers should use the
+    # per-dimension fields above instead.
+    provider_usage_capable_attempts: int = Field(default=0, ge=0)
+    # R8 P1-1 / R9 Section 4: per-attempt usage records exposed for
+    # external audit.  R9 removes the ``list[Any]`` escape hatch — the
+    # field is now strictly typed as ``list[AttemptUsageRecord]``.
+    # The forward reference is resolved via ``model_rebuild()`` called
+    # from :mod:`multi_agent.usage` (no circular import at runtime).
+    # The list is a defensive deep copy so external mutation cannot
+    # corrupt the accountant's state.
+    attempt_usage_records: list[AttemptUsageRecord] = Field(default_factory=list)
+    # R9 Section 2: True when any committed attempt's tool-call count
+    # is unknown (timeout/exception before any receipt).  The Runtime
+    # fails closed — stops retries and new tasks.
+    tool_usage_unavailable: bool = False
     elapsed_ms: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _sync_usage_status_booleans(self) -> "ExecutionUsage":
+        """R6 P1: derive legacy booleans from the three-state status."""
+        object.__setattr__(
+            self,
+            "tokens_usage_available",
+            self.tokens_usage_status != UsageAvailabilityStatus.UNAVAILABLE,
+        )
+        object.__setattr__(
+            self,
+            "cost_usage_available",
+            self.cost_usage_status != UsageAvailabilityStatus.UNAVAILABLE,
+        )
+        return self
 
 
 RunStatus = Literal[

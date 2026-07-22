@@ -22,6 +22,7 @@ from multi_agent.contracts import (
     ToolAuthority,
     ToolCallRecord,
     ToolDescriptor,
+    UsageAvailabilityStatus,
     from_crm_writer_proposal,
     from_productivity_proposal,
 )
@@ -77,6 +78,7 @@ from multi_agent.planning import (
     CODE_INTENT_MISSING_DEPENDENCY,
     CODE_WRITE_REQUEST_MISSING_PROPOSE,
     MAX_ASSIGNMENT_COMBINATIONS,
+    NEVER_RETRYABLE_ERROR_CODES,
     PLANNER_VERSION,
     PlanDraft,
     PlanValidationIssue,
@@ -85,6 +87,7 @@ from multi_agent.planning import (
     PlanningRequest,
     PlanningSignals,
     RequestedTask,
+    RetryPolicy,
     TaskIntent,
     TOOL_TO_AGENT_AUTHORITY,
     build_expected_planned_tasks,
@@ -127,6 +130,108 @@ from multi_agent.planning_templates import (
 from multi_agent.plan_validator import PlanValidator
 from multi_agent.planner import DeterministicPlanner
 
+# Phase 4 — Supervisor Runtime
+from multi_agent.execution import (
+    ExecutionBinding,
+    ExecutionCancellation,
+    ExecutionTraceEvent,
+    FakeExecutionCancellation,
+    SupervisorConfig,
+    SupervisorRunResult,
+    SupervisorRunStatus,
+    TaskAttemptRecord,
+    TaskExecutionRecord,
+    TRACE_BUDGET_EXCEEDED,
+    TRACE_PLAN_VALIDATED,
+    TRACE_RESULTS_MERGED,
+    TRACE_RUN_CANCELLED,
+    TRACE_RUN_COMPLETED,
+    TRACE_RUN_STARTED,
+    TRACE_TASK_COMPLETED,
+    TRACE_TASK_FAILED,
+    TRACE_TASK_NEEDS_INPUT,
+    TRACE_TASK_READY,
+    TRACE_TASK_RETRYING,
+    TRACE_TASK_SKIPPED,
+    TRACE_TASK_STARTED,
+    TRACE_TASK_TIMED_OUT,
+    build_execution_context,
+    final_status_priority,
+    utc_now,
+    validate_agent_result,
+)
+from multi_agent.execution_errors import (
+    ExecutionUsageUnavailableError,
+    InvalidAgentResultError,
+    InvalidInvocationReceiptError,
+    NonRetryableAgentError,
+    RetryableAgentError,
+    RunAlreadyInProgressError,
+    RunPlanConflictError,
+    SupervisorError,
+)
+from multi_agent.invocation import (
+    AgentInvocationReceipt,
+    AgentInvocationFailure,
+    AgentInvocationOutcome,
+    AgentInvoker,
+    DeterministicFakeInvoker,
+    RegistryAgentInvoker,
+    validate_invocation_receipt,
+)
+
+# R10 Sync 1: Usage types are now imported directly from
+# :mod:`multi_agent.usage` (the canonical source) rather than through
+# :mod:`multi_agent.invocation`'s compatibility re-export.  This
+# ensures ``multi_agent.AttemptUsageRecord is multi_agent.usage.AttemptUsageRecord``
+# — there is exactly one definition source.
+from multi_agent.usage import (
+    ERROR_EXECUTION_USAGE_UNAVAILABLE,
+    ERROR_INFRASTRUCTURE_EXCEPTION,
+    ERROR_INVALID_INVOCATION_OUTCOME,
+    ERROR_TOOL_USAGE_UNAVAILABLE,
+    ERROR_USAGE_SOURCE_MISMATCH,
+    AttemptUsageDisposition,
+    AttemptUsageRecord,
+    ProviderUsageVerifier,
+    UsageProvenance,
+    # R7 P1-1: DEPRECATED — ``UsageTrustLevel`` is retained for
+    # backwards compatibility but new code must use ``UsageProvenance``
+    # and ``AttemptUsageDisposition``.  The legacy ``usage_trust`` field
+    # on ``AgentInvocationReceipt`` is auto-derived from
+    # ``usage_provenance`` and will be removed in the next incompatible
+    # version.
+    UsageTrustLevel,
+    UsageVerificationCapabilities,
+    VerifiedUsage,
+    get_usage_capabilities,
+    validate_usage_dimension,
+)
+from multi_agent.run_store import (
+    InMemoryRunStore,
+    RunIdentity,
+    RunIdentityStatus,
+    RunLease,
+    RunStore,
+    defensive_copy_result,
+)
+from multi_agent.scheduler import (
+    AgentCallPermit,
+    BeforeWave,
+    DagScheduler,
+    DispatchDecision,
+    PreDispatch,
+    TaskOutcome,
+    WaveCallback,
+    WaveStartedCallback,
+)
+from multi_agent.supervisor import SupervisorRuntime
+from multi_agent.supervisor_graph import (
+    FakeSupervisorRuntime,
+    SupervisorGraphState,
+    build_supervisor_graph,
+)
+
 __all__ = [
     # Phase 2
     "ActionProposal",
@@ -151,6 +256,7 @@ __all__ = [
     "ExecutionBudget",
     "ExecutionUsage",
     "ForeignTenantEvidenceError",
+    "UsageAvailabilityStatus",
     "MergeConflict",
     "MergeConflictError",
     "MergedState",
@@ -197,6 +303,7 @@ __all__ = [
     "CODE_INTENT_MISSING_DEPENDENCY",
     "CODE_WRITE_REQUEST_MISSING_PROPOSE",
     "MAX_ASSIGNMENT_COMBINATIONS",
+    "NEVER_RETRYABLE_ERROR_CODES",
     "PLANNER_VERSION",
     "PlanDraft",
     "PlanValidationIssue",
@@ -205,6 +312,7 @@ __all__ = [
     "PlanningRequest",
     "PlanningSignals",
     "RequestedTask",
+    "RetryPolicy",
     "TaskIntent",
     "TOOL_TO_AGENT_AUTHORITY",
     "build_expected_planned_tasks",
@@ -244,4 +352,86 @@ __all__ = [
     # Phase 3 — Validator & Planner
     "PlanValidator",
     "DeterministicPlanner",
+    # Phase 4 — Execution Errors
+    "ExecutionUsageUnavailableError",
+    "InvalidAgentResultError",
+    "InvalidInvocationReceiptError",
+    "NonRetryableAgentError",
+    "RetryableAgentError",
+    "RunAlreadyInProgressError",
+    "RunPlanConflictError",
+    "SupervisorError",
+    # Phase 4 — Invocation
+    "AgentInvocationReceipt",
+    "AgentInvocationFailure",
+    "AgentInvocationOutcome",
+    "AgentInvoker",
+    "DeterministicFakeInvoker",
+    "RegistryAgentInvoker",
+    "validate_invocation_receipt",
+    # Phase 4 — Usage (R10 Sync 1: canonical source is multi_agent.usage)
+    "AttemptUsageDisposition",
+    "AttemptUsageRecord",
+    "ERROR_EXECUTION_USAGE_UNAVAILABLE",
+    "ERROR_INFRASTRUCTURE_EXCEPTION",
+    "ERROR_INVALID_INVOCATION_OUTCOME",
+    "ERROR_TOOL_USAGE_UNAVAILABLE",
+    "ERROR_USAGE_SOURCE_MISMATCH",
+    "ProviderUsageVerifier",
+    "UsageProvenance",
+    # R7 P1-1: DEPRECATED — use UsageProvenance / AttemptUsageDisposition.
+    "UsageTrustLevel",
+    "UsageVerificationCapabilities",
+    "VerifiedUsage",
+    "get_usage_capabilities",
+    "validate_usage_dimension",
+    # Phase 4 — Execution Contracts
+    "ExecutionBinding",
+    "ExecutionCancellation",
+    "ExecutionTraceEvent",
+    "FakeExecutionCancellation",
+    "SupervisorConfig",
+    "SupervisorRunResult",
+    "SupervisorRunStatus",
+    "TaskAttemptRecord",
+    "TaskExecutionRecord",
+    "TRACE_BUDGET_EXCEEDED",
+    "TRACE_PLAN_VALIDATED",
+    "TRACE_RESULTS_MERGED",
+    "TRACE_RUN_CANCELLED",
+    "TRACE_RUN_COMPLETED",
+    "TRACE_RUN_STARTED",
+    "TRACE_TASK_COMPLETED",
+    "TRACE_TASK_FAILED",
+    "TRACE_TASK_NEEDS_INPUT",
+    "TRACE_TASK_READY",
+    "TRACE_TASK_RETRYING",
+    "TRACE_TASK_SKIPPED",
+    "TRACE_TASK_STARTED",
+    "TRACE_TASK_TIMED_OUT",
+    "build_execution_context",
+    "final_status_priority",
+    "utc_now",
+    "validate_agent_result",
+    # Phase 4 — Run Store
+    "InMemoryRunStore",
+    "RunIdentity",
+    "RunIdentityStatus",
+    "RunLease",
+    "RunStore",
+    "defensive_copy_result",
+    # Phase 4 — Scheduler & Supervisor
+    "AgentCallPermit",
+    "BeforeWave",
+    "DagScheduler",
+    "DispatchDecision",
+    "PreDispatch",
+    "TaskOutcome",
+    "WaveCallback",
+    "WaveStartedCallback",
+    "SupervisorRuntime",
+    # Phase 4 — LangGraph Adapter
+    "FakeSupervisorRuntime",
+    "SupervisorGraphState",
+    "build_supervisor_graph",
 ]

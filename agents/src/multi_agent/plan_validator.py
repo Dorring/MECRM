@@ -1078,6 +1078,27 @@ class PlanValidator:
                 )
             )
 
+        # -- Retry policy (R5 P0-1) ----------------------------------------
+        # RetryPolicy is copied verbatim from TaskIntent.retry_policy
+        # into PlannedTask.retry_policy by build_expected_planned_tasks.
+        # It participates in Plan Hash and Canonical Plan comparison so
+        # that tampering with max_retries / retryable_error_codes is
+        # detectable.  The task.max_retries check above validates the
+        # derived value; this check validates the full policy object.
+        if pt.retry_policy != expected.retry_policy:
+            issues.append(
+                PlanValidationIssue(
+                    code=CODE_TASK_FIELD_MISMATCH,
+                    severity="error",
+                    message=(
+                        f"PlannedTask {intent_id!r} retry_policy "
+                        f"{pt.retry_policy!r} != expected "
+                        f"{expected.retry_policy!r}"
+                    ),
+                    task_id=task_id,
+                )
+            )
+
         return issues
 
     # ------------------------------------------------------------------
