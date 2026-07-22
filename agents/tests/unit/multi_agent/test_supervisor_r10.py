@@ -1262,14 +1262,15 @@ class TestExecutionUsageForwardReference:
             "assert len(u.attempt_usage_records) == 1; "
             "print('OK')"
         )
-        src_path = str(Path(__file__).resolve().parents[3] / "src")
+        agents_dir = str(Path(__file__).resolve().parents[3])
+        src_path = str(Path(agents_dir) / "src")
         env = os.environ.copy()
         env["PYTHONPATH"] = src_path + os.pathsep + env.get("PYTHONPATH", "")
         result = subprocess.run(
             [sys.executable, "-c", code],
             capture_output=True,
             text=True,
-            cwd=r"e:\M-Agent-ECRM\agents",
+            cwd=agents_dir,
             env=env,
         )
         assert result.returncode == 0, f"contracts-first import failed: {result.stderr}"
@@ -1288,14 +1289,15 @@ class TestExecutionUsageForwardReference:
             "assert len(u.attempt_usage_records) == 1; "
             "print('OK')"
         )
-        src_path = str(Path(__file__).resolve().parents[3] / "src")
+        agents_dir = str(Path(__file__).resolve().parents[3])
+        src_path = str(Path(agents_dir) / "src")
         env = os.environ.copy()
         env["PYTHONPATH"] = src_path + os.pathsep + env.get("PYTHONPATH", "")
         result = subprocess.run(
             [sys.executable, "-c", code],
             capture_output=True,
             text=True,
-            cwd=r"e:\M-Agent-ECRM\agents",
+            cwd=agents_dir,
             env=env,
         )
         assert result.returncode == 0, f"usage-first import failed: {result.stderr}"
