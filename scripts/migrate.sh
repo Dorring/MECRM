@@ -276,10 +276,19 @@ SQL
 }
 
 run_prisma_migrate() {
-  require npx
   [[ -d "${GATEWAY_DIR}/prisma" ]] || { err "gateway prisma dir not found: ${GATEWAY_DIR}/prisma"; exit 1; }
   log "Prisma migrate deploy (schema source: ${GATEWAY_DIR}/prisma/schema.prisma)"
-  ( cd "${GATEWAY_DIR}" && npx prisma migrate deploy )
+  # Prefer the locally-installed prisma binary (no npm/npx needed at runtime,
+  # which avoids shipping npm's transitive deps incl. tar in the Docker image).
+  local prisma_bin="${GATEWAY_DIR}/node_modules/.bin/prisma"
+  if [[ -x "${prisma_bin}" ]]; then
+    ( cd "${GATEWAY_DIR}" && "${prisma_bin}" migrate deploy )
+  elif command -v npx >/dev/null 2>&1; then
+    ( cd "${GATEWAY_DIR}" && npx prisma migrate deploy )
+  else
+    err "neither local prisma binary nor npx found"
+    exit 1
+  fi
 }
 
 run_sql_migrations() {
