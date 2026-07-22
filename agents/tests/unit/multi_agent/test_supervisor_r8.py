@@ -420,7 +420,12 @@ class TestExplicitAttemptDisposition:
         requires an explicit :class:`AgentInvocationOutcome` from the
         Invoker.  The static ``never_calls_provider`` capability is no
         longer sufficient — the Invoker must explicitly attest it via
-        an Outcome (e.g. via :class:`AgentInvocationFailure`)."""
+        an Outcome (e.g. via :class:`AgentInvocationFailure`).
+
+        R10 P0-1: the Accountant VALIDATES ``NO_PROVIDER_CALL`` against
+        ``invoker_capabilities.never_calls_provider``.  The test must
+        pass capabilities with ``never_calls_provider=True`` so the
+        attestation is accepted."""
         from multi_agent.invocation import AgentInvocationOutcome
 
         budget = ExecutionBudget()
@@ -431,10 +436,19 @@ class TestExplicitAttemptDisposition:
             token_disposition=AttemptUsageDisposition.NO_PROVIDER_CALL,
             cost_disposition=AttemptUsageDisposition.NO_PROVIDER_CALL,
         )
+        # R10 P0-1: pass capabilities with never_calls_provider=True so
+        # the NO_PROVIDER_CALL attestation is validated and accepted.
+        deterministic_caps = UsageVerificationCapabilities(
+            verifies_tokens=False,
+            verifies_cost=False,
+            source_id="deterministic_invoker",
+            never_calls_provider=True,
+        )
         accountant.record_usage_unavailable(
             task_id="t1",
             attempt=0,
             outcome=outcome,
+            invoker_capabilities=deterministic_caps,
         )
         record = accountant.last_attempt_record
         assert record is not None
@@ -553,9 +567,16 @@ class TestPerDimensionSourceBinding:
 
     def test_unverified_receipt_not_rejected_by_unrelated_bound_source(self):
         """A receipt with ``token_disposition=UNAVAILABLE`` (not
-        VERIFIED) and a ``token_source_id`` that is NOT in the invoker's
-        ``bound_token_source_ids`` must NOT be rejected — unverified
-        dimensions are not checked against bound sources."""
+        VERIFIED) must NOT be rejected by the invoker's
+        ``bound_token_source_ids`` — unverified dimensions are not
+        checked against bound sources.
+
+        R10 P0-5: ``UNAVAILABLE`` requires ``token_source_id=None`` (no
+        source at all).  The previous ``token_source_id='some_other_source'``
+        is no longer constructible.  The test still verifies that an
+        UNAVAILABLE receipt with an invoker that has bound sources is
+        NOT rejected — the source binding check is skipped for
+        UNAVAILABLE dimensions."""
         budget = ExecutionBudget()
         accountant = _BudgetAccountant(budget, start_monotonic=time.monotonic())
         task = _make_task()
@@ -565,7 +586,7 @@ class TestPerDimensionSourceBinding:
             tokens_used=None,
             cost_usd=None,
             usage_provenance=UsageProvenance(
-                token_source_id="some_other_source",
+                token_source_id=None,
                 tokens_verified=False,
                 cost_verified=False,
             ),
@@ -840,6 +861,8 @@ class TestAtomicAccounting:
         # 3. NO_PROVIDER_CALL via record_usage_unavailable with an
         # explicit Outcome (R9 Section 3: capability-based inference
         # is no longer accepted — only an explicit Outcome attests it).
+        # R10 P0-1: pass capabilities with never_calls_provider=True so
+        # the NO_PROVIDER_CALL attestation is validated and accepted.
         from multi_agent.invocation import AgentInvocationOutcome
 
         no_call_outcome = AgentInvocationOutcome(
@@ -848,10 +871,17 @@ class TestAtomicAccounting:
             token_disposition=AttemptUsageDisposition.NO_PROVIDER_CALL,
             cost_disposition=AttemptUsageDisposition.NO_PROVIDER_CALL,
         )
+        deterministic_caps = UsageVerificationCapabilities(
+            verifies_tokens=False,
+            verifies_cost=False,
+            source_id="deterministic_invoker",
+            never_calls_provider=True,
+        )
         accountant.record_usage_unavailable(
             task_id=task.task_id,
             attempt=2,
             outcome=no_call_outcome,
+            invoker_capabilities=deterministic_caps,
         )
 
         assert len(accountant._attempt_records) == 3

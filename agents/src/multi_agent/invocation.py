@@ -19,6 +19,7 @@ Supervisor stay unchanged.
 
 from __future__ import annotations
 
+import warnings
 from decimal import Decimal
 from typing import Any, Callable, Protocol
 
@@ -51,6 +52,7 @@ from multi_agent.usage import (
     UsageVerificationCapabilities,
     VerifiedUsage,
     get_usage_capabilities,
+    validate_usage_dimension,
 )
 
 # R9 Section 7: legacy trust↔provenance conversion helpers are now
@@ -65,8 +67,8 @@ from multi_agent.usage import _provenance_to_trust, _TRUST_TO_PROVENANCE
 
 
 class AgentInvocationOutcome(StrictContract):
-    """R9 Section 2: Unified outcome for BOTH success and failure
-    invocation paths.
+    """R9 Section 2 / R10 P0-2/P0-5: Unified outcome for BOTH success
+    and failure invocation paths.
 
     Success path: the Invoker returns an :class:`AgentInvocationReceipt`;
     the Supervisor wraps it into an Outcome with ``result=receipt.result``
@@ -78,7 +80,7 @@ class AgentInvocationOutcome(StrictContract):
     produce an Outcome with ``observed_tool_calls=None`` (unknown) and
     ``UNAVAILABLE`` dispositions — the Runtime fails closed.
 
-    Key R9 invariants:
+    Key invariants:
 
     * ``observed_tool_calls`` is ``None`` when the actual count is
       UNKNOWN (e.g. timeout, exception before any receipt).  It is
@@ -90,12 +92,22 @@ class AgentInvocationOutcome(StrictContract):
       is the safe default when the Invoker cannot attest anything.
     * ``token_source_id`` / ``cost_source_id`` are non-None only when
       the corresponding disposition is ``VERIFIED`` (R9 Section 6).
+
+    R10 P0-2: ``observed_tool_calls`` is constrained to ``ge=0`` and,
+    when ``result`` is present, MUST equal ``len(result.tool_calls)``.
+    A failure Outcome can no longer under-report, negative-report, or
+    hide tool calls that are visible in the Result.
+
+    R10 P0-5: per-dimension invariants are enforced by the shared
+    :func:`validate_usage_dimension` function — the SAME authority used
+    by :class:`AttemptUsageRecord`, :class:`AgentInvocationReceipt`,
+    and :class:`TaskAttemptRecord`.
     """
 
     result: AgentResult | None = None
     error_code: str | None = None
 
-    observed_tool_calls: int | None = None
+    observed_tool_calls: int | None = Field(default=None, ge=0)
 
     token_disposition: AttemptUsageDisposition = AttemptUsageDisposition.UNAVAILABLE
     cost_disposition: AttemptUsageDisposition = AttemptUsageDisposition.UNAVAILABLE
@@ -105,6 +117,38 @@ class AgentInvocationOutcome(StrictContract):
 
     token_source_id: str | None = None
     cost_source_id: str | None = None
+
+    @model_validator(mode="after")
+    def _enforce_outcome_invariants(self) -> "AgentInvocationOutcome":
+        # R10 P0-2: when a Result is present, observed_tool_calls MUST
+        # match len(result.tool_calls).  A failure Outcome cannot
+        # under-report or hide tool calls that are visible in the
+        # Result — the Invoker boundary is the trusted source.
+        if self.result is not None and self.observed_tool_calls is not None:
+            actual = len(self.result.tool_calls)
+            if self.observed_tool_calls != actual:
+                raise ValueError(
+                    f"AgentInvocationOutcome.observed_tool_calls="
+                    f"{self.observed_tool_calls} does not match "
+                    f"len(result.tool_calls)={actual} — a failure Outcome "
+                    f"cannot under-report or hide tool calls (R10 P0-2)"
+                )
+        # R10 P0-5: enforce per-dimension invariants via the shared
+        # function so Outcome, Receipt, Record, and AttemptRecord all
+        # follow the SAME rules.
+        validate_usage_dimension(
+            "token",
+            self.token_disposition,
+            self.tokens_used,
+            self.token_source_id,
+        )
+        validate_usage_dimension(
+            "cost",
+            self.cost_disposition,
+            self.cost_usd,
+            self.cost_source_id,
+        )
+        return self
 
 
 class AgentInvocationFailure(Exception):
@@ -207,6 +251,31 @@ class AgentInvocationReceipt(StrictContract):
     # ``ValidationError`` (even when the derived trust matches).
     usage_trust: UsageTrustLevel = Field(default="unverified")
 
+    @model_validator(mode="after")
+    def _enforce_receipt_dimension_invariants(self) -> "AgentInvocationReceipt":
+        # R10 P0-5: enforce per-dimension invariants via the shared
+        # function so the Receipt follows the SAME rules as
+        # AttemptUsageRecord, AgentInvocationOutcome, and
+        # TaskAttemptRecord.  The R9 carve-out that allowed numeric 0
+        # alongside UNAVAILABLE / NO_PROVIDER_CALL is REMOVED.
+        #
+        # The Receipt's per-dimension source ids live on the nested
+        # ``usage_provenance`` object (``token_source_id`` /
+        # ``cost_source_id``), not as top-level fields.
+        validate_usage_dimension(
+            "token",
+            self.token_disposition,
+            self.tokens_used,
+            self.usage_provenance.token_source_id,
+        )
+        validate_usage_dimension(
+            "cost",
+            self.cost_disposition,
+            self.cost_usd,
+            self.usage_provenance.cost_source_id,
+        )
+        return self
+
     @model_validator(mode="before")
     @classmethod
     def _sync_trust_provenance(cls, data: Any) -> Any:
@@ -248,7 +317,15 @@ class AgentInvocationReceipt(StrictContract):
                 data = dict(data)
                 data["usage_trust"] = _provenance_to_trust(prov_obj)
         elif prov is None and trust is not None:
-            # Legacy code: derive provenance from trust.
+            # Legacy code: derive provenance from trust.  R10 Sync 6:
+            # emit a DeprecationWarning so callers know to migrate.
+            warnings.warn(
+                "AgentInvocationReceipt.usage_trust is deprecated; "
+                "use usage_provenance with explicit per-dimension "
+                "source_id fields (R10 Sync 6).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             data = dict(data)
             data["usage_provenance"] = _TRUST_TO_PROVENANCE.get(
                 trust, UsageProvenance(source_id=str(trust))
@@ -486,14 +563,20 @@ class RegistryAgentInvoker:
         # that omits ``provider_metadata`` triggers fail-closed when a
         # budget is configured — it cannot self-attest "no provider
         # call" by simply leaving the field empty.
-        if result.provider_metadata is not None:
-            tokens_used: int | None = result.token_usage.total_tokens
-        else:
-            tokens_used = None
+        #
+        # R10 P0-5: ``tokens_used`` MUST be ``None`` when
+        # ``token_disposition=UNAVAILABLE`` — the strict per-dimension
+        # invariant (shared with AttemptUsageRecord and
+        # AgentInvocationOutcome) no longer allows a numeric value
+        # alongside UNAVAILABLE.  The Handler's self-reported
+        # ``result.token_usage.total_tokens`` is untrusted and must NOT
+        # be carried on the Receipt when the dimension is UNAVAILABLE.
+        # It remains accessible via ``receipt.result.token_usage`` for
+        # diagnostic purposes.
         return AgentInvocationReceipt(
             result=result,
             tool_calls=len(result.tool_calls),
-            tokens_used=tokens_used,
+            tokens_used=None,
             cost_usd=None,
             usage_provenance=UsageProvenance(
                 token_source_id=None,
@@ -674,22 +757,20 @@ def validate_invocation_receipt(receipt: AgentInvocationReceipt) -> None:
     # R6 P0-1: when tokens_verified=True, the verifier's tokens_used
     # is authoritative and may differ from the Handler's self-reported
     # total_tokens.  Skip the consistency check in that case.
-    # When tokens_verified=False but provider_metadata is present,
-    # the Handler's self-reported tokens must match the receipt.
+    # R10 P0-5: ``receipt.tokens_used`` is now ONLY non-None when
+    # ``token_disposition=VERIFIED`` (enforced by the Receipt's
+    # model_validator via :func:`validate_usage_dimension`).  The
+    # previous consistency check for the UNAVAILABLE path is no longer
+    # needed because unverified Handler self-reported tokens are no
+    # longer carried on the Receipt.
     if (
         result.provider_metadata is not None
         and receipt.tokens_used is not None
-        and not receipt.usage_provenance.tokens_verified
+        and receipt.usage_provenance.tokens_verified
     ):
-        actual_tokens = result.token_usage.total_tokens
-        if receipt.tokens_used != actual_tokens:
-            raise InvalidInvocationReceiptError(
-                f"receipt.tokens_used={receipt.tokens_used} does not "
-                f"match result.token_usage.total_tokens={actual_tokens} "
-                f"(provider_metadata is present and tokens are not "
-                f"verifier-attested, so Handler self-report is "
-                f"authoritative)"
-            )
+        # VERIFIED path — the verifier's value is authoritative; no
+        # consistency check against the Handler's self-report.
+        pass
 
     # R6 P0-4: ``tokens_verified=True`` provenance requires the
     # provider metadata to actually be present.  A receipt that claims
@@ -709,55 +790,13 @@ def validate_invocation_receipt(receipt: AgentInvocationReceipt) -> None:
     # ensures the receipt's ``cost_verified`` does not exceed the
     # invoker's ``verifies_cost`` capability.
 
-    # R8 P0-1: validate that the explicit per-attempt dispositions on
-    # the Receipt are consistent with the provenance flags.  The
-    # Invoker is the trusted boundary that declares these; the
-    # Accountant validates them against Invoker capabilities.  Here
-    # we only check internal Receipt consistency.
-    if receipt.token_disposition == AttemptUsageDisposition.VERIFIED:
-        if not receipt.usage_provenance.tokens_verified:
-            raise InvalidInvocationReceiptError(
-                "receipt.token_disposition=VERIFIED but "
-                "usage_provenance.tokens_verified=False — a VERIFIED "
-                "disposition requires the corresponding provenance flag"
-            )
-        if receipt.tokens_used is None:
-            raise InvalidInvocationReceiptError(
-                "receipt.token_disposition=VERIFIED but tokens_used is "
-                "None — a VERIFIED token disposition requires a "
-                "non-None tokens_used value"
-            )
-    if receipt.cost_disposition == AttemptUsageDisposition.VERIFIED:
-        if not receipt.usage_provenance.cost_verified:
-            raise InvalidInvocationReceiptError(
-                "receipt.cost_disposition=VERIFIED but "
-                "usage_provenance.cost_verified=False — a VERIFIED "
-                "disposition requires the corresponding provenance flag"
-            )
-        if receipt.cost_usd is None:
-            raise InvalidInvocationReceiptError(
-                "receipt.cost_disposition=VERIFIED but cost_usd is "
-                "None — a VERIFIED cost disposition requires a "
-                "non-None cost_usd value"
-            )
-    # R8 P0-1: NO_PROVIDER_CALL dispositions must not carry usage
-    # values — if no provider call was made, there is no usage to
-    # report.  A Receipt that declares NO_PROVIDER_CALL but also
-    # reports tokens_used/cost_usd is internally inconsistent.
-    if receipt.token_disposition == AttemptUsageDisposition.NO_PROVIDER_CALL:
-        if receipt.tokens_used is not None and receipt.tokens_used != 0:
-            raise InvalidInvocationReceiptError(
-                "receipt.token_disposition=NO_PROVIDER_CALL but "
-                f"tokens_used={receipt.tokens_used} — no provider "
-                "call means no token usage"
-            )
-    if receipt.cost_disposition == AttemptUsageDisposition.NO_PROVIDER_CALL:
-        if receipt.cost_usd is not None and receipt.cost_usd != Decimal("0"):
-            raise InvalidInvocationReceiptError(
-                "receipt.cost_disposition=NO_PROVIDER_CALL but "
-                f"cost_usd={receipt.cost_usd} — no provider call "
-                "means no cost usage"
-            )
+    # R10 P0-5: per-dimension invariants (VERIFIED requires value +
+    # source; NO_PROVIDER_CALL / UNAVAILABLE require value=None +
+    # source=None) are now enforced by the Receipt's model_validator
+    # via the shared :func:`validate_usage_dimension` function.  The
+    # explicit VERIFIED / NO_PROVIDER_CALL checks that previously lived
+    # here are redundant and have been removed to avoid drift between
+    # two enforcement sites.
 
 
 __all__ = [
@@ -776,4 +815,5 @@ __all__ = [
     "VerifiedUsage",
     "get_usage_capabilities",
     "validate_invocation_receipt",
+    "validate_usage_dimension",
 ]

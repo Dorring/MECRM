@@ -67,13 +67,13 @@ _TRUSTED_TOKEN_CAPS = UsageVerificationCapabilities(
     verifies_tokens=True,
     verifies_cost=False,
     source_id="test_trusted_token_invoker",
-    bound_source_ids=frozenset({"test_trusted_token_invoker"}),
+    bound_token_source_ids=frozenset({"test_trusted_token_invoker"}),
 )
 _TRUSTED_COST_CAPS = UsageVerificationCapabilities(
     verifies_tokens=False,
     verifies_cost=True,
     source_id="test_trusted_cost_invoker",
-    bound_source_ids=frozenset({"test_trusted_cost_invoker"}),
+    bound_cost_source_ids=frozenset({"test_trusted_cost_invoker"}),
 )
 _UNVERIFIED_CAPS = UsageVerificationCapabilities(
     verifies_tokens=False,
@@ -589,7 +589,12 @@ class TestBudgetEnforcement:
             result=_make_result(),
             tool_calls=0,
             tokens_used=None,  # fail-closed
-            usage_trust="verified_provider",
+            # R10 P0-5: do not set usage_trust="verified_provider" here —
+            # that would derive token_source_id='verified_provider' which
+            # conflicts with the default token_disposition=UNAVAILABLE
+            # (UNAVAILABLE requires value=None AND source_id=None).  The
+            # test's intent is to verify that None usage fails closed,
+            # not to test verified-provider behaviour.
         )
         # R9 Section 1: commit-then-check — no exception raised.
         acc.record_receipt(
@@ -613,7 +618,9 @@ class TestBudgetEnforcement:
             result=_make_result(),
             tool_calls=0,
             cost_usd=None,  # fail-closed
-            usage_trust="trusted_adapter",
+            # R10 P0-5: do not set usage_trust="trusted_adapter" here —
+            # that would derive cost_source_id='trusted_adapter' which
+            # conflicts with the default cost_disposition=UNAVAILABLE.
         )
         acc.record_receipt(
             receipt,

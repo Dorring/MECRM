@@ -725,7 +725,11 @@ class TestPerAttemptNoProviderCall:
         :class:`AgentInvocationFailure` with an explicit
         ``NO_PROVIDER_CALL`` Outcome produces a record with
         ``NO_PROVIDER_CALL`` dispositions — the Outcome is the
-        authoritative attestation."""
+        authoritative attestation.
+
+        R10 P0-1: the Accountant VALIDATES ``NO_PROVIDER_CALL`` against
+        ``invoker_capabilities.never_calls_provider``.  The test must
+        pass capabilities with ``never_calls_provider=True``."""
         budget = ExecutionBudget()
         accountant = _BudgetAccountant(budget, start_monotonic=time.monotonic())
         outcome = AgentInvocationOutcome(
@@ -738,6 +742,7 @@ class TestPerAttemptNoProviderCall:
             task_id="t1",
             attempt=0,
             outcome=outcome,
+            invoker_capabilities=_DETERMINISTIC_CAPS,
         )
         record = accountant.last_attempt_record
         assert record is not None
@@ -773,7 +778,12 @@ class TestPerAttemptNoProviderCall:
     def test_no_receipt_requires_attempt_outcome(self):
         """When ``record_usage_unavailable`` is called with an Outcome
         that has ``NO_PROVIDER_CALL``, the record reflects it.  When
-        called WITHOUT an Outcome, it defaults to ``UNAVAILABLE``."""
+        called WITHOUT an Outcome, it defaults to ``UNAVAILABLE``.
+
+        R10 P0-1: the Accountant VALIDATES ``NO_PROVIDER_CALL`` against
+        ``invoker_capabilities.never_calls_provider``.  The test must
+        pass capabilities with ``never_calls_provider=True`` for the
+        Outcome-based path."""
         budget = ExecutionBudget()
         accountant_a = _BudgetAccountant(budget, start_monotonic=time.monotonic())
         accountant_b = _BudgetAccountant(budget, start_monotonic=time.monotonic())
@@ -785,7 +795,12 @@ class TestPerAttemptNoProviderCall:
             token_disposition=AttemptUsageDisposition.NO_PROVIDER_CALL,
             cost_disposition=AttemptUsageDisposition.NO_PROVIDER_CALL,
         )
-        accountant_a.record_usage_unavailable(task_id="t1", attempt=0, outcome=outcome)
+        accountant_a.record_usage_unavailable(
+            task_id="t1",
+            attempt=0,
+            outcome=outcome,
+            invoker_capabilities=_DETERMINISTIC_CAPS,
+        )
         rec_a = accountant_a.last_attempt_record
         assert rec_a is not None
         assert rec_a.token_disposition == AttemptUsageDisposition.NO_PROVIDER_CALL
@@ -1086,11 +1101,18 @@ class TestLegacyTrustAlwaysConflict:
 
     def test_provenance_alone_is_accepted(self):
         """Providing ONLY ``usage_provenance`` is the preferred path —
-        ``usage_trust`` is derived from it."""
+        ``usage_trust`` is derived from it.
+
+        R10 P0-5: when ``tokens_verified=True`` and ``cost_verified=True``,
+        the dispositions must be ``VERIFIED`` (not the default
+        ``UNAVAILABLE``) and the corresponding values must be non-None.
+        """
         task = _make_task()
         receipt = AgentInvocationReceipt(
             result=_ok_result(task=task),
             tool_calls=0,
+            tokens_used=100,
+            cost_usd=Decimal("0.50"),
             usage_provenance=UsageProvenance(
                 source_id="verifier",
                 token_source_id="verifier",
@@ -1098,6 +1120,8 @@ class TestLegacyTrustAlwaysConflict:
                 tokens_verified=True,
                 cost_verified=True,
             ),
+            token_disposition=AttemptUsageDisposition.VERIFIED,
+            cost_disposition=AttemptUsageDisposition.VERIFIED,
         )
         # R9: ``_provenance_to_trust`` returns ``trusted_adapter`` when
         # ``cost_verified=True`` (cost is checked first), even when

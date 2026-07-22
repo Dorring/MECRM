@@ -500,7 +500,7 @@ class _TrustedTokenInvoker:
             verifies_tokens=True,
             verifies_cost=False,
             source_id="test_trusted_token_invoker",
-            bound_source_ids=frozenset({"test_trusted_token_invoker"}),
+            bound_token_source_ids=frozenset({"test_trusted_token_invoker"}),
         )
 
     def __init__(self, tokens_used: int) -> None:
@@ -552,7 +552,7 @@ class _TrustedCostAdapterInvoker:
             verifies_tokens=False,
             verifies_cost=True,
             source_id="test_trusted_cost_adapter_invoker",
-            bound_source_ids=frozenset({"test_trusted_cost_adapter_invoker"}),
+            bound_cost_source_ids=frozenset({"test_trusted_cost_adapter_invoker"}),
         )
 
     def __init__(self, cost_usd: Decimal) -> None:
@@ -578,9 +578,14 @@ class _TrustedCostAdapterInvoker:
 
 
 class _UnverifiedZeroCostInvoker:
-    """R3 P0-4: an untrusted invoker that reports ``cost_usd=0`` with
-    ``usage_trust='unverified'``.  A configured ``cost_budget_usd``
-    must fail closed — the zero value cannot be trusted."""
+    """R3 P0-4: an untrusted invoker that reports ``cost_usd=None``
+    with ``usage_trust='unverified'``.  A configured ``cost_budget_usd``
+    must fail closed — the unverified source cannot be trusted.
+
+    R10 P0-5: the previous ``cost_usd=Decimal('0')`` is no longer
+    valid alongside the default ``cost_disposition=UNAVAILABLE`` —
+    ``0`` is a real value that must only appear with ``VERIFIED``.
+    Unverified cost is now ``None``."""
 
     async def invoke(
         self, handler: Any, task: AgentTask, ctx: AgentExecutionContext
@@ -589,7 +594,7 @@ class _UnverifiedZeroCostInvoker:
         return AgentInvocationReceipt(
             result=result,
             tool_calls=len(result.tool_calls),
-            cost_usd=Decimal("0"),
+            cost_usd=None,
             usage_trust="unverified",
         )
 
@@ -597,7 +602,13 @@ class _UnverifiedZeroCostInvoker:
 class _UnverifiedPositiveCostInvoker:
     """R3 P0-4: an untrusted invoker that reports a *positive*
     ``cost_usd`` with ``usage_trust='unverified'``.  Even a positive
-    value from an unverified source must fail closed."""
+    value from an unverified source must fail closed.
+
+    R10 P0-5: the previous ``cost_usd=self._cost_usd`` is no longer
+    valid alongside the default ``cost_disposition=UNAVAILABLE`` —
+    any non-None value requires ``VERIFIED``.  The invoker now reports
+    ``None``; the test still verifies that an unverified source with a
+    configured budget fails closed."""
 
     def __init__(self, cost_usd: Decimal) -> None:
         self._cost_usd = cost_usd
@@ -609,15 +620,20 @@ class _UnverifiedPositiveCostInvoker:
         return AgentInvocationReceipt(
             result=result,
             tool_calls=len(result.tool_calls),
-            cost_usd=self._cost_usd,
+            cost_usd=None,
             usage_trust="unverified",
         )
 
 
 class _UnverifiedZeroTokensInvoker:
-    """R3 P0-4: an untrusted invoker that reports ``tokens_used=0``
+    """R3 P0-4: an untrusted invoker that reports ``tokens_used=None``
     with ``usage_trust='unverified'``.  A configured ``token_budget``
-    must fail closed — the zero value cannot be trusted."""
+    must fail closed — the unverified source cannot be trusted.
+
+    R10 P0-5: the previous ``tokens_used=0`` is no longer valid
+    alongside the default ``token_disposition=UNAVAILABLE`` — ``0``
+    is a real value that must only appear with ``VERIFIED``.
+    Unverified tokens are now ``None``."""
 
     async def invoke(
         self, handler: Any, task: AgentTask, ctx: AgentExecutionContext
@@ -626,7 +642,7 @@ class _UnverifiedZeroTokensInvoker:
         return AgentInvocationReceipt(
             result=result,
             tool_calls=len(result.tool_calls),
-            tokens_used=0,
+            tokens_used=None,
             usage_trust="unverified",
         )
 

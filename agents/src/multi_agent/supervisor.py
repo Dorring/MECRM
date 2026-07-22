@@ -91,6 +91,11 @@ from multi_agent.invocation import (
     get_usage_capabilities,
     validate_invocation_receipt,
 )
+from multi_agent.usage import (
+    ERROR_EXECUTION_USAGE_UNAVAILABLE,
+    ERROR_INFRASTRUCTURE_EXCEPTION,
+    ERROR_TOOL_USAGE_UNAVAILABLE,
+)
 from multi_agent.plan_validator import PlanValidator
 from multi_agent.planning import PlanDraft
 from multi_agent.registry import AgentHandler, AgentRegistry
@@ -853,7 +858,7 @@ class _BudgetAccountant:
             # R9 Section 2: tool usage is unknown — fail closed.
             self._tool_usage_unavailable = True
             self._exceeded = True
-            self._exceeded_reason = "tool_usage_unavailable"
+            self._exceeded_reason = ERROR_TOOL_USAGE_UNAVAILABLE
             return
         self._tool_calls += observed
         if self._tool_calls > self._budget.max_tool_calls:
@@ -926,7 +931,7 @@ class _BudgetAccountant:
         if self._check_usage_unavailable(record, self._budget):
             self._usage_unavailable = True
             self._exceeded = True
-            self._exceeded_reason = "execution_usage_unavailable"
+            self._exceeded_reason = ERROR_EXECUTION_USAGE_UNAVAILABLE
         # Post-commit budget overflow check (e.g. the commit pushed
         # the total past the limit).  This does not raise — the record
         # is already committed — but marks the accountant so future
@@ -958,46 +963,41 @@ class _BudgetAccountant:
         invoker_capabilities: UsageVerificationCapabilities | None = None,
         outcome: AgentInvocationOutcome | None = None,
     ) -> None:
-        """R6 P0-3 / R7 P0-2 / R8 P0-4/P0-5 / R9 Section 2/3: record
-        that a committed agent call produced no usable Usage Receipt
-        (timeout, exception, Handler pre-return error, OR invalid
-        receipt).
+        """R6 P0-3 / R7 P0-2 / R8 P0-4/P0-5 / R9 Section 2/3 / R10 P0-1:
+        record that a committed agent call produced no usable Usage
+        Receipt (timeout, exception, Handler pre-return error, OR
+        invalid receipt).
 
-        R9 Section 2/3 (CRITICAL): the dispositions are determined as
-        follows:
+        R10 P0-1 (CRITICAL): when an :class:`AgentInvocationOutcome`
+        declares ``NO_PROVIDER_CALL``, the Accountant now VALIDATES
+        ``invoker_capabilities.never_calls_provider == True``.  A
+        Live/Hybrid Invoker can no longer self-attest ``NO_PROVIDER_CALL``
+        on the failure path — the disposition is rejected and falls back
+        to ``UNAVAILABLE``.
+
+        R10 P0-3: this method is the SIMPLE failure path — it records
+        ``UNAVAILABLE`` (or validated ``NO_PROVIDER_CALL``) for both
+        dimensions.  For failure outcomes that carry ``VERIFIED`` usage
+        (e.g. Token=VERIFIED + Cost=UNAVAILABLE), use
+        :meth:`record_invocation_outcome` instead, which preserves the
+        verified dimension's usage.
+
+        R9 Section 2/3: the dispositions are determined as follows:
 
         * If the caller provides an :class:`AgentInvocationOutcome`
           (via the ``outcome`` parameter — e.g. from an
           :class:`AgentInvocationFailure`), the outcome's explicit
-          ``token_disposition`` / ``cost_disposition`` are used.  This
-          is the ONLY way to record ``NO_PROVIDER_CALL`` on the
-          no-receipt path — the Invoker must explicitly attest it via
-          an Outcome.
+          ``token_disposition`` / ``cost_disposition`` are used.
+          ``NO_PROVIDER_CALL`` is validated against
+          ``invoker_capabilities.never_calls_provider`` (R10 P0-1).
         * If NO outcome is provided (timeout, unknown exception), both
-          dimensions default to ``UNAVAILABLE``.  The Runtime can NO
-          LONGER infer ``NO_PROVIDER_CALL`` from the Invoker's static
-          ``never_calls_provider`` capability alone (R9 Section 3).
-
-        The ``invoker_capabilities`` parameter is retained for API
-        compatibility but is NO LONGER used to infer dispositions.
-        R9 Section 3 removed the
-        ``can_attest_no_provider_call``-based inference because a
-        Hybrid Invoker could set the capability to ``True`` while
-        still making a Provider call before erroring.
+          dimensions default to ``UNAVAILABLE``.
 
         R7 P0-2: this method is also called for invalid receipts
         (receipts that failed :func:`validate_invocation_receipt`).
         An invalid receipt's Token/Cost data cannot be trusted, so
         both dimensions are marked ``UNAVAILABLE`` regardless of
-        Invoker capabilities — the receipt existed but was invalid,
-        so the Invoker's attestation cannot be used.  Observed tool
-        calls are still charged (via
-        :meth:`record_observed_tool_calls`) before this method is
-        called.
-
-        R7 P0-3: both Token and Cost dimensions are counted as
-        applicable for coverage purposes (when ``UNAVAILABLE``).
-        ``NO_PROVIDER_CALL`` dimensions are NOT counted as applicable.
+        Invoker capabilities.
 
         Sets ``_usage_unavailable=True`` and, when a budget is
         configured, ``_exceeded=True`` with reason
@@ -1009,6 +1009,26 @@ class _BudgetAccountant:
         if outcome is not None:
             token_disp = outcome.token_disposition
             cost_disp = outcome.cost_disposition
+            # R10 P0-1: validate NO_PROVIDER_CALL against the Invoker's
+            # frozen capability.  A Live/Hybrid Invoker
+            # (never_calls_provider=False) CANNOT self-attest
+            # NO_PROVIDER_CALL on the failure path — the disposition is
+            # rejected and falls back to UNAVAILABLE.
+            if (
+                token_disp == AttemptUsageDisposition.NO_PROVIDER_CALL
+                or cost_disp == AttemptUsageDisposition.NO_PROVIDER_CALL
+            ):
+                if (
+                    invoker_capabilities is None
+                    or not invoker_capabilities.never_calls_provider
+                ):
+                    # Reject the NO_PROVIDER_CALL attestation — the
+                    # Invoker does not have the capability.  Fall back
+                    # to UNAVAILABLE so the Runtime fails closed.
+                    if token_disp == AttemptUsageDisposition.NO_PROVIDER_CALL:
+                        token_disp = AttemptUsageDisposition.UNAVAILABLE
+                    if cost_disp == AttemptUsageDisposition.NO_PROVIDER_CALL:
+                        cost_disp = AttemptUsageDisposition.UNAVAILABLE
         else:
             # No Outcome available (timeout, unknown exception) —
             # both dimensions are UNAVAILABLE.  R9 Section 3: the
@@ -1043,7 +1063,182 @@ class _BudgetAccountant:
         ):
             self._usage_unavailable = True
             self._exceeded = True
-            self._exceeded_reason = "execution_usage_unavailable"
+            self._exceeded_reason = ERROR_EXECUTION_USAGE_UNAVAILABLE
+
+    def record_invocation_outcome(
+        self,
+        outcome: AgentInvocationOutcome,
+        *,
+        invoker_capabilities: UsageVerificationCapabilities,
+        task_id: str,
+        attempt: int,
+    ) -> None:
+        """R10 P0-3: Unified entry point for a failure
+        :class:`AgentInvocationOutcome` that may carry VERIFIED usage.
+
+        Unlike :meth:`record_usage_unavailable` (which always sets
+        values to None), this method preserves VERIFIED usage from a
+        failure Outcome.  For example, a failure Outcome with
+        ``Token=VERIFIED + Cost=UNAVAILABLE`` will commit the verified
+        token usage and fail closed on the cost dimension — the
+        verified token usage is NOT discarded.
+
+        The method follows the SAME three-phase pipeline as
+        :meth:`record_receipt`:
+
+        1. **Compute** — validate the Outcome's dispositions against
+           Invoker capabilities (VERIFIED requires ``verifies_tokens`` /
+           ``verifies_cost``; NO_PROVIDER_CALL requires
+           ``never_calls_provider``) and source bindings.  Build an
+           :class:`AttemptUsageRecord`.  No state mutation.
+        2. **Commit** — atomic commit via :meth:`_commit_attempt_usage`.
+        3. **Post-commit check** — fail-closed when any dimension is
+           UNAVAILABLE with a configured budget.
+
+        R10 P0-1: NO_PROVIDER_CALL is validated against
+        ``invoker_capabilities.never_calls_provider``.  An invalid
+        attestation raises :class:`ExecutionUsageUnavailableError` so
+        the caller can fall back to :meth:`record_usage_unavailable`.
+
+        Raises :class:`ExecutionUsageUnavailableError` on any
+        validation failure (Trust / Source / Capability mismatch).
+        The caller is responsible for then calling
+        :meth:`record_usage_unavailable` so the attempt still produces
+        exactly one :class:`AttemptUsageRecord`.
+        """
+        token_disp = outcome.token_disposition
+        cost_disp = outcome.cost_disposition
+
+        # R10 P0-1: validate NO_PROVIDER_CALL against the Invoker's
+        # frozen capability.
+        if token_disp == AttemptUsageDisposition.NO_PROVIDER_CALL:
+            if not invoker_capabilities.never_calls_provider:
+                raise ExecutionUsageUnavailableError(
+                    f"outcome.token_disposition=NO_PROVIDER_CALL but invoker "
+                    f"({invoker_capabilities.source_id}) does not have "
+                    f"never_calls_provider=True — a Live/Hybrid Invoker "
+                    f"cannot self-attest no provider call on the failure "
+                    f"path (R10 P0-1)"
+                )
+        if cost_disp == AttemptUsageDisposition.NO_PROVIDER_CALL:
+            if not invoker_capabilities.never_calls_provider:
+                raise ExecutionUsageUnavailableError(
+                    f"outcome.cost_disposition=NO_PROVIDER_CALL but invoker "
+                    f"({invoker_capabilities.source_id}) does not have "
+                    f"never_calls_provider=True — a Live/Hybrid Invoker "
+                    f"cannot self-attest no provider call on the failure "
+                    f"path (R10 P0-1)"
+                )
+
+        # R10 P0-3: validate VERIFIED dispositions against Invoker
+        # capabilities and source bindings — same logic as
+        # _compute_attempt_usage for receipts.
+        if token_disp == AttemptUsageDisposition.VERIFIED:
+            if not invoker_capabilities.verifies_tokens:
+                raise ExecutionUsageUnavailableError(
+                    f"outcome.token_disposition=VERIFIED but invoker "
+                    f"({invoker_capabilities.source_id}) does not have "
+                    f"verifies_tokens=True — outcome cannot self-elevate "
+                    f"token trust above the invoker's capabilities"
+                )
+            if outcome.tokens_used is None:
+                raise ExecutionUsageUnavailableError(
+                    "outcome.token_disposition=VERIFIED but tokens_used "
+                    "is None — a VERIFIED disposition requires a "
+                    "non-None value (R10 P0-3)"
+                )
+            if invoker_capabilities.bound_token_source_ids:
+                src = outcome.token_source_id
+                if src is None:
+                    raise ExecutionUsageUnavailableError(
+                        "outcome token_disposition=VERIFIED but "
+                        "token_source_id is None — R10 P0-3: "
+                        "token_source_id is required"
+                    )
+                if src not in invoker_capabilities.bound_token_source_ids:
+                    raise ExecutionUsageUnavailableError(
+                        f"outcome token_source_id={src!r} is not in the "
+                        f"invoker's bound_token_source_ids "
+                        f"({sorted(invoker_capabilities.bound_token_source_ids)})"
+                    )
+        if cost_disp == AttemptUsageDisposition.VERIFIED:
+            if not invoker_capabilities.verifies_cost:
+                raise ExecutionUsageUnavailableError(
+                    f"outcome.cost_disposition=VERIFIED but invoker "
+                    f"({invoker_capabilities.source_id}) does not have "
+                    f"verifies_cost=True — outcome cannot self-elevate "
+                    f"cost trust above the invoker's capabilities"
+                )
+            if outcome.cost_usd is None:
+                raise ExecutionUsageUnavailableError(
+                    "outcome.cost_disposition=VERIFIED but cost_usd "
+                    "is None — a VERIFIED disposition requires a "
+                    "non-None value (R10 P0-3)"
+                )
+            if invoker_capabilities.bound_cost_source_ids:
+                src = outcome.cost_source_id
+                if src is None:
+                    raise ExecutionUsageUnavailableError(
+                        "outcome cost_disposition=VERIFIED but "
+                        "cost_source_id is None — R10 P0-3: "
+                        "cost_source_id is required"
+                    )
+                if src not in invoker_capabilities.bound_cost_source_ids:
+                    raise ExecutionUsageUnavailableError(
+                        f"outcome cost_source_id={src!r} is not in the "
+                        f"invoker's bound_cost_source_ids "
+                        f"({sorted(invoker_capabilities.bound_cost_source_ids)})"
+                    )
+
+        # Build the AttemptUsageRecord — preserves VERIFIED values.
+        record = AttemptUsageRecord(
+            task_id=task_id,
+            attempt=attempt,
+            token_disposition=token_disp,
+            cost_disposition=cost_disp,
+            tokens_used=outcome.tokens_used
+            if token_disp == AttemptUsageDisposition.VERIFIED
+            else None,
+            cost_usd=outcome.cost_usd
+            if cost_disp == AttemptUsageDisposition.VERIFIED
+            else None,
+            token_source_id=(
+                outcome.token_source_id
+                if token_disp == AttemptUsageDisposition.VERIFIED
+                else None
+            ),
+            cost_source_id=(
+                outcome.cost_source_id
+                if cost_disp == AttemptUsageDisposition.VERIFIED
+                else None
+            ),
+        )
+        # Phase 2: atomic commit (preserves VERIFIED usage).
+        self._commit_attempt_usage(record)
+        # Phase 3: post-commit fail-closed check.
+        if self._check_usage_unavailable(record, self._budget):
+            self._usage_unavailable = True
+            self._exceeded = True
+            self._exceeded_reason = ERROR_EXECUTION_USAGE_UNAVAILABLE
+        # Post-commit budget overflow check.
+        if (
+            self._budget.token_budget is not None
+            and self._tokens_used > self._budget.token_budget
+        ):
+            self._exceeded = True
+            self._exceeded_reason = (
+                f"token_budget exceeded: "
+                f"{self._tokens_used} > {self._budget.token_budget}"
+            )
+        if (
+            self._budget.cost_budget_usd is not None
+            and self._cost_usd > self._budget.cost_budget_usd
+        ):
+            self._exceeded = True
+            self._exceeded_reason = (
+                f"cost_budget_usd exceeded: "
+                f"{self._cost_usd} > {self._budget.cost_budget_usd}"
+            )
 
     def can_start_iteration(self) -> bool:
         """R1 P0-2: check before reserving a new wave.
@@ -1780,15 +1975,53 @@ class SupervisorRuntime:
                 attempt_status = "failed"
                 error_code = "invalid_receipt"
                 invocation_error = exc
-            # R3 P0-2: NO ``except Exception`` catch-all.  Unknown
-            # errors (RuntimeError, TypeError, KeyError, AssertionError,
-            # etc.) are programming/infrastructure failures that must
-            # propagate to the Scheduler's structured-concurrency
-            # boundary so sibling tasks are cancelled and awaited.
-            # Downgrading them to a plain task failure would let
-            # siblings continue running on a corrupted state, and
-            # would hide the real defect behind a generic
-            # ``error_code=RuntimeError`` record.
+            except Exception as infra_exc:
+                # R10 P1-1: Infrastructure Exception Audit.
+                #
+                # R3 P0-2 originally had NO ``except Exception`` catch-all
+                # here — unknown errors (RuntimeError, TypeError, KeyError,
+                # AssertionError, etc.) are programming/infrastructure
+                # failures that must propagate to the Scheduler's
+                # structured-concurrency boundary so sibling tasks are
+                # cancelled and awaited.  Downgrading them to a plain
+                # task failure would let siblings continue running on a
+                # corrupted state.
+                #
+                # R10 P1-1 adds a NARROW ``except Exception`` that does
+                # NOT downgrade the error — it records a fail-closed
+                # UNAVAILABLE usage audit so the invariant "every
+                # committed agent call produces exactly one
+                # AttemptUsageRecord" holds, then RE-RAISES the original
+                # exception so the Scheduler still cancels siblings.
+                #
+                # The agent call was already committed at this point
+                # (``commit_agent_call`` ran before ``invoker.invoke()``),
+                # so ``agent_calls`` is incremented but no
+                # AttemptUsageRecord would be created without this audit.
+                try:
+                    accountant.record_observed_tool_calls(None)
+                    accountant.record_usage_unavailable(
+                        task_id=task.task_id,
+                        attempt=attempt_idx,
+                    )
+                    trace.emit(
+                        TRACE_TASK_FAILED,
+                        task_id=task.task_id,
+                        agent_id=task.agent_id,
+                        data={
+                            "attempt": attempt_idx,
+                            "error_code": ERROR_INFRASTRUCTURE_EXCEPTION,
+                            "error": (f"{type(infra_exc).__name__}: {infra_exc}"),
+                            "infrastructure_exception": True,
+                        },
+                        occurred_at=utc_now(),
+                    )
+                except Exception:
+                    # Best-effort audit — never mask the original
+                    # infrastructure exception with an audit-recording
+                    # failure.
+                    pass
+                raise
 
             attempt_completed_at = utc_now()
             attempt_completed_mono = time.monotonic()
@@ -1903,17 +2136,42 @@ class SupervisorRuntime:
                 # :class:`AgentInvocationOutcome` (from
                 # :class:`AgentInvocationFailure`) can attest
                 # ``NO_PROVIDER_CALL`` on the no-receipt path.
+                #
+                # R10 P0-3: when a failure Outcome is available, use
+                # :meth:`record_invocation_outcome` (the unified entry
+                # point) which preserves VERIFIED usage.  If the Outcome
+                # fails capability/source validation, fall back to
+                # :meth:`record_usage_unavailable` so the attempt still
+                # produces exactly one :class:`AttemptUsageRecord`.
                 if failure_outcome is not None:
                     # R9 Section 2: use the Outcome's observed_tool_calls
                     # (may be a concrete int from before the exception,
                     # or None when unknown).
                     observed_tool_calls = failure_outcome.observed_tool_calls
                     accountant.record_observed_tool_calls(observed_tool_calls)
-                    accountant.record_usage_unavailable(
-                        task_id=task.task_id,
-                        attempt=attempt_idx,
-                        outcome=failure_outcome,
-                    )
+                    # R10 P0-3: try the unified outcome recording first.
+                    # This preserves VERIFIED usage (e.g. Token=VERIFIED
+                    # + Cost=UNAVAILABLE).  If capability/source
+                    # validation fails, fall back to the simple
+                    # UNAVAILABLE path.
+                    try:
+                        accountant.record_invocation_outcome(
+                            failure_outcome,
+                            invoker_capabilities=invoker_caps,
+                            task_id=task.task_id,
+                            attempt=attempt_idx,
+                        )
+                    except ExecutionUsageUnavailableError:
+                        # R10 P0-1/P0-3: the Outcome's dispositions
+                        # failed validation (e.g. a Live Invoker tried
+                        # to declare NO_PROVIDER_CALL, or a VERIFIED
+                        # dimension lacked a valid source).  Fall back
+                        # to UNAVAILABLE so the Runtime fails closed.
+                        accountant.record_usage_unavailable(
+                            task_id=task.task_id,
+                            attempt=attempt_idx,
+                            invoker_capabilities=invoker_caps,
+                        )
                 else:
                     # R9 Section 2: no Outcome available (timeout,
                     # unknown exception).  Tool calls are unknown.
@@ -2183,6 +2441,17 @@ class SupervisorRuntime:
                 # explicit error_code so the audit log distinguishes
                 # the two.  Both are retryable iff result.errors
                 # contain a retryable error.
+                #
+                # R10 P0-4: the TaskAttemptRecord MUST use the
+                # Accountant's committed values
+                # (``attempt_actual_tokens`` / ``attempt_actual_cost``
+                # / ``attempt_token_disp`` / ``attempt_cost_disp`` /
+                # ``attempt_token_src`` / ``attempt_cost_src``) — NOT
+                # the raw Receipt's declared values.  Previously this
+                # branch wrote ``receipt.tokens_used`` /
+                # ``receipt.cost_usd`` without the corresponding
+                # dispositions, causing the audit to publish
+                # unverified values as "Actual Usage".
                 result_retryable = any(err.retryable for err in result.errors)
                 degraded = result.status == "degraded"
                 attempts[-1] = TaskAttemptRecord(
@@ -2200,8 +2469,14 @@ class SupervisorRuntime:
                     ),
                     agent_calls=1,
                     tool_calls=receipt.tool_calls,
-                    tokens_used=receipt.tokens_used,
-                    cost_usd=receipt.cost_usd,
+                    tokens_used=attempt_actual_tokens,
+                    cost_usd=attempt_actual_cost,
+                    token_disposition=attempt_token_disp,
+                    cost_disposition=attempt_cost_disp,
+                    token_source_id=attempt_token_src,
+                    cost_source_id=attempt_cost_src,
+                    declared_tokens_used=None,
+                    declared_cost_usd=None,
                 )
                 trace.emit(
                     TRACE_TASK_FAILED,

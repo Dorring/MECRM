@@ -592,7 +592,7 @@ class _MutableCapsInvoker:
             verifies_tokens=self._verifies_tokens,
             verifies_cost=False,
             source_id="mutable_caps_invoker",
-            bound_source_ids=(
+            bound_token_source_ids=(
                 frozenset({"mutable_caps_invoker"})
                 if self._verifies_tokens
                 else frozenset()
@@ -1095,7 +1095,7 @@ class TestUsageRecordingVsEnforcement:
             verifies_tokens=True,
             verifies_cost=False,
             source_id="test_token_verifier",
-            bound_source_ids=frozenset({"test_token_verifier"}),
+            bound_token_source_ids=frozenset({"test_token_verifier"}),
         )
 
         def factory(
@@ -1130,7 +1130,7 @@ class TestUsageRecordingVsEnforcement:
             verifies_tokens=False,
             verifies_cost=True,
             source_id="test_cost_verifier",
-            bound_source_ids=frozenset({"test_cost_verifier"}),
+            bound_cost_source_ids=frozenset({"test_cost_verifier"}),
         )
 
         def factory(
@@ -1214,7 +1214,7 @@ class TestUsageRecordingVsEnforcement:
             verifies_tokens=True,
             verifies_cost=False,
             source_id="test_token_verifier",
-            bound_source_ids=frozenset({"test_token_verifier"}),
+            bound_token_source_ids=frozenset({"test_token_verifier"}),
         )
 
         def factory(

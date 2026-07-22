@@ -1426,7 +1426,8 @@ class TestPerDimensionUsageProvenance:
             verifies_tokens=True,
             verifies_cost=True,
             source_id="test_both_verifier",
-            bound_source_ids=frozenset({"test_both_verifier"}),
+            bound_token_source_ids=frozenset({"test_both_verifier"}),
+            bound_cost_source_ids=frozenset({"test_both_verifier"}),
         )
 
         def factory(
@@ -1485,7 +1486,7 @@ class TestPerDimensionUsageProvenance:
             verifies_tokens=True,
             verifies_cost=False,  # Invoker cannot verify cost
             source_id="token_only_verifier",
-            bound_source_ids=frozenset({"token_only_verifier"}),
+            bound_token_source_ids=frozenset({"token_only_verifier"}),
         )
 
         def factory(
@@ -1500,7 +1501,7 @@ class TestPerDimensionUsageProvenance:
                 result=result,
                 tool_calls=len(result.tool_calls),
                 tokens_used=100,
-                cost_usd=Decimal("0.50"),  # claimed cost, but not verified
+                cost_usd=None,  # R10 P0-5: cost not verified → must be None
                 usage_provenance=UsageProvenance(
                     source_id="token_only_verifier",
                     token_source_id="token_only_verifier",
@@ -1537,7 +1538,7 @@ class TestPerDimensionUsageProvenance:
             verifies_tokens=True,
             verifies_cost=False,
             source_id="token_only_invoker",
-            bound_source_ids=frozenset({"token_only_invoker"}),
+            bound_token_source_ids=frozenset({"token_only_invoker"}),
         )
 
         def factory(
@@ -1594,7 +1595,7 @@ class TestPerDimensionUsageProvenance:
             verifies_tokens=False,
             verifies_cost=True,
             source_id="cost_only_invoker",
-            bound_source_ids=frozenset({"cost_only_invoker"}),
+            bound_cost_source_ids=frozenset({"cost_only_invoker"}),
         )
 
         def factory(
@@ -1657,7 +1658,8 @@ class TestPerDimensionUsageProvenance:
             verifies_tokens=True,
             verifies_cost=True,
             source_id="test_cost_record",
-            bound_source_ids=frozenset({"test_cost_record"}),
+            bound_token_source_ids=frozenset({"test_cost_record"}),
+            bound_cost_source_ids=frozenset({"test_cost_record"}),
         )
 
         def factory(
@@ -1952,7 +1954,7 @@ class TestUsageAvailabilityStatus:
             verifies_tokens=True,
             verifies_cost=False,
             source_id="partial_verifier",
-            bound_source_ids=frozenset({"partial_verifier"}),
+            bound_token_source_ids=frozenset({"partial_verifier"}),
         )
 
         call_count = {"n": 0}
@@ -1982,10 +1984,13 @@ class TestUsageAvailabilityStatus:
                 )
             # Unverified tokens (provider_metadata present but no
             # verifier attestation — self-reported).
+            # R10 P0-5: tokens_used must be None when the disposition
+            # is UNAVAILABLE (the default for unverified).  The
+            # self-reported value remains in result.token_usage.
             return AgentInvocationReceipt(
                 result=result,
                 tool_calls=len(result.tool_calls),
-                tokens_used=100,
+                tokens_used=None,
                 usage_provenance=UsageProvenance(
                     source_id="unverified",
                     tokens_verified=False,
@@ -2027,7 +2032,8 @@ class TestUsageAvailabilityStatus:
             verifies_tokens=True,
             verifies_cost=True,
             source_id="full_verifier",
-            bound_source_ids=frozenset({"full_verifier"}),
+            bound_token_source_ids=frozenset({"full_verifier"}),
+            bound_cost_source_ids=frozenset({"full_verifier"}),
         )
 
         def factory(

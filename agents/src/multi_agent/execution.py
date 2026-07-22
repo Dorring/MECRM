@@ -42,7 +42,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Literal, Protocol
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from multi_agent.contracts import (
     AgentCapability,
@@ -57,7 +57,7 @@ from multi_agent.errors import ProposalHashMismatchError
 from multi_agent.execution_errors import InvalidAgentResultError
 from multi_agent.planning import PlanDraft
 from multi_agent.state import MergedState
-from multi_agent.usage import AttemptUsageDisposition
+from multi_agent.usage import AttemptUsageDisposition, validate_usage_dimension
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +160,27 @@ class TaskAttemptRecord(StrictContract):
         if v is not None and v.tzinfo is None:
             raise ValueError("datetime fields must be timezone-aware (UTC)")
         return v
+
+    @model_validator(mode="after")
+    def _enforce_usage_dimension_invariants(self) -> "TaskAttemptRecord":
+        # R10 P0-5: enforce per-dimension invariants via the shared
+        # function so TaskAttemptRecord follows the SAME rules as
+        # AttemptUsageRecord, AgentInvocationOutcome, and
+        # AgentInvocationReceipt.  The ``declared_*`` fields are
+        # explicitly untrusted and are NOT subject to this invariant.
+        validate_usage_dimension(
+            "token",
+            self.token_disposition,
+            self.tokens_used,
+            self.token_source_id,
+        )
+        validate_usage_dimension(
+            "cost",
+            self.cost_disposition,
+            self.cost_usd,
+            self.cost_source_id,
+        )
+        return self
 
 
 _TaskExecutionStatus = Literal[

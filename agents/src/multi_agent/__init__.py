@@ -175,11 +175,25 @@ from multi_agent.invocation import (
     AgentInvocationFailure,
     AgentInvocationOutcome,
     AgentInvoker,
+    DeterministicFakeInvoker,
+    RegistryAgentInvoker,
+    validate_invocation_receipt,
+)
+
+# R10 Sync 1: Usage types are now imported directly from
+# :mod:`multi_agent.usage` (the canonical source) rather than through
+# :mod:`multi_agent.invocation`'s compatibility re-export.  This
+# ensures ``multi_agent.AttemptUsageRecord is multi_agent.usage.AttemptUsageRecord``
+# — there is exactly one definition source.
+from multi_agent.usage import (
+    ERROR_EXECUTION_USAGE_UNAVAILABLE,
+    ERROR_INFRASTRUCTURE_EXCEPTION,
+    ERROR_INVALID_INVOCATION_OUTCOME,
+    ERROR_TOOL_USAGE_UNAVAILABLE,
+    ERROR_USAGE_SOURCE_MISMATCH,
     AttemptUsageDisposition,
     AttemptUsageRecord,
-    DeterministicFakeInvoker,
     ProviderUsageVerifier,
-    RegistryAgentInvoker,
     UsageProvenance,
     # R7 P1-1: DEPRECATED — ``UsageTrustLevel`` is retained for
     # backwards compatibility but new code must use ``UsageProvenance``
@@ -191,7 +205,7 @@ from multi_agent.invocation import (
     UsageVerificationCapabilities,
     VerifiedUsage,
     get_usage_capabilities,
-    validate_invocation_receipt,
+    validate_usage_dimension,
 )
 from multi_agent.run_store import (
     InMemoryRunStore,
@@ -352,18 +366,25 @@ __all__ = [
     "AgentInvocationFailure",
     "AgentInvocationOutcome",
     "AgentInvoker",
+    "DeterministicFakeInvoker",
+    "RegistryAgentInvoker",
+    "validate_invocation_receipt",
+    # Phase 4 — Usage (R10 Sync 1: canonical source is multi_agent.usage)
     "AttemptUsageDisposition",
     "AttemptUsageRecord",
-    "DeterministicFakeInvoker",
+    "ERROR_EXECUTION_USAGE_UNAVAILABLE",
+    "ERROR_INFRASTRUCTURE_EXCEPTION",
+    "ERROR_INVALID_INVOCATION_OUTCOME",
+    "ERROR_TOOL_USAGE_UNAVAILABLE",
+    "ERROR_USAGE_SOURCE_MISMATCH",
     "ProviderUsageVerifier",
-    "RegistryAgentInvoker",
     "UsageProvenance",
     # R7 P1-1: DEPRECATED — use UsageProvenance / AttemptUsageDisposition.
     "UsageTrustLevel",
     "UsageVerificationCapabilities",
     "VerifiedUsage",
     "get_usage_capabilities",
-    "validate_invocation_receipt",
+    "validate_usage_dimension",
     # Phase 4 — Execution Contracts
     "ExecutionBinding",
     "ExecutionCancellation",

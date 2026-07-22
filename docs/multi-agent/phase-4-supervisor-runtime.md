@@ -1,37 +1,58 @@
 # Phase 4: Supervisor Runtime + Dependency-Aware DAG Execution
 
-**Status:** Complete  
+**Status:** Complete (R10)  
+**Revision:** R10  
 **Branch:** `feat/ma-04-supervisor-runtime`  
 **Baseline:** `main` (Phase 3, commit `d586e70`)
 
-> **R9 Revision** — This document reflects the R9 audit fixes (Unified
-> Invocation Outcome + Strict Usage Audit).
-> R1 baseline: commit `e5ab368`. R2 baseline: commit `64fedd1` (5 P0 + 3 P1
-> fixes, request-changes). R3 baseline: commit `5b9c647` (4 P0 + 3 P1 fixes,
-> request-changes). R4 baseline: commit `bc5abd4` (4 P0 + 2 P1 fixes,
-> request-changes). R5 baseline: commit `f2288f8` (5 P0 + 2 P1 fixes,
-> request-changes). R6 baseline: commit `d5fd130` (5 P0 + 2 P1 fixes,
-> request-changes). R7 baseline: commit `1483ad4` (5 P0 + 2 P1 fixes,
-> request-changes). R8 baseline: commit `88a5b6d` (5 P0 + 2 P1 fixes,
-> request-changes). R9 addresses 5 P0 and 3 P1 issues from the R8 review,
-> focused on **unified invocation outcome for success and failure paths,
-> mixed-dimension usage accounting, per-attempt no-provider-call attestation,
-> strict usage audit contracts, and no cross-dimension source fallback**:
-> R9 introduces `AgentInvocationOutcome` / `AgentInvocationFailure` so that
-> BOTH success and failure paths produce a typed outcome with
-> `observed_tool_calls` (None = unknown → fail-closed); `record_receipt()`
-> uses commit-then-check (mixed records with VERIFIED + UNAVAILABLE dimensions
-> are committed, preserving verified usage, THEN `exceeded` is set);
-> `can_attest_no_provider_call` is renamed to `never_calls_provider` (validation
-> only, not inference); shared Usage types are moved to `multi_agent/usage.py`
-> with strict Pydantic types (no `Any`); `AttemptUsageRecord` enforces
-> per-dimension invariants (VERIFIED → value + source_id non-None,
-> NO_PROVIDER_CALL → value None, UNAVAILABLE → value None);
-> per-dimension `token_source_id` / `cost_source_id` are required for VERIFIED
-> with no fallback to legacy `source_id`; legacy `usage_trust` +
-> `usage_provenance` simultaneously is ALWAYS a `ValidationError`; and
-> `VerifiedUsage` no longer carries per-dimension source fields (Choice A —
-> the Invoker uses the Verifier's frozen `source_id`).
+> **R10 Revision** — This document reflects the R10 Unified Outcome Validation
+> Hotfix.  R10 closes five P0 Contract vulnerabilities and two P1 cleanup items
+> from the R9 review, plus seven horizontal sync requirements:
+>
+> * **P0-1**: Failure Outcome `NO_PROVIDER_CALL` is validated against the
+>   Invoker's frozen `never_calls_provider` capability — Live/Hybrid Invokers
+>   cannot self-attest no-provider-call on the failure path.
+> * **P0-2**: `observed_tool_calls` is constrained to `ge=0` and, when a
+>   Result is present, MUST equal `len(result.tool_calls)` — no under-reporting,
+>   negative-reporting, or hiding of tool calls.
+> * **P0-3**: Unified `record_invocation_outcome()` preserves VERIFIED usage
+>   from failure Outcomes (e.g. Token=VERIFIED + Cost=UNAVAILABLE) through the
+>   same Capability → Source Binding → Commit → Fail-Closed pipeline as
+>   `record_receipt()`.
+> * **P0-4**: Failed/Degraded `TaskAttemptRecord` uses the Accountant's
+>   committed values and dispositions, NOT the raw Receipt's declared values.
+> * **P0-5**: A single pure function `validate_usage_dimension()` is the ONLY
+>   authority for per-dimension (disposition, value, source_id) invariants,
+>   shared by `AttemptUsageRecord`, `AgentInvocationOutcome`,
+>   `AgentInvocationReceipt`, and `TaskAttemptRecord`.  The R9 carve-out that
+>   allowed numeric `0` alongside `UNAVAILABLE`/`NO_PROVIDER_CALL` is REMOVED.
+> * **P1-1**: Infrastructure exceptions (unknown `Exception`) propagate to the
+>   Scheduler but record an UNAVAILABLE `AttemptUsageRecord` before re-raising,
+>   ensuring every committed Agent Call has exactly one Usage Record.
+> * **P1-2**: `UsageVerificationCapabilities.bound_source_ids` is NO LONGER
+>   mirrored into `bound_token_source_ids` / `bound_cost_source_ids` — the two
+>   per-dimension sets are the sole authority.
+> * **Sync 1**: Usage types are publicly exported from `multi_agent.usage`;
+>   Invocation types from `multi_agent.invocation`.
+> * **Sync 2**: `ExecutionUsage` forward reference resolves regardless of
+>   import order (contracts-first or usage-first).
+> * **Sync 3**: RunStore cache round-trip preserves dispositions, Decimal cost,
+>   None tool calls, and mixed-dimension usage.
+> * **Sync 4**: LangGraph Adapter propagates usage audit without duplicating
+>   Accountant logic.
+> * **Sync 5**: Stable error-code constants (`ERROR_TOOL_USAGE_UNAVAILABLE`,
+>   `ERROR_EXECUTION_USAGE_UNAVAILABLE`, `ERROR_INVALID_INVOCATION_OUTCOME`,
+>   `ERROR_INFRASTRUCTURE_EXCEPTION`, `ERROR_USAGE_SOURCE_MISMATCH`) are
+>   defined in `multi_agent.usage` and shared by all consumers.
+> * **Sync 6**: Legacy `usage_trust` input emits `DeprecationWarning`;
+>   production runtime no longer reads `usage_trust`; `bound_source_ids`
+>   migrated to per-dimension fields in all tests.
+> * **Sync 7**: PR #112 title updated to "Phase 4: Supervisor Runtime and
+>   Dependency-Aware DAG Execution"; this document updated to R10 final state.
+>
+> R10 does NOT modify `PLANNER_VERSION` or Phase 3 Spec Version — R10 changes
+> Phase 4 Execution Contracts, Usage Accounting, Invocation Outcome, and Audit
+> Schema only.
 
 ---
 
@@ -2294,4 +2315,185 @@ class ProviderUsageVerifier(Protocol):
         provider_metadata: ProviderMetadata,
         token_usage: TokenUsage,
     ) -> VerifiedUsage: ...
+```
+
+---
+
+## 附录 C: R10 Unified Outcome Validation Hotfix
+
+R10 closes five P0 Contract vulnerabilities and two P1 cleanup items from the
+R9 review, plus seven horizontal sync requirements.  The core principle:
+**failure Outcomes and success Receipts are subject to the SAME Capability,
+Source, Value, and Tool Usage invariants.**
+
+### C.1 Failure NO_PROVIDER_CALL Capability Validation (P0-1)
+
+`record_invocation_outcome()` and `record_usage_unavailable()` validate
+`NO_PROVIDER_CALL` dispositions against the Invoker's frozen
+`never_calls_provider` capability:
+
+```text
+never_calls_provider=True
+  + Outcome declares NO_PROVIDER_CALL
+  → accepted
+
+never_calls_provider=False (Live/Hybrid)
+  + Outcome declares NO_PROVIDER_CALL
+  → rejected (ExecutionUsageUnavailableError)
+```
+
+`record_usage_unavailable()` silently downgrades an invalid `NO_PROVIDER_CALL`
+to `UNAVAILABLE` (best-effort audit), while `record_invocation_outcome()`
+rejects it outright (fail-closed).
+
+### C.2 Strict Failure Tool Usage Validation (P0-2)
+
+`AgentInvocationOutcome.observed_tool_calls` is constrained to `ge=0` and,
+when a Result is present, MUST equal `len(result.tool_calls)`:
+
+```python
+observed_tool_calls: int | None = Field(default=None, ge=0)
+
+@model_validator(mode="after")
+def _enforce_outcome_invariants(self):
+    if self.result is not None and self.observed_tool_calls is not None:
+        actual = len(self.result.tool_calls)
+        if self.observed_tool_calls != actual:
+            raise ValueError(...)
+```
+
+A failure Outcome can no longer under-report, negative-report, or hide tool
+calls that are visible in the Result.
+
+### C.3 Unified Failure Outcome Accounting (P0-3)
+
+`record_invocation_outcome()` is the unified entry point for failure Outcomes,
+following the same three-phase pipeline as `record_receipt()`:
+
+```text
+1. Capability validation (never_calls_provider, verifies_tokens/cost)
+2. Source Binding (bound_token_source_ids / bound_cost_source_ids)
+3. Commit AttemptUsageRecord with VERIFIED values preserved
+4. Budget Fail-Closed (if any dimension is UNAVAILABLE)
+```
+
+This supports mixed-dimension failure Outcomes (e.g. Token=VERIFIED +
+Cost=UNAVAILABLE) — the VERIFIED dimension is committed and preserved, then
+fail-closed is triggered for the UNAVAILABLE dimension.
+
+### C.4 Failed/Degraded TaskAttemptRecord (P0-4)
+
+Failed/Degraded `TaskAttemptRecord` construction uses the Accountant's
+committed values, NOT the raw Receipt's declared values:
+
+```text
+attempt_actual_tokens = accountant.last_attempt_record.tokens_used
+attempt_actual_cost   = accountant.last_attempt_record.cost_usd
+attempt_token_disp    = accountant.last_attempt_record.token_disposition
+attempt_cost_disp     = accountant.last_attempt_record.cost_disposition
+attempt_token_src     = accountant.last_attempt_record.token_source_id
+attempt_cost_src      = accountant.last_attempt_record.cost_source_id
+```
+
+This prevents the R9 bug where `token_disposition=UNAVAILABLE` +
+`tokens_used=500` could appear in a `TaskAttemptRecord` because the Supervisor
+copied `receipt.tokens_used` without the corresponding disposition.
+
+### C.5 Shared Usage Dimension Invariants (P0-5)
+
+A single pure function `validate_usage_dimension()` is the ONLY authority for
+per-dimension (disposition, value, source_id) invariants:
+
+```python
+def validate_usage_dimension(
+    dim: str,
+    disposition: AttemptUsageDisposition,
+    value: object,
+    source_id: str | None,
+) -> None:
+    if disposition == VERIFIED:
+        require value is not None
+        require source_id is not None
+    elif disposition == NO_PROVIDER_CALL:
+        require value is None
+        require source_id is None
+    elif disposition == UNAVAILABLE:
+        require value is None
+        require source_id is None
+```
+
+This function is called by `AttemptUsageRecord`, `AgentInvocationOutcome`,
+`AgentInvocationReceipt`, and `TaskAttemptRecord` — the four contracts cannot
+drift.  The R9 carve-out that allowed numeric `0` alongside
+`UNAVAILABLE`/`NO_PROVIDER_CALL` is REMOVED — `0` is a real value and must
+only appear with `VERIFIED`.
+
+### C.6 Infrastructure Exception Audit (P1-1)
+
+Unknown exceptions (`RuntimeError`, `TypeError`, etc.) propagate to the
+Scheduler for structured-concurrency cancellation, but the `except Exception`
+clause in `_execute_task` records an UNAVAILABLE `AttemptUsageRecord` before
+re-raising:
+
+```python
+except Exception as infra_exc:
+    try:
+        accountant.record_observed_tool_calls(None)
+        accountant.record_usage_unavailable(task_id=task.task_id, attempt=attempt_idx)
+        trace.emit(TRACE_TASK_FAILED, ..., error_code=ERROR_INFRASTRUCTURE_EXCEPTION, ...)
+    except Exception:
+        pass  # best-effort; original exception must propagate
+    raise
+```
+
+This ensures the public invariant "every committed Agent Call has exactly one
+AttemptUsageRecord" holds even for infrastructure exceptions.
+
+### C.7 Legacy bound_source_ids Removal (P1-2)
+
+`UsageVerificationCapabilities.bound_source_ids` is NO LONGER mirrored into
+`bound_token_source_ids` / `bound_cost_source_ids`.  The two per-dimension
+sets are the sole authority.  The legacy field is retained as a deprecated
+diagnostic but the runtime never copies it.
+
+### C.8 Horizontal Sync (Sync 1-7)
+
+| Sync | Description |
+|------|-------------|
+| **1** | Usage types (`AttemptUsageDisposition`, `AttemptUsageRecord`, `UsageProvenance`, `UsageVerificationCapabilities`, `VerifiedUsage`) are publicly exported from `multi_agent.usage`.  Invocation types (`AgentInvocationReceipt`, `AgentInvocationOutcome`, `AgentInvocationFailure`, `AgentInvoker`) from `multi_agent.invocation`. |
+| **2** | `ExecutionUsage` forward reference resolves regardless of import order.  `model_rebuild()` is called from `multi_agent.usage` as a deliberate initialization point. |
+| **3** | RunStore cache round-trip preserves `AttemptUsageRecord`, mixed-dimension dispositions, `Decimal` cost, `None` tool calls, and source IDs.  Cache hit returns a defensive deep copy. |
+| **4** | LangGraph Adapter propagates `attempt_usage_records`, mixed-dimension usage, `tool_usage_unavailable`, `budget_exceeded` reason, and infrastructure exception audit without duplicating Accountant logic. |
+| **5** | Stable error-code constants defined in `multi_agent.usage`: `ERROR_TOOL_USAGE_UNAVAILABLE`, `ERROR_EXECUTION_USAGE_UNAVAILABLE`, `ERROR_INVALID_INVOCATION_OUTCOME`, `ERROR_INFRASTRUCTURE_EXCEPTION`, `ERROR_USAGE_SOURCE_MISMATCH`. |
+| **6** | Legacy `usage_trust` input emits `DeprecationWarning`.  Production runtime (`supervisor.py`) no longer reads `usage_trust`.  All tests migrated from `bound_source_ids` to per-dimension `bound_token_source_ids` / `bound_cost_source_ids`. |
+| **7** | PR #112 title updated to "Phase 4: Supervisor Runtime and Dependency-Aware DAG Execution".  PR description rewritten to final delivery summary.  This document updated to R10 final state. |
+
+### C.9 R10 Test Coverage
+
+`test_supervisor_r10.py` adds 44 tests across 10 groups:
+
+| Group | Tests | Coverage |
+|-------|-------|----------|
+| P0-1 Failure NO_PROVIDER_CALL | 4 | Capability validation on failure path |
+| P0-2 Failure Tool Usage | 4 | `ge=0` + Result match constraint |
+| P0-3 Unified Failure Outcome | 5 | Mixed-dimension VERIFIED preservation |
+| P0-4 Failed/Degraded Audit | 4 | Accountant values vs Receipt values |
+| P0-5 Shared Invariants | 6 | Four contracts, same rules |
+| P1-1 Infrastructure Exception | 2 | Best-effort audit before re-raise |
+| Sync 1 Public Exports | 3 | `is` identity, `__all__` resolution |
+| Sync 2 Forward Reference | 6 | Import order, JSON schema, round-trip |
+| Sync 3 RunStore Cache | 5 | Deep copy, type fidelity, mixed usage |
+| Sync 4 LangGraph Adapter | 5 | Propagation without duplication |
+
+### C.10 R10 Final Test Results
+
+```text
+multi_agent:     803 passed
+ai_mode:          76 passed
+run_store + graph: 45 passed
+collect-only:    879 tests collected
+ruff check:      All checks passed
+ruff format:     R10 files formatted (134 pre-existing files unchanged)
+compileall:      Success
+mypy:            Success, no issues in 21 source files
 ```

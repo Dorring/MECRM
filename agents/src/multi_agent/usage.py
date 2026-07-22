@@ -36,6 +36,28 @@ R9 changes from R8:
 * **Section 8** — :class:`VerifiedUsage` no longer carries
   ``token_source_id`` / ``cost_source_id``.  The Invoker uses the
   Verifier's frozen ``source_id`` for both dimensions (Choice A).
+
+R10 changes from R9:
+
+* **P0-5 / Section 5** — A single pure function
+  :func:`validate_usage_dimension` is now the ONLY authority for
+  per-dimension (disposition, value, source_id) invariants.  It is
+  shared by :class:`AttemptUsageRecord`, :class:`AgentInvocationOutcome`,
+  :class:`AgentInvocationReceipt`, and :class:`TaskAttemptRecord` so the
+  four contracts cannot drift.  The R9 carve-out that allowed numeric
+  ``0`` alongside ``UNAVAILABLE`` / ``NO_PROVIDER_CALL`` is REMOVED —
+  ``0`` is a real value and must only appear with ``VERIFIED``.
+
+* **P1-2** — :class:`UsageVerificationCapabilities` no longer mirrors
+  the legacy ``bound_source_ids`` into ``bound_token_source_ids`` /
+  ``bound_cost_source_ids``.  The two per-dimension sets are the sole
+  authority; ``bound_source_ids`` is retained only as a deprecated
+  diagnostic input that callers may set for migration but the runtime
+  never copies it.
+
+* **Sync 5** — Stable usage error-code constants are defined here so
+  the Supervisor, Accountant, Trace, tests, and documentation share a
+  single source of truth.
 """
 
 from __future__ import annotations
@@ -50,6 +72,21 @@ from multi_agent.contracts import StrictContract
 
 if TYPE_CHECKING:
     from multi_agent.contracts import ProviderMetadata, TokenUsage
+
+
+# ---------------------------------------------------------------------------
+# R10 Sync 5: Stable usage error-code constants
+# ---------------------------------------------------------------------------
+# These are the ONLY values that may appear as ``error_code`` on a
+# :class:`TaskAttemptRecord`, as the ``exceeded_reason`` on a
+# :class:`_BudgetAccountant`, or in ``ExecutionTraceEvent.data["reason"]``
+# for usage-related fail-closed events.  Centralising them prevents the
+# Supervisor, Accountant, Trace, tests, and docs from drifting.
+ERROR_TOOL_USAGE_UNAVAILABLE = "tool_usage_unavailable"
+ERROR_EXECUTION_USAGE_UNAVAILABLE = "execution_usage_unavailable"
+ERROR_INVALID_INVOCATION_OUTCOME = "invalid_invocation_outcome"
+ERROR_INFRASTRUCTURE_EXCEPTION = "infrastructure_exception"
+ERROR_USAGE_SOURCE_MISMATCH = "usage_source_mismatch"
 
 
 # ---------------------------------------------------------------------------
@@ -138,19 +175,100 @@ class UsageProvenance(StrictContract):
 
 
 # ---------------------------------------------------------------------------
-# R7 P0-3 / R8 P0-3 / R9 Section 5: AttemptUsageRecord
+# R10 P0-5: Pure per-dimension invariant function — the SINGLE authority
+# shared by AttemptUsageRecord, AgentInvocationOutcome,
+# AgentInvocationReceipt, and TaskAttemptRecord.
+# ---------------------------------------------------------------------------
+
+
+def validate_usage_dimension(
+    dim: str,
+    disposition: AttemptUsageDisposition,
+    value: object,
+    source_id: str | None,
+) -> None:
+    """R10 P0-5: validate a single (disposition, value, source_id) triple.
+
+    This is the ONLY function that decides whether a per-dimension usage
+    triple is internally consistent.  It is shared by
+    :class:`AttemptUsageRecord`, :class:`AgentInvocationOutcome`,
+    :class:`AgentInvocationReceipt`, and :class:`TaskAttemptRecord` so
+    the four contracts cannot drift.
+
+    Strict rules (R10 — the R9 ``value == 0`` carve-out is REMOVED):
+
+    * ``VERIFIED`` → ``value`` is non-None AND ``source_id`` is non-None.
+      ``0`` is a legitimate verified value (e.g. a cached call that the
+      Verifier confirmed cost nothing) and is accepted here.
+    * ``NO_PROVIDER_CALL`` → ``value`` is None AND ``source_id`` is None.
+      A numeric ``0`` is NOT accepted — if no provider call was made,
+      there is no usage to report, not even zero.
+    * ``UNAVAILABLE`` → ``value`` is None AND ``source_id`` is None.
+      A numeric ``0`` is NOT accepted — ``0`` is a real value that can
+      only appear with ``VERIFIED``.  Callers that previously relied on
+      ``0`` to mean "unknown" must migrate to ``None``.
+
+    Raises :class:`ValueError` on any violation.
+    """
+    if disposition == AttemptUsageDisposition.VERIFIED:
+        if value is None:
+            raise ValueError(
+                f"{dim}_disposition=VERIFIED but {dim}_value is None — "
+                f"VERIFIED requires a non-None actual value (R10 P0-5)"
+            )
+        if source_id is None:
+            raise ValueError(
+                f"{dim}_disposition=VERIFIED but {dim}_source_id is None — "
+                f"VERIFIED requires a non-None source_id (R10 P0-5)"
+            )
+    elif disposition == AttemptUsageDisposition.NO_PROVIDER_CALL:
+        if value is not None:
+            raise ValueError(
+                f"{dim}_disposition=NO_PROVIDER_CALL but {dim}_value={value} "
+                f"— no provider call means no usage; value must be None "
+                f"(R10 P0-5: numeric 0 is no longer accepted)"
+            )
+        if source_id is not None:
+            raise ValueError(
+                f"{dim}_disposition=NO_PROVIDER_CALL but "
+                f"{dim}_source_id={source_id!r} — no provider call means "
+                f"no source (R10 P0-5)"
+            )
+    elif disposition == AttemptUsageDisposition.UNAVAILABLE:
+        if value is not None:
+            raise ValueError(
+                f"{dim}_disposition=UNAVAILABLE but {dim}_value={value} — "
+                f"UNAVAILABLE means the actual value is unknown; value must "
+                f"be None (R10 P0-5: numeric 0 is no longer accepted, use "
+                f"None for unknown)"
+            )
+        if source_id is not None:
+            raise ValueError(
+                f"{dim}_disposition=UNAVAILABLE but "
+                f"{dim}_source_id={source_id!r} — UNAVAILABLE means no "
+                f"source (R10 P0-5)"
+            )
+
+
+# ---------------------------------------------------------------------------
+# R7 P0-3 / R8 P0-3 / R9 Section 5 / R10 P0-5: AttemptUsageRecord
 # ---------------------------------------------------------------------------
 
 
 class AttemptUsageRecord(StrictContract):
     """Per-attempt usage record for independent Token/Cost coverage.
 
-    R9 Section 5 invariants (per-dimension):
+    R10 P0-5 invariants (per-dimension) — enforced by the shared
+    :func:`validate_usage_dimension` function:
 
     * ``VERIFIED`` → value (``tokens_used`` / ``cost_usd``) is non-None
       AND the corresponding ``source_id`` is non-None.
     * ``NO_PROVIDER_CALL`` → value is None AND ``source_id`` is None.
-    * ``UNAVAILABLE`` → value is None.
+    * ``UNAVAILABLE`` → value is None AND ``source_id`` is None.
+
+    R10 change: the R9 carve-out that allowed numeric ``0`` alongside
+    ``UNAVAILABLE`` / ``NO_PROVIDER_CALL`` is REMOVED.  ``0`` is a real
+    value and must only appear with ``VERIFIED``.
 
     Token and Cost are validated independently — a single record can be
     ``VERIFIED`` for tokens but ``UNAVAILABLE`` for cost (mixed
@@ -171,62 +289,22 @@ class AttemptUsageRecord(StrictContract):
 
     @model_validator(mode="after")
     def _enforce_token_invariants(self) -> "AttemptUsageRecord":
-        return self._enforce_dimension(
+        validate_usage_dimension(
             "token",
             self.token_disposition,
             self.tokens_used,
             self.token_source_id,
         )
+        return self
 
     @model_validator(mode="after")
     def _enforce_cost_invariants(self) -> "AttemptUsageRecord":
-        return self._enforce_dimension(
+        validate_usage_dimension(
             "cost",
             self.cost_disposition,
             self.cost_usd,
             self.cost_source_id,
         )
-
-    def _enforce_dimension(
-        self,
-        dim: str,
-        disposition: AttemptUsageDisposition,
-        value: object,
-        source_id: str | None,
-    ) -> "AttemptUsageRecord":
-        if disposition == AttemptUsageDisposition.VERIFIED:
-            if value is None:
-                raise ValueError(
-                    f"AttemptUsageRecord.{dim}_disposition=VERIFIED but "
-                    f"{dim}_value is None — VERIFIED requires a non-None "
-                    f"actual value (R9 Section 5)"
-                )
-            if source_id is None:
-                raise ValueError(
-                    f"AttemptUsageRecord.{dim}_disposition=VERIFIED but "
-                    f"{dim}_source_id is None — VERIFIED requires a "
-                    f"non-None source_id (R9 Section 5)"
-                )
-        elif disposition == AttemptUsageDisposition.NO_PROVIDER_CALL:
-            if value is not None and value != 0 and value != Decimal("0"):
-                raise ValueError(
-                    f"AttemptUsageRecord.{dim}_disposition=NO_PROVIDER_CALL "
-                    f"but {dim}_value={value} — no provider call means no "
-                    f"usage (R9 Section 5)"
-                )
-            if source_id is not None:
-                raise ValueError(
-                    f"AttemptUsageRecord.{dim}_disposition=NO_PROVIDER_CALL "
-                    f"but {dim}_source_id={source_id!r} — no provider call "
-                    f"means no source (R9 Section 5)"
-                )
-        elif disposition == AttemptUsageDisposition.UNAVAILABLE:
-            if value is not None and value != 0 and value != Decimal("0"):
-                raise ValueError(
-                    f"AttemptUsageRecord.{dim}_disposition=UNAVAILABLE but "
-                    f"{dim}_value={value} — UNAVAILABLE means the actual "
-                    f"value is unknown (R9 Section 5)"
-                )
         return self
 
 
@@ -279,6 +357,13 @@ class UsageVerificationCapabilities(StrictContract):
     and Receipts; it is NOT used to INFER them.  The runtime only
     accepts ``NO_PROVIDER_CALL`` when the Invoker explicitly declares
     it via an :class:`AgentInvocationOutcome` (R9 Section 3).
+
+    R10 P1-2: the legacy ``bound_source_ids`` field is NO LONGER
+    mirrored into ``bound_token_source_ids`` / ``bound_cost_source_ids``.
+    The two per-dimension sets are the sole authority.  ``bound_source_ids``
+    is retained only as a deprecated diagnostic that callers may set for
+    migration, but the runtime never copies it.  This closes the R9
+    loophole where a single legacy set silently elevated both dimensions.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -292,30 +377,32 @@ class UsageVerificationCapabilities(StrictContract):
     never_calls_provider: bool = False
     bound_token_source_ids: frozenset[str] = Field(default_factory=frozenset)
     bound_cost_source_ids: frozenset[str] = Field(default_factory=frozenset)
-    # DEPRECATED — retained for backwards-compatible input migration.
+    # DEPRECATED — R10 P1-2: retained for backwards-compatible input
+    # migration ONLY.  The runtime does NOT mirror this into the
+    # per-dimension sets.  Callers must set ``bound_token_source_ids``
+    # and ``bound_cost_source_ids`` explicitly.
     bound_source_ids: frozenset[str] = Field(default_factory=frozenset)
 
     @model_validator(mode="after")
-    def _sync_bound_source_ids(self) -> "UsageVerificationCapabilities":
-        # Mirror legacy single ``bound_source_ids`` into per-dimension
-        # sets when the caller did not specify them explicitly.
-        if self.bound_source_ids and not self.bound_token_source_ids:
-            object.__setattr__(self, "bound_token_source_ids", self.bound_source_ids)
-        if self.bound_source_ids and not self.bound_cost_source_ids:
-            object.__setattr__(self, "bound_cost_source_ids", self.bound_source_ids)
-        # Contract invariant — declaring ``verifies_*=True`` without any
-        # bound source for that dimension is a programming error.
+    def _enforce_capabilities(self) -> "UsageVerificationCapabilities":
+        # R10 P1-2: NO mirroring from ``bound_source_ids`` into the
+        # per-dimension sets.  The two per-dimension sets are the sole
+        # authority.  Contract invariant — declaring ``verifies_*=True``
+        # without any bound source for that dimension is a programming
+        # error.
         if self.verifies_tokens and not self.bound_token_source_ids:
             raise ValueError(
                 "verifies_tokens=True requires a non-empty "
                 "bound_token_source_ids — an Invoker that can verify "
-                "tokens must bind the Verifier/Adapter sources it accepts"
+                "tokens must bind the Verifier/Adapter sources it accepts "
+                "(R10 P1-2: bound_source_ids is no longer mirrored)"
             )
         if self.verifies_cost and not self.bound_cost_source_ids:
             raise ValueError(
                 "verifies_cost=True requires a non-empty "
                 "bound_cost_source_ids — an Invoker that can verify "
-                "cost must bind the Verifier/Adapter sources it accepts"
+                "cost must bind the Verifier/Adapter sources it accepts "
+                "(R10 P1-2: bound_source_ids is no longer mirrored)"
             )
         return self
 
@@ -417,12 +504,18 @@ class ProviderUsageVerifier(Protocol):
 __all__ = [
     "AttemptUsageDisposition",
     "AttemptUsageRecord",
+    "ERROR_EXECUTION_USAGE_UNAVAILABLE",
+    "ERROR_INFRASTRUCTURE_EXCEPTION",
+    "ERROR_INVALID_INVOCATION_OUTCOME",
+    "ERROR_TOOL_USAGE_UNAVAILABLE",
+    "ERROR_USAGE_SOURCE_MISMATCH",
     "ProviderUsageVerifier",
     "UsageProvenance",
     "UsageTrustLevel",
     "UsageVerificationCapabilities",
     "VerifiedUsage",
     "get_usage_capabilities",
+    "validate_usage_dimension",
 ]
 
 

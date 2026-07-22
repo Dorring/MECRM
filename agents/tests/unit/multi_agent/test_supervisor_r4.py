@@ -799,13 +799,22 @@ class _UnmarkedInvoker:
 def _receipt_with_trusted_adapter(
     task: AgentTask, *, cost_usd: Decimal = Decimal("0.01")
 ) -> AgentInvocationReceipt:
-    """A receipt that claims ``trusted_adapter`` trust with a cost."""
+    """A receipt that previously claimed ``trusted_adapter`` trust
+    with a cost.
+
+    R10 P0-5: the legacy ``usage_trust='trusted_adapter'`` derived
+    ``cost_source_id='trusted_adapter'`` which conflicted with the
+    default ``cost_disposition=UNAVAILABLE`` (UNAVAILABLE requires
+    ``source_id=None`` AND ``value=None``).  The receipt now uses
+    ``UNAVAILABLE`` with ``cost_usd=None`` — the test still verifies
+    that an unverified receipt fails closed when ``cost_budget_usd``
+    is configured (R9 Section 1 commit-then-check).
+    """
     result = _ok_result(task=task)
     return AgentInvocationReceipt(
         result=result,
         tool_calls=len(result.tool_calls),
-        cost_usd=cost_usd,
-        usage_trust="trusted_adapter",
+        cost_usd=None,
     )
 
 
@@ -814,12 +823,18 @@ def _receipt_with_verified_provider(
     *,
     tokens_used: int = 50,
 ) -> AgentInvocationReceipt:
-    """A receipt that claims ``verified_provider`` trust with tokens.
+    """A receipt that previously claimed ``verified_provider`` trust
+    with tokens.
 
-    Includes ``provider_metadata`` so ``validate_invocation_receipt``
-    does not reject the ``verified_provider`` provenance claim — the
-    test verifies that the *Invoker capability* check (not the receipt
-    structure check) is what rejects the trust elevation.
+    Includes ``provider_metadata`` so the result carries the
+    self-reported token usage for diagnostics.
+
+    R10 P0-5: the legacy ``usage_trust='verified_provider'`` derived
+    ``token_source_id='verified_provider'`` which conflicted with the
+    default ``token_disposition=UNAVAILABLE``.  The receipt now uses
+    ``UNAVAILABLE`` with ``tokens_used=None`` — the test still
+    verifies that an unverified receipt fails closed when
+    ``token_budget`` is configured (R9 Section 1 commit-then-check).
     """
     result = _ok_result(
         task=task,
@@ -838,8 +853,7 @@ def _receipt_with_verified_provider(
     return AgentInvocationReceipt(
         result=result,
         tool_calls=len(result.tool_calls),
-        tokens_used=tokens_used,
-        usage_trust="verified_provider",
+        tokens_used=None,
     )
 
 
@@ -958,7 +972,7 @@ class TestUsageTrustInvokerBound:
             verifies_tokens=False,
             verifies_cost=True,
             source_id="test_cost_only_invoker",
-            bound_source_ids=frozenset({"test_cost_only_invoker"}),
+            bound_cost_source_ids=frozenset({"test_cost_only_invoker"}),
         )
 
         def factory(
@@ -1002,7 +1016,7 @@ class TestUsageTrustInvokerBound:
             verifies_tokens=True,
             verifies_cost=False,
             source_id="test_token_only_invoker",
-            bound_source_ids=frozenset({"test_token_only_invoker"}),
+            bound_token_source_ids=frozenset({"test_token_only_invoker"}),
         )
 
         def factory(
@@ -1050,7 +1064,7 @@ class TestUsageTrustInvokerBound:
             verifies_tokens=True,
             verifies_cost=False,
             source_id="test_token_only_invoker",
-            bound_source_ids=frozenset({"test_token_only_invoker"}),
+            bound_token_source_ids=frozenset({"test_token_only_invoker"}),
         )
 
         def factory(

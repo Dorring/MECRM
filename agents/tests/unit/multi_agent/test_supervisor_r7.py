@@ -21,8 +21,8 @@ identified in the Phase 4 R7 review:
   bounded by the outer ``asyncio.wait_for``, so a slow verifier
   cannot block the event loop or exceed the run deadline.
 * **P0-6** — Receipt ``usage_provenance.source_id`` must be in the
-  Invoker's ``bound_source_ids`` — a receipt cannot claim provenance
-  from an unbound source.
+  Invoker's ``bound_token_source_ids`` / ``bound_cost_source_ids`` — a
+  receipt cannot claim provenance from an unbound source.
 * **P1-1** — Legacy ``usage_trust`` / ``UsageTrustLevel`` is
   DEPRECATED; new code uses ``UsageProvenance`` and
   ``AttemptUsageDisposition``.
@@ -253,7 +253,8 @@ _REGISTRY_CAPS_WITH_VERIFIER = UsageVerificationCapabilities(
     verifies_cost=True,
     source_id="registry_agent_invoker+provider_verifier",
     never_calls_provider=False,
-    bound_source_ids=frozenset({"tracking_verifier"}),
+    bound_token_source_ids=frozenset({"tracking_verifier"}),
+    bound_cost_source_ids=frozenset({"tracking_verifier"}),
 )
 
 _DETERMINISTIC_CAPS = UsageVerificationCapabilities(
@@ -375,9 +376,9 @@ class TestTrustedNoProviderCall:
             tool_calls=0,
             tokens_used=None,
             cost_usd=None,
-            # R7 P0-6: source_id must match the deterministic invoker's
-            # bound_source_ids so the receipt is not rejected as an
-            # unbound provenance claim.
+            # R7 P0-6: the deterministic invoker does not bind
+            # per-dimension source IDs, so the source binding check
+            # is skipped and the receipt is not rejected.
             usage_provenance=UsageProvenance(
                 source_id="deterministic_fake_invoker",
                 tokens_verified=False,
@@ -415,8 +416,8 @@ class TestTrustedNoProviderCall:
             tool_calls=0,
             tokens_used=None,
             cost_usd=None,
-            # R7 P0-6: source_id must match the deterministic invoker's
-            # bound_source_ids.
+            # R7 P0-6: the deterministic invoker does not bind
+            # per-dimension source IDs.
             usage_provenance=UsageProvenance(
                 source_id="deterministic_fake_invoker",
                 tokens_verified=False,
@@ -619,7 +620,7 @@ class TestPerDimensionCoverage:
             verifies_cost=True,
             source_id="cost_only_verifier",
             never_calls_provider=False,
-            bound_source_ids=frozenset({"cost_only_verifier"}),
+            bound_cost_source_ids=frozenset({"cost_only_verifier"}),
         )
         receipt_b = AgentInvocationReceipt(
             result=_ok_result(
@@ -1101,11 +1102,11 @@ class TestAsyncVerifierDeadline:
 
 class TestProvenanceSourceBinding:
     """R7 P0-6: Receipt ``usage_provenance.source_id`` must be in the
-    Invoker's ``bound_source_ids``."""
+    Invoker's ``bound_token_source_ids`` / ``bound_cost_source_ids``."""
 
     def test_provenance_source_matches_bound_verifier(self):
-        """A receipt whose ``source_id`` is in ``bound_source_ids``
-        is accepted."""
+        """A receipt whose ``source_id`` is in ``bound_token_source_ids``
+        / ``bound_cost_source_ids`` is accepted."""
         budget = ExecutionBudget()
         accountant = _BudgetAccountant(budget, start_monotonic=time.monotonic())
         task = _make_task()
@@ -1128,7 +1129,7 @@ class TestProvenanceSourceBinding:
             ),
             token_disposition=AttemptUsageDisposition.VERIFIED,
         )
-        # bound_source_ids includes "tracking_verifier"
+        # bound_token_source_ids / bound_cost_source_ids include "tracking_verifier"
         accountant.record_receipt(
             receipt,
             invoker_capabilities=_REGISTRY_CAPS_WITH_VERIFIER,
@@ -1140,8 +1141,8 @@ class TestProvenanceSourceBinding:
 
     def test_unbound_source_id_is_rejected(self):
         """A receipt whose ``source_id`` is NOT in
-        ``bound_source_ids`` must be rejected with
-        ``ExecutionUsageUnavailableError``."""
+        ``bound_token_source_ids`` / ``bound_cost_source_ids`` must be
+        rejected with ``ExecutionUsageUnavailableError``."""
         budget = ExecutionBudget()
         accountant = _BudgetAccountant(budget, start_monotonic=time.monotonic())
         task = _make_task()
@@ -1173,9 +1174,9 @@ class TestProvenanceSourceBinding:
             )
 
     def test_empty_bound_source_ids_allows_any(self):
-        """When ``bound_source_ids`` is empty, any ``source_id`` is
-        accepted (backwards-compatible with Invokers that don't bind
-        sources)."""
+        """When ``bound_token_source_ids`` / ``bound_cost_source_ids``
+        are empty, any ``source_id`` is accepted (backwards-compatible
+        with Invokers that don't bind sources)."""
         budget = ExecutionBudget()
         accountant = _BudgetAccountant(budget, start_monotonic=time.monotonic())
         task = _make_task()
@@ -1193,7 +1194,7 @@ class TestProvenanceSourceBinding:
                 cost_verified=False,
             ),
         )
-        # _REGISTRY_CAPS has empty bound_source_ids
+        # _REGISTRY_CAPS has empty bound_token_source_ids / bound_cost_source_ids
         accountant.record_receipt(
             receipt,
             invoker_capabilities=_REGISTRY_CAPS,
@@ -1268,8 +1269,8 @@ class TestLegacyTrustDeprecation:
             tool_calls=0,
             tokens_used=None,
             cost_usd=None,
-            # R7 P0-6: source_id must match the deterministic invoker's
-            # bound_source_ids.
+            # R7 P0-6: the deterministic invoker does not bind
+            # per-dimension source IDs.
             usage_provenance=UsageProvenance(
                 source_id="deterministic_fake_invoker",
                 tokens_verified=False,

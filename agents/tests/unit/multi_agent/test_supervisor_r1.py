@@ -55,7 +55,9 @@ from multi_agent.execution_errors import (
 )
 from multi_agent.invocation import (
     AgentInvocationReceipt,
+    AttemptUsageDisposition,
     DeterministicFakeInvoker,
+    UsageProvenance,
 )
 from multi_agent.planner import DeterministicPlanner
 from multi_agent.planning import (
@@ -963,26 +965,32 @@ class TestReceiptConsistency:
             pt.task for pt in plan.tasks if pt.intent_id == INTENT_CUSTOMER_CONTEXT
         )
 
-        provider_meta = ProviderMetadata(
-            provider="openai",
-            chat_model="gpt-4",
-            embedding_model="text-embedding-3-small",
-            ai_mode="live",
-        )
         token_usage = TokenUsage(input_tokens=10, output_tokens=5, total_tokens=15)
 
         def factory(
             task: AgentTask, ctx: AgentExecutionContext
         ) -> AgentInvocationReceipt:
             if task.task_id == root_task.task_id:
+                # R10 P0-5: the old mismatch scenario (result says 15
+                # tokens, receipt says 5) is no longer constructible
+                # because unverified receipts must have tokens_used=None.
+                # Instead, test that a receipt claiming VERIFIED tokens
+                # without provider_metadata is rejected by
+                # ``validate_invocation_receipt``.
                 result = _ok_result(
                     task=task,
-                    provider_metadata=provider_meta,
+                    provider_metadata=None,
                     token_usage=token_usage,
                 )
-                # Mismatch: result says 15 tokens, receipt says 5.
                 return AgentInvocationReceipt(
-                    result=result, tool_calls=0, tokens_used=5
+                    result=result,
+                    tool_calls=0,
+                    tokens_used=5,
+                    token_disposition=AttemptUsageDisposition.VERIFIED,
+                    usage_provenance=UsageProvenance(
+                        token_source_id="verifier",
+                        tokens_verified=True,
+                    ),
                 )
             return AgentInvocationReceipt(result=_ok_result(task=task))
 

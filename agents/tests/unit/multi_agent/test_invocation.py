@@ -186,7 +186,12 @@ class TestRegistryAgentInvoker:
             invoker, handler, _make_task(), AgentExecutionContext(tenant_id="t-001")
         )
 
-        assert receipt.tokens_used == 15
+        # R10 P0-5: without a ProviderUsageVerifier, the Handler's
+        # self-reported token_usage is untrusted and MUST NOT be carried
+        # on the Receipt.  tokens_used is None (UNAVAILABLE disposition);
+        # the self-reported value remains accessible via
+        # ``receipt.result.token_usage.total_tokens`` for diagnostics.
+        assert receipt.tokens_used is None
         assert receipt.tool_calls == 0
 
     def test_invoke_tokens_none_when_provider_metadata_absent(self):
@@ -233,9 +238,7 @@ class TestDeterministicFakeInvoker:
             )
 
     def test_receipt_mode_returns_preset_receipt(self):
-        receipt = AgentInvocationReceipt(
-            result=_make_result(), tool_calls=3, tokens_used=42
-        )
+        receipt = AgentInvocationReceipt(result=_make_result(), tool_calls=3)
         invoker = DeterministicFakeInvoker(receipt=receipt)
         task = _make_task()
         ctx = AgentExecutionContext(tenant_id="t-001")
