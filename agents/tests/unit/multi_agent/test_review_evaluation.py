@@ -38,6 +38,7 @@ from multi_agent.contracts import (
     TokenUsage,
 )
 from multi_agent.execution import (
+    ExecutionCapabilitySnapshot,
     ExecutionTraceEvent,
     SupervisorRunResult,
     SupervisorRunStatus,
@@ -45,7 +46,6 @@ from multi_agent.execution import (
 )
 from multi_agent.state import MergedState
 from multi_agent.review_contracts import (
-    CapabilitySnapshot,
     PolicyContext,
     REVIEWER_VERSION,
 )
@@ -59,6 +59,7 @@ from multi_agent.review_evaluation import (
 )
 from multi_agent.policy import DeterministicPolicyEvaluator
 from multi_agent.reviewer import ProposalReviewer
+from multi_agent.serialization import stable_hash
 
 
 _TS = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -147,6 +148,7 @@ def _make_supervisor_result(
     evidence: list[Evidence] | None = None,
     agent_id: str = "agent_test",
     task_id: str = "task-001",
+    capability_bindings: list[ExecutionCapabilitySnapshot] | None = None,
 ) -> SupervisorRunResult:
     proposals = proposals or [_make_proposal(tenant_id=tenant_id)]
     evidence = evidence or [_make_evidence(tenant_id=tenant_id)]
@@ -189,6 +191,7 @@ def _make_supervisor_result(
                 occurred_at=_TS,
             )
         ],
+        capability_bindings=capability_bindings or [],
         started_at=_TS,
         completed_at=_TS,
         duration_ms=0,
@@ -301,8 +304,11 @@ class TestBuildReviewRequest:
         assert len(result.merged_state.merged_proposals) == original_proposal_count
         assert len(result.merged_state.merged_evidence) == original_evidence_count
 
-    def test_accepts_capability_snapshots(self):
-
+    def test_carries_capability_bindings(self):
+        """R1: build_review_request reads capability_bindings from the
+        SupervisorRunResult (no longer accepts a capability_snapshots
+        parameter).  The bindings are preserved on the ReviewRequest.
+        """
         cap = AgentCapability(
             agent_id="agent_test",
             version="1.0.0",
@@ -317,17 +323,26 @@ class TestBuildReviewRequest:
             max_retries=0,
             estimated_cost_class="low",
         )
-        snap = CapabilitySnapshot(agent_id="agent_test", capability=cap)
-
-        result = _make_supervisor_result()
-        request = build_review_request(
-            result,
-            review_id="rev-001",
-            capability_snapshots=[snap],
+        binding = ExecutionCapabilitySnapshot(
+            task_id="task-001",
+            agent_id="agent_test",
+            agent_version="1.0.0",
+            capability=cap,
+            binding_hash=stable_hash(
+                {
+                    "task_id": "task-001",
+                    "agent_id": "agent_test",
+                    "agent_version": "1.0.0",
+                    "capability": cap.model_dump(mode="python"),
+                }
+            ),
         )
 
-        assert len(request.capability_snapshots) == 1
-        assert request.capability_snapshots[0].agent_id == "agent_test"
+        result = _make_supervisor_result(capability_bindings=[binding])
+        request = build_review_request(result, review_id="rev-001")
+
+        assert len(request.capability_bindings) == 1
+        assert request.capability_bindings[0].agent_id == "agent_test"
 
     def test_accepts_custom_policy_context(self):
         ctx = PolicyContext(
@@ -441,8 +456,11 @@ class TestBuildReviewFixtures:
     def test_conflict_fixtures_declare_conflicted_ids(self):
         fixtures = build_review_fixtures()
         for fixture in fixtures:
-            if fixture.name in ("exact_duplicate", "same_resource_conflict"):
+            if fixture.name == "same_resource_conflict":
                 assert len(fixture.expected_conflicted_proposal_ids) > 0
+            elif fixture.name == "exact_duplicate":
+                # R1: exact duplicates are DEDUPLICATED, not CONFLICT
+                assert len(fixture.expected_conflicted_proposal_ids) == 0
 
     def test_fixture_hashes_stable_across_calls(self):
         """Calling build_review_fixtures twice yields identical hashes."""

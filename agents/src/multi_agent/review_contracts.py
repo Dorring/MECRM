@@ -37,8 +37,13 @@ from multi_agent.contracts import (
     JsonValue,
     StrictContract,
 )
-from multi_agent.review_errors import ReviewIntegrityError
-from multi_agent.serialization import canonicalize, stable_hash
+from multi_agent.execution import ExecutionCapabilitySnapshot
+from multi_agent.review_errors import (
+    InvalidReviewRequestError,
+    InvalidReviewResultError,
+    ReviewIntegrityError,
+)
+from multi_agent.serialization import canonicalize, content_hash, stable_hash
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +70,7 @@ class ReviewDecisionStatus(StrEnum):
     NEEDS_APPROVAL = "needs_approval"
     NEEDS_INPUT = "needs_input"
     CONFLICT = "conflict"
+    DEDUPLICATED = "deduplicated"
 
 
 class ReviewFindingSeverity(StrEnum):
@@ -85,7 +91,8 @@ class ReviewBatchStatus(StrEnum):
     """Highest-priority decision across all Proposals in a batch.
 
     Priority (highest first): ``conflict`` > ``rejected`` >
-    ``needs_input`` > ``needs_approval`` > ``approved``.
+    ``needs_input`` > ``needs_approval`` > ``deduplicated`` >
+    ``approved``.
     """
 
     APPROVED = "approved"
@@ -93,6 +100,7 @@ class ReviewBatchStatus(StrEnum):
     NEEDS_INPUT = "needs_input"
     REJECTED = "rejected"
     CONFLICT = "conflict"
+    DEDUPLICATED = "deduplicated"
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +224,54 @@ class CapabilitySnapshot(StrictContract):
     capability: AgentCapability
 
 
+class ReviewProposalEnvelope(StrictContract):
+    """Frozen, strict-origin envelope binding a Proposal to the exact
+    Phase 4 Task/Result that produced it.
+
+    Phase 5A must NOT accept a Proposal whose origin can be re-attached
+    to an arbitrary Task.  The Reviewer validates every field below
+    against the ReviewRequest's task_records / capability_bindings.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    proposal: ActionProposal
+    run_id: str
+    result_id: str
+    task_id: str
+    agent_id: str
+    agent_version: str
+    origin_hash: str
+
+    @field_validator(
+        "run_id", "result_id", "task_id", "agent_id", "agent_version", "origin_hash"
+    )
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("ReviewProposalEnvelope identity fields must not be blank")
+        return v
+
+    @model_validator(mode="after")
+    def _verify_origin_hash(self) -> "ReviewProposalEnvelope":
+        from multi_agent.serialization import stable_hash
+
+        expected = stable_hash(
+            {
+                "proposal": self.proposal.model_dump(mode="python"),
+                "run_id": self.run_id,
+                "result_id": self.result_id,
+                "task_id": self.task_id,
+                "agent_id": self.agent_id,
+                "agent_version": self.agent_version,
+            }
+        )
+        if self.origin_hash != expected:
+            raise ValueError("ReviewProposalEnvelope origin_hash mismatch")
+        return self
+
+
 # ---------------------------------------------------------------------------
 # ReviewFinding
 # ---------------------------------------------------------------------------
@@ -317,6 +373,51 @@ class PolicyContext(StrictContract):
         return validate_strict_json(v)
 
 
+def canonical_review_request_payload(request: ReviewRequest) -> dict[str, Any]:
+    """Return a canonical, ORDER-INVARIANT dict for hashing.
+
+    Each list field is sorted by a stable key so that reordering the
+    input lists does not change the request_hash (R1 P0-4).
+    ``request_hash`` is excluded (self-referential).
+    """
+    proposals = sorted(request.proposals, key=lambda p: p.proposal_id)
+    proposal_envelopes = sorted(
+        request.proposal_envelopes, key=lambda e: e.proposal.proposal_id
+    )
+    evidence = sorted(request.evidence, key=lambda e: e.evidence_id)
+    task_records = sorted(request.task_records, key=lambda t: t.task_id)
+    capability_bindings = sorted(
+        request.capability_bindings, key=lambda c: (c.task_id, c.agent_id)
+    )
+    trace = sorted(request.trace, key=lambda t: t.sequence)
+    rules = sorted(
+        request.policy_context.rules,
+        key=lambda r: (int(r.get("priority", 0)), str(r.get("rule_id", ""))),
+    )
+
+    payload: dict[str, Any] = {
+        "review_id": request.review_id,
+        "run_id": request.run_id,
+        "tenant_id": request.tenant_id,
+        "plan_hash": request.plan_hash,
+        "registry_version": request.registry_version,
+        "proposals": [p.model_dump(mode="python") for p in proposals],
+        "evidence": [e.model_dump(mode="python") for e in evidence],
+        "task_records": [t.model_dump(mode="python") for t in task_records],
+        "trace": [t.model_dump(mode="python") for t in trace],
+        "proposal_envelopes": [e.model_dump(mode="python") for e in proposal_envelopes],
+        "capability_bindings": [
+            c.model_dump(mode="python") for c in capability_bindings
+        ],
+        "policy_context": {
+            **request.policy_context.model_dump(mode="python"),
+            "rules": rules,
+        },
+        "reviewer_version": request.reviewer_version,
+    }
+    return canonicalize(payload)
+
+
 class ReviewRequest(StrictContract):
     """Frozen input to :meth:`ProposalReviewer.review`.
 
@@ -342,7 +443,8 @@ class ReviewRequest(StrictContract):
     evidence: list[Evidence] = Field(default_factory=list)
     task_records: list[TaskRecordSummary] = Field(default_factory=list)
     trace: list[TraceSummary] = Field(default_factory=list)
-    capability_snapshots: list[CapabilitySnapshot] = Field(default_factory=list)
+    proposal_envelopes: list[ReviewProposalEnvelope] = Field(default_factory=list)
+    capability_bindings: list[ExecutionCapabilitySnapshot] = Field(default_factory=list)
     policy_context: PolicyContext
     reviewer_version: str = REVIEWER_VERSION
 
@@ -383,18 +485,127 @@ class ReviewRequest(StrictContract):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_identity_uniqueness(self) -> "ReviewRequest":
+        """Fail-closed identity uniqueness checks.
+
+        Any duplicate-with-different-content, duplicate task_id,
+        duplicate agent_id in capability_bindings, duplicate trace
+        sequence, duplicate origin_hash, or envelope/proposal mismatch
+        raises :class:`InvalidReviewRequestError`.
+        """
+        from multi_agent.evidence_review import compute_review_evidence_hash
+
+        # proposal_id uniqueness — same id (whether same or different
+        # content) is an error: Phase 4 merge should have deduped.
+        proposals_by_id: dict[str, list[ActionProposal]] = {}
+        for p in self.proposals:
+            proposals_by_id.setdefault(p.proposal_id, []).append(p)
+        for pid, group in proposals_by_id.items():
+            if len(group) > 1:
+                hashes = {content_hash(p) for p in group}
+                if len(hashes) > 1:
+                    raise InvalidReviewRequestError(
+                        f"Duplicate proposal_id {pid!r} with different content "
+                        f"in ReviewRequest {self.review_id!r}"
+                    )
+                raise InvalidReviewRequestError(
+                    f"Duplicate proposal_id {pid!r} (same content) in "
+                    f"ReviewRequest {self.review_id!r} — Phase 4 merge should "
+                    f"have deduped"
+                )
+
+        # evidence_id uniqueness — same id with different review-hash
+        # → fail-closed raise.  Same id + same hash → benign, allow.
+        evidence_by_id: dict[str, list[Evidence]] = {}
+        for ev in self.evidence:
+            evidence_by_id.setdefault(ev.evidence_id, []).append(ev)
+        for eid, evidence_group in evidence_by_id.items():
+            if len(evidence_group) > 1:
+                hashes = {
+                    compute_review_evidence_hash(ev_item) for ev_item in evidence_group
+                }
+                if len(hashes) > 1:
+                    raise InvalidReviewRequestError(
+                        f"Duplicate evidence_id {eid!r} with different content "
+                        f"in ReviewRequest {self.review_id!r}"
+                    )
+
+        # task_id uniqueness across task_records
+        task_ids: dict[str, int] = {}
+        for tr in self.task_records:
+            task_ids[tr.task_id] = task_ids.get(tr.task_id, 0) + 1
+        for tid, count in task_ids.items():
+            if count > 1:
+                raise InvalidReviewRequestError(
+                    f"Duplicate task_id {tid!r} in ReviewRequest {self.review_id!r}"
+                )
+
+        # agent_id uniqueness across capability_bindings
+        agent_ids: dict[str, int] = {}
+        for cb in self.capability_bindings:
+            agent_ids[cb.agent_id] = agent_ids.get(cb.agent_id, 0) + 1
+        for aid, count in agent_ids.items():
+            if count > 1:
+                raise InvalidReviewRequestError(
+                    f"Duplicate agent_id {aid!r} in capability_bindings of "
+                    f"ReviewRequest {self.review_id!r}"
+                )
+
+        # sequence uniqueness across trace
+        sequences: dict[int, int] = {}
+        for trace_ev in self.trace:
+            sequences[trace_ev.sequence] = sequences.get(trace_ev.sequence, 0) + 1
+        for seq, count in sequences.items():
+            if count > 1:
+                raise InvalidReviewRequestError(
+                    f"Duplicate trace sequence {seq} in ReviewRequest "
+                    f"{self.review_id!r}"
+                )
+
+        # origin_hash uniqueness across proposal_envelopes
+        origin_hashes: dict[str, int] = {}
+        for env in self.proposal_envelopes:
+            origin_hashes[env.origin_hash] = origin_hashes.get(env.origin_hash, 0) + 1
+        for oh, count in origin_hashes.items():
+            if count > 1:
+                raise InvalidReviewRequestError(
+                    f"Duplicate origin_hash {oh[:12]!r} in proposal_envelopes "
+                    f"of ReviewRequest {self.review_id!r}"
+                )
+
+        # Envelope ↔ Proposal bijection: every envelope's proposal_id
+        # must match exactly one proposal, and every proposal must have
+        # a matching envelope.
+        proposal_ids = {p.proposal_id for p in self.proposals}
+        envelope_proposal_ids = {
+            env.proposal.proposal_id for env in self.proposal_envelopes
+        }
+        missing_envelopes = proposal_ids - envelope_proposal_ids
+        if missing_envelopes:
+            raise InvalidReviewRequestError(
+                f"Proposals without matching envelope in ReviewRequest "
+                f"{self.review_id!r}: {sorted(missing_envelopes)!r}"
+            )
+        orphan_envelopes = envelope_proposal_ids - proposal_ids
+        if orphan_envelopes:
+            raise InvalidReviewRequestError(
+                f"Envelopes without matching proposal in ReviewRequest "
+                f"{self.review_id!r}: {sorted(orphan_envelopes)!r}"
+            )
+
+        return self
+
     # -- public API ---------------------------------------------------------
 
     def compute_hash(self) -> str:
         """Return a stable SHA-256 over the canonical request content.
 
         Excludes ``request_hash`` (self-referential) and any
-        wall-clock field.  List fields are sorted by stable key inside
-        :func:`canonicalize` (via frozenset conversion for sets, and
-        explicit sort for lists of BaseModel via the ``mode="python"``
-        round-trip).
+        wall-clock field.  List fields are sorted by stable key so
+        the hash is ORDER-INVARIANT (R1 P0-4).
         """
-        return stable_hash(self, exclude={"request_hash"})
+        return stable_hash(canonical_review_request_payload(self))
 
     def verify_integrity(self) -> None:
         """Recompute and compare ``request_hash``.  Raise on mismatch."""
@@ -407,14 +618,42 @@ class ReviewRequest(StrictContract):
     def to_canonical_payload(self) -> dict[str, Any]:
         """Return the canonical dict used for hashing — exposed for
         audit / debugging."""
-        data = self.model_dump(mode="python")
-        data.pop("request_hash", None)
-        return canonicalize(data)
+        return canonical_review_request_payload(self)
 
 
 # ---------------------------------------------------------------------------
 # ProposalReview
 # ---------------------------------------------------------------------------
+
+
+# Finding codes whose presence justifies a REJECTED decision.  Used by
+# :meth:`ProposalReview.verify_semantics` to detect a status/finding
+# contradiction (e.g. status==REJECTED but no rejection-class finding).
+REJECTION_FINDING_CODES: frozenset[str] = frozenset(
+    {
+        CODE_TENANT_CROSS_REFERENCE,
+        CODE_TENANT_SECRET_FIELD,
+        CODE_TENANT_PII_EGRESS,
+        CODE_AUTHORITY_INSUFFICIENT,
+        CODE_AUTHORITY_READ_ONLY_WRITE,
+        CODE_AUTHORITY_PROPOSE_EXECUTE,
+        CODE_AUTHORITY_EXCEEDS_SNAPSHOT,
+        CODE_POLICY_DENIED,
+        CODE_EVIDENCE_HASH_MISMATCH,
+        CODE_EVIDENCE_DUPLICATE,
+        CODE_EVIDENCE_FOREIGN_TENANT,
+        CODE_EVIDENCE_TYPE_MISMATCH,
+        CODE_IDENTITY_MISMATCH,
+        CODE_IDENTITY_DUPLICATE_PROPOSAL_ID,
+        CODE_ACTION_UNKNOWN_TYPE,
+        CODE_ACTION_TOOL_FORBIDDEN,
+        CODE_ACTION_PARAMETER_INVALID,
+        CODE_ACTION_CATEGORY_NOT_REVIEWABLE,
+        CODE_IDEMPOTENCY_MISSING,
+        CODE_IDEMPOTENCY_BLANK,
+        CODE_IDEMPOTENCY_INCONSISTENT,
+    }
+)
 
 
 class ProposalReview(StrictContract):
@@ -468,6 +707,84 @@ class ProposalReview(StrictContract):
                 f"match recomputed content"
             )
 
+    def verify_semantics(self) -> None:
+        """Validate that status and flags are consistent with findings.
+
+        Raises :class:`InvalidReviewResultError` on any inconsistency.
+        """
+        has_error = any(
+            f.severity in (ReviewFindingSeverity.ERROR, ReviewFindingSeverity.CRITICAL)
+            for f in self.findings
+        )
+        finding_codes = {f.finding_code for f in self.findings}
+
+        if self.status == ReviewDecisionStatus.APPROVED:
+            if has_error:
+                raise InvalidReviewResultError(
+                    f"ProposalReview {self.proposal_id!r}: status APPROVED but "
+                    f"has ERROR/CRITICAL findings"
+                )
+        elif self.status == ReviewDecisionStatus.REJECTED:
+            if not (finding_codes & REJECTION_FINDING_CODES):
+                raise InvalidReviewResultError(
+                    f"ProposalReview {self.proposal_id!r}: status REJECTED but "
+                    f"no rejection-class finding"
+                )
+        elif self.status == ReviewDecisionStatus.NEEDS_APPROVAL:
+            if not self.required_approval:
+                raise InvalidReviewResultError(
+                    f"ProposalReview {self.proposal_id!r}: status NEEDS_APPROVAL "
+                    f"but required_approval is False"
+                )
+        elif self.status == ReviewDecisionStatus.NEEDS_INPUT:
+            if not (finding_codes & {CODE_EVIDENCE_MISSING, CODE_POLICY_NEEDS_INPUT}):
+                raise InvalidReviewResultError(
+                    f"ProposalReview {self.proposal_id!r}: status NEEDS_INPUT "
+                    f"but no {CODE_EVIDENCE_MISSING!r}/{CODE_POLICY_NEEDS_INPUT!r} "
+                    f"finding"
+                )
+        elif self.status == ReviewDecisionStatus.CONFLICT:
+            if not any(c.startswith("review.conflict.") for c in finding_codes):
+                raise InvalidReviewResultError(
+                    f"ProposalReview {self.proposal_id!r}: status CONFLICT but "
+                    f"no review.conflict.* finding"
+                )
+        elif self.status == ReviewDecisionStatus.DEDUPLICATED:
+            if CODE_DUPLICATE_DEDUPED not in finding_codes:
+                raise InvalidReviewResultError(
+                    f"ProposalReview {self.proposal_id!r}: status DEDUPLICATED "
+                    f"but no {CODE_DUPLICATE_DEDUPED!r} finding"
+                )
+
+        # Flag ↔ finding consistency
+        has_authority_error = any(
+            f.finding_code.startswith("review.authority.")
+            and f.severity
+            in (ReviewFindingSeverity.ERROR, ReviewFindingSeverity.CRITICAL)
+            for f in self.findings
+        )
+        if has_authority_error and self.authority_valid:
+            raise InvalidReviewResultError(
+                f"ProposalReview {self.proposal_id!r}: authority_valid=True but "
+                f"an authority ERROR finding exists"
+            )
+        if CODE_POLICY_DENIED in finding_codes and self.policy_valid:
+            raise InvalidReviewResultError(
+                f"ProposalReview {self.proposal_id!r}: policy_valid=True but "
+                f"a {CODE_POLICY_DENIED!r} finding exists"
+            )
+        has_idempotency_error = any(
+            f.finding_code.startswith("review.idempotency.")
+            and f.severity
+            in (ReviewFindingSeverity.ERROR, ReviewFindingSeverity.CRITICAL)
+            for f in self.findings
+        )
+        if has_idempotency_error and self.idempotency_valid:
+            raise InvalidReviewResultError(
+                f"ProposalReview {self.proposal_id!r}: idempotency_valid=True "
+                f"but an idempotency ERROR finding exists"
+            )
+
 
 # ---------------------------------------------------------------------------
 # ReviewBatchResult
@@ -478,10 +795,11 @@ def batch_status_priority(status: ReviewBatchStatus) -> int:
     """Return priority weight — higher wins.
 
     Priority order (Phase 5A Section 11):
-        conflict > rejected > needs_input > needs_approval > approved
+        conflict > rejected > needs_input > needs_approval > deduplicated > approved
     """
     order = {
         ReviewBatchStatus.APPROVED: 0,
+        ReviewBatchStatus.DEDUPLICATED: 1,
         ReviewBatchStatus.NEEDS_APPROVAL: 1,
         ReviewBatchStatus.NEEDS_INPUT: 2,
         ReviewBatchStatus.REJECTED: 3,
@@ -498,6 +816,7 @@ def proposal_status_to_batch(status: ReviewDecisionStatus) -> ReviewBatchStatus:
         ReviewDecisionStatus.NEEDS_INPUT: ReviewBatchStatus.NEEDS_INPUT,
         ReviewDecisionStatus.REJECTED: ReviewBatchStatus.REJECTED,
         ReviewDecisionStatus.CONFLICT: ReviewBatchStatus.CONFLICT,
+        ReviewDecisionStatus.DEDUPLICATED: ReviewBatchStatus.DEDUPLICATED,
     }
     return mapping[status]
 
@@ -529,6 +848,7 @@ class ReviewBatchResult(StrictContract):
     rejected_proposal_ids: list[str] = Field(default_factory=list)
     approval_required_proposal_ids: list[str] = Field(default_factory=list)
     conflicted_proposal_ids: list[str] = Field(default_factory=list)
+    deduplicated_proposal_ids: list[str] = Field(default_factory=list)
     findings: list[ReviewFinding] = Field(default_factory=list)
 
     result_hash: str = ""
@@ -572,6 +892,94 @@ class ReviewBatchResult(StrictContract):
                 f"match recomputed content"
             )
 
+    def verify_semantics(self) -> None:
+        """Validate that batch-level summaries are consistent with
+        per-proposal reviews.
+
+        Raises :class:`InvalidReviewResultError` on any inconsistency.
+        """
+        if not self.reviewer_version.strip():
+            raise InvalidReviewResultError(
+                f"ReviewBatchResult {self.review_id!r}: reviewer_version blank"
+            )
+
+        # proposal_ids unique
+        ids = [r.proposal_id for r in self.proposal_reviews]
+        if len(ids) != len(set(ids)):
+            raise InvalidReviewResultError(
+                f"ReviewBatchResult {self.review_id!r}: duplicate proposal_ids "
+                f"in proposal_reviews"
+            )
+
+        # batch_status recompute
+        if self.proposal_reviews:
+            recomputed = max(
+                (proposal_status_to_batch(r.status) for r in self.proposal_reviews),
+                key=batch_status_priority,
+            )
+        else:
+            recomputed = ReviewBatchStatus.APPROVED
+        if self.batch_status != recomputed:
+            raise InvalidReviewResultError(
+                f"ReviewBatchResult {self.review_id!r}: batch_status "
+                f"{self.batch_status.value!r} != recomputed "
+                f"{recomputed.value!r}"
+            )
+
+        # Summary id lists
+        expected_approved = sorted(
+            r.proposal_id
+            for r in self.proposal_reviews
+            if r.status == ReviewDecisionStatus.APPROVED
+        )
+        if self.approved_proposal_ids != expected_approved:
+            raise InvalidReviewResultError(
+                f"ReviewBatchResult {self.review_id!r}: approved_proposal_ids mismatch"
+            )
+        expected_rejected = sorted(
+            r.proposal_id
+            for r in self.proposal_reviews
+            if r.status == ReviewDecisionStatus.REJECTED
+        )
+        if self.rejected_proposal_ids != expected_rejected:
+            raise InvalidReviewResultError(
+                f"ReviewBatchResult {self.review_id!r}: rejected_proposal_ids mismatch"
+            )
+        expected_approval = sorted(
+            r.proposal_id
+            for r in self.proposal_reviews
+            if r.status == ReviewDecisionStatus.NEEDS_APPROVAL
+        )
+        if self.approval_required_proposal_ids != expected_approval:
+            raise InvalidReviewResultError(
+                f"ReviewBatchResult {self.review_id!r}: "
+                f"approval_required_proposal_ids mismatch"
+            )
+        expected_conflicted = sorted(
+            r.proposal_id
+            for r in self.proposal_reviews
+            if r.status == ReviewDecisionStatus.CONFLICT
+        )
+        if self.conflicted_proposal_ids != expected_conflicted:
+            raise InvalidReviewResultError(
+                f"ReviewBatchResult {self.review_id!r}: "
+                f"conflicted_proposal_ids mismatch"
+            )
+        expected_deduped = sorted(
+            r.proposal_id
+            for r in self.proposal_reviews
+            if r.status == ReviewDecisionStatus.DEDUPLICATED
+        )
+        if self.deduplicated_proposal_ids != expected_deduped:
+            raise InvalidReviewResultError(
+                f"ReviewBatchResult {self.review_id!r}: "
+                f"deduplicated_proposal_ids mismatch"
+            )
+
+        # Per-proposal semantic validation
+        for r in self.proposal_reviews:
+            r.verify_semantics()
+
 
 __all__ = [
     "CODE_ACTION_CATEGORY_NOT_REVIEWABLE",
@@ -614,16 +1022,19 @@ __all__ = [
     "CapabilitySnapshot",
     "PolicyContext",
     "ProposalReview",
+    "REJECTION_FINDING_CODES",
     "REVIEWER_VERSION",
     "ReviewBatchResult",
     "ReviewBatchStatus",
     "ReviewDecisionStatus",
     "ReviewFinding",
     "ReviewFindingSeverity",
+    "ReviewProposalEnvelope",
     "ReviewRequest",
     "ReviewRiskLevel",
     "TaskRecordSummary",
     "TraceSummary",
     "batch_status_priority",
+    "canonical_review_request_payload",
     "proposal_status_to_batch",
 ]

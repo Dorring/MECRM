@@ -118,22 +118,26 @@ def _make_cap_snapshot(
 class TestBuildEvidenceIndex:
     def test_single_evidence_indexed(self):
         ev = _make_evidence("ev-001")
-        idx = build_evidence_index([ev])
+        idx, _ = build_evidence_index([ev])
         assert idx["ev-001"] == ev
 
     def test_duplicate_with_same_content_deduped(self):
         ev1 = _make_evidence("ev-001")
         ev2 = _make_evidence("ev-001")
-        idx = build_evidence_index([ev1, ev2])
+        idx, _ = build_evidence_index([ev1, ev2])
         # Same content → only one kept
         assert "ev-001" in idx
 
     def test_duplicate_with_different_content_excluded(self):
-        ev1 = _make_evidence("ev-001", content_hash="a" * 64)
-        ev2 = _make_evidence("ev-001", content_hash="b" * 64)
-        idx = build_evidence_index([ev1, ev2])
+        # compute_review_evidence_hash excludes the self-referential
+        # content_hash field, so differ in source_agent to produce
+        # genuinely distinct review hashes.
+        ev1 = _make_evidence("ev-001", source_agent="agent_a")
+        ev2 = _make_evidence("ev-001", source_agent="agent_b")
+        idx, excluded = build_evidence_index([ev1, ev2])
         # Different content → all excluded (fail closed)
         assert "ev-001" not in idx
+        assert "ev-001" in excluded
 
 
 # ---------------------------------------------------------------------------
@@ -148,8 +152,11 @@ class TestDetectDuplicateEvidence:
         assert findings == []
 
     def test_duplicate_with_different_content_flagged(self):
-        ev1 = _make_evidence("ev-001", content_hash="a" * 64)
-        ev2 = _make_evidence("ev-001", content_hash="b" * 64)
+        # compute_review_evidence_hash excludes the self-referential
+        # content_hash field, so differ in source_agent to produce
+        # genuinely distinct review hashes.
+        ev1 = _make_evidence("ev-001", source_agent="agent_a")
+        ev2 = _make_evidence("ev-001", source_agent="agent_b")
         findings = detect_duplicate_evidence([ev1, ev2])
         assert len(findings) == 1
         assert findings[0].finding_code == CODE_EVIDENCE_DUPLICATE
@@ -172,7 +179,7 @@ class TestValidateEvidenceForProposal:
         ev = _make_evidence("ev-001")
         prop = _make_proposal(evidence_ids=["ev-001"])
         cap = _make_cap_snapshot()
-        idx = build_evidence_index([ev])
+        idx, _ = build_evidence_index([ev])
         findings = validate_evidence_for_proposal(
             prop,
             idx,
@@ -184,7 +191,7 @@ class TestValidateEvidenceForProposal:
     def test_missing_evidence_flagged(self):
         prop = _make_proposal(evidence_ids=["ev-does-not-exist"])
         cap = _make_cap_snapshot()
-        idx = build_evidence_index([])
+        idx, _ = build_evidence_index([])
         findings = validate_evidence_for_proposal(
             prop,
             idx,
@@ -199,7 +206,7 @@ class TestValidateEvidenceForProposal:
         ev = _make_evidence("ev-001", tenant_id="tenant-OTHER")
         prop = _make_proposal(evidence_ids=["ev-001"])
         cap = _make_cap_snapshot()
-        idx = build_evidence_index([ev])
+        idx, _ = build_evidence_index([ev])
         findings = validate_evidence_for_proposal(
             prop,
             idx,
@@ -214,7 +221,7 @@ class TestValidateEvidenceForProposal:
         ev = _make_evidence("ev-001", source_agent="rogue_agent")
         prop = _make_proposal(evidence_ids=["ev-001"])
         cap = _make_cap_snapshot(agent_id="agent_test")
-        idx = build_evidence_index([ev])
+        idx, _ = build_evidence_index([ev])
         findings = validate_evidence_for_proposal(
             prop,
             idx,
@@ -227,7 +234,7 @@ class TestValidateEvidenceForProposal:
         ev = _make_evidence("ev-001", content_hash="not-hex!")
         prop = _make_proposal(evidence_ids=["ev-001"])
         cap = _make_cap_snapshot()
-        idx = build_evidence_index([ev])
+        idx, _ = build_evidence_index([ev])
         findings = validate_evidence_for_proposal(
             prop,
             idx,
@@ -249,7 +256,7 @@ class TestValidateEvidenceForProposal:
             risk_level=ActionRiskLevel.MEDIUM,
         )
         cap = _make_cap_snapshot()
-        idx = build_evidence_index([ev])
+        idx, _ = build_evidence_index([ev])
         findings = validate_evidence_for_proposal(
             prop,
             idx,
@@ -262,7 +269,7 @@ class TestValidateEvidenceForProposal:
         ev = _make_evidence("ev-001")
         prop = _make_proposal(evidence_ids=["ev-001", "ev-001"])
         cap = _make_cap_snapshot()
-        idx = build_evidence_index([ev])
+        idx, _ = build_evidence_index([ev])
         findings = validate_evidence_for_proposal(
             prop,
             idx,
@@ -278,7 +285,7 @@ class TestValidateEvidenceForProposal:
             risk_level=ActionRiskLevel.HIGH,
         )
         cap = _make_cap_snapshot()
-        idx = build_evidence_index([])
+        idx, _ = build_evidence_index([])
         findings = validate_evidence_for_proposal(
             prop,
             idx,
@@ -299,7 +306,7 @@ class TestDetectDanglingEvidence:
     def test_orphan_evidence_info_finding(self):
         ev = _make_evidence("ev-orphan")
         prop = _make_proposal(evidence_ids=["ev-001"])  # references a different id
-        idx = build_evidence_index([ev])
+        idx, _ = build_evidence_index([ev])
         findings = detect_dangling_evidence([prop], idx)
         assert len(findings) == 1
         assert findings[0].finding_code == CODE_EVIDENCE_DANGLING
@@ -308,6 +315,6 @@ class TestDetectDanglingEvidence:
     def test_no_orphans_no_findings(self):
         ev = _make_evidence("ev-001")
         prop = _make_proposal(evidence_ids=["ev-001"])
-        idx = build_evidence_index([ev])
+        idx, _ = build_evidence_index([ev])
         findings = detect_dangling_evidence([prop], idx)
         assert findings == []

@@ -41,12 +41,13 @@ from multi_agent.contracts import (
     EvidenceType,
 )
 from multi_agent.execution import (
+    ExecutionCapabilitySnapshot,
     SupervisorRunResult,
 )
 from multi_agent.review_contracts import (
-    CapabilitySnapshot,
     PolicyContext,
     ReviewDecisionStatus,
+    ReviewProposalEnvelope,
     ReviewRequest,
     TaskRecordSummary,
     TraceSummary,
@@ -55,6 +56,7 @@ from multi_agent.review_contracts import (
 from multi_agent.review_errors import InvalidReviewRequestError
 from multi_agent.policy import DeterministicPolicyEvaluator, PolicyEvaluator
 from multi_agent.reviewer import ProposalReviewer
+from multi_agent.serialization import stable_hash
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +87,6 @@ def build_review_request(
     supervisor_result: SupervisorRunResult,
     *,
     review_id: str,
-    capability_snapshots: list[CapabilitySnapshot] | None = None,
     policy_context: PolicyContext | None = None,
 ) -> ReviewRequest:
     """Convert a :class:`SupervisorRunResult` into a :class:`ReviewRequest`.
@@ -99,9 +100,10 @@ def build_review_request(
     * Does NOT lose Proposal / Evidence Identity
     * Returns a defensive deep copy
 
-    If the Phase 4 result lacks binding information the Reviewer
-    needs, this adapter reads from the existing Trace / Task Records /
-    Merged State — it does NOT re-open the Phase 4 Runtime.
+    R1: ``capability_bindings`` and ``proposal_envelopes`` are built
+    from the Phase 4 result's ``capability_bindings`` and
+    ``merged_state.results`` — the caller no longer supplies
+    ``capability_snapshots``.
     """
     # Defensive deep copies via Pydantic model_validate (round-trip
     # through model_dump so the caller cannot mutate the original
@@ -140,6 +142,43 @@ def build_review_request(
             )
         )
 
+    # R1: capability_bindings from Phase 4 (defensive copy)
+    capability_bindings: list[ExecutionCapabilitySnapshot] = [
+        ExecutionCapabilitySnapshot.model_validate(cb.model_dump(mode="python"))
+        for cb in supervisor_result.capability_bindings
+    ]
+
+    # R1: proposal_envelopes from Phase 4 results — bind each Proposal
+    # to the exact AgentResult that produced it.
+    proposal_by_id = {p.proposal_id: p for p in proposals_copy}
+    proposal_envelopes: list[ReviewProposalEnvelope] = []
+    for result in merged.results:
+        for ap in result.action_proposals:
+            matching = proposal_by_id.get(ap.proposal_id)
+            if matching is None:
+                continue
+            origin_hash = stable_hash(
+                {
+                    "proposal": matching.model_dump(mode="python"),
+                    "run_id": supervisor_result.run_id,
+                    "result_id": result.result_id,
+                    "task_id": result.task_id,
+                    "agent_id": result.agent_id,
+                    "agent_version": result.agent_version,
+                }
+            )
+            proposal_envelopes.append(
+                ReviewProposalEnvelope(
+                    proposal=matching,
+                    run_id=supervisor_result.run_id,
+                    result_id=result.result_id,
+                    task_id=result.task_id,
+                    agent_id=result.agent_id,
+                    agent_version=result.agent_version,
+                    origin_hash=origin_hash,
+                )
+            )
+
     return ReviewRequest(
         review_id=review_id,
         run_id=supervisor_result.run_id,
@@ -150,7 +189,8 @@ def build_review_request(
         evidence=evidence_copy,
         task_records=task_records,
         trace=trace,
-        capability_snapshots=capability_snapshots or [],
+        capability_bindings=capability_bindings,
+        proposal_envelopes=proposal_envelopes,
         policy_context=policy_context or default_policy_context(),
         reviewer_version=REVIEWER_VERSION,
     )
@@ -293,14 +333,75 @@ def _make_proposal(
     )
 
 
+def _make_capability_binding(
+    task_id: str,
+    agent_id: str,
+    capability: AgentCapability,
+) -> ExecutionCapabilitySnapshot:
+    """Build an :class:`ExecutionCapabilitySnapshot` with a correct
+    ``binding_hash``."""
+    binding_hash = stable_hash(
+        {
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "agent_version": capability.version,
+            "capability": capability.model_dump(mode="python"),
+        }
+    )
+    return ExecutionCapabilitySnapshot(
+        task_id=task_id,
+        agent_id=agent_id,
+        agent_version=capability.version,
+        capability=capability,
+        binding_hash=binding_hash,
+    )
+
+
+def _make_envelope(
+    proposal: ActionProposal,
+    *,
+    run_id: str = "run-fixture",
+    result_id: str = "result-fixture",
+    task_id: str = "task-fixture",
+    agent_id: str | None = None,
+    agent_version: str = "1.0.0",
+) -> ReviewProposalEnvelope:
+    """Build a :class:`ReviewProposalEnvelope` with a correct ``origin_hash``."""
+    aid = agent_id or proposal.created_by_agent
+    origin_hash = stable_hash(
+        {
+            "proposal": proposal.model_dump(mode="python"),
+            "run_id": run_id,
+            "result_id": result_id,
+            "task_id": task_id,
+            "agent_id": aid,
+            "agent_version": agent_version,
+        }
+    )
+    return ReviewProposalEnvelope(
+        proposal=proposal,
+        run_id=run_id,
+        result_id=result_id,
+        task_id=task_id,
+        agent_id=aid,
+        agent_version=agent_version,
+        origin_hash=origin_hash,
+    )
+
+
 def _make_request(
     review_id: str,
     proposals: list[ActionProposal],
     evidence: list[Evidence],
     *,
-    capability_snapshots: list[CapabilitySnapshot] | None = None,
+    capability_bindings: list[ExecutionCapabilitySnapshot] | None = None,
     task_records: list[TaskRecordSummary] | None = None,
+    proposal_envelopes: list[ReviewProposalEnvelope] | None = None,
+    policy_context: PolicyContext | None = None,
 ) -> ReviewRequest:
+    # R1: auto-build envelopes for every proposal if not supplied
+    if proposal_envelopes is None:
+        proposal_envelopes = [_make_envelope(p) for p in proposals]
     return ReviewRequest(
         review_id=review_id,
         run_id="run-fixture",
@@ -325,8 +426,9 @@ def _make_request(
                 agent_id=None,
             )
         ],
-        capability_snapshots=capability_snapshots or [],
-        policy_context=default_policy_context(),
+        capability_bindings=capability_bindings or [],
+        proposal_envelopes=proposal_envelopes,
+        policy_context=policy_context or default_policy_context(),
     )
 
 
@@ -352,17 +454,19 @@ def build_review_fixtures() -> list[ReviewFixture]:
     Proposal IDs — the :func:`compute_review_metrics` function reads
     ``expected_blocked_proposal_ids`` to determine expected outcomes.
     """
-    cap_snapshot_read = CapabilitySnapshot(
-        agent_id="fixture_agent",
-        capability=_make_capability(
+    cap_binding_read = _make_capability_binding(
+        "task-fixture",
+        "fixture_agent",
+        _make_capability(
             "fixture_agent",
             authority=AgentAuthority.READ,
             allowed_tools=frozenset({"crm_reader.get_customers"}),
         ),
     )
-    cap_snapshot_propose = CapabilitySnapshot(
-        agent_id="fixture_agent",
-        capability=_make_capability(
+    cap_binding_propose = _make_capability_binding(
+        "task-fixture",
+        "fixture_agent",
+        _make_capability(
             "fixture_agent",
             authority=AgentAuthority.PROPOSE,
             allowed_tools=frozenset(
@@ -390,7 +494,7 @@ def build_review_fixtures() -> list[ReviewFixture]:
                     )
                 ],
                 evidence=[_make_evidence("ev-valid-001")],
-                capability_snapshots=[cap_snapshot_read],
+                capability_bindings=[cap_binding_read],
             ),
             expected_blocked_proposal_ids=frozenset(),
             description="A valid low-risk read-only Proposal with valid Evidence.",
@@ -411,7 +515,7 @@ def build_review_fixtures() -> list[ReviewFixture]:
                     )
                 ],
                 evidence=[],
-                capability_snapshots=[cap_snapshot_read],
+                capability_bindings=[cap_binding_read],
             ),
             expected_blocked_proposal_ids=frozenset({"prop-missing-ev-001"}),
             description="A Proposal references an evidence_id that does not exist.",
@@ -432,7 +536,7 @@ def build_review_fixtures() -> list[ReviewFixture]:
                     )
                 ],
                 evidence=[_make_evidence("ev-orphan-001")],
-                capability_snapshots=[cap_snapshot_read],
+                capability_bindings=[cap_binding_read],
             ),
             expected_blocked_proposal_ids=frozenset(),
             description="Evidence present but not referenced — informational.",
@@ -458,7 +562,7 @@ def build_review_fixtures() -> list[ReviewFixture]:
                         tenant_id="tenant-OTHER",
                     )
                 ],
-                capability_snapshots=[cap_snapshot_read],
+                capability_bindings=[cap_binding_read],
             ),
             expected_blocked_proposal_ids=frozenset({"prop-foreign-ev-001"}),
             description="Evidence belongs to a different tenant.",
@@ -481,7 +585,7 @@ def build_review_fixtures() -> list[ReviewFixture]:
                     )
                 ],
                 evidence=[_make_evidence("ev-auth-001")],
-                capability_snapshots=[cap_snapshot_read],
+                capability_bindings=[cap_binding_read],
             ),
             expected_blocked_proposal_ids=frozenset({"prop-auth-violation-001"}),
             description="READ-only agent proposes a Write action.",
@@ -502,7 +606,7 @@ def build_review_fixtures() -> list[ReviewFixture]:
                     )
                 ],
                 evidence=[],
-                capability_snapshots=[cap_snapshot_read],
+                capability_bindings=[cap_binding_read],
             ),
             expected_blocked_proposal_ids=frozenset({"prop-unknown-action-001"}),
             description="Action type is not in the registered allowlist.",
@@ -535,7 +639,7 @@ def build_review_fixtures() -> list[ReviewFixture]:
                     )
                 ],
                 evidence=[_make_evidence("ev-short-idem-001")],
-                capability_snapshots=[cap_snapshot_propose],
+                capability_bindings=[cap_binding_propose],
             ),
             expected_blocked_proposal_ids=frozenset({"prop-short-idem-001"}),
             description="High-risk Proposal with an idempotency_key that is too short.",
@@ -558,7 +662,7 @@ def build_review_fixtures() -> list[ReviewFixture]:
                     )
                 ],
                 evidence=[_make_evidence("ev-high-risk-001")],
-                capability_snapshots=[cap_snapshot_propose],
+                capability_bindings=[cap_binding_propose],
             ),
             expected_blocked_proposal_ids=frozenset({"prop-high-risk-001"}),
             description="High-risk action that requires human approval.",
@@ -580,12 +684,8 @@ def build_review_fixtures() -> list[ReviewFixture]:
     fixtures.append(
         ReviewFixture(
             name="policy_deny",
-            request=ReviewRequest(
-                review_id="review-policy-deny",
-                run_id="run-fixture",
-                tenant_id="tenant-fixture",
-                plan_hash="plan-fixture-hash",
-                registry_version="registry-fixture-v1",
+            request=_make_request(
+                "review-policy-deny",
                 proposals=[
                     _make_proposal(
                         "prop-policy-deny-001",
@@ -594,20 +694,7 @@ def build_review_fixtures() -> list[ReviewFixture]:
                     )
                 ],
                 evidence=[_make_evidence("ev-policy-deny-001")],
-                task_records=[
-                    TaskRecordSummary(
-                        task_id="task-fixture",
-                        agent_id="fixture_agent",
-                        status="completed",
-                    )
-                ],
-                trace=[
-                    TraceSummary(
-                        sequence=0,
-                        event_type="run_started",
-                    )
-                ],
-                capability_snapshots=[cap_snapshot_read],
+                capability_bindings=[cap_binding_read],
                 policy_context=deny_ctx,
             ),
             expected_blocked_proposal_ids=frozenset({"prop-policy-deny-001"}),
@@ -635,10 +722,10 @@ def build_review_fixtures() -> list[ReviewFixture]:
                 "review-exact-duplicate",
                 proposals=[dup_proposal_a, dup_proposal_b],
                 evidence=[_make_evidence("ev-dup-001")],
-                capability_snapshots=[cap_snapshot_read],
+                capability_bindings=[cap_binding_read],
             ),
             expected_blocked_proposal_ids=frozenset({"prop-dup-002"}),
-            expected_conflicted_proposal_ids=frozenset({"prop-dup-002"}),
+            expected_conflicted_proposal_ids=frozenset(),
             description="Two exact-duplicate Proposals — one is deduped.",
         )
     )
@@ -671,7 +758,7 @@ def build_review_fixtures() -> list[ReviewFixture]:
                 "review-same-resource-conflict",
                 proposals=[conflict_proposal_a, conflict_proposal_b],
                 evidence=[_make_evidence("ev-conflict-001")],
-                capability_snapshots=[cap_snapshot_propose],
+                capability_bindings=[cap_binding_propose],
             ),
             expected_blocked_proposal_ids=frozenset(
                 {"prop-conflict-001", "prop-conflict-002"}
@@ -708,7 +795,7 @@ def build_review_fixtures() -> list[ReviewFixture]:
                     _make_evidence("ev-multi-001"),
                     _make_evidence("ev-multi-002"),
                 ],
-                capability_snapshots=[cap_snapshot_read],
+                capability_bindings=[cap_binding_read],
             ),
             expected_blocked_proposal_ids=frozenset(),
             description="Two independent valid low-risk Proposals.",

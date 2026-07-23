@@ -146,17 +146,33 @@ def _make_finding(
 # ---------------------------------------------------------------------------
 
 
+def compute_review_evidence_hash(evidence: Evidence) -> str:
+    """Single source of truth for Evidence content integrity.
+
+    Hashes all canonical Evidence fields EXCEPT the self-referential
+    ``content_hash`` field, so a tampered Evidence that keeps the old
+    declared hash is detected.
+    """
+    from multi_agent.serialization import stable_hash
+
+    payload = evidence.model_dump(mode="python")
+    payload.pop("content_hash", None)
+    return stable_hash(payload)
+
+
 def build_evidence_index(
     evidence: list[Evidence],
-) -> dict[str, Evidence]:
-    """Return a deterministic ``evidence_id → Evidence`` mapping.
+) -> tuple[dict[str, Evidence], set[str]]:
+    """Return a deterministic ``evidence_id → Evidence`` mapping and a
+    set of excluded evidence_ids.
 
-    If the input contains duplicate evidence_ids with the SAME content,
-    one copy is kept (benign deduplication).  If duplicates have
-    DIFFERENT content, ALL copies of that id are excluded from the
-    index (fail closed).  The caller is responsible for surfacing the
-    content-mismatch duplicate as a :class:`ReviewFinding` via
-    :func:`detect_duplicate_evidence`.
+    If the input contains duplicate evidence_ids with the SAME content
+    (compared via :func:`compute_review_evidence_hash`), one copy is
+    kept (benign deduplication).  If duplicates have DIFFERENT content,
+    ALL copies of that id are excluded from the index (fail closed) and
+    the id is added to the excluded set.  The caller is responsible for
+    surfacing the content-mismatch duplicate as a :class:`ReviewFinding`
+    via :func:`detect_duplicate_evidence`.
     """
     # Group by evidence_id to detect duplicates with different content.
     seen: dict[str, list[Evidence]] = {}
@@ -164,19 +180,21 @@ def build_evidence_index(
         seen.setdefault(ev.evidence_id, []).append(ev)
 
     index: dict[str, Evidence] = {}
+    excluded: set[str] = set()
     for ev_id, group in seen.items():
         if len(group) == 1:
             index[ev_id] = group[0]
         else:
             # Multiple entries with the same evidence_id — check
-            # whether their content hashes all match.
-            hashes = {ev.content_hash for ev in group}
+            # whether their review hashes all match.
+            hashes = {compute_review_evidence_hash(ev) for ev in group}
             if len(hashes) == 1:
                 # Same content — benign duplicate, keep one.
                 index[ev_id] = group[0]
-            # Different content — fail closed: exclude all copies.
-            # detect_duplicate_evidence will surface the finding.
-    return index
+            else:
+                # Different content — fail closed: exclude all copies.
+                excluded.add(ev_id)
+    return index, excluded
 
 
 def detect_duplicate_evidence(
@@ -187,10 +205,9 @@ def detect_duplicate_evidence(
 
     Same evidence_id + same content is a benign duplicate (already
     deduplicated by Phase 4 merge).  Same evidence_id + different
-    content is a content_mismatch — all copies are flagged.
+    content (compared via :func:`compute_review_evidence_hash`) is a
+    content_mismatch — all copies are flagged.
     """
-    from multi_agent.serialization import content_hash
-
     findings: list[ReviewFinding] = []
     seen: dict[str, list[Evidence]] = {}
     for ev in evidence:
@@ -200,7 +217,7 @@ def detect_duplicate_evidence(
         group = seen[ev_id]
         if len(group) <= 1:
             continue
-        hashes = {content_hash(ev.model_dump(mode="python")) for ev in group}
+        hashes = {compute_review_evidence_hash(ev) for ev in group}
         if len(hashes) > 1:
             findings.append(
                 ReviewFinding(
@@ -229,6 +246,7 @@ def validate_evidence_for_proposal(
     capability_snapshots: dict[str, CapabilitySnapshot],
     *,
     tenant_id: str,
+    excluded_evidence_ids: set[str] | None = None,
 ) -> list[ReviewFinding]:
     """Validate every Evidence reference on *proposal*.
 
@@ -236,8 +254,14 @@ def validate_evidence_for_proposal(
     means all references are valid.  Never raises (the Reviewer
     surfaces findings rather than throwing for business-level
     evidence problems).
+
+    ``excluded_evidence_ids`` contains evidence_ids that were excluded
+    from the index due to content mismatch (tamper detection).  Every
+    Proposal referencing an excluded id gets a blocking
+    ``CODE_EVIDENCE_HASH_MISMATCH`` ERROR finding.
     """
     findings: list[ReviewFinding] = []
+    excluded = excluded_evidence_ids or set()
 
     # 1. Duplicate references within the same Proposal
     seen_in_proposal: dict[str, int] = {}
@@ -269,6 +293,27 @@ def validate_evidence_for_proposal(
 
     matched_evidence: list[Evidence] = []
     for ev_id in proposal.evidence_ids:
+        # 2a. Excluded due to content mismatch (tamper detection)
+        if ev_id in excluded:
+            findings.append(
+                _make_finding(
+                    code=CODE_EVIDENCE_HASH_MISMATCH,
+                    severity=ReviewFindingSeverity.ERROR,
+                    message=(
+                        f"Proposal {proposal.proposal_id!r} references "
+                        f"evidence {ev_id!r} which was excluded due to "
+                        f"content mismatch (tamper detected)"
+                    ),
+                    proposal=proposal,
+                    evidence_ids=[ev_id],
+                    details={
+                        "evidence_id": ev_id,
+                        "reason": "content_mismatch_excluded",
+                    },
+                )
+            )
+            continue
+
         ev = evidence_index.get(ev_id)
         if ev is None:
             findings.append(
@@ -448,6 +493,7 @@ def detect_dangling_evidence(
 
 __all__ = [
     "build_evidence_index",
+    "compute_review_evidence_hash",
     "detect_dangling_evidence",
     "detect_duplicate_evidence",
     "validate_evidence_for_proposal",

@@ -173,6 +173,11 @@ def build_review_graph(reviewer: _ReviewerLike | None = None):
             return {"error": state.error}
         try:
             state.result.verify_integrity()
+            # R1: also enforce semantic invariants (decision ↔ findings,
+            # DEDUPLICATED ↔ CODE_DUPLICATE_DEDUPED, etc.) so the graph
+            # cannot ship a result that passes integrity but violates
+            # the trust-chain semantic contract.
+            state.result.verify_semantics()
         except ReviewError as e:
             state.error = e
             return {"error": e}

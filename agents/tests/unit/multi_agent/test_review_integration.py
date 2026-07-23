@@ -9,7 +9,7 @@ Phase 5A Section 17 — Phase 4 Integration:
 
 Uses real Phase 4 contracts (no placeholder Dicts).  Builds a realistic
 SupervisorRunResult for a Customer Recovery scenario with multiple
-proposals, evidence pieces, and capability snapshots, then runs the
+proposals, evidence pieces, and capability bindings, then runs the
 Reviewer end-to-end and verifies the ReviewBatchResult.
 
 Also includes the Side-effect Guard tests (Section 17):
@@ -41,6 +41,7 @@ from multi_agent.contracts import (
     ToolCallRecord,
 )
 from multi_agent.execution import (
+    ExecutionCapabilitySnapshot,
     ExecutionTraceEvent,
     SupervisorRunResult,
     SupervisorRunStatus,
@@ -52,7 +53,6 @@ from multi_agent.execution import (
 )
 from multi_agent.state import MergedState
 from multi_agent.review_contracts import (
-    CapabilitySnapshot,
     ReviewBatchResult,
     ReviewBatchStatus,
     ReviewDecisionStatus,
@@ -60,6 +60,7 @@ from multi_agent.review_contracts import (
 from multi_agent.review_evaluation import build_review_request
 from multi_agent.policy import DeterministicPolicyEvaluator
 from multi_agent.reviewer import ProposalReviewer
+from multi_agent.serialization import stable_hash
 
 
 _TS = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -324,25 +325,37 @@ def _build_customer_recovery_supervisor_result() -> SupervisorRunResult:
                 occurred_at=_TS,
             ),
         ],
+        capability_bindings=_recovery_capability_bindings(),
         started_at=_TS,
         completed_at=_TS,
         duration_ms=100,
     )
 
 
-def _recovery_capability_snapshots() -> list[CapabilitySnapshot]:
+def _recovery_capability_bindings() -> list[ExecutionCapabilitySnapshot]:
+    cap = _recovery_capability(
+        "agent_recovery",
+        authority=AgentAuthority.PROPOSE,
+        allowed_tools=frozenset(
+            {
+                "crm_reader.get_customers",
+                "crm_writer.propose",
+            }
+        ),
+    )
     return [
-        CapabilitySnapshot(
+        ExecutionCapabilitySnapshot(
+            task_id="task-recovery-001",
             agent_id="agent_recovery",
-            capability=_recovery_capability(
-                "agent_recovery",
-                authority=AgentAuthority.PROPOSE,
-                allowed_tools=frozenset(
-                    {
-                        "crm_reader.get_customers",
-                        "crm_writer.propose",
-                    }
-                ),
+            agent_version="1.0.0",
+            capability=cap,
+            binding_hash=stable_hash(
+                {
+                    "task_id": "task-recovery-001",
+                    "agent_id": "agent_recovery",
+                    "agent_version": "1.0.0",
+                    "capability": cap.model_dump(mode="python"),
+                }
             ),
         ),
     ]
@@ -368,7 +381,6 @@ class TestCustomerRecoveryIntegration:
         request = build_review_request(
             supervisor_result,
             review_id="review-recovery-001",
-            capability_snapshots=_recovery_capability_snapshots(),
         )
         reviewer = ProposalReviewer()
         evaluator = DeterministicPolicyEvaluator()
@@ -400,7 +412,6 @@ class TestCustomerRecoveryIntegration:
         request = build_review_request(
             supervisor_result,
             review_id="review-recovery-002",
-            capability_snapshots=_recovery_capability_snapshots(),
         )
         result = await ProposalReviewer().review(
             request,
@@ -426,7 +437,6 @@ class TestCustomerRecoveryIntegration:
         request = build_review_request(
             supervisor_result,
             review_id="review-recovery-003",
-            capability_snapshots=_recovery_capability_snapshots(),
         )
         result = await ProposalReviewer().review(
             request,
@@ -448,7 +458,6 @@ class TestCustomerRecoveryIntegration:
         request = build_review_request(
             supervisor_result,
             review_id="review-recovery-004",
-            capability_snapshots=_recovery_capability_snapshots(),
         )
         result = await ProposalReviewer().review(
             request,
@@ -471,7 +480,6 @@ class TestCustomerRecoveryIntegration:
         request = build_review_request(
             supervisor_result,
             review_id="review-recovery-005",
-            capability_snapshots=_recovery_capability_snapshots(),
         )
         result = await ProposalReviewer().review(
             request,
@@ -488,7 +496,6 @@ class TestCustomerRecoveryIntegration:
         request = build_review_request(
             supervisor_result,
             review_id="review-recovery-006",
-            capability_snapshots=_recovery_capability_snapshots(),
         )
         result = await ProposalReviewer().review(
             request,
@@ -506,17 +513,14 @@ class TestCustomerRecoveryIntegration:
         """Two reviews of the same input produce the same result_hash."""
         supervisor_a = _build_customer_recovery_supervisor_result()
         supervisor_b = _build_customer_recovery_supervisor_result()
-        snaps = _recovery_capability_snapshots()
 
         request_a = build_review_request(
             supervisor_a,
             review_id="rev",
-            capability_snapshots=snaps,
         )
         request_b = build_review_request(
             supervisor_b,
             review_id="rev",
-            capability_snapshots=snaps,
         )
 
         result_a = await ProposalReviewer().review(
@@ -540,7 +544,6 @@ class TestCustomerRecoveryIntegration:
         _ = build_review_request(
             supervisor_result,
             review_id="review-no-mutate",
-            capability_snapshots=_recovery_capability_snapshots(),
         )
 
         assert (
@@ -580,7 +583,6 @@ class TestSideEffectGuard:
         request = build_review_request(
             supervisor_result,
             review_id="review-side-effect-db",
-            capability_snapshots=_recovery_capability_snapshots(),
         )
 
         # Patch common DB write entry points.  If any is called, the
@@ -617,7 +619,6 @@ class TestSideEffectGuard:
         request = build_review_request(
             supervisor_result,
             review_id="review-side-effect-kafka",
-            capability_snapshots=_recovery_capability_snapshots(),
         )
 
         try:
@@ -656,7 +657,6 @@ class TestSideEffectGuard:
         request = build_review_request(
             supervisor_result,
             review_id="review-side-effect-http",
-            capability_snapshots=_recovery_capability_snapshots(),
         )
 
         with (
@@ -685,7 +685,6 @@ class TestSideEffectGuard:
         request = build_review_request(
             supervisor_result,
             review_id="review-side-effect-tool",
-            capability_snapshots=_recovery_capability_snapshots(),
         )
 
         # The Reviewer never imports Tool handlers at runtime, but we
@@ -713,7 +712,6 @@ class TestSideEffectGuard:
         request = build_review_request(
             supervisor_result,
             review_id="review-side-effect-executor",
-            capability_snapshots=_recovery_capability_snapshots(),
         )
 
         # Patch the executor module's run entry point if it exists;
@@ -745,7 +743,6 @@ class TestSideEffectGuard:
         request = build_review_request(
             supervisor_result,
             review_id="review-side-effect-crm",
-            capability_snapshots=_recovery_capability_snapshots(),
         )
 
         # Patch CRM writer entry points if they exist.
@@ -783,7 +780,6 @@ class TestSideEffectGuard:
         request = build_review_request(
             supervisor_result,
             review_id="review-side-effect-msg",
-            capability_snapshots=_recovery_capability_snapshots(),
         )
 
         try:
@@ -823,7 +819,6 @@ class TestSideEffectGuard:
         request = build_review_request(
             supervisor_result,
             review_id="review-side-effect-opa",
-            capability_snapshots=_recovery_capability_snapshots(),
         )
 
         with (
@@ -866,7 +861,6 @@ class TestApprovedDoesNotMeanExecuted:
         request = build_review_request(
             supervisor_result,
             review_id="review-approved-noexec",
-            capability_snapshots=_recovery_capability_snapshots(),
         )
 
         # Patch HTTP entry points with explicit AssertionError side

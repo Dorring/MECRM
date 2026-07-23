@@ -281,6 +281,8 @@ class SupervisorRunResult(StrictContract):
     usage: ExecutionUsage
     trace: list[ExecutionTraceEvent] = Field(default_factory=list)
 
+    capability_bindings: list[ExecutionCapabilitySnapshot] = Field(default_factory=list)
+
     started_at: datetime
     completed_at: datetime
     duration_ms: int = Field(ge=0)
@@ -338,6 +340,49 @@ class ExecutionBinding(StrictContract):
     task_id: str
     agent_id: str
     capability_snapshot: AgentCapability
+
+
+class ExecutionCapabilitySnapshot(StrictContract):
+    """Frozen, auditable summary of a Phase 4 pre-flight ExecutionBinding.
+
+    Carried on SupervisorRunResult so Phase 5A can validate Proposal
+    authority against the capability that was *actually bound at
+    pre-flight time* — never a caller-supplied snapshot.
+    """
+
+    model_config = {"extra": "forbid", "frozen": True}
+
+    task_id: str
+    agent_id: str
+    agent_version: str
+    capability: AgentCapability
+    binding_hash: str
+
+    @field_validator("task_id", "agent_id", "agent_version", "binding_hash")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError(
+                "ExecutionCapabilitySnapshot identity fields must not be blank"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _verify_binding_hash(self) -> "ExecutionCapabilitySnapshot":
+        from multi_agent.serialization import stable_hash
+
+        expected = stable_hash(
+            {
+                "task_id": self.task_id,
+                "agent_id": self.agent_id,
+                "agent_version": self.agent_version,
+                "capability": self.capability.model_dump(mode="python"),
+            }
+        )
+        if self.binding_hash != expected:
+            raise ValueError("ExecutionCapabilitySnapshot binding_hash mismatch")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +639,8 @@ def utc_now() -> datetime:
 
 
 __all__ = [
+    "ExecutionBinding",
+    "ExecutionCapabilitySnapshot",
     "ExecutionCancellation",
     "ExecutionTraceEvent",
     "FakeExecutionCancellation",

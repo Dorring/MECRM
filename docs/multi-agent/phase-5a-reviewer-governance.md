@@ -73,6 +73,7 @@ Executor that consumes approved Proposals.
 │    .merged_state.merged_evidence    ──┤                  │
 │    .task_records                    ──┤                  │
 │    .trace                           ──┤                  │
+│    .capability_bindings              ──┤                  │
 │    .run_id / .plan_hash /           ──┤                  │
 │    .registry_version                ──┤                  │
 └─────────────────────────────────────────┘
@@ -86,7 +87,8 @@ Executor that consumes approved Proposals.
 │  evidence: list[Evidence]                               │
 │  task_records: list[TaskRecordSummary]                  │
 │  trace: list[TraceSummary]                              │
-│  capability_snapshots: list[CapabilitySnapshot]         │
+│  capability_bindings: list[ExecutionCapabilitySnapshot] │
+│  proposal_envelopes: list[ReviewProposalEnvelope]       │
 │  policy_context: PolicyContext                          │
 │  request_hash: str  (SHA-256, cross-process stable)     │
 └─────────────────────────────────────────────────────────┘
@@ -102,6 +104,7 @@ Executor that consumes approved Proposals.
 │  rejected_proposal_ids: list[str]                       │
 │  approval_required_proposal_ids: list[str]              │
 │  conflicted_proposal_ids: list[str]                     │
+│  deduplicated_proposal_ids: list[str]                   │
 │  findings: list[ReviewFinding]                          │
 │  result_hash: str  (SHA-256, cross-process stable)      │
 └─────────────────────────────────────────────────────────┘
@@ -128,7 +131,9 @@ audit records are immutable after construction.
 | `ReviewFinding` | Yes | — | Single observation |
 | `TaskRecordSummary` | Yes | — | Minimal Task identity snapshot |
 | `TraceSummary` | Yes | — | Minimal Trace event snapshot |
-| `CapabilitySnapshot` | Yes | — | Frozen Agent capability for authority validation |
+| `ReviewProposalEnvelope` | Yes | `origin_hash` | Binds a Proposal to its Phase 4 Task/Result origin |
+| `ExecutionCapabilitySnapshot` | Yes | `binding_hash` | Phase 4 frozen Agent capability used for authority validation |
+| `CapabilitySnapshot` | Yes | — | Internal Reviewer wrapper for authority validation |
 | `PolicyContext` | Yes | — | Frozen policy rules + version |
 
 Key design rules:
@@ -152,6 +157,7 @@ class ReviewDecisionStatus(StrEnum):
     NEEDS_APPROVAL = "needs_approval"
     NEEDS_INPUT = "needs_input"
     CONFLICT = "conflict"
+    DEDUPLICATED = "deduplicated"
 
 class ReviewBatchStatus(StrEnum):
     APPROVED = "approved"
@@ -159,6 +165,7 @@ class ReviewBatchStatus(StrEnum):
     NEEDS_INPUT = "needs_input"
     REJECTED = "rejected"
     CONFLICT = "conflict"
+    DEDUPLICATED = "deduplicated"
 
 class ReviewRiskLevel(StrEnum):
     LOW = "low"
@@ -337,20 +344,26 @@ canonical_key = SHA-256(
 
 ### Duplicate Detection
 
-Two Proposals are **duplicates** if they share:
+Two Proposals are **exact duplicates** if they share:
 - The same `canonical_key`
 - The same `idempotency_key`
 
-Duplicates are deduplicated: the lexicographically smallest
-`proposal_id` is the **primary**; the rest are marked `CONFLICT`
-with an audit finding. No Proposal is silently deleted.
+Exact duplicates are deduplicated: the lexicographically smallest
+`proposal_id` is the **primary** (it retains its normal review
+decision); the rest are marked `DEDUPLICATED` (not `CONFLICT`) with a
+`CODE_DUPLICATE_DEDUPED` finding. No Proposal is silently deleted.
+
+A **conflict** (same idempotency_key with *different* canonical keys,
+or same resource targeted with mutually exclusive values) is still
+surfaced as `CONFLICT`.
 
 ### Audit Trail
 
 Each deduplication records:
 - `primary_proposal_id`
 - `duplicate_proposal_ids`
-- A `ReviewFinding` with `CODE_DUPLICATE_DETECTED`
+- A `ReviewFinding` with `CODE_DUPLICATE_DETECTED` and per-duplicate
+  `CODE_DUPLICATE_DEDUPED` findings
 
 ---
 
@@ -382,7 +395,15 @@ input order and async completion order do not affect the output.
 Batch status priority (highest first):
 
 ```
-conflict > rejected > needs_input > needs_approval > approved
+conflict > rejected > needs_input > needs_approval > deduplicated > approved
+```
+
+Per-proposal decision priority (highest first):
+
+```
+conflict > deduplicated > rejected (rejection-class codes) >
+needs_input (missing-evidence / policy-needs-input) >
+needs_approval (high-risk / policy-needs-approval) > approved
 ```
 
 Notes:
@@ -390,6 +411,9 @@ Notes:
 - Each Proposal retains its own independent decision.
 - Batch status is the highest-priority summary across all Proposals.
 - Approved Proposals are still NOT executed.
+- `DENIED` policy decisions are no longer short-circuited by the
+  built-in `always-needs-approval` rules — `REJECTED` (denied) takes
+  priority over `NEEDS_APPROVAL` (R1 aggregate policy fix).
 
 ---
 
@@ -441,7 +465,8 @@ validate_request → review_proposals → resolve_conflicts → finalize_review
 - `resolve_conflicts` — no-op pass-through (conflict resolution is
   already inside the Reviewer; this node exists for trace clarity and
   future Phase 5B extension).
-- `finalize_review` — runs `ReviewBatchResult.verify_integrity()`.
+- `finalize_review` — runs `ReviewBatchResult.verify_integrity()` and
+  `ReviewBatchResult.verify_semantics()` (R1).
 
 The graph does **NOT** re-implement Policy, Conflict, or Hash
 algorithms. Graph output is byte-for-byte identical to direct
@@ -575,7 +600,8 @@ agents/tests/unit/multi_agent/
 ├── test_proposal_reviewer.py      # Authority + risk + policy + conflict + batch
 ├── test_review_evaluation.py      # Phase 4 adapter + fixtures + metrics
 ├── test_review_graph.py           # LangGraph adapter + parity + routing
-└── test_review_integration.py     # End-to-end Customer Recovery + side-effect guard
+├── test_review_integration.py     # End-to-end Customer Recovery + side-effect guard
+└── test_r1_trust_chain.py         # R1 regression: 8 P0 trust-chain defects
 ```
 
 ---
@@ -597,6 +623,122 @@ pytest tests/unit/multi_agent/test_review_contracts.py -vv -p no:cacheprovider
 pytest tests/unit/multi_agent/test_proposal_reviewer.py -vv -p no:cacheprovider
 pytest tests/unit/multi_agent/test_conflict_resolution.py -vv -p no:cacheprovider
 pytest tests/unit/multi_agent/test_review_graph.py -vv -p no:cacheprovider
+pytest tests/unit/multi_agent/test_r1_trust_chain.py -vv -p no:cacheprovider
 
 pytest tests/unit/ --collect-only -q
 ```
+
+---
+
+## R1 Revision
+
+The R1 revision closes 8 P0 trust-chain defects discovered during the
+Phase 5A audit. All changes are backwards-incompatible at the
+contract level but preserve the Phase 5A boundary: the Reviewer still
+never executes an `ActionProposal`, never writes to a database, and
+never calls an external service.
+
+### P0 Defects Closed
+
+1. **Identity uniqueness (fail-closed)** — `ReviewRequest` now rejects
+   duplicate `proposal_id` (with different *or* identical content),
+   duplicate `evidence_id` with different content, duplicate
+   `task_id`, duplicate `agent_id` in `capability_bindings`, duplicate
+   trace `sequence`, and duplicate `origin_hash`. The previous behaviour
+   silently deduped or ignored duplicates; R1 raises
+   `InvalidReviewRequestError`.
+
+2. **Envelope ↔ Proposal bijection** — Every `ActionProposal` on a
+   `ReviewRequest` must have exactly one matching
+   `ReviewProposalEnvelope` (matched by `proposal_id`), and every
+   envelope must reference a Proposal on the request. Orphan envelopes
+   or missing envelopes now raise `InvalidReviewRequestError`. The new
+   `ReviewProposalEnvelope` binds a Proposal to its exact Phase 4
+   `run_id` / `result_id` / `task_id` / `agent_id` / `agent_version`
+   and verifies a stable `origin_hash` at construction.
+
+3. **Canonical, order-invariant hashing** —
+   `canonical_review_request_payload` sorts every list field by a
+   stable key before hashing, so reordering `proposals`, `evidence`,
+   `task_records`, `trace`, `capability_bindings`,
+   `proposal_envelopes`, or `policy_context.rules` does not change
+   `request_hash`. `result_hash` is similarly order-invariant.
+
+4. **Tamper detection** — `ReviewRequest.verify_integrity()`,
+   `ProposalReview.verify_integrity()`, and
+   `ReviewBatchResult.verify_integrity()` all compare the stored hash
+   with a recomputed hash using `hmac.compare_digest`. A mutated
+   field, swapped list element, or tampered hash is detectable post
+   round-trip.
+
+5. **Aggregate policy priority** — The previous
+   `always-needs-approval` rules short-circuited before
+   `PolicyDecision.DENIED` could be evaluated, so a `refund.issue`
+   Proposal could end up `needs_approval` even when policy said
+   `DENIED`. R1 enforces
+   `denied > needs_input > needs_approval > allowed` so a deny always
+   wins. `_compute_decision` now uses `REJECTION_FINDING_CODES` to
+   classify rejection-class findings before considering risk level.
+
+6. **`DEDUPLICATED` status** — Exact duplicates (same `canonical_key`
+   *and* same `idempotency_key`) are no longer collapsed into
+   `CONFLICT`. The duplicate copies are marked
+   `ReviewDecisionStatus.DEDUPLICATED` with a `CODE_DUPLICATE_DEDUPED`
+   finding; only the primary copy goes through normal review. Real
+   conflicts (same idempotency_key, different canonical key; same
+   resource, different value) remain `CONFLICT`.
+
+7. **Semantic validation** — `ProposalReview.verify_semantics()` and
+   `ReviewBatchResult.verify_semantics()` enforce decision ↔ findings
+   ↔ flags consistency. A `REJECTED` review must carry a
+   `REJECTION_FINDING_CODES` finding; a `NEEDS_INPUT` review must
+   carry `CODE_EVIDENCE_MISSING` or `CODE_POLICY_NEEDS_INPUT`; a
+   `DEDUPLICATED` review must carry `CODE_DUPLICATE_DEDUPED`; an
+   `APPROVED` review must have no `ERROR`/`CRITICAL` findings. The
+   LangGraph `finalize_review` node now calls `verify_semantics()` in
+   addition to `verify_integrity()`.
+
+8. **Public API round-trip** —
+   `serialize_contract` → `deserialize_contract` → `verify_integrity`
+   + `verify_semantics` is verified by
+   `test_r1_trust_chain.py::TestPublicApiRoundTrip`. The
+   `usage_trust`-style self-referential hash exclusion problem is
+   avoided by excluding `request_hash` / `result_hash` / `review_hash`
+   from the canonical hash payload.
+
+### Contract Field Renames
+
+| Old (Phase 5A initial) | New (R1) | Module |
+|---|---|---|
+| `ReviewRequest.capability_snapshots: list[CapabilitySnapshot]` | `ReviewRequest.capability_bindings: list[ExecutionCapabilitySnapshot]` | `multi_agent.review_contracts` |
+| — | `ReviewRequest.proposal_envelopes: list[ReviewProposalEnvelope]` | `multi_agent.review_contracts` |
+| — | `ReviewBatchResult.deduplicated_proposal_ids: list[str]` | `multi_agent.review_contracts` |
+| `ReviewDecisionStatus` (5 values) | `ReviewDecisionStatus` (6 values — added `DEDUPLICATED`) | `multi_agent.review_contracts` |
+| `ReviewBatchStatus` (5 values) | `ReviewBatchStatus` (6 values — added `DEDUPLICATED`) | `multi_agent.review_contracts` |
+| `build_review_request(supervisor_result, review_id, policy_context, capability_snapshots=…)` | `build_review_request(supervisor_result, *, review_id, policy_context=…)` — `capability_bindings` are read from the `SupervisorRunResult` | `multi_agent.review_evaluation` |
+
+`CapabilitySnapshot` (the lightweight `(agent_id, capability)` wrapper)
+is retained as an internal Reviewer type but is no longer a
+`ReviewRequest` field. Phase 4's `ExecutionCapabilitySnapshot`
+(`task_id`, `agent_id`, `agent_version`, `capability`, `binding_hash`)
+is the authoritative authority source.
+
+### New Public Exports
+
+Phase 5A symbols are now re-exported from `multi_agent.__init__`:
+
+- Contracts and enums from `multi_agent.review_contracts`
+- Errors from `multi_agent.review_errors`
+- Policy types from `multi_agent.policy`
+- Evidence and conflict helpers from `multi_agent.evidence_review`
+  and `multi_agent.conflict_resolution`
+- `ProposalReviewer` and per-aspect validators from `multi_agent.reviewer`
+- Phase 4 adapter, fixtures, and metrics from `multi_agent.review_evaluation`
+- LangGraph adapter from `multi_agent.review_graph`
+
+### Regression Coverage
+
+`agents/tests/unit/multi_agent/test_r1_trust_chain.py` adds 24 tests
+(23 counter-examples + 1 public-API round-trip) covering all 8 P0
+defects. Async tests use `asyncio.run()` inside the test body rather
+than `@pytest.mark.asyncio` per the R1 spec.

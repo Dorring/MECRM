@@ -106,7 +106,7 @@ def _make_request(
                 event_type="run_started",
             )
         ],
-        capability_snapshots=[],
+        capability_bindings=[],
         policy_context=PolicyContext(
             policy_version="test-v1",
             rules=[],

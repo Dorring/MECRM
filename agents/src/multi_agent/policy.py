@@ -319,7 +319,7 @@ class DeterministicPolicyEvaluator:
         matched: list[PolicyMatchedRule] = []
         findings: list[ReviewFinding] = []
 
-        # 1. Action category gate
+        # 1. Action category gate — built-in, can DENY and short-circuit.
         if action in _EXECUTE_ONLY_CATEGORIES:
             findings.append(
                 ReviewFinding(
@@ -372,7 +372,7 @@ class DeterministicPolicyEvaluator:
             )
         )
 
-        # 2. Authority floor
+        # 2. Authority floor — built-in, can DENY and short-circuit.
         floor = _AUTHORITY_FLOOR.get(action, AgentAuthority.PROPOSE)
         try:
             agent_auth = AgentAuthority(request.agent_authority)
@@ -431,8 +431,12 @@ class DeterministicPolicyEvaluator:
             )
         )
 
-        # 3. Always-needs-approval gate
+        # 3. Built-in needs-approval signals (always-needs-approval,
+        #    high-risk).  These do NOT short-circuit anymore — they
+        #    set a flag so context-rule DENIED can override them.
+        builtin_needs_approval = False
         if action in _ALWAYS_NEEDS_APPROVAL:
+            builtin_needs_approval = True
             matched.append(
                 PolicyMatchedRule(
                     rule_id="always-needs-approval",
@@ -451,16 +455,9 @@ class DeterministicPolicyEvaluator:
                     details={"action_type": action},
                 )
             )
-            return PolicyEvaluationResult(
-                proposal_id=request.proposal_id,
-                decision=PolicyDecision.NEEDS_APPROVAL,
-                matched_rules=sorted(matched, key=lambda r: r.rule_id),
-                policy_version=ctx.policy_version,
-                findings=findings,
-            )
 
-        # 4. Risk-level gate
         if request.risk_level in ("high", "critical"):
+            builtin_needs_approval = True
             matched.append(
                 PolicyMatchedRule(
                     rule_id="high-risk-needs-approval",
@@ -481,15 +478,11 @@ class DeterministicPolicyEvaluator:
                     details={"risk_level": request.risk_level},
                 )
             )
-            return PolicyEvaluationResult(
-                proposal_id=request.proposal_id,
-                decision=PolicyDecision.NEEDS_APPROVAL,
-                matched_rules=sorted(matched, key=lambda r: r.rule_id),
-                policy_version=ctx.policy_version,
-                findings=findings,
-            )
 
-        # 5. PolicyContext.rules — explicit deny / needs_input overrides
+        # 4. PolicyContext.rules — collect ALL matching rules (no
+        #    first-match early return).  Sort by (-priority, rule_id)
+        #    so HIGHER priority number wins, ties broken by rule_id.
+        context_effects: list[tuple[int, str, PolicyDecision]] = []
         for rule in ctx.rules:
             rule_id = str(rule.get("rule_id", ""))
             if not rule_id:
@@ -503,10 +496,13 @@ class DeterministicPolicyEvaluator:
             rule_action = rule.get("action_type")
             if rule_action is not None and str(rule_action) != action:
                 continue
+            priority = int(rule.get("priority", 0))
+            rule_version = str(rule.get("rule_version", "")) or ctx.policy_version
+            context_effects.append((priority, rule_id, effect))
             matched.append(
                 PolicyMatchedRule(
                     rule_id=rule_id,
-                    rule_version=ctx.policy_version,
+                    rule_version=rule_version,
                     effect=effect,
                     matched_fields=["action_type"] if rule_action else [],
                 )
@@ -522,14 +518,7 @@ class DeterministicPolicyEvaluator:
                         details={"rule_id": rule_id, "action_type": action},
                     )
                 )
-                return PolicyEvaluationResult(
-                    proposal_id=request.proposal_id,
-                    decision=PolicyDecision.DENIED,
-                    matched_rules=sorted(matched, key=lambda r: r.rule_id),
-                    policy_version=ctx.policy_version,
-                    findings=findings,
-                )
-            if effect == PolicyDecision.NEEDS_INPUT:
+            elif effect == PolicyDecision.NEEDS_INPUT:
                 findings.append(
                     ReviewFinding(
                         finding_code=CODE_POLICY_NEEDS_INPUT,
@@ -543,14 +532,7 @@ class DeterministicPolicyEvaluator:
                         details={"rule_id": rule_id, "action_type": action},
                     )
                 )
-                return PolicyEvaluationResult(
-                    proposal_id=request.proposal_id,
-                    decision=PolicyDecision.NEEDS_INPUT,
-                    matched_rules=sorted(matched, key=lambda r: r.rule_id),
-                    policy_version=ctx.policy_version,
-                    findings=findings,
-                )
-            if effect == PolicyDecision.NEEDS_APPROVAL:
+            elif effect == PolicyDecision.NEEDS_APPROVAL:
                 findings.append(
                     ReviewFinding(
                         finding_code=CODE_POLICY_NEEDS_APPROVAL,
@@ -564,18 +546,25 @@ class DeterministicPolicyEvaluator:
                         details={"rule_id": rule_id, "action_type": action},
                     )
                 )
-                return PolicyEvaluationResult(
-                    proposal_id=request.proposal_id,
-                    decision=PolicyDecision.NEEDS_APPROVAL,
-                    matched_rules=sorted(matched, key=lambda r: r.rule_id),
-                    policy_version=ctx.policy_version,
-                    findings=findings,
-                )
 
-        # 6. Default: allowed
+        # 5. Aggregate context-rule decision: denied > needs_input >
+        #    needs_approval > allowed.
+        context_effects_set = {e for _, _, e in context_effects}
+        if PolicyDecision.DENIED in context_effects_set:
+            final_decision = PolicyDecision.DENIED
+        elif (
+            builtin_needs_approval
+            or PolicyDecision.NEEDS_APPROVAL in context_effects_set
+        ):
+            final_decision = PolicyDecision.NEEDS_APPROVAL
+        elif PolicyDecision.NEEDS_INPUT in context_effects_set:
+            final_decision = PolicyDecision.NEEDS_INPUT
+        else:
+            final_decision = PolicyDecision.ALLOWED
+
         return PolicyEvaluationResult(
             proposal_id=request.proposal_id,
-            decision=PolicyDecision.ALLOWED,
+            decision=final_decision,
             matched_rules=sorted(matched, key=lambda r: r.rule_id),
             policy_version=ctx.policy_version,
             findings=findings,

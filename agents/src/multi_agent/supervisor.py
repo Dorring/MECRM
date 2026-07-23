@@ -43,6 +43,7 @@ from multi_agent.planning import (
 )
 from multi_agent.execution import (
     ExecutionBinding,
+    ExecutionCapabilitySnapshot,
     ExecutionCancellation,
     ExecutionTraceEvent,
     FakeExecutionCancellation,
@@ -108,6 +109,7 @@ from multi_agent.scheduler import (
     TaskOutcome,
 )
 from multi_agent.state import merge_parallel_results
+from multi_agent.serialization import stable_hash
 
 
 # ---------------------------------------------------------------------------
@@ -1425,6 +1427,7 @@ class SupervisorRuntime:
                 started_at=started_at,
                 start_mono=start_mono,
                 canc=canc,
+                bindings=bindings,
             )
 
         # Idempotency lease — only acquired after pre-flight passes.
@@ -1467,6 +1470,7 @@ class SupervisorRuntime:
                     forced_status=SupervisorRunStatus.BUDGET_EXCEEDED,
                     canc=canc,
                     started_at=started_at,
+                    bindings=bindings,
                 )
 
             # Cancellation state shared between run_task and should_stop.
@@ -1550,6 +1554,7 @@ class SupervisorRuntime:
                 forced_status=None,
                 canc=canc,
                 started_at=started_at,
+                bindings=bindings,
             )
         except BaseException as exc:
             # R1 P0-1: Release the lease on any non-clean exit.  We
@@ -1647,6 +1652,7 @@ class SupervisorRuntime:
         started_at: Any,
         start_mono: float,
         canc: ExecutionCancellation,
+        bindings: dict[str, ExecutionBinding],
     ) -> SupervisorRunResult:
         """Build a cancelled result for a run that was cancelled
         *before* the lease was acquired.
@@ -1687,6 +1693,7 @@ class SupervisorRuntime:
                 forced_status=SupervisorRunStatus.CANCELLED,
                 canc=canc,
                 started_at=started_at,
+                bindings=bindings,
             )
         except BaseException as exc:
             await self._run_store.abort(lease, error_code=type(exc).__name__)
@@ -2925,6 +2932,7 @@ class SupervisorRuntime:
         forced_status: SupervisorRunStatus | None,
         canc: ExecutionCancellation,
         started_at: Any,
+        bindings: dict[str, ExecutionBinding],
     ) -> SupervisorRunResult:
         cancelled_during_run = await canc.is_cancelled(
             plan.run_id
@@ -2994,6 +3002,23 @@ class SupervisorRuntime:
         # stable even if the live registry drifts — otherwise a future
         # cache lookup for the same (run_id, plan_hash) would see a
         # mismatched registry_version field despite being a valid hit.
+        capability_bindings = [
+            ExecutionCapabilitySnapshot(
+                task_id=b.task_id,
+                agent_id=b.agent_id,
+                agent_version=b.capability_snapshot.version,
+                capability=b.capability_snapshot,
+                binding_hash=stable_hash(
+                    {
+                        "task_id": b.task_id,
+                        "agent_id": b.agent_id,
+                        "agent_version": b.capability_snapshot.version,
+                        "capability": b.capability_snapshot.model_dump(mode="python"),
+                    }
+                ),
+            )
+            for b in sorted(bindings.values(), key=lambda x: x.task_id)
+        ]
         result = SupervisorRunResult(
             run_id=plan.run_id,
             plan_hash=plan.plan_hash,
@@ -3003,6 +3028,7 @@ class SupervisorRuntime:
             merged_state=merged_state,
             usage=accountant.usage,
             trace=trace.events,
+            capability_bindings=capability_bindings,
             started_at=started_at,
             completed_at=completed_at,
             duration_ms=duration_ms,

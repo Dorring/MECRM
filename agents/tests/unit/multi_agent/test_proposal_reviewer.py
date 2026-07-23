@@ -28,6 +28,7 @@ from multi_agent.contracts import (
     Evidence,
     EvidenceType,
 )
+from multi_agent.execution import ExecutionCapabilitySnapshot
 from multi_agent.policy import (
     DeterministicPolicyEvaluator,
     FakePolicyEvaluator,
@@ -35,16 +36,17 @@ from multi_agent.policy import (
     PolicyEvaluationResult,
 )
 from multi_agent.review_contracts import (
-    CapabilitySnapshot,
     PolicyContext,
     ReviewBatchStatus,
     ReviewDecisionStatus,
+    ReviewProposalEnvelope,
     ReviewRequest,
     TaskRecordSummary,
     TraceSummary,
     REVIEWER_VERSION,
 )
 from multi_agent.reviewer import ProposalReviewer
+from multi_agent.serialization import stable_hash
 
 
 _TS = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -118,11 +120,61 @@ def _make_proposal(
     )
 
 
+def _make_capability_binding(
+    capability: AgentCapability,
+    *,
+    task_id: str = "task-test",
+) -> ExecutionCapabilitySnapshot:
+    return ExecutionCapabilitySnapshot(
+        task_id=task_id,
+        agent_id=capability.agent_id,
+        agent_version=capability.version,
+        capability=capability,
+        binding_hash=stable_hash(
+            {
+                "task_id": task_id,
+                "agent_id": capability.agent_id,
+                "agent_version": capability.version,
+                "capability": capability.model_dump(mode="python"),
+            }
+        ),
+    )
+
+
+def _make_envelope(
+    proposal: ActionProposal,
+    *,
+    run_id: str = "run-test-001",
+    result_id: str = "r-test-001",
+    task_id: str = "task-test",
+    agent_version: str = "1.0.0",
+) -> ReviewProposalEnvelope:
+    aid = proposal.created_by_agent
+    return ReviewProposalEnvelope(
+        proposal=proposal,
+        run_id=run_id,
+        result_id=result_id,
+        task_id=task_id,
+        agent_id=aid,
+        agent_version=agent_version,
+        origin_hash=stable_hash(
+            {
+                "proposal": proposal.model_dump(mode="python"),
+                "run_id": run_id,
+                "result_id": result_id,
+                "task_id": task_id,
+                "agent_id": aid,
+                "agent_version": agent_version,
+            }
+        ),
+    )
+
+
 def _make_request(
     proposals: list[ActionProposal],
     *,
     evidence: list[Evidence] | None = None,
-    capability_snapshots: list[CapabilitySnapshot] | None = None,
+    capability_bindings: list[ExecutionCapabilitySnapshot] | None = None,
     policy_context: PolicyContext | None = None,
     review_id: str = "review-test-001",
 ) -> ReviewRequest:
@@ -142,7 +194,8 @@ def _make_request(
             )
         ],
         trace=[TraceSummary(sequence=0, event_type="run_started")],
-        capability_snapshots=capability_snapshots or [],
+        capability_bindings=capability_bindings or [],
+        proposal_envelopes=[_make_envelope(p) for p in proposals],
         policy_context=policy_context
         or PolicyContext(
             policy_version="test-v1",
@@ -167,9 +220,8 @@ class TestAuthorityValidation:
             idempotency_key="idem-key-0001",
         )
         ev = _make_evidence("ev-001")
-        cap = CapabilitySnapshot(
-            agent_id="agent_test",
-            capability=_make_capability(
+        cap = _make_capability_binding(
+            _make_capability(
                 authority=AgentAuthority.READ,
                 allowed_tools=frozenset({"crm_reader.get_customers"}),
             ),
@@ -177,7 +229,7 @@ class TestAuthorityValidation:
         req = _make_request(
             [prop],
             evidence=[ev],
-            capability_snapshots=[cap],
+            capability_bindings=[cap],
         )
         reviewer = ProposalReviewer()
         result = await reviewer.review(
@@ -195,9 +247,8 @@ class TestAuthorityValidation:
             idempotency_key="idem-key-0001",
         )
         ev = _make_evidence("ev-001")
-        cap = CapabilitySnapshot(
-            agent_id="agent_test",
-            capability=_make_capability(
+        cap = _make_capability_binding(
+            _make_capability(
                 authority=AgentAuthority.PROPOSE,
                 allowed_tools=frozenset(
                     {
@@ -210,7 +261,7 @@ class TestAuthorityValidation:
         req = _make_request(
             [prop],
             evidence=[ev],
-            capability_snapshots=[cap],
+            capability_bindings=[cap],
         )
         reviewer = ProposalReviewer()
         result = await reviewer.review(
@@ -226,7 +277,7 @@ class TestAuthorityValidation:
         req = _make_request(
             [prop],
             evidence=[ev],
-            capability_snapshots=[],  # no snapshot
+            capability_bindings=[],  # no snapshot
         )
         reviewer = ProposalReviewer()
         result = await reviewer.review(
@@ -252,9 +303,8 @@ class TestRiskClassification:
             idempotency_key="high-risk-key-0001",
         )
         ev = _make_evidence("ev-001")
-        cap = CapabilitySnapshot(
-            agent_id="agent_test",
-            capability=_make_capability(
+        cap = _make_capability_binding(
+            _make_capability(
                 authority=AgentAuthority.PROPOSE,
                 allowed_tools=frozenset(
                     {
@@ -267,7 +317,7 @@ class TestRiskClassification:
         req = _make_request(
             [prop],
             evidence=[ev],
-            capability_snapshots=[cap],
+            capability_bindings=[cap],
         )
         reviewer = ProposalReviewer()
         result = await reviewer.review(
@@ -285,14 +335,13 @@ class TestRiskClassification:
             risk_level=ActionRiskLevel.LOW,
         )
         ev = _make_evidence("ev-001")
-        cap = CapabilitySnapshot(
-            agent_id="agent_test",
-            capability=_make_capability(authority=AgentAuthority.READ),
+        cap = _make_capability_binding(
+            _make_capability(authority=AgentAuthority.READ),
         )
         req = _make_request(
             [prop],
             evidence=[ev],
-            capability_snapshots=[cap],
+            capability_bindings=[cap],
         )
         reviewer = ProposalReviewer()
         result = await reviewer.review(
@@ -313,9 +362,8 @@ class TestPolicyIntegration:
     async def test_policy_deny_rejected(self):
         prop = _make_proposal(evidence_ids=["ev-001"])
         ev = _make_evidence("ev-001")
-        cap = CapabilitySnapshot(
-            agent_id="agent_test",
-            capability=_make_capability(authority=AgentAuthority.READ),
+        cap = _make_capability_binding(
+            _make_capability(authority=AgentAuthority.READ),
         )
         # Fake evaluator returns DENIED
         fake = FakePolicyEvaluator()
@@ -327,7 +375,7 @@ class TestPolicyIntegration:
                 policy_version="test-v1",
             ),
         )
-        req = _make_request([prop], evidence=[ev], capability_snapshots=[cap])
+        req = _make_request([prop], evidence=[ev], capability_bindings=[cap])
         reviewer = ProposalReviewer()
         result = await reviewer.review(req, policy_evaluator=fake)
         review = result.proposal_reviews[0]
@@ -338,9 +386,8 @@ class TestPolicyIntegration:
     async def test_policy_needs_input(self):
         prop = _make_proposal(evidence_ids=["ev-001"])
         ev = _make_evidence("ev-001")
-        cap = CapabilitySnapshot(
-            agent_id="agent_test",
-            capability=_make_capability(authority=AgentAuthority.READ),
+        cap = _make_capability_binding(
+            _make_capability(authority=AgentAuthority.READ),
         )
         fake = FakePolicyEvaluator()
         fake.set(
@@ -351,7 +398,7 @@ class TestPolicyIntegration:
                 policy_version="test-v1",
             ),
         )
-        req = _make_request([prop], evidence=[ev], capability_snapshots=[cap])
+        req = _make_request([prop], evidence=[ev], capability_bindings=[cap])
         reviewer = ProposalReviewer()
         result = await reviewer.review(req, policy_evaluator=fake)
         review = result.proposal_reviews[0]
@@ -361,11 +408,10 @@ class TestPolicyIntegration:
     async def test_deterministic_policy_replay(self):
         prop = _make_proposal(evidence_ids=["ev-001"])
         ev = _make_evidence("ev-001")
-        cap = CapabilitySnapshot(
-            agent_id="agent_test",
-            capability=_make_capability(authority=AgentAuthority.READ),
+        cap = _make_capability_binding(
+            _make_capability(authority=AgentAuthority.READ),
         )
-        req = _make_request([prop], evidence=[ev], capability_snapshots=[cap])
+        req = _make_request([prop], evidence=[ev], capability_bindings=[cap])
         reviewer = ProposalReviewer()
         r1 = await reviewer.review(req, policy_evaluator=DeterministicPolicyEvaluator())
         r2 = await reviewer.review(req, policy_evaluator=DeterministicPolicyEvaluator())
@@ -380,23 +426,23 @@ class TestPolicyIntegration:
 
 class TestConflictAndDuplicate:
     @pytest.mark.asyncio
-    async def test_duplicate_proposal_marked_conflict(self):
+    async def test_duplicate_proposal_marked_deduplicated(self):
         p1 = _make_proposal("prop-001", idempotency_key="shared-key-0001")
         p2 = _make_proposal("prop-002", idempotency_key="shared-key-0001")
         ev = _make_evidence("ev-001")
-        cap = CapabilitySnapshot(
-            agent_id="agent_test",
-            capability=_make_capability(authority=AgentAuthority.READ),
+        cap = _make_capability_binding(
+            _make_capability(authority=AgentAuthority.READ),
         )
-        req = _make_request([p1, p2], evidence=[ev], capability_snapshots=[cap])
+        req = _make_request([p1, p2], evidence=[ev], capability_bindings=[cap])
         reviewer = ProposalReviewer()
         result = await reviewer.review(
             req, policy_evaluator=DeterministicPolicyEvaluator()
         )
-        # The deduped proposal (prop-002) should be marked CONFLICT
+        # R1: exact duplicates (same idempotency_key) are DEDUPLICATED,
+        # not CONFLICT.  The deduped proposal (prop-002) is DEDUPLICATED.
         statuses = {r.proposal_id: r.status for r in result.proposal_reviews}
-        assert statuses["prop-002"] == ReviewDecisionStatus.CONFLICT
-        assert result.batch_status == ReviewBatchStatus.CONFLICT
+        assert statuses["prop-002"] == ReviewDecisionStatus.DEDUPLICATED
+        assert result.batch_status == ReviewBatchStatus.DEDUPLICATED
 
     @pytest.mark.asyncio
     async def test_same_resource_conflict(self):
@@ -421,9 +467,8 @@ class TestConflictAndDuplicate:
             idempotency_key="key-0002",
         )
         ev = _make_evidence("ev-001")
-        cap = CapabilitySnapshot(
-            agent_id="agent_test",
-            capability=_make_capability(
+        cap = _make_capability_binding(
+            _make_capability(
                 authority=AgentAuthority.PROPOSE,
                 allowed_tools=frozenset(
                     {
@@ -433,7 +478,7 @@ class TestConflictAndDuplicate:
                 ),
             ),
         )
-        req = _make_request([p1, p2], evidence=[ev], capability_snapshots=[cap])
+        req = _make_request([p1, p2], evidence=[ev], capability_bindings=[cap])
         reviewer = ProposalReviewer()
         result = await reviewer.review(
             req, policy_evaluator=DeterministicPolicyEvaluator()
@@ -465,9 +510,8 @@ class TestConflictAndDuplicate:
             idempotency_key="key-0002",
         )
         ev = _make_evidence("ev-001")
-        cap = CapabilitySnapshot(
-            agent_id="agent_test",
-            capability=_make_capability(
+        cap = _make_capability_binding(
+            _make_capability(
                 authority=AgentAuthority.PROPOSE,
                 allowed_tools=frozenset(
                     {
@@ -478,10 +522,10 @@ class TestConflictAndDuplicate:
             ),
         )
         req1 = _make_request(
-            [p1, p2], evidence=[ev], capability_snapshots=[cap], review_id="review-001"
+            [p1, p2], evidence=[ev], capability_bindings=[cap], review_id="review-001"
         )
         req2 = _make_request(
-            [p2, p1], evidence=[ev], capability_snapshots=[cap], review_id="review-002"
+            [p2, p1], evidence=[ev], capability_bindings=[cap], review_id="review-002"
         )
         # review_id differs, so request_hash will differ — but the
         # batch_status and proposal_statuses must be identical.
@@ -508,11 +552,10 @@ class TestBatchStatus:
     async def test_all_approved_batch_approved(self):
         prop = _make_proposal(evidence_ids=["ev-001"])
         ev = _make_evidence("ev-001")
-        cap = CapabilitySnapshot(
-            agent_id="agent_test",
-            capability=_make_capability(authority=AgentAuthority.READ),
+        cap = _make_capability_binding(
+            _make_capability(authority=AgentAuthority.READ),
         )
-        req = _make_request([prop], evidence=[ev], capability_snapshots=[cap])
+        req = _make_request([prop], evidence=[ev], capability_bindings=[cap])
         reviewer = ProposalReviewer()
         result = await reviewer.review(
             req, policy_evaluator=DeterministicPolicyEvaluator()
@@ -533,11 +576,10 @@ class TestBatchStatus:
             idempotency_key="bad-key-0001",
         )
         ev = _make_evidence("ev-001")
-        cap = CapabilitySnapshot(
-            agent_id="agent_test",
-            capability=_make_capability(authority=AgentAuthority.READ),
+        cap = _make_capability_binding(
+            _make_capability(authority=AgentAuthority.READ),
         )
-        req = _make_request([p_ok, p_bad], evidence=[ev], capability_snapshots=[cap])
+        req = _make_request([p_ok, p_bad], evidence=[ev], capability_bindings=[cap])
         reviewer = ProposalReviewer()
         result = await reviewer.review(
             req, policy_evaluator=DeterministicPolicyEvaluator()
@@ -565,11 +607,10 @@ class TestResultIntegrity:
     async def test_result_hash_stable(self):
         prop = _make_proposal(evidence_ids=["ev-001"])
         ev = _make_evidence("ev-001")
-        cap = CapabilitySnapshot(
-            agent_id="agent_test",
-            capability=_make_capability(authority=AgentAuthority.READ),
+        cap = _make_capability_binding(
+            _make_capability(authority=AgentAuthority.READ),
         )
-        req = _make_request([prop], evidence=[ev], capability_snapshots=[cap])
+        req = _make_request([prop], evidence=[ev], capability_bindings=[cap])
         reviewer = ProposalReviewer()
         r1 = await reviewer.review(req, policy_evaluator=DeterministicPolicyEvaluator())
         r2 = await reviewer.review(req, policy_evaluator=DeterministicPolicyEvaluator())
@@ -579,11 +620,10 @@ class TestResultIntegrity:
     async def test_result_verify_integrity(self):
         prop = _make_proposal(evidence_ids=["ev-001"])
         ev = _make_evidence("ev-001")
-        cap = CapabilitySnapshot(
-            agent_id="agent_test",
-            capability=_make_capability(authority=AgentAuthority.READ),
+        cap = _make_capability_binding(
+            _make_capability(authority=AgentAuthority.READ),
         )
-        req = _make_request([prop], evidence=[ev], capability_snapshots=[cap])
+        req = _make_request([prop], evidence=[ev], capability_bindings=[cap])
         reviewer = ProposalReviewer()
         result = await reviewer.review(
             req, policy_evaluator=DeterministicPolicyEvaluator()

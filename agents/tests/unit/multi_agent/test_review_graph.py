@@ -29,12 +29,13 @@ from multi_agent.contracts import (
     Evidence,
     EvidenceType,
 )
+from multi_agent.execution import ExecutionCapabilitySnapshot
 from multi_agent.policy import DeterministicPolicyEvaluator
 from multi_agent.review_contracts import (
-    CapabilitySnapshot,
     PolicyContext,
     ReviewBatchResult,
     ReviewBatchStatus,
+    ReviewProposalEnvelope,
     ReviewRequest,
     TaskRecordSummary,
     TraceSummary,
@@ -50,6 +51,7 @@ from multi_agent.review_graph import (
     build_review_graph,
 )
 from multi_agent.reviewer import ProposalReviewer
+from multi_agent.serialization import stable_hash
 
 
 _TS = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -124,20 +126,71 @@ def _make_proposal(
     )
 
 
+def _make_capability_binding(
+    capability: AgentCapability,
+    *,
+    task_id: str = "task-graph-001",
+) -> ExecutionCapabilitySnapshot:
+    return ExecutionCapabilitySnapshot(
+        task_id=task_id,
+        agent_id=capability.agent_id,
+        agent_version=capability.version,
+        capability=capability,
+        binding_hash=stable_hash(
+            {
+                "task_id": task_id,
+                "agent_id": capability.agent_id,
+                "agent_version": capability.version,
+                "capability": capability.model_dump(mode="python"),
+            }
+        ),
+    )
+
+
+def _make_envelope(
+    proposal: ActionProposal,
+    *,
+    run_id: str = "run-graph-001",
+    result_id: str = "r-graph-001",
+    task_id: str = "task-graph-001",
+    agent_version: str = "1.0.0",
+) -> ReviewProposalEnvelope:
+    aid = proposal.created_by_agent
+    return ReviewProposalEnvelope(
+        proposal=proposal,
+        run_id=run_id,
+        result_id=result_id,
+        task_id=task_id,
+        agent_id=aid,
+        agent_version=agent_version,
+        origin_hash=stable_hash(
+            {
+                "proposal": proposal.model_dump(mode="python"),
+                "run_id": run_id,
+                "result_id": result_id,
+                "task_id": task_id,
+                "agent_id": aid,
+                "agent_version": agent_version,
+            }
+        ),
+    )
+
+
 def _make_request(
     *,
     review_id: str = "review-graph-001",
     proposals: list[ActionProposal] | None = None,
     evidence: list[Evidence] | None = None,
-    capability_snapshots: list[CapabilitySnapshot] | None = None,
+    capability_bindings: list[ExecutionCapabilitySnapshot] | None = None,
 ) -> ReviewRequest:
+    props = proposals or [_make_proposal()]
     return ReviewRequest(
         review_id=review_id,
         run_id="run-graph-001",
         tenant_id="tenant-graph",
         plan_hash="plan-graph-hash",
         registry_version="registry-graph-v1",
-        proposals=proposals or [_make_proposal()],
+        proposals=props,
         evidence=evidence or [_make_evidence()],
         task_records=[
             TaskRecordSummary(
@@ -154,13 +207,9 @@ def _make_request(
                 agent_id=None,
             )
         ],
-        capability_snapshots=capability_snapshots
-        or [
-            CapabilitySnapshot(
-                agent_id="agent_graph",
-                capability=_make_capability(),
-            )
-        ],
+        capability_bindings=capability_bindings
+        or [_make_capability_binding(_make_capability())],
+        proposal_envelopes=[_make_envelope(p) for p in props],
         policy_context=PolicyContext(
             policy_version="graph-test-v1",
             rules=[],

@@ -48,16 +48,20 @@ from multi_agent.review_contracts import (
     CODE_AUTHORITY_INSUFFICIENT,
     CODE_AUTHORITY_PROPOSE_EXECUTE,
     CODE_AUTHORITY_READ_ONLY_WRITE,
+    CODE_EVIDENCE_MISSING,
     CODE_IDEMPOTENCY_BLANK,
     CODE_IDEMPOTENCY_INCONSISTENT,
     CODE_IDEMPOTENCY_MISSING,
     CODE_IDENTITY_DUPLICATE_PROPOSAL_ID,
     CODE_IDENTITY_MISMATCH,
+    CODE_POLICY_DENIED,
+    CODE_POLICY_NEEDS_INPUT,
     CODE_RISK_CRITICAL_NEEDS_APPROVAL,
     CODE_RISK_HIGH_NEEDS_APPROVAL,
     CODE_TENANT_CROSS_REFERENCE,
     CODE_TENANT_PII_EGRESS,
     CODE_TENANT_SECRET_FIELD,
+    REJECTION_FINDING_CODES,
     CapabilitySnapshot,
     ProposalReview,
     ReviewBatchResult,
@@ -633,8 +637,13 @@ class ProposalReviewer:
             ) from e
 
         # 2. Build lookup indices
-        evidence_index = build_evidence_index(request.evidence)
-        capability_snapshots = {cs.agent_id: cs for cs in request.capability_snapshots}
+        evidence_index, excluded_evidence_ids = build_evidence_index(request.evidence)
+        capability_snapshots = {
+            cb.agent_id: CapabilitySnapshot(
+                agent_id=cb.agent_id, capability=cb.capability
+            )
+            for cb in request.capability_bindings
+        }
         task_records = {tr.task_id: tr for tr in request.task_records}
 
         # 3. Detect duplicate Evidence (cross-Proposal)
@@ -667,6 +676,7 @@ class ProposalReviewer:
                 proposal=proposal,
                 request=request,
                 evidence_index=evidence_index,
+                excluded_evidence_ids=excluded_evidence_ids,
                 capability_snapshots=capability_snapshots,
                 task_records=task_records,
                 policy_evaluator=policy_evaluator,
@@ -700,6 +710,11 @@ class ProposalReviewer:
             for r in per_proposal_reviews
             if r.status == ReviewDecisionStatus.CONFLICT
         )
+        deduplicated_ids = sorted(
+            r.proposal_id
+            for r in per_proposal_reviews
+            if r.status == ReviewDecisionStatus.DEDUPLICATED
+        )
 
         # 10. Build the final ReviewBatchResult
         result = ReviewBatchResult(
@@ -713,6 +728,7 @@ class ProposalReviewer:
             rejected_proposal_ids=rejected_ids,
             approval_required_proposal_ids=approval_required_ids,
             conflicted_proposal_ids=conflicted_ids,
+            deduplicated_proposal_ids=deduplicated_ids,
             findings=sorted(
                 all_findings,
                 key=lambda f: (f.proposal_id, f.finding_code, f.message),
@@ -730,6 +746,17 @@ class ProposalReviewer:
                 f"verification: {e}"
             ) from e
 
+        # 12. Semantic validation — status/finding/flag consistency
+        try:
+            result.verify_semantics()
+        except InvalidReviewResultError:
+            raise
+        except Exception as e:
+            raise InvalidReviewResultError(
+                f"ReviewBatchResult {result.review_id!r} failed semantic "
+                f"verification: {e}"
+            ) from e
+
         return result
 
     # -----------------------------------------------------------------
@@ -742,6 +769,7 @@ class ProposalReviewer:
         proposal: ActionProposal,
         request: ReviewRequest,
         evidence_index: dict[str, Evidence],
+        excluded_evidence_ids: set[str],
         capability_snapshots: dict[str, CapabilitySnapshot],
         task_records: dict[str, TaskRecordSummary],
         policy_evaluator: PolicyEvaluator,
@@ -768,12 +796,13 @@ class ProposalReviewer:
         # 3. Action allowlist validation
         findings.extend(validate_action_allowlist(proposal))
 
-        # 4. Evidence validation
+        # 4. Evidence validation (with tamper-detection excluded set)
         ev_findings = validate_evidence_for_proposal(
             proposal,
             evidence_index,
             capability_snapshots,
             tenant_id=request.tenant_id,
+            excluded_evidence_ids=excluded_evidence_ids,
         )
         findings.extend(ev_findings)
         # Matched evidence = referenced evidence that passed validation
@@ -871,7 +900,53 @@ class ProposalReviewer:
                     f"Policy evaluator raised for proposal "
                     f"{proposal.proposal_id!r}: {e}"
                 ) from e
+            # R1 Section VI: validate policy result identity before
+            # consuming it — fail-closed on any mismatch.
+            self._validate_policy_result_identity(policy_result, proposal, request)
         findings.extend(policy_result.findings)
+
+        # R1: synthesize policy-decision findings if the policy
+        # evaluator did not emit one.  verify_semantics() requires
+        # REJECTED ↔ rejection-class finding (CODE_POLICY_DENIED) and
+        # NEEDS_INPUT ↔ CODE_EVIDENCE_MISSING/CODE_POLICY_NEEDS_INPUT.
+        if policy_result.decision == PolicyDecision.DENIED and not any(
+            f.finding_code == CODE_POLICY_DENIED for f in findings
+        ):
+            findings.append(
+                ReviewFinding(
+                    finding_code=CODE_POLICY_DENIED,
+                    severity=ReviewFindingSeverity.ERROR,
+                    message=f"Policy denied proposal {proposal.proposal_id!r}",
+                    proposal_id=proposal.proposal_id,
+                    agent_id=proposal.created_by_agent,
+                    policy_source=f"policy@{policy_result.policy_version}",
+                    details={
+                        "policy_version": policy_result.policy_version,
+                        "matched_rule_count": len(policy_result.matched_rules),
+                    },
+                )
+            )
+        if policy_result.decision == PolicyDecision.NEEDS_INPUT and not any(
+            f.finding_code in (CODE_POLICY_NEEDS_INPUT, CODE_EVIDENCE_MISSING)
+            for f in findings
+        ):
+            findings.append(
+                ReviewFinding(
+                    finding_code=CODE_POLICY_NEEDS_INPUT,
+                    severity=ReviewFindingSeverity.ERROR,
+                    message=(
+                        f"Policy requested additional input for proposal "
+                        f"{proposal.proposal_id!r}"
+                    ),
+                    proposal_id=proposal.proposal_id,
+                    agent_id=proposal.created_by_agent,
+                    policy_source=f"policy@{policy_result.policy_version}",
+                    details={
+                        "policy_version": policy_result.policy_version,
+                        "matched_rule_count": len(policy_result.matched_rules),
+                    },
+                )
+            )
 
         policy_valid = policy_result.decision != PolicyDecision.DENIED
 
@@ -883,6 +958,24 @@ class ProposalReviewer:
         # 10. Conflict / duplicate status
         is_duplicate = proposal.proposal_id in dedup_result.excluded_proposal_ids
         is_conflict = proposal.proposal_id in conflict_result.conflicted_proposal_ids
+
+        # Add dedup finding to this proposal's own findings so that
+        # verify_semantics() can confirm DEDUPLICATED ↔ CODE_DUPLICATE_DEDUPED.
+        if is_duplicate:
+            findings.extend(
+                f
+                for f in dedup_result.findings
+                if f.proposal_id == proposal.proposal_id
+            )
+
+        # R1: thread conflict findings to this proposal's own findings
+        # so that verify_semantics() can confirm CONFLICT ↔ review.conflict.*.
+        if is_conflict:
+            findings.extend(
+                f
+                for f in conflict_result.findings
+                if f.proposal_id == proposal.proposal_id
+            )
 
         # 11. Decision
         status = self._compute_decision(
@@ -911,7 +1004,44 @@ class ProposalReviewer:
         )
 
     # -----------------------------------------------------------------
-    # Decision logic
+    # Policy result identity validation — R1 Section VI
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _validate_policy_result_identity(
+        policy_result: PolicyEvaluationResult,
+        proposal: ActionProposal,
+        request: ReviewRequest,
+    ) -> None:
+        """Fail-closed validation that the policy result belongs to the
+        proposal it claims to be for.
+
+        Raises :class:`PolicyEvaluationError` on any identity mismatch.
+        """
+        if policy_result.proposal_id != proposal.proposal_id:
+            raise PolicyEvaluationError(
+                f"Policy result proposal_id {policy_result.proposal_id!r} != "
+                f"expected {proposal.proposal_id!r}"
+            )
+        if policy_result.policy_version != request.policy_context.policy_version:
+            raise PolicyEvaluationError(
+                f"Policy result policy_version {policy_result.policy_version!r} "
+                f"!= expected {request.policy_context.policy_version!r}"
+            )
+        for finding in policy_result.findings:
+            if finding.proposal_id != proposal.proposal_id:
+                raise PolicyEvaluationError(
+                    f"Policy finding proposal_id {finding.proposal_id!r} != "
+                    f"expected {proposal.proposal_id!r}"
+                )
+        for rule in policy_result.matched_rules:
+            if not rule.rule_version.strip():
+                raise PolicyEvaluationError(
+                    f"Matched rule {rule.rule_id!r} has blank rule_version"
+                )
+
+    # -----------------------------------------------------------------
+    # Decision logic — R1 Section VII
     # -----------------------------------------------------------------
 
     def _compute_decision(
@@ -923,50 +1053,48 @@ class ProposalReviewer:
         is_duplicate: bool,
         is_conflict: bool,
     ) -> ReviewDecisionStatus:
-        # Conflict takes priority over everything except infrastructure errors
+        """Classify the per-proposal decision by finding CODE priority.
+
+        Order (R1 Section VII):
+            conflict > deduplicated > rejected (rejection-class codes) >
+            needs_input (missing-evidence / policy-needs-input) >
+            needs_approval (high-risk / policy-needs-approval) > approved
+        """
+        # 1. Conflict takes priority over everything
         if is_conflict:
             return ReviewDecisionStatus.CONFLICT
 
-        # Duplicates are not "rejected" — they are deduped.  But they
-        # cannot be approved either.  Mark as CONFLICT so the batch
-        # status reflects the dedup.  (Phase 5A Section 10.2: "不得
-        # 无审计地删除" — the dedup finding is recorded, and the
-        # duplicate proposal is surfaced as CONFLICT so the caller
-        # knows it was not approved.)
+        # 2. Exact duplicates are DEDUPLICATED (not CONFLICT, not REJECTED)
         if is_duplicate:
-            return ReviewDecisionStatus.CONFLICT
+            return ReviewDecisionStatus.DEDUPLICATED
 
-        # Any CRITICAL or ERROR finding → rejected
-        has_blocking = any(
-            f.severity in (ReviewFindingSeverity.ERROR, ReviewFindingSeverity.CRITICAL)
+        finding_codes = {f.finding_code for f in findings}
+
+        # 3. Rejection-class findings (ERROR/CRITICAL severity) → REJECTED
+        has_rejection = any(
+            f.finding_code in REJECTION_FINDING_CODES
+            and f.severity
+            in (ReviewFindingSeverity.ERROR, ReviewFindingSeverity.CRITICAL)
             for f in findings
         )
-        if has_blocking:
+        if has_rejection:
             return ReviewDecisionStatus.REJECTED
 
-        # Policy deny
-        if policy_decision == PolicyDecision.DENIED:
-            return ReviewDecisionStatus.REJECTED
+        # 4. Missing evidence or policy needs input → NEEDS_INPUT
+        if finding_codes & {CODE_EVIDENCE_MISSING, CODE_POLICY_NEEDS_INPUT}:
+            return ReviewDecisionStatus.NEEDS_INPUT
 
-        # Policy needs input
+        # 5. Policy needs input (fallback if finding missing)
         if policy_decision == PolicyDecision.NEEDS_INPUT:
             return ReviewDecisionStatus.NEEDS_INPUT
 
-        # Policy needs approval OR high/critical risk
-        if policy_decision == PolicyDecision.NEEDS_APPROVAL:
-            return ReviewDecisionStatus.NEEDS_APPROVAL
+        # 6. High/critical risk → NEEDS_APPROVAL
         if risk_level in (ReviewRiskLevel.HIGH, ReviewRiskLevel.CRITICAL):
             return ReviewDecisionStatus.NEEDS_APPROVAL
 
-        # No evidence for a risk that requires it
-        if risk_level in (ReviewRiskLevel.HIGH, ReviewRiskLevel.CRITICAL):
-            has_evidence_finding = any(
-                f.finding_code.startswith("review.evidence.")
-                and f.severity == ReviewFindingSeverity.ERROR
-                for f in findings
-            )
-            if has_evidence_finding:
-                return ReviewDecisionStatus.NEEDS_INPUT
+        # 7. Policy needs approval
+        if policy_decision == PolicyDecision.NEEDS_APPROVAL:
+            return ReviewDecisionStatus.NEEDS_APPROVAL
 
         return ReviewDecisionStatus.APPROVED
 
