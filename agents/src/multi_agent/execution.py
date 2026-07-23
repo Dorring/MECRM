@@ -281,6 +281,28 @@ class SupervisorRunResult(StrictContract):
     usage: ExecutionUsage
     trace: list[ExecutionTraceEvent] = Field(default_factory=list)
 
+    capability_bindings: list[ExecutionCapabilitySnapshot] = Field(default_factory=list)
+
+    # R2 S2: authoritative Run identity.  When present, the Phase 5A
+    # Adapter MUST source ``run_id`` / ``tenant_id`` / ``plan_hash``
+    # / ``registry_version`` from this field instead of inferring
+    # them from the first Proposal / Evidence / Result.  The field
+    # is optional so older fixtures / tests that pre-date R2 still
+    # construct without it; Phase 5A Reviewer treats a missing
+    # identity as a fail-closed contract violation.
+    run_identity: ExecutionRunIdentity | None = None
+
+    # R2.1 P0-4: per-Result origin snapshots produced by
+    # :meth:`SupervisorRuntime._finalize` from the actual
+    # :class:`AgentResult` instances.  Each ResultOriginSnapshot binds
+    # one Result to its concrete identity + Proposal Hash list +
+    # Evidence Snapshot Hash list and verifies its own ``origin_hash``.
+    # Phase 5A Adapter MUST copy this tuple verbatim — it MUST NOT
+    # regenerate ResultOriginSnapshot from ``merged_state.results``
+    # (the R2 implementation did, which made Envelope and ResultOrigin
+    # the same self-attested source and trivially forgeable together).
+    result_origins: tuple[ResultOriginSnapshot, ...] = ()
+
     started_at: datetime
     completed_at: datetime
     duration_ms: int = Field(ge=0)
@@ -291,6 +313,25 @@ class SupervisorRunResult(StrictContract):
         if v.tzinfo is None:
             raise ValueError("datetime fields must be timezone-aware (UTC)")
         return v
+
+    @model_validator(mode="after")
+    def _verify_run_identity_consistency(self) -> "SupervisorRunResult":
+        # R2 S2: if run_identity is present, its frozen identity
+        # fields MUST match the top-level fields.  This catches a
+        # buggy Runtime that builds the identity from one source and
+        # the top-level fields from another.
+        if self.run_identity is not None:
+            ident = self.run_identity
+            if (
+                ident.run_id != self.run_id
+                or ident.plan_hash != self.plan_hash
+                or ident.registry_version != self.registry_version
+            ):
+                raise ValueError(
+                    "SupervisorRunResult.run_identity disagrees with the "
+                    "top-level run_id/plan_hash/registry_version fields"
+                )
+        return self
 
 
 class SupervisorConfig(StrictContract):
@@ -338,6 +379,202 @@ class ExecutionBinding(StrictContract):
     task_id: str
     agent_id: str
     capability_snapshot: AgentCapability
+
+
+class ExecutionCapabilitySnapshot(StrictContract):
+    """Frozen, auditable summary of a Phase 4 pre-flight ExecutionBinding.
+
+    Carried on SupervisorRunResult so Phase 5A can validate Proposal
+    authority against the capability that was *actually bound at
+    pre-flight time* — never a caller-supplied snapshot.
+
+    R2 P0-2: capability bindings are unique by ``task_id`` (NOT by
+    ``agent_id``) — the same Agent may legitimately be bound to
+    multiple Tasks in one Run.  The Reviewer looks up capability by
+    ``envelope.task_id`` so a Proposal cannot borrow another Task's
+    binding for the same Agent.
+    """
+
+    model_config = {"extra": "forbid", "frozen": True}
+
+    task_id: str
+    agent_id: str
+    agent_version: str
+    capability: AgentCapability
+    binding_hash: str
+
+    @field_validator("task_id", "agent_id", "agent_version", "binding_hash")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError(
+                "ExecutionCapabilitySnapshot identity fields must not be blank"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _verify_binding_hash(self) -> "ExecutionCapabilitySnapshot":
+        from multi_agent.serialization import stable_hash
+
+        expected = stable_hash(
+            {
+                "task_id": self.task_id,
+                "agent_id": self.agent_id,
+                "agent_version": self.agent_version,
+                "capability": self.capability.model_dump(mode="python"),
+            }
+        )
+        if self.binding_hash != expected:
+            raise ValueError("ExecutionCapabilitySnapshot binding_hash mismatch")
+        return self
+
+
+# ---------------------------------------------------------------------------
+# R2 S2 / P0-1: ExecutionRunIdentity + ResultOriginSnapshot
+# ---------------------------------------------------------------------------
+
+
+class ExecutionRunIdentity(StrictContract):
+    """R2 S2: frozen, hash-stable authoritative Run identity.
+
+    Carried on :class:`SupervisorRunResult` so the Phase 5A Adapter
+    can build ``run_id`` / ``tenant_id`` / ``plan_hash`` /
+    ``registry_version`` from a *single* authoritative source instead
+    of inferring them from the first Proposal / Evidence / Result
+    (R1's ``_extract_tenant_id`` was vulnerable to a mixed-tenant
+    batch where the first carrier happened to match the request).
+
+    ``identity_hash`` is the canonical SHA-256 over
+    ``{run_id, tenant_id, plan_hash, registry_version}`` and is
+    verified on construction so a tampered identity is detected at
+    the boundary.
+    """
+
+    model_config = {"extra": "forbid", "frozen": True}
+
+    run_id: str
+    tenant_id: str
+    plan_hash: str
+    registry_version: str
+    identity_hash: str
+
+    @field_validator("run_id", "tenant_id", "plan_hash", "registry_version")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("ExecutionRunIdentity identity fields must not be blank")
+        return v
+
+    @model_validator(mode="after")
+    def _verify_identity_hash(self) -> "ExecutionRunIdentity":
+        from multi_agent.serialization import stable_hash
+
+        expected = stable_hash(
+            {
+                "run_id": self.run_id,
+                "tenant_id": self.tenant_id,
+                "plan_hash": self.plan_hash,
+                "registry_version": self.registry_version,
+            }
+        )
+        if self.identity_hash != expected:
+            raise ValueError("ExecutionRunIdentity identity_hash mismatch")
+        return self
+
+
+class ResultOriginSnapshot(StrictContract):
+    """R2.1 P0-4: frozen snapshot of the Phase 4 origin of one Result.
+
+    Produced by :meth:`SupervisorRuntime._finalize` from the actual
+    :class:`AgentResult` produced during execution — NOT regenerated
+    by the Phase 5A Adapter.  The Adapter may only copy this snapshot.
+
+    ``origin_hash`` is a canonical SHA-256 over the Result identity
+    (``run_id`` / ``tenant_id`` / ``result_id`` / ``task_id`` /
+    ``agent_id`` / ``agent_version``) plus the Result's full Proposal
+    Hash list and Evidence Snapshot Hash list.  This binds the Result
+    to its concrete content so a buggy or malicious Adapter cannot
+    re-associate a Proposal with a different Result.
+
+    Because the same hash inputs are used to build
+    :class:`ReviewProposalEnvelope.origin_hash` for each Proposal that
+    originated from this Result, the Reviewer can cross-check each
+    Envelope's identity fields against the matching ResultOriginSnapshot
+    without trusting the Adapter.
+    """
+
+    model_config = {"extra": "forbid", "frozen": True}
+
+    run_id: str
+    tenant_id: str
+    result_id: str
+    task_id: str
+    agent_id: str
+    agent_version: str
+    # (proposal_id, proposal_hash) pairs emitted by this Result.
+    proposal_hashes: tuple[tuple[str, str], ...] = ()
+    # (evidence_id, evidence_snapshot_hash) pairs emitted by this Result.
+    evidence_hashes: tuple[tuple[str, str], ...] = ()
+    origin_hash: str
+
+    @field_validator(
+        "run_id",
+        "tenant_id",
+        "result_id",
+        "task_id",
+        "agent_id",
+        "agent_version",
+        "origin_hash",
+    )
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("ResultOriginSnapshot identity fields must not be blank")
+        return v
+
+    @field_validator("proposal_hashes", "evidence_hashes")
+    @classmethod
+    def _validate_pairs(
+        cls, v: tuple[tuple[str, str], ...]
+    ) -> tuple[tuple[str, str], ...]:
+        cleaned: list[tuple[str, str]] = []
+        for pair in v:
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise ValueError(
+                    "ResultOriginSnapshot hash pairs must be (id, hash) tuples"
+                )
+            pid, ph = pair
+            pid_s = str(pid).strip()
+            ph_s = str(ph).strip()
+            if not pid_s or not ph_s:
+                raise ValueError(
+                    "ResultOriginSnapshot hash pair members must not be blank"
+                )
+            cleaned.append((pid_s, ph_s))
+        return tuple(cleaned)
+
+    @model_validator(mode="after")
+    def _verify_origin_hash(self) -> "ResultOriginSnapshot":
+        from multi_agent.serialization import stable_hash
+
+        expected = stable_hash(
+            {
+                "run_id": self.run_id,
+                "tenant_id": self.tenant_id,
+                "result_id": self.result_id,
+                "task_id": self.task_id,
+                "agent_id": self.agent_id,
+                "agent_version": self.agent_version,
+                "proposal_hashes": sorted(self.proposal_hashes),
+                "evidence_hashes": sorted(self.evidence_hashes),
+            }
+        )
+        if self.origin_hash != expected:
+            raise ValueError("ResultOriginSnapshot.origin_hash mismatch")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -594,9 +831,13 @@ def utc_now() -> datetime:
 
 
 __all__ = [
+    "ExecutionBinding",
+    "ExecutionCapabilitySnapshot",
     "ExecutionCancellation",
+    "ExecutionRunIdentity",
     "ExecutionTraceEvent",
     "FakeExecutionCancellation",
+    "ResultOriginSnapshot",
     "SupervisorConfig",
     "SupervisorRunResult",
     "SupervisorRunStatus",

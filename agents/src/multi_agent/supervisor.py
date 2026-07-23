@@ -43,9 +43,12 @@ from multi_agent.planning import (
 )
 from multi_agent.execution import (
     ExecutionBinding,
+    ExecutionCapabilitySnapshot,
     ExecutionCancellation,
+    ExecutionRunIdentity,
     ExecutionTraceEvent,
     FakeExecutionCancellation,
+    ResultOriginSnapshot,
     SupervisorConfig,
     SupervisorRunResult,
     SupervisorRunStatus,
@@ -107,7 +110,9 @@ from multi_agent.scheduler import (
     PreDispatch,
     TaskOutcome,
 )
+from multi_agent.integrity import compute_evidence_hash_from_payload
 from multi_agent.state import merge_parallel_results
+from multi_agent.serialization import stable_hash
 
 
 # ---------------------------------------------------------------------------
@@ -1425,6 +1430,7 @@ class SupervisorRuntime:
                 started_at=started_at,
                 start_mono=start_mono,
                 canc=canc,
+                bindings=bindings,
             )
 
         # Idempotency lease — only acquired after pre-flight passes.
@@ -1467,6 +1473,7 @@ class SupervisorRuntime:
                     forced_status=SupervisorRunStatus.BUDGET_EXCEEDED,
                     canc=canc,
                     started_at=started_at,
+                    bindings=bindings,
                 )
 
             # Cancellation state shared between run_task and should_stop.
@@ -1550,6 +1557,7 @@ class SupervisorRuntime:
                 forced_status=None,
                 canc=canc,
                 started_at=started_at,
+                bindings=bindings,
             )
         except BaseException as exc:
             # R1 P0-1: Release the lease on any non-clean exit.  We
@@ -1647,6 +1655,7 @@ class SupervisorRuntime:
         started_at: Any,
         start_mono: float,
         canc: ExecutionCancellation,
+        bindings: dict[str, ExecutionBinding],
     ) -> SupervisorRunResult:
         """Build a cancelled result for a run that was cancelled
         *before* the lease was acquired.
@@ -1687,6 +1696,7 @@ class SupervisorRuntime:
                 forced_status=SupervisorRunStatus.CANCELLED,
                 canc=canc,
                 started_at=started_at,
+                bindings=bindings,
             )
         except BaseException as exc:
             await self._run_store.abort(lease, error_code=type(exc).__name__)
@@ -2925,6 +2935,7 @@ class SupervisorRuntime:
         forced_status: SupervisorRunStatus | None,
         canc: ExecutionCancellation,
         started_at: Any,
+        bindings: dict[str, ExecutionBinding],
     ) -> SupervisorRunResult:
         cancelled_during_run = await canc.is_cancelled(
             plan.run_id
@@ -2994,6 +3005,89 @@ class SupervisorRuntime:
         # stable even if the live registry drifts — otherwise a future
         # cache lookup for the same (run_id, plan_hash) would see a
         # mismatched registry_version field despite being a valid hit.
+        capability_bindings = [
+            ExecutionCapabilitySnapshot(
+                task_id=b.task_id,
+                agent_id=b.agent_id,
+                agent_version=b.capability_snapshot.version,
+                capability=b.capability_snapshot,
+                binding_hash=stable_hash(
+                    {
+                        "task_id": b.task_id,
+                        "agent_id": b.agent_id,
+                        "agent_version": b.capability_snapshot.version,
+                        "capability": b.capability_snapshot.model_dump(mode="python"),
+                    }
+                ),
+            )
+            for b in sorted(bindings.values(), key=lambda x: x.task_id)
+        ]
+        # R2 S2: build the authoritative Run identity so the Phase 5A
+        # Adapter does not have to infer tenant_id from the first
+        # Proposal / Evidence / Result.  ``identity_hash`` is verified
+        # by ExecutionRunIdentity's model_validator.
+        run_identity = ExecutionRunIdentity(
+            run_id=plan.run_id,
+            tenant_id=plan.tenant_id,
+            plan_hash=plan.plan_hash,
+            registry_version=plan.registry_version,
+            identity_hash=stable_hash(
+                {
+                    "run_id": plan.run_id,
+                    "tenant_id": plan.tenant_id,
+                    "plan_hash": plan.plan_hash,
+                    "registry_version": plan.registry_version,
+                }
+            ),
+        )
+        # R2.1 P0-4: build ResultOriginSnapshot for every AgentResult
+        # produced during this Run.  Each snapshot's ``origin_hash`` is
+        # verified by ResultOriginSnapshot's model_validator and covers
+        # the Result identity (run_id / tenant_id / result_id / task_id
+        # / agent_id / agent_version) PLUS the Result's full Proposal
+        # Hash list and Evidence Snapshot Hash list.  The Phase 5A
+        # Adapter MUST copy this tuple verbatim — it MUST NOT regenerate
+        # ResultOriginSnapshot from ``merged_state.results``.
+        result_origins_list: list[ResultOriginSnapshot] = []
+        for res in valid_results:
+            proposal_pairs = tuple(
+                (ap.proposal_id, ap.proposal_hash)
+                for ap in sorted(res.action_proposals, key=lambda p: p.proposal_id)
+                if ap.proposal_hash
+            )
+            evidence_pairs = tuple(
+                (
+                    ev.evidence_id,
+                    compute_evidence_hash_from_payload(ev.model_dump(mode="python")),
+                )
+                for ev in sorted(res.evidence, key=lambda e: e.evidence_id)
+            )
+            origin_hash = stable_hash(
+                {
+                    "run_id": plan.run_id,
+                    "tenant_id": res.tenant_id,
+                    "result_id": res.result_id,
+                    "task_id": res.task_id,
+                    "agent_id": res.agent_id,
+                    "agent_version": res.agent_version,
+                    "proposal_hashes": sorted(proposal_pairs),
+                    "evidence_hashes": sorted(evidence_pairs),
+                }
+            )
+            result_origins_list.append(
+                ResultOriginSnapshot(
+                    run_id=plan.run_id,
+                    tenant_id=res.tenant_id,
+                    result_id=res.result_id,
+                    task_id=res.task_id,
+                    agent_id=res.agent_id,
+                    agent_version=res.agent_version,
+                    proposal_hashes=proposal_pairs,
+                    evidence_hashes=evidence_pairs,
+                    origin_hash=origin_hash,
+                )
+            )
+        result_origins = tuple(sorted(result_origins_list, key=lambda ro: ro.result_id))
         result = SupervisorRunResult(
             run_id=plan.run_id,
             plan_hash=plan.plan_hash,
@@ -3003,6 +3097,9 @@ class SupervisorRuntime:
             merged_state=merged_state,
             usage=accountant.usage,
             trace=trace.events,
+            capability_bindings=capability_bindings,
+            run_identity=run_identity,
+            result_origins=result_origins,
             started_at=started_at,
             completed_at=completed_at,
             duration_ms=duration_ms,
