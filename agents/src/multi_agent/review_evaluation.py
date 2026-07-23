@@ -352,6 +352,12 @@ class ReviewFixture:
     needs_approval, or conflict).  The metrics computation uses this
     to detect false approvals / false rejections.
 
+    R2 S9 / final-verification: ``expected_evidence_error`` and
+    ``expected_authority_violation`` are STRUCTURED expected-outcome
+    flags.  The metrics computation reads these flags — it MUST NOT
+    infer error categories from :attr:`name` (which would be a label
+    leak).  Renaming a fixture must not change the metrics.
+
     Fixtures are constructed WITHOUT reading the wall-clock — the
     ``created_at`` fields on Proposals and Evidence use a fixed
     timestamp so the ``request_hash`` is reproducible.
@@ -361,6 +367,10 @@ class ReviewFixture:
     request: ReviewRequest
     expected_blocked_proposal_ids: frozenset[str]
     expected_conflicted_proposal_ids: frozenset[str] = frozenset()
+    # R2 S9: structured expected-outcome flags — read by
+    # compute_review_metrics INSTEAD of inferring from ``name``.
+    expected_evidence_error: bool = False
+    expected_authority_violation: bool = False
     description: str = ""
 
 
@@ -720,6 +730,7 @@ def build_review_fixtures() -> list[ReviewFixture]:
                 capability_bindings=[cap_binding_read],
             ),
             expected_blocked_proposal_ids=frozenset({"prop-missing-ev-001"}),
+            expected_evidence_error=True,
             description="A Proposal references an evidence_id that does not exist.",
         )
     )
@@ -767,6 +778,7 @@ def build_review_fixtures() -> list[ReviewFixture]:
                 capability_bindings=[cap_binding_read],
             ),
             expected_blocked_proposal_ids=frozenset({"prop-foreign-ev-001"}),
+            expected_evidence_error=True,
             description="Evidence belongs to a different tenant.",
         )
     )
@@ -790,6 +802,7 @@ def build_review_fixtures() -> list[ReviewFixture]:
                 capability_bindings=[cap_binding_read],
             ),
             expected_blocked_proposal_ids=frozenset({"prop-auth-violation-001"}),
+            expected_authority_violation=True,
             description="READ-only agent proposes a Write action.",
         )
     )
@@ -1041,9 +1054,12 @@ def compute_review_metrics(
 
     The metrics computation does NOT hardcode judgments based on
     fixture names or Proposal IDs — it reads
-    :attr:`ReviewFixture.expected_blocked_proposal_ids` and
-    :attr:`ReviewFixture.expected_conflicted_proposal_ids` to determine
-    expected outcomes.
+    :attr:`ReviewFixture.expected_blocked_proposal_ids`,
+    :attr:`ReviewFixture.expected_conflicted_proposal_ids`,
+    :attr:`ReviewFixture.expected_evidence_error`, and
+    :attr:`ReviewFixture.expected_authority_violation` to determine
+    expected outcomes.  Renaming a fixture must not change the
+    computed metrics (R2 S9: no label leakage).
     """
     reviewer = reviewer or ProposalReviewer()
     policy_evaluator = policy_evaluator or DeterministicPolicyEvaluator()
@@ -1084,13 +1100,12 @@ def compute_review_metrics(
             total_blocked_expected += len(fixture.expected_blocked_proposal_ids)
             total_conflicts_expected += len(fixture.expected_conflicted_proposal_ids)
 
-            # Track expected evidence / authority violations by fixture name
-            if (
-                fixture.name == "missing_evidence"
-                or fixture.name == "foreign_tenant_evidence"
-            ):
+            # Track expected evidence / authority violations by
+            # STRUCTURED flags — NOT by fixture.name (R2 S9: no label
+            # leakage).  Renaming a fixture must not change metrics.
+            if fixture.expected_evidence_error:
                 total_evidence_errors_expected += 1
-            if fixture.name == "authority_violation":
+            if fixture.expected_authority_violation:
                 total_authority_violations_expected += 1
 
             # First run
@@ -1119,22 +1134,24 @@ def compute_review_metrics(
                     actual_blocked.add(r.proposal_id)
                 if r.status == ReviewDecisionStatus.CONFLICT:
                     actual_conflicts.add(r.proposal_id)
-                # Evidence error detection
+                # Evidence error detection — gated by the STRUCTURED
+                # expected_evidence_error flag, NOT fixture.name.
                 if any(
                     f.finding_code.startswith("review.evidence.")
                     and f.severity in ("error", "critical")
                     for f in r.findings
                 ):
-                    if fixture.name in ("missing_evidence", "foreign_tenant_evidence"):
+                    if fixture.expected_evidence_error:
                         if r.proposal_id in fixture.expected_blocked_proposal_ids:
                             total_evidence_errors_detected += 1
-                # Authority violation detection
+                # Authority violation detection — gated by the
+                # STRUCTURED expected_authority_violation flag.
                 if any(
                     f.finding_code.startswith("review.authority.")
                     and f.severity in ("error", "critical")
                     for f in r.findings
                 ):
-                    if fixture.name == "authority_violation":
+                    if fixture.expected_authority_violation:
                         total_authority_violations_detected += 1
 
             total_blocked_actual += len(actual_blocked)
