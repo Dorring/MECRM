@@ -27,6 +27,7 @@ from typing import Protocol, runtime_checkable
 from pydantic import ConfigDict, field_validator, model_validator
 
 from multi_agent.contracts import StrictContract
+from multi_agent.execution_error_codes import ExecutionError
 from multi_agent.review_contracts import ReviewRiskLevel
 from multi_agent.serialization import stable_hash
 
@@ -311,7 +312,24 @@ class ApprovalDecision(StrictContract):
             )
 
 
+# ---------------------------------------------------------------------------
+# ApprovalConflictError — same approval_id with a different request hash (P1-1).
+# ---------------------------------------------------------------------------
+
+
+class ApprovalConflictError(ExecutionError):
+    """Same ``approval_id`` was used with a different ``approval_request_hash``.
+
+    Raised by :meth:`ApprovalStore.create` when an existing request with
+    the same ``approval_id`` has a different ``approval_request_hash``
+    (P1-1: same ID + different hash → conflict, NOT silent return).
+    """
+
+    error_code = "approval_conflict"
+
+
 __all__ = [
+    "ApprovalConflictError",
     "ApprovalDecision",
     "ApprovalRequest",
     "ApprovalStatus",

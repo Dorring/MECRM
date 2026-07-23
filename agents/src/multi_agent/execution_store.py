@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 from enum import StrEnum
 from hmac import compare_digest
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from pydantic import ConfigDict, field_validator, model_validator
 
@@ -29,6 +29,9 @@ from multi_agent.execution_error_codes import (
     IdempotencyConflictError,
 )
 from multi_agent.serialization import stable_hash
+
+if TYPE_CHECKING:
+    from multi_agent.execution_receipts import ActionExecutionReceipt
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +123,12 @@ class ExecutionStore(Protocol):
     All methods are async so a future Redis-backed adapter can poll
     without changing call sites.  Implementations MUST be safe under
     concurrent ``reserve`` calls for the same key (compare-and-set).
+
+    P0-6: ``complete_with_receipt`` atomically commits the terminal
+    idempotency state AND the full :class:`ActionExecutionReceipt`.
+    This prevents the crash-window where the store is SUCCEEDED but
+    no trusted receipt exists.  ``get_receipt`` returns the original
+    receipt for deterministic replay (P0-6 replay).
     """
 
     async def reserve(
@@ -144,6 +153,12 @@ class ExecutionStore(Protocol):
         succeeded: bool,
     ) -> IdempotencyRecord: ...
 
+    async def complete_with_receipt(
+        self,
+        record: IdempotencyRecord,
+        receipt: ActionExecutionReceipt,
+    ) -> IdempotencyRecord: ...
+
     async def mark_unknown(
         self,
         record: IdempotencyRecord,
@@ -154,6 +169,12 @@ class ExecutionStore(Protocol):
         tenant_id: str,
         key: str,
     ) -> IdempotencyRecord | None: ...
+
+    async def get_receipt(
+        self,
+        tenant_id: str,
+        key: str,
+    ) -> ActionExecutionReceipt | None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +207,7 @@ class InMemoryExecutionStore:
 
     def __init__(self) -> None:
         self._records: dict[tuple[str, str], IdempotencyRecord] = {}
+        self._receipts: dict[tuple[str, str], ActionExecutionReceipt] = {}
         self._lock = asyncio.Lock()
 
     async def reserve(
@@ -316,6 +338,49 @@ class InMemoryExecutionStore:
             self._records[ck] = updated
             return updated
 
+    async def complete_with_receipt(
+        self,
+        record: IdempotencyRecord,
+        receipt: ActionExecutionReceipt,
+    ) -> IdempotencyRecord:
+        """P0-6: atomically commit terminal state + full receipt.
+
+        The receipt is stored alongside the idempotency record so
+        replay returns the ORIGINAL trusted receipt, not a
+        fabricated DEDUPLICATED one.  Both writes happen under the
+        same lock — a crash between them is impossible.
+        """
+        async with self._lock:
+            ck = (record.tenant_id, record.idempotency_key)
+            existing = self._records.get(ck)
+            if existing is None:
+                raise KeyError(
+                    f"no idempotency record for ({record.tenant_id!r}, "
+                    f"{record.idempotency_key!r})"
+                )
+            if existing.execution_fingerprint != record.execution_fingerprint:
+                raise IdempotencyConflictError(
+                    "fingerprint mismatch on complete_with_receipt",
+                )
+            succeeded = receipt.status.value in (
+                "succeeded",
+                "dry_run_succeeded",
+            )
+            new_state = (
+                IdempotencyState.SUCCEEDED if succeeded else IdempotencyState.FAILED
+            )
+            updated = IdempotencyRecord(
+                tenant_id=existing.tenant_id,
+                idempotency_key=existing.idempotency_key,
+                execution_fingerprint=existing.execution_fingerprint,
+                state=new_state,
+                command_id=existing.command_id,
+                receipt_id=receipt.receipt_id,
+            )
+            self._records[ck] = updated
+            self._receipts[ck] = receipt
+            return updated
+
     async def get(
         self,
         tenant_id: str,
@@ -323,6 +388,15 @@ class InMemoryExecutionStore:
     ) -> IdempotencyRecord | None:
         async with self._lock:
             return self._records.get((tenant_id, key))
+
+    async def get_receipt(
+        self,
+        tenant_id: str,
+        key: str,
+    ) -> ActionExecutionReceipt | None:
+        """P0-6: return the original trusted receipt for replay."""
+        async with self._lock:
+            return self._receipts.get((tenant_id, key))
 
 
 __all__ = [

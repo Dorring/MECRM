@@ -28,11 +28,14 @@ APPROVAL_REJECTED = "approval_rejected"
 APPROVAL_EXPIRED = "approval_expired"
 APPROVAL_REVOKED = "approval_revoked"
 APPROVAL_ALREADY_CONSUMED = "approval_already_consumed"
+APPROVAL_CONFLICT = "approval_conflict"
 AUTHORIZATION_INTEGRITY_FAILED = "authorization_integrity_failed"
 REVIEW_BINDING_MISMATCH = "review_binding_mismatch"
 GOVERNANCE_SPEC_MISMATCH = "governance_spec_mismatch"
+GOVERNANCE_SPEC_DRIFT = "governance_spec_drift"
 ADAPTER_NOT_FOUND = "adapter_not_found"
 ADAPTER_VERSION_MISMATCH = "adapter_version_mismatch"
+ADAPTER_BINDING_DRIFT = "adapter_binding_drift"
 ACTION_NOT_SUPPORTED = "action_not_supported"
 KILL_SWITCH_ACTIVE = "kill_switch_active"
 IDEMPOTENCY_CONFLICT = "idempotency_conflict"
@@ -40,10 +43,12 @@ EXECUTION_ALREADY_IN_PROGRESS = "execution_already_in_progress"
 EXECUTION_OUTCOME_UNKNOWN = "execution_outcome_unknown"
 EXECUTION_TIMEOUT = "execution_timeout"
 EXECUTION_CANCELLED = "execution_cancelled"
+EXECUTION_CANCELLED_BEFORE_CALL = "execution_cancelled_before_call"
 INVALID_ADAPTER_OUTCOME = "invalid_adapter_outcome"
 INVALID_EXECUTION_RECEIPT = "invalid_execution_receipt"
 TENANT_MISMATCH = "tenant_mismatch"
 EXECUTION_DEADLINE_EXCEEDED = "execution_deadline_exceeded"
+DRY_RUN_NOT_SUPPORTED = "dry_run_not_supported"
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +144,18 @@ class KillSwitchExecutionBlockedError(ExecutionError):
     error_code = KILL_SWITCH_ACTIVE
 
 
+class GovernanceSpecDriftError(ExecutionError):
+    """P0-9: live governance spec hash does not match the request."""
+
+    error_code = GOVERNANCE_SPEC_DRIFT
+
+
+class AdapterBindingDriftError(ExecutionError):
+    """P0-4: live adapter does not match the frozen binding snapshot."""
+
+    error_code = ADAPTER_BINDING_DRIFT
+
+
 # Re-export for convenience
 __all__ = [
     # Error codes
@@ -148,11 +165,14 @@ __all__ = [
     "APPROVAL_EXPIRED",
     "APPROVAL_REVOKED",
     "APPROVAL_ALREADY_CONSUMED",
+    "APPROVAL_CONFLICT",
     "AUTHORIZATION_INTEGRITY_FAILED",
     "REVIEW_BINDING_MISMATCH",
     "GOVERNANCE_SPEC_MISMATCH",
+    "GOVERNANCE_SPEC_DRIFT",
     "ADAPTER_NOT_FOUND",
     "ADAPTER_VERSION_MISMATCH",
+    "ADAPTER_BINDING_DRIFT",
     "ACTION_NOT_SUPPORTED",
     "KILL_SWITCH_ACTIVE",
     "IDEMPOTENCY_CONFLICT",
@@ -160,10 +180,12 @@ __all__ = [
     "EXECUTION_OUTCOME_UNKNOWN",
     "EXECUTION_TIMEOUT",
     "EXECUTION_CANCELLED",
+    "EXECUTION_CANCELLED_BEFORE_CALL",
     "INVALID_ADAPTER_OUTCOME",
     "INVALID_EXECUTION_RECEIPT",
     "TENANT_MISMATCH",
     "EXECUTION_DEADLINE_EXCEEDED",
+    "DRY_RUN_NOT_SUPPORTED",
     # Exception classes
     "ExecutionError",
     "ExecutionAuthorizationError",
@@ -177,4 +199,6 @@ __all__ = [
     "ExecutionReceiptError",
     "ExecutionIntegrityError",
     "KillSwitchExecutionBlockedError",
+    "GovernanceSpecDriftError",
+    "AdapterBindingDriftError",
 ]

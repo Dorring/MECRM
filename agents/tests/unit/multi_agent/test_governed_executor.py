@@ -218,7 +218,7 @@ class TestExecutionOptions:
         assert opts.batch_deadline_seconds > 0
         assert opts.per_action_timeout_seconds > 0
         assert opts.max_concurrency >= 1
-        assert opts.dry_run is False
+        assert opts.dry_run is True
 
     def test_non_positive_deadline_rejected(self) -> None:
         with pytest.raises(ValidationError):
@@ -397,6 +397,7 @@ class TestGovernedExecutorHappyPath:
                 adapter_registry=registry,
                 kill_switch=NoKillSwitch(),
                 clock=FrozenClock(TS),
+                options=ExecutionOptions(dry_run=False),
             )
         )
         assert batch.batch_status == BatchExecutionStatus.SUCCEEDED
@@ -426,7 +427,9 @@ class TestGovernedExecutorHappyPath:
             )
         )
         assert batch.dry_run is True
-        assert batch.batch_status == BatchExecutionStatus.SUCCEEDED
+        assert batch.batch_status == BatchExecutionStatus.DRY_RUN_COMPLETED
+        assert len(batch.receipts) == 1
+        assert batch.receipts[0].status == ExecutionStatus.DRY_RUN_SUCCEEDED
 
 
 # ---------------------------------------------------------------------------
@@ -435,8 +438,9 @@ class TestGovernedExecutorHappyPath:
 
 
 class TestGovernedExecutorEmptyBatch:
-    def test_all_non_executable_yields_no_actions(self) -> None:
-        """When no proposals are executable, the batch is NO_ACTIONS."""
+    def test_all_non_executable_yields_blocked(self) -> None:
+        """When proposals exist but none are executable (NEEDS_INPUT),
+        the batch is BLOCKED (P0-7), not NO_ACTIONS."""
         proposal = make_proposal()
         request = make_request("review-no-exe", [proposal])
         review = make_review(
@@ -461,10 +465,10 @@ class TestGovernedExecutorEmptyBatch:
                 clock=FrozenClock(TS),
             )
         )
-        assert batch.batch_status == BatchExecutionStatus.NO_ACTIONS
+        assert batch.batch_status == BatchExecutionStatus.BLOCKED
         assert len(batch.receipts) == 0
 
-    def test_rejected_proposal_is_skipped(self) -> None:
+    def test_rejected_proposal_is_blocked(self) -> None:
         proposal = make_proposal()
         request = make_request("review-rejected", [proposal])
         review = make_review(
@@ -489,7 +493,7 @@ class TestGovernedExecutorEmptyBatch:
                 clock=FrozenClock(TS),
             )
         )
-        assert batch.batch_status == BatchExecutionStatus.NO_ACTIONS
+        assert batch.batch_status == BatchExecutionStatus.BLOCKED
         assert len(batch.receipts) == 0
 
 

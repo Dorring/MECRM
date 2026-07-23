@@ -199,6 +199,12 @@ class AdapterExecutionOutcome(StrictContract):
                 f"AdapterExecutionOutcome {self.command_id!r}: SUCCEEDED requires "
                 f"executed=True (got {self.executed!r})"
             )
+        if s == ExecutionStatus.DRY_RUN_SUCCEEDED and self.executed is not False:
+            raise ValueError(
+                f"AdapterExecutionOutcome {self.command_id!r}: DRY_RUN_SUCCEEDED "
+                f"requires executed=False (got {self.executed!r}) — dry-run "
+                f"produces NO real side-effect (P0-1)"
+            )
         if s == ExecutionStatus.FAILED and self.executed is not False:
             raise ValueError(
                 f"AdapterExecutionOutcome {self.command_id!r}: FAILED requires "
@@ -216,10 +222,13 @@ class AdapterExecutionOutcome(StrictContract):
                 f"AdapterExecutionOutcome {self.command_id!r}: DEDUPLICATED "
                 f"requires executed=True (got {self.executed!r})"
             )
-        # SUCCEEDED MUST NOT carry an error_code; FAILED/UNKNOWN MAY.
-        if s == ExecutionStatus.SUCCEEDED and self.error_code:
+        # SUCCEEDED / DRY_RUN_SUCCEEDED MUST NOT carry an error_code.
+        if (
+            s in (ExecutionStatus.SUCCEEDED, ExecutionStatus.DRY_RUN_SUCCEEDED)
+            and self.error_code
+        ):
             raise ValueError(
-                f"AdapterExecutionOutcome {self.command_id!r}: SUCCEEDED must "
+                f"AdapterExecutionOutcome {self.command_id!r}: {s.value!r} must "
                 f"not carry an error_code"
             )
         # Populate the receipt hash.
@@ -232,6 +241,45 @@ class AdapterExecutionOutcome(StrictContract):
                 f"adapter_receipt_hash mismatch"
             )
         return self
+
+    def verify_against_command(self, command: ExecutionCommand) -> None:
+        """Bind the outcome back to the command that produced it (P0-4).
+
+        Verifies ``command_id``, ``adapter_id``, and ``adapter_version``
+        match the command.
+        """
+        if self.command_id != command.command_id:
+            raise ValueError(
+                f"AdapterExecutionOutcome {self.command_id!r}: command_id "
+                f"mismatch (command {command.command_id!r})"
+            )
+        if self.adapter_id != command.adapter_id:
+            raise ValueError(
+                f"AdapterExecutionOutcome {self.command_id!r}: adapter_id "
+                f"{self.adapter_id!r} != command {command.adapter_id!r}"
+            )
+        if self.adapter_version != command.adapter_version:
+            raise ValueError(
+                f"AdapterExecutionOutcome {self.command_id!r}: adapter_version "
+                f"{self.adapter_version!r} != command {command.adapter_version!r}"
+            )
+
+    def verify_against_binding(self, binding: ActionAdapterBinding) -> None:
+        """Bind the outcome back to the frozen adapter binding (P0-4).
+
+        Verifies ``adapter_id`` and ``adapter_version`` match the
+        frozen :class:`ActionAdapterBinding` snapshot.
+        """
+        if self.adapter_id != binding.adapter_id:
+            raise ValueError(
+                f"AdapterExecutionOutcome {self.command_id!r}: adapter_id "
+                f"{self.adapter_id!r} != binding {binding.adapter_id!r}"
+            )
+        if self.adapter_version != binding.adapter_version:
+            raise ValueError(
+                f"AdapterExecutionOutcome {self.command_id!r}: adapter_version "
+                f"{self.adapter_version!r} != binding {binding.adapter_version!r}"
+            )
 
     def compute_hash(self) -> str:
         return stable_hash(self, exclude={"adapter_receipt_hash"})
@@ -514,12 +562,17 @@ def compute_execution_fingerprint(
 
 
 class DeterministicNoopAdapter:
-    """Adapter that produces NO side-effect.
+    """Adapter that produces NO side-effect (P0-1).
 
-    Returns a deterministic ``SUCCEEDED`` outcome with a stable
-    ``external_reference`` derived from the command id.  Used as the
-    default binding in CI / dry-run so the whole stack runs without
-    any network, CRM, Kafka, e-mail, or SMS.
+    Only accepts ``dry_run=True`` commands.  Returns
+    ``DRY_RUN_SUCCEEDED`` with ``executed=False`` — this is NEVER
+    equivalent to ``SUCCEEDED`` and MUST NOT be counted as real
+    execution.
+
+    A ``dry_run=False`` command is rejected with ``NOT_AUTHORIZED``
+    because the noop cannot produce a real side-effect.  Production
+    execution MUST inject a non-Noop adapter and explicitly set
+    ``dry_run=False``.
 
     ``supports_dry_run`` is True; ``retry_safe`` is True (the noop is
     safely idempotent); ``idempotency_scope`` is TENANT.
@@ -537,14 +590,40 @@ class DeterministicNoopAdapter:
             self.supported_action_types = frozenset(supported_action_types)
 
     async def execute(self, command: ExecutionCommand) -> AdapterExecutionOutcome:
+        if not command.dry_run:
+            # P0-1: Noop MUST NOT claim real execution.  A dry_run=False
+            # command targeting the noop is fail-closed NOT_AUTHORIZED.
+            return AdapterExecutionOutcome(
+                command_id=command.command_id,
+                adapter_id=self.adapter_id,
+                adapter_version=self.adapter_version,
+                status=ExecutionStatus.NOT_AUTHORIZED,
+                executed=False,
+                external_reference=None,
+                result_payload={
+                    "noop": True,
+                    "rejected": True,
+                    "reason": "noop adapter only accepts dry_run=True",
+                },
+                retryable=False,
+                error_code="execution_not_authorized",
+                error_message=(
+                    "DeterministicNoopAdapter only accepts dry_run=True "
+                    "commands; real execution requires a non-Noop adapter"
+                ),
+            )
         return AdapterExecutionOutcome(
             command_id=command.command_id,
             adapter_id=self.adapter_id,
             adapter_version=self.adapter_version,
-            status=ExecutionStatus.SUCCEEDED,
-            executed=True,
-            external_reference=f"noop-{command.command_id}",
-            result_payload={"noop": True, "command_id": command.command_id},
+            status=ExecutionStatus.DRY_RUN_SUCCEEDED,
+            executed=False,
+            external_reference=f"noop-dry-{command.command_id}",
+            result_payload={
+                "noop": True,
+                "dry_run": True,
+                "command_id": command.command_id,
+            },
             retryable=False,
         )
 
@@ -594,8 +673,11 @@ class RecordingActionAdapter:
         # of the sink does not affect the receipt.
         self._sink.append(command)
         status = self._outcome_status
-        executed: bool | None
-        if status == ExecutionStatus.SUCCEEDED:
+        # P0-1: dry_run=True with SUCCEEDED → DRY_RUN_SUCCEEDED (executed=False).
+        if command.dry_run and status == ExecutionStatus.SUCCEEDED:
+            status = ExecutionStatus.DRY_RUN_SUCCEEDED
+            executed = False
+        elif status == ExecutionStatus.SUCCEEDED:
             executed = True
         elif status == ExecutionStatus.FAILED:
             executed = False
@@ -608,7 +690,11 @@ class RecordingActionAdapter:
             status=status,
             executed=executed,
             external_reference=self._external_reference or f"rec-{command.command_id}",
-            result_payload={"recorded": True, "command_id": command.command_id},
+            result_payload={
+                "recorded": True,
+                "command_id": command.command_id,
+                "dry_run": command.dry_run,
+            },
             retryable=False,
             error_code=self._error_code,
             error_message=self._error_message,

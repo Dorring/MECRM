@@ -45,6 +45,10 @@ class ExecutionStatus(StrEnum):
     Key invariant (Phase 5B): ``SUCCEEDED`` requires ``executed=True``,
     ``FAILED`` requires ``executed=False``, and ``UNKNOWN`` requires
     ``executed=None`` — they are NEVER interchangeable.
+
+    ``DRY_RUN_SUCCEEDED`` — the action was executed in dry-run mode;
+    ``executed=False`` because NO real side-effect was produced.  This
+    is NEVER equivalent to ``SUCCEEDED`` (P0-1).
     """
 
     NOT_AUTHORIZED = "not_authorized"
@@ -52,6 +56,7 @@ class ExecutionStatus(StrEnum):
     READY = "ready"
     IN_PROGRESS = "in_progress"
     SUCCEEDED = "succeeded"
+    DRY_RUN_SUCCEEDED = "dry_run_succeeded"
     FAILED = "failed"
     UNKNOWN = "unknown"
     CANCELLED = "cancelled"
@@ -81,23 +86,26 @@ class BatchExecutionStatus(StrEnum):
     PENDING_APPROVAL = "pending_approval"
     PARTIAL_SUCCESS = "partial_success"
     SUCCEEDED = "succeeded"
+    DRY_RUN_COMPLETED = "dry_run_completed"
     FAILED = "failed"
     UNKNOWN = "unknown"
     CANCELLED = "cancelled"
 
 
 # Unique priority weights — highest wins (Phase 5B Section 22).
-# UNKNOWN(7) > FAILED(6) > CANCELLED(5) > PARTIAL_SUCCESS(4) >
-# PENDING_APPROVAL(3) > BLOCKED(2) > SUCCEEDED(1) > NO_ACTIONS(0).
+# UNKNOWN(8) > FAILED(7) > CANCELLED(6) > PARTIAL_SUCCESS(5) >
+# PENDING_APPROVAL(4) > BLOCKED(3) > SUCCEEDED(2) > DRY_RUN_COMPLETED(1)
+# > NO_ACTIONS(0).
 _BATCH_PRIORITY: dict[BatchExecutionStatus, int] = {
     BatchExecutionStatus.NO_ACTIONS: 0,
-    BatchExecutionStatus.SUCCEEDED: 1,
-    BatchExecutionStatus.BLOCKED: 2,
-    BatchExecutionStatus.PENDING_APPROVAL: 3,
-    BatchExecutionStatus.PARTIAL_SUCCESS: 4,
-    BatchExecutionStatus.CANCELLED: 5,
-    BatchExecutionStatus.FAILED: 6,
-    BatchExecutionStatus.UNKNOWN: 7,
+    BatchExecutionStatus.DRY_RUN_COMPLETED: 1,
+    BatchExecutionStatus.SUCCEEDED: 2,
+    BatchExecutionStatus.BLOCKED: 3,
+    BatchExecutionStatus.PENDING_APPROVAL: 4,
+    BatchExecutionStatus.PARTIAL_SUCCESS: 5,
+    BatchExecutionStatus.CANCELLED: 6,
+    BatchExecutionStatus.FAILED: 7,
+    BatchExecutionStatus.UNKNOWN: 8,
 }
 
 

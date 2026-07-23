@@ -386,8 +386,11 @@ def make_request(
     capability: AgentCapability | None = None,
     tenant_id: str = TENANT,
 ) -> ReviewRequest:
-    proposals = proposals or [make_proposal()]
-    evidence = evidence or [make_evidence()]
+    # Distinguish None (use default) from [] (explicitly empty).
+    if proposals is None:
+        proposals = [make_proposal()]
+    if evidence is None:
+        evidence = [make_evidence()]
     cap = capability or make_capability()
     cap_binding = make_capability_binding("task-test", "test_agent", cap)
     evidence_snapshots = [

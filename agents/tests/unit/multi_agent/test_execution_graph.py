@@ -30,7 +30,7 @@ from multi_agent.execution_graph import (
     build_execution_graph,
 )
 from multi_agent.execution_store import InMemoryExecutionStore
-from multi_agent.governed_executor import GovernedExecutor
+from multi_agent.governed_executor import ExecutionOptions, GovernedExecutor
 from multi_agent.review_contracts import ReviewGraphError
 
 from phase5b_helpers import (
@@ -56,6 +56,7 @@ def _build_graph_state(
     kill_switch,
     execution_store=None,
     approval_store=None,
+    options=None,
 ) -> ExecutionGraphState:
     """Build a fully-populated ExecutionGraphState for ainvoke."""
     return ExecutionGraphState(
@@ -66,6 +67,7 @@ def _build_graph_state(
         adapter_registry=registry,
         kill_switch=kill_switch,
         clock=FrozenClock(TS),
+        options=options or ExecutionOptions(dry_run=False),
     )
 
 
@@ -77,6 +79,7 @@ def _direct_execute(
     kill_switch,
     execution_store=None,
     approval_store=None,
+    options=None,
 ):
     return run_async(
         GovernedExecutor().execute(
@@ -87,6 +90,7 @@ def _direct_execute(
             adapter_registry=registry,
             kill_switch=kill_switch,
             clock=FrozenClock(TS),
+            options=options or ExecutionOptions(dry_run=False),
         )
     )
 
@@ -99,6 +103,7 @@ def _graph_execute(
     kill_switch,
     execution_store=None,
     approval_store=None,
+    options=None,
 ):
     graph = build_execution_graph()
     state = _build_graph_state(
@@ -108,6 +113,7 @@ def _graph_execute(
         kill_switch=kill_switch,
         execution_store=execution_store,
         approval_store=approval_store,
+        options=options,
     )
     return run_async(graph.ainvoke(state))
 

@@ -111,6 +111,11 @@ class ActionExecutionReceipt(StrictContract):
             raise ValueError(
                 f"Receipt {self.receipt_id!r}: SUCCEEDED requires executed=True"
             )
+        if s == ExecutionStatus.DRY_RUN_SUCCEEDED and self.executed is not False:
+            raise ValueError(
+                f"Receipt {self.receipt_id!r}: DRY_RUN_SUCCEEDED requires "
+                f"executed=False (dry-run produces NO real side-effect)"
+            )
         if s == ExecutionStatus.FAILED and self.executed is not False:
             raise ValueError(
                 f"Receipt {self.receipt_id!r}: FAILED requires executed=False"
@@ -232,4 +237,27 @@ class ActionExecutionReceipt(StrictContract):
                 )
 
 
-__all__ = ["ActionExecutionReceipt"]
+__all__ = ["ActionExecutionReceipt", "ExecutionReceiptView"]
+
+
+# ---------------------------------------------------------------------------
+# ExecutionReceiptView — replay wrapper (P0-6).
+# ---------------------------------------------------------------------------
+
+
+class ExecutionReceiptView(StrictContract):
+    """Wrapper around an :class:`ActionExecutionReceipt` for replay.
+
+    P0-6: when the same idempotency key + fingerprint is replayed
+    after a SUCCEEDED state, the executor returns the ORIGINAL
+    receipt (defensive copy) wrapped in this view with
+    ``replayed=True``.  The original receipt's ``command_id``,
+    ``external_reference``, ``result_summary``, ``timestamps``, and
+    ``receipt_hash`` are preserved exactly — no fabricated
+    DEDUPLICATED receipt is created.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    receipt: ActionExecutionReceipt
+    replayed: bool = False

@@ -6,7 +6,7 @@ Covers the full pipeline from :class:`ReviewRequest` →
 
 * Approved low-risk happy path (SUCCEEDED).
 * NEEDS_APPROVAL review + approval request + approve + consume.
-* Rejected Proposal (skipped, NO_ACTIONS).
+* Rejected Proposal (skipped, BLOCKED).
 * Kill switch active (BLOCKED).
 * Idempotent replay (DEDUPLICATED, adapter called once).
 * Partial success (mixed SUCCEEDED / FAILED).
@@ -68,8 +68,11 @@ def _execute(
     execution_store=None,
     approval_store=None,
     executor=None,
+    options=None,
 ):
     """Run the GovernedExecutor with sensible defaults."""
+    from multi_agent.governed_executor import ExecutionOptions
+
     return run_async(
         (executor or GovernedExecutor()).execute(
             request=request,
@@ -79,6 +82,7 @@ def _execute(
             adapter_registry=registry,
             kill_switch=kill_switch,
             clock=FrozenClock(TS),
+            options=options or ExecutionOptions(dry_run=False),
         )
     )
 
@@ -238,8 +242,8 @@ class TestPhase5BEndToEnd:
         assert consumed.approval_id == "appr-001"
 
     def test_full_pipeline_rejected_skipped(self) -> None:
-        """A REJECTED Proposal is never executed — batch is NO_ACTIONS
-        with zero receipts."""
+        """A REJECTED Proposal is never executed — batch is BLOCKED
+        (proposals exist but none are executable) with zero receipts."""
         proposal = make_proposal()
         request = make_request("review-rejected", [proposal])
         review = make_review(
@@ -256,7 +260,7 @@ class TestPhase5BEndToEnd:
             registry=registry,
             kill_switch=NoKillSwitch(),
         )
-        assert batch.batch_status == BatchExecutionStatus.NO_ACTIONS
+        assert batch.batch_status == BatchExecutionStatus.BLOCKED
         assert len(batch.receipts) == 0
         assert len(sink) == 0
 

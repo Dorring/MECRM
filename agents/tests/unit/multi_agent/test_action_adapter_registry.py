@@ -76,6 +76,7 @@ def _make_command(
     authorization: ExecutionAuthorization | None = None,
     adapter_id: str = "noop-adapter",
     adapter_version: str = "1.0.0",
+    dry_run: bool = False,
 ) -> ExecutionCommand:
     auth = authorization or _make_authorization()
     return ExecutionCommand(
@@ -86,6 +87,7 @@ def _make_command(
         action_type=auth.action_type,
         adapter_id=adapter_id,
         adapter_version=adapter_version,
+        dry_run=dry_run,
         execution_fingerprint="fp" + "0" * 62,
     )
 
@@ -540,17 +542,36 @@ class TestActionAdapterBinding:
 
 
 class TestDeterministicNoopAdapter:
-    def test_noop_returns_succeeded(self) -> None:
+    def test_noop_rejects_dry_run_false_with_not_authorized(self) -> None:
+        """P0-1: the noop MUST NOT claim real execution.  A dry_run=False
+        command is fail-closed ``NOT_AUTHORIZED`` — production execution
+        requires a non-Noop adapter."""
         import asyncio
 
         adapter = DeterministicNoopAdapter(
             supported_action_types=frozenset({"report.generate"})
         )
         cmd = _make_command()
+        # _make_command defaults to dry_run=False.
         outcome = asyncio.run(adapter.execute(cmd))
-        assert outcome.status == ExecutionStatus.SUCCEEDED
-        assert outcome.executed is True
-        assert outcome.external_reference == f"noop-{cmd.command_id}"
+        assert outcome.status == ExecutionStatus.NOT_AUTHORIZED
+        assert outcome.executed is False
+        assert outcome.error_code == "execution_not_authorized"
+        assert outcome.retryable is False
+
+    def test_noop_dry_run_returns_dry_run_succeeded(self) -> None:
+        """A dry_run=True command returns DRY_RUN_SUCCEEDED with
+        ``executed=False`` — never equivalent to real SUCCEEDED."""
+        import asyncio
+
+        adapter = DeterministicNoopAdapter(
+            supported_action_types=frozenset({"report.generate"})
+        )
+        cmd = _make_command(dry_run=True)
+        outcome = asyncio.run(adapter.execute(cmd))
+        assert outcome.status == ExecutionStatus.DRY_RUN_SUCCEEDED
+        assert outcome.executed is False
+        assert outcome.external_reference == f"noop-dry-{cmd.command_id}"
 
     def test_noop_supports_dry_run(self) -> None:
         adapter = DeterministicNoopAdapter(

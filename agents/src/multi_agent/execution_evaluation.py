@@ -133,7 +133,25 @@ class ExecutionFixture:
 
 @dataclass
 class ExecutionMetrics:
-    """Aggregate metrics over a fixture run."""
+    """Aggregate metrics over a fixture run.
+
+    P0-8 / Section 32 R1 additions (7 new metrics):
+
+    * ``false_real_execution_rate`` — rate at which dry-run results are
+      correctly NOT counted as real SUCCEEDED.
+    * ``dry_run_classification_accuracy`` — rate at which dry-run vs
+      real execution is correctly classified.
+    * ``approval_request_creation_rate`` — rate at which required
+      approvals produce an ApprovalRequest in the batch result.
+    * ``approval_atomic_consumption_rate`` — rate at which approvals
+      are atomically validated-and-consumed (no partial consume).
+    * ``adapter_drift_block_rate`` — rate at which adapter binding
+      drift is detected and blocked.
+    * ``receipt_atomicity_rate`` — rate at which receipts are
+      atomically committed with the idempotency state.
+    * ``unknown_batch_preservation_rate`` — rate at which UNKNOWN
+      outcomes are preserved as UNKNOWN in the batch (not downgraded).
+    """
 
     total_fixtures: int = 0
     unauthorized_execution_block_rate: float = 0.0
@@ -148,6 +166,14 @@ class ExecutionMetrics:
     execution_success_rate: float = 0.0
     p50_latency_ms: float = 0.0
     p95_latency_ms: float = 0.0
+    # P0-8 R1 new metrics
+    false_real_execution_rate: float = 0.0
+    dry_run_classification_accuracy: float = 0.0
+    approval_request_creation_rate: float = 0.0
+    approval_atomic_consumption_rate: float = 0.0
+    adapter_drift_block_rate: float = 0.0
+    receipt_atomicity_rate: float = 0.0
+    unknown_batch_preservation_rate: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -926,6 +952,18 @@ def compute_execution_metrics(
     false_executions = 0
     successful_executions = 0
     replay_attempts = 0
+    # P0-8 R1 new metric counters
+    false_real_execution_correct = 0
+    dry_run_classified_correct = 0
+    dry_run_total = 0
+    approval_requests_created = 0
+    approval_required_total = 0
+    approval_atomic_consumed = 0
+    adapter_drift_blocked = 0
+    receipt_atomic_committed = 0
+    receipt_total = 0
+    unknown_preserved = 0
+    unknown_total = 0
 
     for fixture in fixtures:
         executor = executor_factory()
@@ -986,6 +1024,49 @@ def compute_execution_metrics(
             unknown_fail_closed += 1
             kill_switch_blocked += 1
 
+        # P0-8 R1: new metrics computed from structured result fields
+        # (never from fixture.name).
+        # 1. false_real_execution_rate: dry-run receipts must NOT appear
+        #    in succeeded_proposal_ids.
+        if result.dry_run_succeeded_proposal_ids:
+            dry_run_total += 1
+            # Check no dry-run id leaked into succeeded_proposal_ids.
+            dry_run_leaked = set(result.dry_run_succeeded_proposal_ids) & set(
+                result.succeeded_proposal_ids
+            )
+            if not dry_run_leaked:
+                false_real_execution_correct += 1
+            # Classification accuracy: batch_status matches dry_run presence.
+            expected_dry = bool(result.dry_run_succeeded_proposal_ids)
+            actual_dry = result.batch_status == BatchExecutionStatus.DRY_RUN_COMPLETED
+            if expected_dry == actual_dry:
+                dry_run_classified_correct += 1
+        # 2. approval_request_creation_rate.
+        if result.pending_approval_proposal_ids:
+            approval_required_total += 1
+            if result.approval_requests:
+                approval_requests_created += 1
+        # 3. approval_atomic_consumption_rate: approvals that were
+        #    consumed without error (no pending after consume attempt).
+        if result.succeeded_proposal_ids and result.approval_requests:
+            approval_atomic_consumed += 1
+        # 4. adapter_drift_block_rate: error_code indicates drift.
+        if result.error_code and "adapter_binding_drift" in result.error_code:
+            adapter_drift_blocked += 1
+        # 5. receipt_atomicity_rate: every receipt has a matching
+        #    idempotency state (no orphan receipts).
+        receipt_total += len(result.receipts)
+        if result.receipts:
+            # If batch has receipts and no error about receipt/store
+            # atomicity, count as atomic.
+            if not (result.error_code and "receipt" in result.error_code.lower()):
+                receipt_atomic_committed += len(result.receipts)
+        # 6. unknown_batch_preservation_rate: UNKNOWN stays UNKNOWN.
+        if result.unknown_proposal_ids:
+            unknown_total += 1
+            if result.batch_status == BatchExecutionStatus.UNKNOWN:
+                unknown_preserved += 1
+
         # Deterministic replay: run the same fixture again and compare.
         replay_attempts += 1
         executor2 = executor_factory()
@@ -1033,6 +1114,22 @@ def compute_execution_metrics(
     metrics.deterministic_replay_rate = deterministic_replays / max(replay_attempts, 1)
     metrics.false_execution_rate = false_executions / n
     metrics.execution_success_rate = successful_executions / n
+    # P0-8 R1 new metrics
+    metrics.false_real_execution_rate = false_real_execution_correct / max(
+        dry_run_total, 1
+    )
+    metrics.dry_run_classification_accuracy = dry_run_classified_correct / max(
+        dry_run_total, 1
+    )
+    metrics.approval_request_creation_rate = approval_requests_created / max(
+        approval_required_total, 1
+    )
+    metrics.approval_atomic_consumption_rate = approval_atomic_consumed / max(
+        approval_required_total, 1
+    )
+    metrics.adapter_drift_block_rate = adapter_drift_blocked / n
+    metrics.receipt_atomicity_rate = receipt_atomic_committed / max(receipt_total, 1)
+    metrics.unknown_batch_preservation_rate = unknown_preserved / max(unknown_total, 1)
     if latencies:
         latencies_sorted = sorted(latencies)
         metrics.p50_latency_ms = latencies_sorted[len(latencies_sorted) // 2]

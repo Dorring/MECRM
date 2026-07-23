@@ -118,9 +118,11 @@ class TestSideEffectGuard:
             registry=noop_registry,
             kill_switch=NoKillSwitch(),
         )
-        # The noop adapter returns SUCCEEDED.
-        assert batch.batch_status == BatchExecutionStatus.SUCCEEDED
+        # With dry_run=True (default), the noop returns
+        # DRY_RUN_SUCCEEDED — NO real side-effect.
+        assert batch.batch_status == BatchExecutionStatus.DRY_RUN_COMPLETED
         assert len(batch.receipts) == 1
+        assert batch.receipts[0].status.value == "dry_run_succeeded"
         # The recording sink is untouched — no external call.
         assert len(recording_sink) == 0
 
@@ -143,7 +145,8 @@ class TestSideEffectGuard:
             registry=registry,
             kill_switch=NoKillSwitch(),
         )
-        assert batch.batch_status == BatchExecutionStatus.NO_ACTIONS
+        # P0-7: proposals exist but none are executable → BLOCKED.
+        assert batch.batch_status == BatchExecutionStatus.BLOCKED
         assert len(batch.receipts) == 0
         assert len(sink) == 0  # adapter was never called
 
@@ -227,7 +230,8 @@ class TestSideEffectGuard:
         execution_store = InMemoryExecutionStore()
         approval_store = InMemoryApprovalStore()
 
-        # First execution — adapter is called.
+        # First execution — adapter is called.  With dry_run=True
+        # (default), the recording adapter returns DRY_RUN_SUCCEEDED.
         batch1 = _execute(
             request,
             result,
@@ -236,11 +240,12 @@ class TestSideEffectGuard:
             execution_store=execution_store,
             approval_store=approval_store,
         )
-        assert batch1.batch_status == BatchExecutionStatus.SUCCEEDED
+        assert batch1.batch_status == BatchExecutionStatus.DRY_RUN_COMPLETED
         assert len(sink) == 1
 
         # Second execution — same idempotency key + same inputs.
-        # The adapter MUST NOT be called again.
+        # The adapter MUST NOT be called again.  P0-6: the original
+        # trusted receipt (DRY_RUN_SUCCEEDED) is returned.
         batch2 = _execute(
             request,
             result,
@@ -250,8 +255,7 @@ class TestSideEffectGuard:
             approval_store=approval_store,
         )
         assert len(sink) == 1  # adapter was called exactly once
-        # The second batch succeeds via cached receipt (DEDUPLICATED
-        # internally, but batch_status is SUCCEEDED since the cached
-        # receipt has status=SUCCEEDED).
-        assert batch2.batch_status == BatchExecutionStatus.SUCCEEDED
+        # The second batch returns DRY_RUN_COMPLETED via the cached
+        # original receipt (status=DRY_RUN_SUCCEEDED).
+        assert batch2.batch_status == BatchExecutionStatus.DRY_RUN_COMPLETED
         assert len(batch2.receipts) == 1

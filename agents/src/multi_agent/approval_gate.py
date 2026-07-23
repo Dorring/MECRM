@@ -22,11 +22,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 
 from multi_agent.action_governance import ActionGovernanceSpec
 from multi_agent.approval_contracts import (
+    ApprovalConflictError,
     ApprovalDecision,
     ApprovalRequest,
     ApprovalStatus,
@@ -72,6 +73,12 @@ class ApprovalStore(Protocol):
     All methods are async so a future DB-backed adapter can poll
     without changing call sites.  Implementations MUST be safe under
     concurrent ``decide`` / ``consume`` calls (compare-and-set).
+
+    P0-3: ``validate_and_consume`` is the ONLY atomic consume path —
+    it validates tenant, run, proposal, authorization hash, request
+    hash, approver role, expiry, and status ALL under the store lock
+    before marking CONSUMED.  The separate ``consume`` method is
+    DEPRECATED and MUST NOT be used by the executor.
     """
 
     async def create(self, request: ApprovalRequest) -> ApprovalRequest: ...
@@ -90,6 +97,16 @@ class ApprovalStore(Protocol):
         authorization_hash: str,
     ) -> ApprovalDecision: ...
 
+    async def validate_and_consume(
+        self,
+        approval_id: str,
+        *,
+        authorization: ExecutionAuthorization,
+        now: datetime,
+    ) -> ApprovalDecision: ...
+
+    async def get_decision(self, approval_id: str) -> ApprovalDecision | None: ...
+
 
 # ---------------------------------------------------------------------------
 # InMemoryApprovalStore
@@ -101,16 +118,22 @@ class InMemoryApprovalStore:
 
     Concurrency-safe via a single :class:`asyncio.Lock`.
 
-    Semantics:
+    Semantics (P0-3 + P1-1):
 
-    * ``create`` — stores a PENDING request; idempotent on
-      ``approval_id`` (returns the existing request if present).
+    * ``create`` — stores a PENDING request.  Same ``approval_id`` +
+      same ``approval_request_hash`` → idempotent return.  Same
+      ``approval_id`` + different ``approval_request_hash`` →
+      :class:`ApprovalConflictError` (P1-1).
     * ``decide`` — applies a terminal decision; only ONE terminal
-      decision is allowed per approval (subsequent attempts raise
-      :class:`ApprovalValidationError`).
-    * ``consume`` — marks an APPROVED decision as CONSUMED; can be
-      called exactly ONCE.  REJECTED / EXPIRED / REVOKED decisions
-      can NEVER be consumed.
+      decision is allowed per approval.
+    * ``validate_and_consume`` — the ONLY atomic consume path (P0-3):
+      validates tenant, run, proposal, authorization_hash,
+      approval_request_hash, approver role, expiry (vs ``now``), and
+      status ALL under the store lock before marking CONSUMED.  Any
+      validation failure does NOT consume the approval.
+    * ``consume`` — DEPRECATED; delegates to ``validate_and_consume``
+      with minimal checks (kept for backwards compatibility with
+      tests that pre-construct decisions).
     """
 
     def __init__(self) -> None:
@@ -123,6 +146,12 @@ class InMemoryApprovalStore:
         async with self._lock:
             existing = self._requests.get(request.approval_id)
             if existing is not None:
+                # P1-1: same ID + same hash → idempotent; different hash → conflict.
+                if existing.approval_request_hash != request.approval_request_hash:
+                    raise ApprovalConflictError(
+                        f"approval {request.approval_id!r} already exists with "
+                        f"a different approval_request_hash",
+                    )
                 return existing
             self._requests[request.approval_id] = request
             return request
@@ -130,6 +159,10 @@ class InMemoryApprovalStore:
     async def get(self, approval_id: str) -> ApprovalRequest | None:
         async with self._lock:
             return self._requests.get(approval_id)
+
+    async def get_decision(self, approval_id: str) -> ApprovalDecision | None:
+        async with self._lock:
+            return self._decisions.get(approval_id)
 
     async def decide(
         self,
@@ -162,6 +195,11 @@ class InMemoryApprovalStore:
         approval_id: str,
         authorization_hash: str,
     ) -> ApprovalDecision:
+        """DEPRECATED — use ``validate_and_consume`` instead (P0-3).
+
+        Kept for backwards compatibility; performs the old non-atomic
+        consume.  The executor MUST use ``validate_and_consume``.
+        """
         async with self._lock:
             request = self._requests.get(approval_id)
             if request is None:
@@ -199,6 +237,129 @@ class InMemoryApprovalStore:
                     "decision.authorization_hash does not match the "
                     "execution authorization",
                 )
+            self._consumed.add(approval_id)
+            return decision
+
+    async def validate_and_consume(
+        self,
+        approval_id: str,
+        *,
+        authorization: ExecutionAuthorization,
+        now: datetime,
+    ) -> ApprovalDecision:
+        """P0-3: atomically validate and consume an approval.
+
+        ALL checks run under the store lock.  Any failure does NOT
+        consume the approval — it remains available for correction
+        and a subsequent valid consume.
+
+        Checks (in order):
+        1. Request exists.
+        2. Decision exists (APPROVED).
+        3. Not already consumed.
+        4. Tenant matches authorization.
+        5. Run matches authorization.
+        6. Proposal matches authorization.
+        7. Authorization ID matches request.
+        8. Authorization hash matches decision.
+        9. Approval request hash matches decision.
+        10. Decision status is APPROVED.
+        11. ``now`` <= ``request.expires_at`` (P0-3: uses execution
+            clock, NOT ``decision.decided_at``).
+        12. Approver holds at least one required role.
+        """
+        async with self._lock:
+            request = self._requests.get(approval_id)
+            if request is None:
+                raise ApprovalValidationError(
+                    f"approval {approval_id!r} not found",
+                )
+            if approval_id in self._consumed:
+                raise ApprovalValidationError(
+                    f"approval {approval_id!r} already consumed",
+                )
+            decision = self._decisions.get(approval_id)
+            if decision is None:
+                raise ApprovalRequiredError(
+                    f"approval {approval_id!r} has no decision yet",
+                )
+
+            # --- Identity checks (fail-closed, no consume) ---
+            if request.tenant_id != authorization.tenant_id:
+                raise ApprovalValidationError(
+                    f"approval {approval_id!r}: tenant_id "
+                    f"{request.tenant_id!r} != authorization "
+                    f"{authorization.tenant_id!r}",
+                )
+            if request.run_id != authorization.run_id:
+                raise ApprovalValidationError(
+                    f"approval {approval_id!r}: run_id mismatch",
+                )
+            if request.proposal_id != authorization.proposal_id:
+                raise ApprovalValidationError(
+                    f"approval {approval_id!r}: proposal_id "
+                    f"{request.proposal_id!r} != authorization "
+                    f"{authorization.proposal_id!r}",
+                )
+            if request.authorization_id != authorization.authorization_id:
+                raise ApprovalValidationError(
+                    f"approval {approval_id!r}: authorization_id mismatch",
+                )
+            if request.authorization_hash != authorization.authorization_hash:
+                raise ApprovalValidationError(
+                    f"approval {approval_id!r}: request.authorization_hash "
+                    f"does not match authorization",
+                )
+            if decision.authorization_hash != authorization.authorization_hash:
+                raise ApprovalValidationError(
+                    f"approval {approval_id!r}: decision.authorization_hash "
+                    f"does not match authorization",
+                )
+            if decision.approval_request_hash != request.approval_request_hash:
+                raise ApprovalValidationError(
+                    f"approval {approval_id!r}: decision.approval_request_hash "
+                    f"does not match request",
+                )
+            if decision.approval_id != approval_id:
+                raise ApprovalValidationError(
+                    f"approval {approval_id!r}: decision.approval_id mismatch",
+                )
+            if decision.status != ApprovalStatus.APPROVED:
+                raise ApprovalValidationError(
+                    f"approval {approval_id!r}: decision status is "
+                    f"{decision.status.value!r}, not APPROVED",
+                )
+
+            # P0-3: expiry check uses the EXECUTION clock (``now``),
+            # NOT ``decision.decided_at``.  An approval decided before
+            # expiry but consumed after expiry is INVALID.
+            if request.expires_at is not None:
+                now_utc = now
+                if now_utc.tzinfo is None:
+                    now_utc = now_utc.replace(tzinfo=timezone.utc)
+                now_utc = now_utc.astimezone(timezone.utc)
+                if now_utc > request.expires_at:
+                    raise ApprovalValidationError(
+                        f"approval {approval_id!r}: expired at execution time "
+                        f"(now={now_utc.isoformat()}, "
+                        f"expires_at={request.expires_at.isoformat()})",
+                    )
+
+            # Approver role check.
+            if not request.required_approver_roles:
+                raise ApprovalValidationError(
+                    f"approval {approval_id!r}: required_approver_roles is empty",
+                )
+            held = set(decision.approver_roles)
+            required = set(request.required_approver_roles)
+            if not (held & required):
+                raise ApprovalValidationError(
+                    f"approval {approval_id!r}: approver roles "
+                    f"{sorted(held)!r} do not include any required role "
+                    f"{sorted(required)!r}",
+                )
+
+            # All checks passed → atomically mark CONSUMED.
             self._consumed.add(approval_id)
             return decision
 

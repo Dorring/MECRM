@@ -31,14 +31,14 @@ outcomes, and NEVER calls the adapter without a valid authorization
 from __future__ import annotations
 
 import asyncio
-import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from hmac import compare_digest
 
 from pydantic import ConfigDict, field_validator, model_validator
 
 from multi_agent.action_adapter import (
     ActionAdapter,
+    ActionAdapterBinding,
     ActionAdapterRegistry,
     ActionAdapterRegistrySnapshot,
     ExecutionCommand,
@@ -47,10 +47,13 @@ from multi_agent.action_adapter import (
 from multi_agent.action_governance import (
     ACTION_GOVERNANCE_SPEC_HASH,
     ActionGovernanceSpec,
+    compute_live_governance_spec_hash,
     get_action_governance_spec,
 )
 from multi_agent.approval_contracts import (
+    ApprovalConflictError,
     ApprovalDecision,
+    ApprovalRequest,
     Clock,
 )
 from multi_agent.approval_gate import (
@@ -66,11 +69,15 @@ from multi_agent.execution_authorization import (
 )
 from multi_agent.execution_error_codes import (
     ACTION_NOT_SUPPORTED,
+    ADAPTER_BINDING_DRIFT,
     ADAPTER_NOT_FOUND,
+    APPROVAL_CONFLICT,
     APPROVAL_REQUIRED,
     AUTHORIZATION_INTEGRITY_FAILED,
+    EXECUTION_CANCELLED_BEFORE_CALL,
+    EXECUTION_DEADLINE_EXCEEDED,
     EXECUTION_OUTCOME_UNKNOWN,
-    GOVERNANCE_SPEC_MISMATCH,
+    GOVERNANCE_SPEC_DRIFT,
     KILL_SWITCH_ACTIVE,
     REVIEW_BINDING_MISMATCH,
     ApprovalRequiredError,
@@ -80,7 +87,6 @@ from multi_agent.execution_error_codes import (
 from multi_agent.execution_receipts import ActionExecutionReceipt
 from multi_agent.execution_store import (
     ExecutionStore,
-    IdempotencyRecord,
     IdempotencyState,
 )
 from multi_agent.review_contracts import (
@@ -123,8 +129,12 @@ class ExecutionRetryPolicy(StrictContract):
 class ExecutionOptions(StrictContract):
     """Per-batch execution options.
 
-    All defaults are CI-safe: no network, bounded timeouts, low
-    concurrency, dry-run off but safe to flip on.
+    P0-1: ``dry_run`` defaults to ``True`` — the default mode is
+    CI-safe with NO real side-effects.  Production execution MUST
+    explicitly set ``dry_run=False`` and inject a non-Noop adapter.
+
+    P0-8: ``batch_deadline_seconds``, ``max_concurrency``, and
+    ``retry_policy`` are ALL enforced at runtime.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -133,7 +143,7 @@ class ExecutionOptions(StrictContract):
     per_action_timeout_seconds: float = 30.0
     max_concurrency: int = 4
     retry_policy: ExecutionRetryPolicy = ExecutionRetryPolicy()
-    dry_run: bool = False
+    dry_run: bool = True
 
     @field_validator("batch_deadline_seconds", "per_action_timeout_seconds")
     @classmethod
@@ -166,6 +176,7 @@ class _ActionExecutionResult(StrictContract):
     error_code: str | None = None
     error_message: str | None = None
     skipped: bool = False
+    dry_run_succeeded: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -176,9 +187,14 @@ class _ActionExecutionResult(StrictContract):
 class ExecutionBatchResult(StrictContract):
     """Frozen, hash-stable aggregate result for one execution batch.
 
-    ``batch_status`` is the highest-priority status across all
-    per-action receipts.  ``NO_ACTIONS`` is NEVER equivalent to
-    ``SUCCEEDED`` (Phase 5B Section 22).
+    P0-2: ``approval_requests`` carries the :class:`ApprovalRequest`
+    objects created by the executor for proposals needing approval.
+
+    P0-7: ``batch_status`` is derived from per-action outcomes, NOT
+    from whether receipts exist.  ``UNKNOWN`` / ``FAILED`` /
+    ``CANCELLED`` are valid even when ``receipts`` is empty.
+    ``NO_ACTIONS`` is ONLY for empty ReviewRequests; a Review with
+    all-rejected proposals yields ``BLOCKED``.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -192,17 +208,19 @@ class ExecutionBatchResult(StrictContract):
     adapter_registry_hash: str
 
     receipts: tuple[ActionExecutionReceipt, ...] = ()
+    approval_requests: tuple[ApprovalRequest, ...] = ()
     skipped_proposal_ids: tuple[str, ...] = ()
     blocked_proposal_ids: tuple[str, ...] = ()
     pending_approval_proposal_ids: tuple[str, ...] = ()
     failed_proposal_ids: tuple[str, ...] = ()
     unknown_proposal_ids: tuple[str, ...] = ()
     succeeded_proposal_ids: tuple[str, ...] = ()
+    dry_run_succeeded_proposal_ids: tuple[str, ...] = ()
 
     batch_status: BatchExecutionStatus = BatchExecutionStatus.NO_ACTIONS
     started_at: datetime
     completed_at: datetime
-    dry_run: bool = False
+    dry_run: bool = True
     error_code: str | None = None
     batch_hash: str = ""
 
@@ -233,18 +251,21 @@ class ExecutionBatchResult(StrictContract):
     def _verify_batch_invariants(self) -> ExecutionBatchResult:
         if self.started_at > self.completed_at:
             raise ValueError("started_at > completed_at")
-        # NO_ACTIONS requires no receipts.
+        # P0-7: NO_ACTIONS requires no receipts AND no per-action results.
         if self.batch_status == BatchExecutionStatus.NO_ACTIONS and self.receipts:
             raise ValueError("batch_status NO_ACTIONS but receipts is non-empty")
+        # P0-7: empty receipts is valid for UNKNOWN, FAILED, CANCELLED,
+        # BLOCKED, PENDING_APPROVAL, NO_ACTIONS, and DRY_RUN_COMPLETED.
         if not self.receipts and self.batch_status not in (
             BatchExecutionStatus.NO_ACTIONS,
             BatchExecutionStatus.BLOCKED,
             BatchExecutionStatus.PENDING_APPROVAL,
+            BatchExecutionStatus.UNKNOWN,
+            BatchExecutionStatus.FAILED,
+            BatchExecutionStatus.CANCELLED,
         ):
             raise ValueError(
-                f"empty receipts but batch_status is "
-                f"{self.batch_status.value!r} (expected NO_ACTIONS, "
-                f"BLOCKED, or PENDING_APPROVAL)"
+                f"empty receipts but batch_status is {self.batch_status.value!r}"
             )
         expected = self.compute_hash()
         if not self.batch_hash:
@@ -377,6 +398,24 @@ def build_authorization(
 
 
 # ---------------------------------------------------------------------------
+# Deterministic ID helpers (P1-1 / P1-2)
+# ---------------------------------------------------------------------------
+
+
+def _deterministic_approval_id(auth: ExecutionAuthorization) -> str:
+    """P1-1: derive a stable approval_id from the authorization."""
+    return f"appr-{auth.proposal_id}-{auth.authorization_hash[:12]}"
+
+
+def _deterministic_command_id(
+    auth: ExecutionAuthorization, fingerprint: str, attempt: int
+) -> str:
+    """P1-2: derive a stable command_id so replays produce the same id."""
+    raw = f"{auth.authorization_hash}:{fingerprint}:{attempt}"
+    return f"cmd-{auth.proposal_id}-{stable_hash(raw)[:12]}"
+
+
+# ---------------------------------------------------------------------------
 # GovernedExecutor
 # ---------------------------------------------------------------------------
 
@@ -455,7 +494,13 @@ class GovernedExecutor:
             )
 
         # ---- Step 4: verify governance spec hash ----------------------
-        if request.governance_spec_hash != ACTION_GOVERNANCE_SPEC_HASH:
+        # P0-9: verify the LIVE governance spec hash matches the module
+        # constant, the request, and the review result (all three must
+        # agree — a tampered registry or a stale request is detected
+        # here, before any authorization is built).
+        try:
+            live_hash = compute_live_governance_spec_hash()
+        except Exception as e:
             return self._fail_batch(
                 request,
                 review_result,
@@ -463,23 +508,78 @@ class GovernedExecutor:
                 opts,
                 started_at,
                 clock,
-                error_code=GOVERNANCE_SPEC_MISMATCH,
-                error_message="governance spec hash drift between request and live registry",
+                error_code=GOVERNANCE_SPEC_DRIFT,
+                error_message=f"failed to compute live governance spec hash: {e}",
+            )
+        if live_hash != ACTION_GOVERNANCE_SPEC_HASH:
+            return self._fail_batch(
+                request,
+                review_result,
+                adapter_registry,
+                opts,
+                started_at,
+                clock,
+                error_code=GOVERNANCE_SPEC_DRIFT,
+                error_message="live governance spec hash drifts from module constant",
+            )
+        if live_hash != request.governance_spec_hash:
+            return self._fail_batch(
+                request,
+                review_result,
+                adapter_registry,
+                opts,
+                started_at,
+                clock,
+                error_code=GOVERNANCE_SPEC_DRIFT,
+                error_message="live governance spec hash != request",
+            )
+        if live_hash != review_result.governance_spec_hash:
+            return self._fail_batch(
+                request,
+                review_result,
+                adapter_registry,
+                opts,
+                started_at,
+                clock,
+                error_code=GOVERNANCE_SPEC_DRIFT,
+                error_message="live governance spec hash != review result",
             )
 
         # ---- Step 5: select executable reviews ------------------------
         executable = select_executable_reviews(request, review_result)
         if not executable:
-            return self._build_empty_batch(
-                request, review_result, adapter_registry, opts, started_at, clock
+            # P0-7: distinguish NO_ACTIONS (ReviewRequest produced no
+            # proposals at all) from BLOCKED (proposals exist but none
+            # are executable — all REJECTED / NEEDS_INPUT / etc.).
+            if not review_result.proposal_reviews:
+                return self._build_empty_batch(
+                    request, review_result, adapter_registry, opts, started_at, clock
+                )
+            # Proposals exist but all were REJECTED / NEEDS_INPUT / etc.
+            return self._build_blocked_batch(
+                request,
+                review_result,
+                adapter_registry,
+                opts,
+                started_at,
+                clock,
+                blocked_ids=tuple(
+                    sorted(r.proposal_id for r in review_result.proposal_reviews)
+                ),
             )
 
         # ---- Step 6-11: per-proposal authorization + approval ----------
+        # P0-8: Phase 1 (sequential prepare) builds authorizations and
+        # resolves approvals; Phase 2 (concurrent execute) runs the
+        # adapter calls under a Semaphore + per-resource Lock with the
+        # batch deadline and retry policy enforced.
         registry_snapshot = adapter_registry.freeze_snapshot()
         per_action: list[_ActionExecutionResult] = []
-        skipped_ids: list[str] = []
-        blocked_ids: list[str] = []
-        pending_approval_ids: list[str] = []
+        approval_requests_created: list[ApprovalRequest] = []
+
+        ready: list[
+            tuple[ProposalReview, ExecutionAuthorization, ActionGovernanceSpec]
+        ] = []
 
         for review in executable:
             auth = build_authorization(
@@ -503,7 +603,6 @@ class GovernedExecutor:
                         skipped=True,
                     )
                 )
-                blocked_ids.append(review.proposal_id)
                 continue
 
             # Resolve governance spec for this action.
@@ -518,7 +617,6 @@ class GovernedExecutor:
                         skipped=True,
                     )
                 )
-                blocked_ids.append(review.proposal_id)
                 continue
 
             # Step 8-10: approval gate.
@@ -527,7 +625,28 @@ class GovernedExecutor:
             )
             if requirement.required:
                 if auth.approval_id is None:
-                    pending_approval_ids.append(review.proposal_id)
+                    # P0-2: create an ApprovalRequest so the approval
+                    # store has a durable record the human approver can
+                    # act on.  The approval_id is deterministic so a
+                    # replay does not create a duplicate request.
+                    approval_id = _deterministic_approval_id(auth)
+                    approval_req = self._build_approval_request(
+                        auth, review, gov_spec, approval_id, clock
+                    )
+                    try:
+                        await approval_store.create(approval_req)
+                    except ApprovalConflictError as e:
+                        per_action.append(
+                            _ActionExecutionResult(
+                                proposal_id=review.proposal_id,
+                                status=ExecutionStatus.NOT_AUTHORIZED,
+                                error_code=APPROVAL_CONFLICT,
+                                error_message=str(e),
+                                skipped=True,
+                            )
+                        )
+                        continue
+                    approval_requests_created.append(approval_req)
                     per_action.append(
                         _ActionExecutionResult(
                             proposal_id=review.proposal_id,
@@ -538,13 +657,17 @@ class GovernedExecutor:
                         )
                     )
                     continue
-                # Try to consume an existing approval decision.
+                # P0-3: atomically validate-and-consume.  ALL checks
+                # (tenant, run, proposal, authorization_hash, request
+                # hash, approver role, expiry, status) run under the
+                # store lock before the approval is marked CONSUMED.
                 try:
-                    decision = await approval_store.consume(
-                        auth.approval_id, auth.authorization_hash
+                    decision = await approval_store.validate_and_consume(
+                        auth.approval_id,
+                        authorization=auth,
+                        now=clock.now(),
                     )
                 except ApprovalRequiredError:
-                    pending_approval_ids.append(review.proposal_id)
                     per_action.append(
                         _ActionExecutionResult(
                             proposal_id=review.proposal_id,
@@ -556,37 +679,6 @@ class GovernedExecutor:
                     )
                     continue
                 except ApprovalValidationError as e:
-                    blocked_ids.append(review.proposal_id)
-                    per_action.append(
-                        _ActionExecutionResult(
-                            proposal_id=review.proposal_id,
-                            status=ExecutionStatus.NOT_AUTHORIZED,
-                            error_code=e.error_code,
-                            error_message=str(e),
-                            skipped=True,
-                        )
-                    )
-                    continue
-                # Validate the decision.
-                approval_request = await approval_store.get(auth.approval_id)
-                if approval_request is None:
-                    blocked_ids.append(review.proposal_id)
-                    per_action.append(
-                        _ActionExecutionResult(
-                            proposal_id=review.proposal_id,
-                            status=ExecutionStatus.NOT_AUTHORIZED,
-                            error_code=APPROVAL_REQUIRED,
-                            error_message="approval request not found",
-                            skipped=True,
-                        )
-                    )
-                    continue
-                try:
-                    self._approval_gate.validate_decision(
-                        decision, approval_request, auth
-                    )
-                except ApprovalValidationError as e:
-                    blocked_ids.append(review.proposal_id)
                     per_action.append(
                         _ActionExecutionResult(
                             proposal_id=review.proposal_id,
@@ -600,8 +692,178 @@ class GovernedExecutor:
                 # Bind the decision hash to the authorization.
                 auth = self._bind_approval(auth, decision)
 
-            # Step 11-18: execute the action.
-            outcome = await self._execute_one(
+            ready.append((review, auth, gov_spec))
+
+        # ---- Phase 2: concurrent execute (P0-8) ----------------------
+        if ready:
+            concurrent_results = await self._execute_concurrent(
+                ready_actions=ready,
+                request=request,
+                review_result=review_result,
+                registry_snapshot=registry_snapshot,
+                adapter_registry=adapter_registry,
+                execution_store=execution_store,
+                kill_switch=kill_switch,
+                clock=clock,
+                opts=opts,
+                started_at=started_at,
+            )
+            per_action.extend(concurrent_results)
+
+        return self._assemble_batch(
+            request,
+            review_result,
+            registry_snapshot,
+            per_action,
+            opts,
+            started_at,
+            clock,
+            dry_run=opts.dry_run,
+            approval_requests=approval_requests_created,
+        )
+
+    # -----------------------------------------------------------------
+    # Concurrent execution (P0-8)
+    # -----------------------------------------------------------------
+
+    async def _execute_concurrent(
+        self,
+        *,
+        ready_actions: list[
+            tuple[ProposalReview, ExecutionAuthorization, ActionGovernanceSpec]
+        ],
+        request: ReviewRequest,
+        review_result: ReviewBatchResult,
+        registry_snapshot: ActionAdapterRegistrySnapshot,
+        adapter_registry: ActionAdapterRegistry,
+        execution_store: ExecutionStore,
+        kill_switch,
+        clock: Clock,
+        opts: ExecutionOptions,
+        started_at: datetime,
+    ) -> list[_ActionExecutionResult]:
+        """P0-8: run ready actions concurrently under a Semaphore +
+        per-resource Lock, enforcing the batch deadline and retry policy.
+
+        Concurrency rules:
+
+        * ``asyncio.Semaphore(max_concurrency)`` bounds the number of
+          in-flight adapter calls.
+        * Actions sharing the same ``(tenant_id, idempotency_key)``
+          resource key are serialized via a per-key ``asyncio.Lock``
+          so the same resource is never touched twice in parallel.
+        * The batch deadline (``started_at + batch_deadline_seconds``)
+          is checked before each action starts; an action that would
+          start after the deadline returns ``UNKNOWN`` with
+          ``EXECUTION_DEADLINE_EXCEEDED``.
+        * Per-action timeout is ``min(per_action_timeout_seconds,
+          remaining_deadline)`` so the adapter call never exceeds the
+          batch deadline.
+        """
+        semaphore = asyncio.Semaphore(opts.max_concurrency)
+        resource_locks: dict[str, asyncio.Lock] = {}
+        deadline = started_at + timedelta(seconds=opts.batch_deadline_seconds)
+
+        async def _run_one(
+            review: ProposalReview,
+            auth: ExecutionAuthorization,
+            gov_spec: ActionGovernanceSpec,
+        ) -> _ActionExecutionResult:
+            # P0-8: serialize actions on the same resource key.
+            resource_key = f"{auth.tenant_id}:{auth.idempotency_key}"
+            lock = resource_locks.setdefault(resource_key, asyncio.Lock())
+            async with semaphore:
+                async with lock:
+                    # Check batch deadline against the injected clock.
+                    now = clock.now()
+                    remaining = (deadline - now).total_seconds()
+                    if remaining <= 0:
+                        return _ActionExecutionResult(
+                            proposal_id=review.proposal_id,
+                            status=ExecutionStatus.UNKNOWN,
+                            error_code=EXECUTION_DEADLINE_EXCEEDED,
+                            error_message=(
+                                "batch deadline exceeded before action start"
+                            ),
+                        )
+                    per_action_timeout = min(opts.per_action_timeout_seconds, remaining)
+                    try:
+                        return await asyncio.wait_for(
+                            self._execute_one_with_retry(
+                                request=request,
+                                review_result=review_result,
+                                review=review,
+                                auth=auth,
+                                gov_spec=gov_spec,
+                                registry_snapshot=registry_snapshot,
+                                adapter_registry=adapter_registry,
+                                execution_store=execution_store,
+                                kill_switch=kill_switch,
+                                clock=clock,
+                                opts=opts,
+                                attempt=1,
+                                per_action_timeout=per_action_timeout,
+                                batch_deadline=deadline,
+                            ),
+                            timeout=per_action_timeout + 2.0,
+                        )
+                    except asyncio.TimeoutError:
+                        return _ActionExecutionResult(
+                            proposal_id=review.proposal_id,
+                            status=ExecutionStatus.UNKNOWN,
+                            error_code=EXECUTION_OUTCOME_UNKNOWN,
+                            error_message="action exceeded deadline / timeout",
+                        )
+                    except Exception as e:
+                        return _ActionExecutionResult(
+                            proposal_id=review.proposal_id,
+                            status=ExecutionStatus.UNKNOWN,
+                            error_code=EXECUTION_OUTCOME_UNKNOWN,
+                            error_message=f"unexpected execution error: {e}",
+                        )
+
+        tasks = [_run_one(r, a, g) for r, a, g in ready_actions]
+        return await asyncio.gather(*tasks)
+
+    async def _execute_one_with_retry(
+        self,
+        *,
+        request: ReviewRequest,
+        review_result: ReviewBatchResult,
+        review: ProposalReview,
+        auth: ExecutionAuthorization,
+        gov_spec: ActionGovernanceSpec,
+        registry_snapshot: ActionAdapterRegistrySnapshot,
+        adapter_registry: ActionAdapterRegistry,
+        execution_store: ExecutionStore,
+        kill_switch,
+        clock: Clock,
+        opts: ExecutionOptions,
+        attempt: int,
+        per_action_timeout: float,
+        batch_deadline: datetime,
+    ) -> _ActionExecutionResult:
+        """P0-8: wrap ``_execute_one`` with the retry policy.
+
+        Retry conditions (ALL must hold):
+
+        * ``adapter.retry_safe=True`` (or ``retry_only_when_safe=False``).
+        * The outcome was ``FAILED`` with ``executed=False`` (confirmed
+          no side-effect — UNKNOWN is NEVER retried).
+        * ``error_code`` is in ``retryable_error_codes``.
+        * ``attempt <= max_retries``.
+        * Batch deadline not exceeded.
+        * Kill switch not active.
+
+        Never retried: UNKNOWN, CANCELLED, PENDING_APPROVAL,
+        NOT_AUTHORIZED, SUCCEEDED, DRY_RUN_SUCCEEDED, DEDUPLICATED,
+        SKIPPED.
+        """
+        policy = opts.retry_policy
+        max_attempts = policy.max_retries + 1
+
+        while True:
+            result = await self._execute_one(
                 request=request,
                 review_result=review_result,
                 review=review,
@@ -613,21 +875,52 @@ class GovernedExecutor:
                 kill_switch=kill_switch,
                 clock=clock,
                 opts=opts,
+                attempt=attempt,
+                per_action_timeout=per_action_timeout,
             )
-            per_action.append(outcome)
-            if outcome.skipped and outcome.status == ExecutionStatus.SKIPPED:
-                skipped_ids.append(review.proposal_id)
 
-        return self._assemble_batch(
-            request,
-            review_result,
-            registry_snapshot,
-            per_action,
-            opts,
-            started_at,
-            clock,
-            dry_run=opts.dry_run,
-        )
+            # Terminal states that are NEVER retried.
+            if result.status in (
+                ExecutionStatus.SUCCEEDED,
+                ExecutionStatus.DRY_RUN_SUCCEEDED,
+                ExecutionStatus.DEDUPLICATED,
+                ExecutionStatus.UNKNOWN,
+                ExecutionStatus.CANCELLED,
+                ExecutionStatus.PENDING_APPROVAL,
+                ExecutionStatus.NOT_AUTHORIZED,
+                ExecutionStatus.SKIPPED,
+            ):
+                return result
+
+            # Only FAILED may be retried, and only under strict conditions.
+            if result.status != ExecutionStatus.FAILED:
+                return result
+            if attempt >= max_attempts:
+                return result
+            # retry_only_when_safe: look up the adapter binding to check
+            # retry_safe.  If the adapter cannot be resolved, do not retry.
+            try:
+                binding = adapter_registry.get_binding(
+                    auth.action_type, registry_snapshot
+                )
+            except Exception:
+                return result
+            if policy.retry_only_when_safe and not binding.retry_safe:
+                return result
+            if result.error_code is None:
+                return result
+            if result.error_code not in policy.retryable_error_codes:
+                return result
+            # Check batch deadline and kill switch before retrying.
+            if clock.now() > batch_deadline:
+                return result
+            try:
+                ks_active = await kill_switch.is_kill_switch_active(auth.tenant_id)
+            except Exception:
+                ks_active = True
+            if ks_active:
+                return result
+            attempt += 1
 
     # -----------------------------------------------------------------
     # Single-action execution (steps 12-18)
@@ -647,6 +940,8 @@ class GovernedExecutor:
         kill_switch,
         clock: Clock,
         opts: ExecutionOptions,
+        attempt: int = 1,
+        per_action_timeout: float | None = None,
     ) -> _ActionExecutionResult:
         # Locate the proposal snapshot for the canonical payload.
         snapshot = None
@@ -667,9 +962,10 @@ class GovernedExecutor:
                 error_message=f"no adapter bound for {auth.action_type!r}",
                 skipped=True,
             )
-        # Verify adapter version matches the binding (fail-closed).
-        if binding.adapter_id != binding.adapter_id:
-            pass
+        # P0-4: the live adapter is verified against the binding AFTER
+        # the adapter call (see _lookup_and_verify_adapter).  No noop
+        # self-comparison here — the binding was already validated at
+        # freeze_snapshot time.
         canonical_payload = frozen_value_to_json(snapshot.payload)
         fingerprint = compute_execution_fingerprint(
             tenant_id=auth.tenant_id,
@@ -686,7 +982,14 @@ class GovernedExecutor:
             idempotency_key=auth.idempotency_key,
             dry_run=auth.dry_run,
         )
-        command_id = f"cmd-{auth.proposal_id}-{uuid.uuid4().hex[:8]}"
+        # P1-2: deterministic command_id so a replay produces the same id.
+        # P0-8: attempt is parameterized so retries get a distinct id.
+        effective_timeout = (
+            per_action_timeout
+            if per_action_timeout is not None
+            else opts.per_action_timeout_seconds
+        )
+        command_id = _deterministic_command_id(auth, fingerprint, attempt)
         command = ExecutionCommand(
             command_id=command_id,
             authorization=auth,
@@ -696,10 +999,37 @@ class GovernedExecutor:
             adapter_id=binding.adapter_id,
             adapter_version=binding.adapter_version,
             dry_run=auth.dry_run,
-            attempt=1,
-            timeout_seconds=opts.per_action_timeout_seconds,
+            attempt=attempt,
+            timeout_seconds=effective_timeout,
             execution_fingerprint=fingerprint,
         )
+
+        # P0-5: check kill switch BEFORE reserving the idempotency slot.
+        # Pre-call blocks return BLOCKED / CANCELLED (NOT UNKNOWN) and
+        # do NOT touch the idempotency store — no slot has been reserved
+        # yet, so there is nothing to mark UNKNOWN.
+        try:
+            ks_active = await kill_switch.is_kill_switch_active(auth.tenant_id)
+            cancelled = await kill_switch.is_cancelled(auth.run_id)
+        except Exception:
+            ks_active = True
+            cancelled = False
+        if ks_active:
+            return _ActionExecutionResult(
+                proposal_id=review.proposal_id,
+                status=ExecutionStatus.NOT_AUTHORIZED,
+                error_code=KILL_SWITCH_ACTIVE,
+                error_message="kill switch active for tenant",
+                skipped=True,
+            )
+        if cancelled:
+            return _ActionExecutionResult(
+                proposal_id=review.proposal_id,
+                status=ExecutionStatus.CANCELLED,
+                error_code=EXECUTION_CANCELLED_BEFORE_CALL,
+                error_message="run cancelled before adapter call",
+                skipped=True,
+            )
 
         # Step 13: reserve the idempotency slot.
         try:
@@ -715,15 +1045,31 @@ class GovernedExecutor:
                 skipped=True,
             )
 
-        # Dedup shortcut: a previously SUCCEEDED record with the same
-        # fingerprint returns the cached receipt_id (DEDUPLICATED).
+        # P0-6: return the ORIGINAL trusted receipt on replay.  A
+        # previously SUCCEEDED record with the same fingerprint must
+        # return the cached receipt — NOT a fabricated DEDUPLICATED
+        # one.  If the store claims SUCCEEDED but has no receipt, the
+        # record is marked UNKNOWN (crash window).
         if record.state == IdempotencyState.SUCCEEDED and record.receipt_id:
+            original_receipt = await execution_store.get_receipt(
+                auth.tenant_id, auth.idempotency_key
+            )
+            if original_receipt is not None:
+                return _ActionExecutionResult(
+                    proposal_id=review.proposal_id,
+                    receipt=original_receipt,
+                    status=original_receipt.status,
+                    dry_run_succeeded=(
+                        original_receipt.status == ExecutionStatus.DRY_RUN_SUCCEEDED
+                    ),
+                )
+            # Store says SUCCEEDED but no receipt → UNKNOWN (crash window).
+            await execution_store.mark_unknown(record)
             return _ActionExecutionResult(
                 proposal_id=review.proposal_id,
-                status=ExecutionStatus.DEDUPLICATED,
-                receipt=self._build_dedup_receipt(
-                    command, record, auth, binding, clock
-                ),
+                status=ExecutionStatus.UNKNOWN,
+                error_code=EXECUTION_OUTCOME_UNKNOWN,
+                error_message="SUCCEEDED record but no stored receipt",
             )
         # UNKNOWN outcomes are NOT auto-retried (Phase 5B Section 17).
         if record.state == IdempotencyState.UNKNOWN:
@@ -742,28 +1088,28 @@ class GovernedExecutor:
                 error_message="idempotency slot is IN_PROGRESS",
             )
 
-        # Step 14: kill switch (BEFORE the adapter call).
+        # P0-5: re-check kill switch after reservation, before call.
+        # If the kill switch was activated between reservation and the
+        # adapter call, the slot is already RESERVED (not IN_PROGRESS)
+        # so we do NOT call mark_unknown — the RESERVED slot can be
+        # reused on a later attempt.
         try:
             ks_active = await kill_switch.is_kill_switch_active(auth.tenant_id)
             cancelled = await kill_switch.is_cancelled(auth.run_id)
         except Exception:
             ks_active = True
             cancelled = False
-        if ks_active:
-            await execution_store.mark_unknown(record)
+        if ks_active or cancelled:
             return _ActionExecutionResult(
                 proposal_id=review.proposal_id,
-                status=ExecutionStatus.UNKNOWN,
+                status=(
+                    ExecutionStatus.CANCELLED
+                    if cancelled
+                    else ExecutionStatus.NOT_AUTHORIZED
+                ),
                 error_code=KILL_SWITCH_ACTIVE,
-                error_message="kill switch active for tenant",
-            )
-        if cancelled:
-            await execution_store.mark_unknown(record)
-            return _ActionExecutionResult(
-                proposal_id=review.proposal_id,
-                status=ExecutionStatus.CANCELLED,
-                error_code=KILL_SWITCH_ACTIVE,
-                error_message="run cancelled",
+                error_message="kill switch activated after reservation",
+                skipped=True,
             )
 
         # Step 15: mark IN_PROGRESS.
@@ -778,7 +1124,10 @@ class GovernedExecutor:
             )
 
         # Step 16: invoke the adapter.
-        adapter = self._lookup_adapter(adapter_registry, binding)
+        # P0-4: verify the live adapter matches the frozen binding.
+        adapter = self._lookup_and_verify_adapter(
+            adapter_registry, binding, dry_run=auth.dry_run
+        )
         if adapter is None:
             await execution_store.mark_unknown(record)
             return _ActionExecutionResult(
@@ -791,7 +1140,7 @@ class GovernedExecutor:
         try:
             outcome = await asyncio.wait_for(
                 adapter.execute(command),
-                timeout=opts.per_action_timeout_seconds,
+                timeout=effective_timeout,
             )
             completed = clock.now()
         except asyncio.TimeoutError:
@@ -811,55 +1160,82 @@ class GovernedExecutor:
                 error_message=f"adapter raised: {e}",
             )
 
-        # Step 17: mark the idempotency record terminal.
-        succeeded = outcome.status == ExecutionStatus.SUCCEEDED
+        # P0-4: verify the outcome against the command and the frozen
+        # binding BEFORE any store commit.  A tampered or mis-routed
+        # outcome is detected here and marked UNKNOWN (fail-closed).
+        try:
+            outcome.verify_integrity()
+            outcome.verify_against_command(command)
+            outcome.verify_against_binding(binding)
+        except Exception as e:
+            await execution_store.mark_unknown(record)
+            return _ActionExecutionResult(
+                proposal_id=review.proposal_id,
+                status=ExecutionStatus.UNKNOWN,
+                error_code=ADAPTER_BINDING_DRIFT,
+                error_message=f"adapter outcome verification failed: {e}",
+            )
+
+        # P0-6: build receipt BEFORE store terminal commit.  The receipt
+        # is verified against the command and authorization before it is
+        # committed atomically with the terminal idempotency state.  This
+        # prevents the crash-window where the store is SUCCEEDED but no
+        # trusted receipt exists.
         receipt_id = f"rcpt-{command_id}"
         try:
-            if succeeded:
-                await execution_store.complete(record, receipt_id, succeeded=True)
-            elif outcome.status == ExecutionStatus.FAILED:
-                await execution_store.complete(record, receipt_id, succeeded=False)
-            else:
-                # UNKNOWN — do NOT retry (Section 17).
-                await execution_store.mark_unknown(record)
-        except Exception:
-            # Store failure → fail-closed UNKNOWN.
+            receipt = ActionExecutionReceipt(
+                receipt_id=receipt_id,
+                command_id=command_id,
+                tenant_id=auth.tenant_id,
+                run_id=auth.run_id,
+                proposal_id=auth.proposal_id,
+                authorization_hash=auth.authorization_hash,
+                approval_decision_hash=auth.approval_decision_hash,
+                adapter_id=binding.adapter_id,
+                adapter_version=binding.adapter_version,
+                adapter_registry_hash=registry_snapshot.registry_hash,
+                idempotency_key=auth.idempotency_key,
+                execution_fingerprint=fingerprint,
+                status=outcome.status,
+                executed=outcome.executed,
+                external_reference=outcome.external_reference,
+                safe_result_summary=outcome.result_payload,
+                started_at=started,
+                completed_at=completed,
+                attempt=command.attempt,
+                error_code=outcome.error_code,
+            )
+            receipt.verify_integrity()
+            receipt.verify_against_command(command)
+            receipt.verify_against_authorization(auth)
+        except Exception as e:
+            await execution_store.mark_unknown(record)
             return _ActionExecutionResult(
                 proposal_id=review.proposal_id,
                 status=ExecutionStatus.UNKNOWN,
                 error_code=EXECUTION_OUTCOME_UNKNOWN,
-                error_message="idempotency store failed to complete",
+                error_message=f"receipt construction failed: {e}",
             )
 
-        # Step 18: build the receipt.
-        receipt = ActionExecutionReceipt(
-            receipt_id=receipt_id,
-            command_id=command_id,
-            tenant_id=auth.tenant_id,
-            run_id=auth.run_id,
-            proposal_id=auth.proposal_id,
-            authorization_hash=auth.authorization_hash,
-            approval_decision_hash=auth.approval_decision_hash,
-            adapter_id=binding.adapter_id,
-            adapter_version=binding.adapter_version,
-            adapter_registry_hash=registry_snapshot.registry_hash,
-            idempotency_key=auth.idempotency_key,
-            execution_fingerprint=fingerprint,
-            status=outcome.status,
-            executed=outcome.executed,
-            external_reference=outcome.external_reference,
-            safe_result_summary=outcome.result_payload,
-            started_at=started,
-            completed_at=completed,
-            attempt=command.attempt,
-            error_code=outcome.error_code,
-        )
+        # P0-6: atomically commit state + receipt.
+        try:
+            await execution_store.complete_with_receipt(record, receipt)
+        except Exception:
+            await execution_store.mark_unknown(record)
+            return _ActionExecutionResult(
+                proposal_id=review.proposal_id,
+                status=ExecutionStatus.UNKNOWN,
+                error_code=EXECUTION_OUTCOME_UNKNOWN,
+                error_message="idempotency store failed to commit receipt",
+            )
+
         return _ActionExecutionResult(
             proposal_id=review.proposal_id,
             receipt=receipt,
             status=outcome.status,
             error_code=outcome.error_code,
             error_message=outcome.error_message,
+            dry_run_succeeded=(outcome.status == ExecutionStatus.DRY_RUN_SUCCEEDED),
         )
 
     # -----------------------------------------------------------------
@@ -894,51 +1270,102 @@ class GovernedExecutor:
             agent_version=auth.agent_version,
         )
 
-    def _lookup_adapter(
-        self, registry: ActionAdapterRegistry, binding
+    def _lookup_and_verify_adapter(
+        self,
+        registry: ActionAdapterRegistry,
+        binding: ActionAdapterBinding,
+        dry_run: bool,
     ) -> ActionAdapter | None:
-        """Return the adapter instance for *binding*, if registered.
+        """P0-4: return the live adapter for *binding* after verifying it
+        matches the frozen binding on every field that affects safety.
 
-        The :class:`ActionAdapterRegistry` only stores bindings (frozen
-        metadata); the live adapter instances are held by the caller
-        and looked up here.  For the default noop / recording
-        adapters used in tests, the registry IS the adapter source —
-        we keep a side-table of live adapters.
+        The :class:`ActionAdapterRegistry` stores frozen bindings
+        (metadata); the live adapter instances are held in a side-table
+        on the registry.  This method verifies the live adapter's
+        ``adapter_id``, ``adapter_version``, ``supported_action_types``,
+        ``supports_dry_run``, ``retry_safe``, and ``idempotency_scope``
+        all match the frozen binding — a drifted adapter is rejected
+        (returns ``None`` → caller marks the record UNKNOWN).
         """
         live = getattr(registry, "_live_adapters", None)
         if live is None:
             return None
-        return live.get(binding.adapter_id)
+        adapter = live.get(binding.adapter_id)
+        if adapter is None:
+            return None
+        if adapter.adapter_id != binding.adapter_id:
+            return None
+        if adapter.adapter_version != binding.adapter_version:
+            return None
+        if binding.action_type not in adapter.supported_action_types:
+            return None
+        if dry_run and not adapter.supports_dry_run:
+            return None
+        if adapter.retry_safe != binding.retry_safe:
+            return None
+        if adapter.idempotency_scope != binding.idempotency_scope:
+            return None
+        return adapter
 
-    def _build_dedup_receipt(
+    def _build_approval_request(
         self,
-        command: ExecutionCommand,
-        record: IdempotencyRecord,
         auth: ExecutionAuthorization,
-        binding,
+        review: ProposalReview,
+        gov_spec: ActionGovernanceSpec,
+        approval_id: str,
         clock: Clock,
-    ) -> ActionExecutionReceipt:
+    ) -> ApprovalRequest:
+        """P0-2: build an :class:`ApprovalRequest` for a proposal that
+        requires human approval."""
         now = clock.now()
-        return ActionExecutionReceipt(
-            receipt_id=record.receipt_id or f"rcpt-dedup-{command.command_id}",
-            command_id=command.command_id,
+        expires_at = now + timedelta(hours=24)
+        return ApprovalRequest(
+            approval_id=approval_id,
+            authorization_id=auth.authorization_id,
             tenant_id=auth.tenant_id,
             run_id=auth.run_id,
             proposal_id=auth.proposal_id,
+            review_request_hash=auth.review_request_hash,
+            review_result_hash=auth.review_result_hash,
             authorization_hash=auth.authorization_hash,
-            approval_decision_hash=auth.approval_decision_hash,
-            adapter_id=binding.adapter_id,
-            adapter_version=binding.adapter_version,
-            adapter_registry_hash=auth.adapter_registry_hash,
-            idempotency_key=auth.idempotency_key,
-            execution_fingerprint=command.execution_fingerprint,
-            status=ExecutionStatus.DEDUPLICATED,
-            executed=True,
-            external_reference=record.receipt_id,
-            safe_result_summary={"deduplicated": True},
-            started_at=now,
-            completed_at=now,
-            attempt=command.attempt,
+            risk_level=review.risk_level,
+            action_type=auth.action_type,
+            action_summary=f"Approval required for {auth.action_type}",
+            required_approver_roles=("approver", "admin"),
+            requested_by=auth.created_by_agent,
+            requested_at=now,
+            expires_at=expires_at,
+        )
+
+    def _build_blocked_batch(
+        self,
+        request: ReviewRequest,
+        result: ReviewBatchResult,
+        adapter_registry: ActionAdapterRegistry,
+        opts: ExecutionOptions,
+        started_at: datetime,
+        clock: Clock,
+        *,
+        blocked_ids: tuple[str, ...] = (),
+    ) -> ExecutionBatchResult:
+        """P0-7: build a BLOCKED batch result for proposals that exist
+        but cannot execute (all REJECTED / NEEDS_INPUT / etc.)."""
+        snap = adapter_registry.freeze_snapshot()
+        completed = clock.now()
+        return ExecutionBatchResult(
+            review_id=request.review_id,
+            run_id=request.run_id,
+            tenant_id=request.tenant_id,
+            request_hash=request.request_hash,
+            result_hash=result.result_hash,
+            governance_spec_hash=request.governance_spec_hash,
+            adapter_registry_hash=snap.registry_hash,
+            receipts=(),
+            blocked_proposal_ids=blocked_ids,
+            batch_status=BatchExecutionStatus.BLOCKED,
+            started_at=started_at,
+            completed_at=completed,
+            dry_run=opts.dry_run,
         )
 
     def _fail_batch(
@@ -1008,6 +1435,7 @@ class GovernedExecutor:
         clock: Clock,
         *,
         dry_run: bool,
+        approval_requests: list[ApprovalRequest] | None = None,
     ) -> ExecutionBatchResult:
         receipts = tuple(r.receipt for r in per_action if r.receipt is not None)
         skipped = tuple(sorted(r.proposal_id for r in per_action if r.skipped))
@@ -1035,55 +1463,66 @@ class GovernedExecutor:
                 r.proposal_id for r in per_action if r.status == ExecutionStatus.UNKNOWN
             )
         )
+        # P0-1: DRY_RUN_SUCCEEDED is NOT counted as real SUCCEEDED.
+        dry_run_succeeded_ids = tuple(
+            sorted(r.proposal_id for r in per_action if r.dry_run_succeeded)
+        )
+        # Only real SUCCEEDED (not DRY_RUN_SUCCEEDED) counts as succeeded.
         succeeded = tuple(
             sorted(
                 r.proposal_id
                 for r in per_action
                 if r.status in (ExecutionStatus.SUCCEEDED, ExecutionStatus.DEDUPLICATED)
+                and not r.dry_run_succeeded
             )
         )
 
-        # Compute the batch status via priority.
-        # PARTIAL_SUCCESS is special: it applies when at least one
-        # action SUCCEEDED and at least one FAILED (or UNKNOWN), but
-        # not when ALL failed (that's just FAILED).
-        has_succeeded = bool(succeeded)
+        # P0-7: compute batch status from per-action outcomes.
+        has_real_succeeded = bool(succeeded)
+        has_dry_run = bool(dry_run_succeeded_ids)
         has_failed = bool(failed)
         has_unknown = bool(unknown)
+        has_blocked = bool(blocked)
+        has_pending = bool(pending_approval)
 
         if not per_action:
             batch_status = BatchExecutionStatus.NO_ACTIONS
         elif has_unknown:
             batch_status = BatchExecutionStatus.UNKNOWN
-        elif has_succeeded and has_failed:
-            # Mixed success/failure → PARTIAL_SUCCESS (Section 23)
+        elif has_failed and has_real_succeeded:
             batch_status = BatchExecutionStatus.PARTIAL_SUCCESS
-        elif has_failed and not has_succeeded:
+        elif has_failed and not has_real_succeeded:
             batch_status = BatchExecutionStatus.FAILED
-        elif pending_approval and not has_succeeded:
+        elif has_pending and not has_real_succeeded:
             batch_status = BatchExecutionStatus.PENDING_APPROVAL
-        elif blocked and not has_succeeded:
+        elif has_blocked and not has_real_succeeded and not has_dry_run:
             batch_status = BatchExecutionStatus.BLOCKED
-        elif has_succeeded:
+        elif has_real_succeeded and not has_failed and not has_unknown:
             batch_status = BatchExecutionStatus.SUCCEEDED
-        else:
+        elif (
+            has_dry_run
+            and not has_real_succeeded
+            and not has_failed
+            and not has_unknown
+        ):
+            batch_status = BatchExecutionStatus.DRY_RUN_COMPLETED
+        elif has_real_succeeded or has_dry_run:
+            # Mixed real + dry_run → use priority.
             statuses: list[BatchExecutionStatus] = [
                 self._action_status_to_batch(r.status) for r in per_action
             ]
             batch_status = max(statuses, key=batch_execution_status_priority)
-        # When no adapter was actually invoked (all actions blocked
-        # before execution), the batch is BLOCKED — not UNKNOWN —
-        # because there are no receipts to carry the UNKNOWN outcome.
-        # PENDING_APPROVAL is exempt: a batch where every action is
-        # waiting for approval legitimately has no receipts.
-        if not receipts and per_action and not pending_approval:
+        else:
             batch_status = BatchExecutionStatus.BLOCKED
 
         error_code = None
-        if any(r.status == ExecutionStatus.UNKNOWN for r in per_action):
+        if has_unknown:
             error_code = EXECUTION_OUTCOME_UNKNOWN
-        elif any(r.status == ExecutionStatus.FAILED for r in per_action):
-            error_code = per_action[0].error_code
+        elif has_failed:
+            for r in per_action:
+                if r.status == ExecutionStatus.FAILED and r.error_code:
+                    error_code = r.error_code
+                    break
 
         return ExecutionBatchResult(
             review_id=request.review_id,
@@ -1094,12 +1533,14 @@ class GovernedExecutor:
             governance_spec_hash=request.governance_spec_hash,
             adapter_registry_hash=registry_snapshot.registry_hash,
             receipts=receipts,
+            approval_requests=tuple(approval_requests or []),
             skipped_proposal_ids=skipped,
             blocked_proposal_ids=blocked,
             pending_approval_proposal_ids=pending_approval,
             failed_proposal_ids=failed,
             unknown_proposal_ids=unknown,
             succeeded_proposal_ids=succeeded,
+            dry_run_succeeded_proposal_ids=dry_run_succeeded_ids,
             batch_status=batch_status,
             started_at=started_at,
             completed_at=clock.now(),
@@ -1111,6 +1552,7 @@ class GovernedExecutor:
     def _action_status_to_batch(status: ExecutionStatus) -> BatchExecutionStatus:
         mapping = {
             ExecutionStatus.SUCCEEDED: BatchExecutionStatus.SUCCEEDED,
+            ExecutionStatus.DRY_RUN_SUCCEEDED: BatchExecutionStatus.DRY_RUN_COMPLETED,
             ExecutionStatus.DEDUPLICATED: BatchExecutionStatus.SUCCEEDED,
             ExecutionStatus.FAILED: BatchExecutionStatus.FAILED,
             ExecutionStatus.UNKNOWN: BatchExecutionStatus.UNKNOWN,
