@@ -11,19 +11,20 @@ Covers the idempotency invariants enforced by
 * The same key + a DIFFERENT fingerprint is a fail-closed
   :class:`IdempotencyConflictError`
   (``reserve_different_fingerprint_raises_conflict``).
-* A CALL_STARTED key blocks a second reservation
+* A READY_TO_CALL / CALL_DISPATCHED key blocks a second reservation
   (``reserve_in_progress_raises_already_in_progress``).
 * An UNKNOWN outcome is returned as-is — NEVER auto-retried
   (``reserve_unknown_returns_record_without_retry``).
 * A FAILED key + the same fingerprint returns the FAILED record so the
   caller may retry explicitly
   (``reserve_failed_same_fingerprint_returns_failed``).
-* ``mark_started`` transitions RESERVED → CALL_STARTED
-  (``mark_started_transitions_to_call_started``).
+* ``mark_started`` transitions RESERVED → READY_TO_CALL
+  (``mark_started_transitions_to_ready_to_call``).
 
 Phase 5B R2 (P0-7 / P0-8 / P0-9) additions:
 
-* ``IN_PROGRESS`` is an alias for ``CALL_STARTED`` (P0-9).
+* R3 P0-13: the legacy ``CALL_STARTED`` / ``IN_PROGRESS`` aliases have
+  been REMOVED — all call sites use ``READY_TO_CALL`` directly.
 * ``complete_with_receipt`` atomically commits terminal state + the
   full :class:`ActionExecutionReceipt` (P0-6); the receipt is
   independently verified against the record (tenant / idempotency_key /
@@ -154,23 +155,26 @@ def _make_receipt_for_record(
 
 class TestIdempotencyState:
     def test_states_have_distinct_values(self) -> None:
-        # P0-9: IN_PROGRESS renamed to CALL_STARTED; DRY_RUN_SUCCEEDED
-        # added (P0-7).  Aliases are NOT yielded by iteration.
+        # R3 P0-4/P0-9: CALL_STARTED renamed to READY_TO_CALL;
+        # CALL_DISPATCHED added as intermediate state.  Aliases are
+        # NOT yielded by iteration.
         values = {s.value for s in IdempotencyState}
         assert values == {
             "reserved",
-            "call_started",
+            "ready_to_call",
+            "call_dispatched",
             "succeeded",
             "dry_run_succeeded",
             "failed",
             "unknown",
         }
 
-    def test_in_progress_is_backwards_compatible_alias(self) -> None:
-        # P0-9: IN_PROGRESS is retained as an alias for CALL_STARTED so
-        # legacy callers keep resolving.
-        assert IdempotencyState.IN_PROGRESS is IdempotencyState.CALL_STARTED
-        assert IdempotencyState.IN_PROGRESS.value == "call_started"
+    def test_legacy_aliases_are_removed(self) -> None:
+        # R3 P0-13: the legacy CALL_STARTED / IN_PROGRESS aliases have
+        # been REMOVED from IdempotencyState — all call sites MUST use
+        # READY_TO_CALL directly.
+        assert not hasattr(IdempotencyState, "CALL_STARTED")
+        assert not hasattr(IdempotencyState, "IN_PROGRESS")
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +254,7 @@ class TestReserve:
         store = InMemoryExecutionStore()
         r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
         run_async(store.mark_started(r1, _CMD_1))
+        run_async(store.mark_dispatched(r1))
         receipt = _make_receipt_for_record(
             r1, receipt_id="rcpt-001", status=ExecutionStatus.SUCCEEDED
         )
@@ -278,6 +283,7 @@ class TestReserve:
         store = InMemoryExecutionStore()
         r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
         run_async(store.mark_started(r1, _CMD_1))
+        run_async(store.mark_dispatched(r1))
         run_async(store.mark_unknown(r1))
         replay = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_2))
         assert replay.state == IdempotencyState.UNKNOWN
@@ -288,6 +294,7 @@ class TestReserve:
         store = InMemoryExecutionStore()
         r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
         run_async(store.mark_started(r1, _CMD_1))
+        run_async(store.mark_dispatched(r1))
         receipt = _make_receipt_for_record(
             r1, receipt_id="rcpt-fail", status=ExecutionStatus.FAILED
         )
@@ -319,16 +326,16 @@ class TestReserve:
 
 
 class TestMarkStarted:
-    def test_mark_started_transitions_to_call_started(self) -> None:
-        # P0-9: RESERVED → CALL_STARTED (renamed from IN_PROGRESS).
+    def test_mark_started_transitions_to_ready_to_call(self) -> None:
+        # R3 P0-4: RESERVED → READY_TO_CALL (renamed from CALL_STARTED).
         store = InMemoryExecutionStore()
         r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
         updated = run_async(store.mark_started(r1, _CMD_1))
-        assert updated.state == IdempotencyState.CALL_STARTED
+        assert updated.state == IdempotencyState.READY_TO_CALL
         assert updated.command_id == _CMD_1
 
-    def test_mark_started_on_call_started_is_illegal_transition(self) -> None:
-        # P0-9: strict CAS — CALL_STARTED → CALL_STARTED is illegal.
+    def test_mark_started_on_ready_to_call_is_illegal_transition(self) -> None:
+        # R3 P0-9: strict CAS — READY_TO_CALL → READY_TO_CALL is illegal.
         store = InMemoryExecutionStore()
         r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
         started = run_async(store.mark_started(r1, _CMD_1))
@@ -359,6 +366,7 @@ class TestCompleteWithReceipt:
         store = InMemoryExecutionStore()
         r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
         run_async(store.mark_started(r1, _CMD_1))
+        run_async(store.mark_dispatched(r1))
         receipt = _make_receipt_for_record(
             r1, receipt_id="rcpt-001", status=ExecutionStatus.SUCCEEDED
         )
@@ -383,6 +391,7 @@ class TestCompleteWithReceipt:
         store = InMemoryExecutionStore()
         r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1, dry_run=True))
         run_async(store.mark_started(r1, _CMD_1))
+        run_async(store.mark_dispatched(r1))
         receipt = _make_receipt_for_record(
             r1,
             receipt_id="rcpt-dry",
@@ -398,6 +407,7 @@ class TestCompleteWithReceipt:
         store = InMemoryExecutionStore()
         r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
         run_async(store.mark_started(r1, _CMD_1))
+        run_async(store.mark_dispatched(r1))
         receipt = _make_receipt_for_record(
             r1, receipt_id="rcpt-replay", status=ExecutionStatus.SUCCEEDED
         )
@@ -422,8 +432,8 @@ class TestCompleteWithReceipt:
             run_async(store.complete_with_receipt(phantom, receipt))
 
     def test_complete_from_reserved_is_illegal_transition(self) -> None:
-        # P0-9: strict CAS — RESERVED → SUCCEEDED is illegal (must go
-        # through CALL_STARTED first).
+        # R3 P0-9: strict CAS — RESERVED → SUCCEEDED is illegal (must go
+        # through READY_TO_CALL and CALL_DISPATCHED first).
         store = InMemoryExecutionStore()
         r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
         receipt = _make_receipt_for_record(r1)
@@ -435,6 +445,7 @@ class TestCompleteWithReceipt:
         store = InMemoryExecutionStore()
         r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
         run_async(store.mark_started(r1, _CMD_1))
+        run_async(store.mark_dispatched(r1))
         receipt = _make_receipt_for_record(r1)
         object.__setattr__(receipt, "tenant_id", "tenant-other")
         object.__setattr__(receipt, "receipt_hash", receipt.compute_hash())
@@ -445,6 +456,7 @@ class TestCompleteWithReceipt:
         store = InMemoryExecutionStore()
         r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
         run_async(store.mark_started(r1, _CMD_1))
+        run_async(store.mark_dispatched(r1))
         receipt = _make_receipt_for_record(r1)
         object.__setattr__(receipt, "idempotency_key", "wrong-key")
         object.__setattr__(receipt, "receipt_hash", receipt.compute_hash())
@@ -455,6 +467,7 @@ class TestCompleteWithReceipt:
         store = InMemoryExecutionStore()
         r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
         run_async(store.mark_started(r1, _CMD_1))
+        run_async(store.mark_dispatched(r1))
         receipt = _make_receipt_for_record(r1)
         object.__setattr__(receipt, "command_id", "wrong-cmd")
         object.__setattr__(receipt, "receipt_hash", receipt.compute_hash())
@@ -472,6 +485,7 @@ class TestMarkUnknown:
         store = InMemoryExecutionStore()
         r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
         run_async(store.mark_started(r1, _CMD_1))
+        run_async(store.mark_dispatched(r1))
         unknown = run_async(store.mark_unknown(r1, receipt_id="rcpt-unk"))
         assert unknown.state == IdempotencyState.UNKNOWN
         assert unknown.receipt_id == "rcpt-unk"
@@ -480,6 +494,7 @@ class TestMarkUnknown:
         store = InMemoryExecutionStore()
         r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
         run_async(store.mark_started(r1, _CMD_1))
+        run_async(store.mark_dispatched(r1))
         unknown = run_async(store.mark_unknown(r1))
         assert unknown.state == IdempotencyState.UNKNOWN
         assert unknown.receipt_id is None

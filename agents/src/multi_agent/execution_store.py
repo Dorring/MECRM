@@ -3,8 +3,9 @@
 The idempotency store is the durable record of every execution
 attempt keyed by ``(tenant_id, idempotency_key)``.  It guarantees:
 
-* At most ONE in-flight execution per key (``CALL_STARTED`` blocks a
-  second reservation → :class:`ExecutionAlreadyInProgressError`).
+* At most ONE in-flight execution per key (``READY_TO_CALL`` /
+  ``CALL_DISPATCHED`` blocks a second reservation →
+  :class:`ExecutionAlreadyInProgressError`).
 * Replay safety: the same key + the same ``execution_fingerprint``
   that previously SUCCEEDED returns the cached ``receipt_id``
   without re-invoking the adapter (``DEDUPLICATED``).
@@ -26,9 +27,10 @@ Phase 5B R2 fixes (P0-7 / P0-8 / P0-9):
   creates a fresh record (no replay / no retry) and appends a unique
   ``reservation_id`` to avoid key collision.
 * **P0-9** — Strict compare-and-set state machine.  ``IN_PROGRESS``
-  is renamed to ``CALL_STARTED`` (alias retained) and every
-  transition validates the current state against a legal-transition
-  table.
+  is renamed to ``READY_TO_CALL`` (R3 P0-13: the legacy
+  ``CALL_STARTED`` / ``IN_PROGRESS`` aliases have been REMOVED) and
+  every transition validates the current state against a legal-
+  transition table.
 """
 
 from __future__ import annotations
@@ -61,12 +63,16 @@ if TYPE_CHECKING:
 
 
 class IdempotencyState(StrEnum):
-    """Lifecycle of one idempotency record (Phase 5B R2 — P0-9).
+    """Lifecycle of one idempotency record (Phase 5B R3 — P0-4 / P0-9).
 
-    ``RESERVED`` — a reservation was created but the adapter call has
-    not started yet.
-    ``CALL_STARTED`` — the adapter call is in flight (formerly
-    ``IN_PROGRESS``; the alias is retained for backward compatibility).
+    R3 call-boundary states:
+
+    ``RESERVED`` — a reservation was created but pre-call checks have
+    not passed yet.
+    ``READY_TO_CALL`` — adapter / approval / deadline / kill switch
+    all passed; the adapter call has NOT started.
+    ``CALL_DISPATCHED`` — ``adapter.execute()`` has been entered.
+    Only after this state may an uncertain outcome become UNKNOWN.
     ``SUCCEEDED`` — the adapter returned a definitive REAL success;
     the cached ``receipt_id`` is returned on replay.
     ``DRY_RUN_SUCCEEDED`` — a dry-run execution succeeded; this is
@@ -76,30 +82,39 @@ class IdempotencyState(StrEnum):
     MAY be retried (with a new fingerprint if the command changed).
     ``UNKNOWN`` — the outcome could not be confirmed (timeout,
     cancellation, connection loss).  NEVER auto-retried.
+
+    R3 P0-13: the legacy ``CALL_STARTED`` / ``IN_PROGRESS`` aliases
+    have been REMOVED — all call sites MUST use ``READY_TO_CALL``
+    directly.
     """
 
     RESERVED = "reserved"
-    CALL_STARTED = "call_started"
-    # Backward-compatible alias (P0-9): ``IN_PROGRESS`` is now
-    # ``CALL_STARTED``.  Both names resolve to the same member.
-    IN_PROGRESS = "call_started"
+    READY_TO_CALL = "ready_to_call"
+    CALL_DISPATCHED = "call_dispatched"
     SUCCEEDED = "succeeded"
     DRY_RUN_SUCCEEDED = "dry_run_succeeded"
     FAILED = "failed"
     UNKNOWN = "unknown"
 
 
-# Legal compare-and-set state transitions (P0-9 strict state machine).
+# Legal compare-and-set state transitions (P0-4 / P0-9 strict machine).
 #
-# RESERVED          → CALL_STARTED
-# CALL_STARTED     → SUCCEEDED / FAILED / UNKNOWN / DRY_RUN_SUCCEEDED
-# FAILED           → CALL_STARTED (only for safe retry)
+# RESERVED          → READY_TO_CALL
+# READY_TO_CALL    → CALL_DISPATCHED / FAILED (pre-dispatch fail-closed)
+# CALL_DISPATCHED  → SUCCEEDED / FAILED / UNKNOWN / DRY_RUN_SUCCEEDED
+# FAILED           → READY_TO_CALL (only for safe retry)
 # SUCCEEDED        → (terminal)
 # DRY_RUN_SUCCEEDED → (terminal)
 # UNKNOWN          → (terminal)
 _LEGAL_TRANSITIONS: dict[IdempotencyState, frozenset[IdempotencyState]] = {
-    IdempotencyState.RESERVED: frozenset({IdempotencyState.CALL_STARTED}),
-    IdempotencyState.CALL_STARTED: frozenset(
+    IdempotencyState.RESERVED: frozenset({IdempotencyState.READY_TO_CALL}),
+    IdempotencyState.READY_TO_CALL: frozenset(
+        {
+            IdempotencyState.CALL_DISPATCHED,
+            IdempotencyState.FAILED,
+        }
+    ),
+    IdempotencyState.CALL_DISPATCHED: frozenset(
         {
             IdempotencyState.SUCCEEDED,
             IdempotencyState.FAILED,
@@ -107,7 +122,7 @@ _LEGAL_TRANSITIONS: dict[IdempotencyState, frozenset[IdempotencyState]] = {
             IdempotencyState.DRY_RUN_SUCCEEDED,
         }
     ),
-    IdempotencyState.FAILED: frozenset({IdempotencyState.CALL_STARTED}),
+    IdempotencyState.FAILED: frozenset({IdempotencyState.READY_TO_CALL}),
     IdempotencyState.SUCCEEDED: frozenset(),
     IdempotencyState.DRY_RUN_SUCCEEDED: frozenset(),
     IdempotencyState.UNKNOWN: frozenset(),
@@ -201,22 +216,28 @@ def compute_scope_key(
     tenant_id: str,
     idempotency_key: str,
     scope: IdempotencyScope,
+    *,
+    dry_run: bool = False,
 ) -> tuple[str, ...]:
     """Compute the store key for an idempotency slot given its scope.
 
-    * ``GLOBAL`` → ``("global", idempotency_key)`` — unique across tenants.
-    * ``TENANT`` → ``(tenant_id, idempotency_key)`` — unique within a tenant.
-    * ``NONE``   → ``(tenant_id, idempotency_key, "none")`` — base key for a
-      non-idempotent adapter; :meth:`InMemoryExecutionStore.reserve` appends a
-      unique ``reservation_id`` so every attempt gets a fresh record (no
-      replay / no retry).
+    R3 P0-2: the execution mode (``"dry-run"`` / ``"real"``) is ALWAYS
+    part of the store key so a dry-run execution NEVER collides with a
+    real execution for the same key.
+
+    * ``GLOBAL`` → ``("global", mode, idempotency_key)``
+    * ``TENANT`` → ``(tenant_id, mode, idempotency_key)``
+    * ``NONE``   → ``(tenant_id, mode, idempotency_key, "none")`` — base
+      key; :meth:`InMemoryExecutionStore.reserve` appends a unique
+      ``reservation_id`` so every attempt gets a fresh record.
     """
+    mode = "dry-run" if dry_run else "real"
     if scope is IdempotencyScope.GLOBAL:
-        return ("global", idempotency_key)
+        return ("global", mode, idempotency_key)
     if scope is IdempotencyScope.TENANT:
-        return (tenant_id, idempotency_key)
+        return (tenant_id, mode, idempotency_key)
     # NONE — non-idempotent adapter (base key; reserve appends a suffix).
-    return (tenant_id, idempotency_key, "none")
+    return (tenant_id, mode, idempotency_key, "none")
 
 
 def compute_resource_key(
@@ -283,6 +304,11 @@ class ExecutionStore(Protocol):
         command_id: str,
     ) -> IdempotencyRecord: ...
 
+    async def mark_dispatched(
+        self,
+        record: IdempotencyRecord,
+    ) -> IdempotencyRecord: ...
+
     async def complete_with_receipt(
         self,
         record: IdempotencyRecord,
@@ -319,6 +345,11 @@ class ExecutionStore(Protocol):
         scope: IdempotencyScope | None = None,
     ) -> ActionExecutionReceipt | None: ...
 
+    async def get_receipt_by_command(
+        self,
+        command_id: str,
+    ) -> ActionExecutionReceipt | None: ...
+
 
 # ---------------------------------------------------------------------------
 # InMemoryExecutionStore
@@ -340,7 +371,7 @@ class InMemoryExecutionStore:
       returns the cached record (caller treats as DEDUPLICATED).
     * ``reserve`` with an existing key + different fingerprint →
       :class:`IdempotencyConflictError` (fail-closed).
-    * ``reserve`` with an existing CALL_STARTED key →
+    * ``reserve`` with an existing READY_TO_CALL / CALL_DISPATCHED key →
       :class:`ExecutionAlreadyInProgressError`.
     * ``reserve`` with an existing UNKNOWN key → returns the UNKNOWN
       record (caller MUST NOT auto-retry).
@@ -358,6 +389,9 @@ class InMemoryExecutionStore:
     def __init__(self) -> None:
         self._records: dict[tuple[str, ...], IdempotencyRecord] = {}
         self._receipts: dict[tuple[str, ...], ActionExecutionReceipt] = {}
+        # P0-7 R3: append-only receipt storage by command_id so retry
+        # attempts never overwrite a previous attempt's receipt.
+        self._receipts_by_command: dict[str, ActionExecutionReceipt] = {}
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -374,39 +408,46 @@ class InMemoryExecutionStore:
     ) -> tuple[str, ...]:
         """Store key for the lookup methods (``reserve``/``get``/``get_receipt``).
 
-        For ``NONE`` scope this returns the BASE key (without a
-        ``reservation_id``); since every ``reserve`` stores under a
-        unique suffix, ``get`` for ``NONE`` will not find a record —
-        this is intentional (``NONE`` means no replay).
+        R3 P0-2: mode (``"dry-run"`` / ``"real"``) is ALWAYS part of the
+        store key, regardless of scope.  This is the core fix for dry-run
+        / real isolation.
         """
-        if scope is not None:
-            return compute_scope_key(tenant_id, key, scope)
-        namespace = "dry-run" if dry_run else "real"
-        return (tenant_id, namespace, key)
+        effective_scope = scope if scope is not None else IdempotencyScope.TENANT
+        return compute_scope_key(tenant_id, key, effective_scope, dry_run=dry_run)
 
     @staticmethod
     def _record_store_key(record: IdempotencyRecord) -> tuple[str, ...]:
         """Store key derived from a record (self-locating).
 
-        Mirrors :meth:`_lookup_key` but resolves the namespace from the
-        record's own ``dry_run`` / ``scope`` / ``reservation_id`` so that
-        ``mark_started`` / ``complete_with_receipt`` / ``mark_unknown``
-        can re-find the exact slot without an external index.  For
-        ``NONE`` scope the unique ``reservation_id`` is appended so each
-        attempt maps to its own slot.
+        R3 P0-2: mode is ALWAYS derived from ``record.dry_run`` and
+        included in the key.  For ``NONE`` scope the unique
+        ``reservation_id`` is appended so each attempt maps to its own
+        slot.
         """
         scope = record.scope
         if scope is IdempotencyScope.NONE:
+            mode = "dry-run" if record.dry_run else "real"
             return (
                 record.tenant_id,
+                mode,
                 record.idempotency_key,
                 "none",
                 record.reservation_id or "",
             )
         if scope is not None:
-            return compute_scope_key(record.tenant_id, record.idempotency_key, scope)
-        namespace = "dry-run" if record.dry_run else "real"
-        return (record.tenant_id, namespace, record.idempotency_key)
+            return compute_scope_key(
+                record.tenant_id,
+                record.idempotency_key,
+                scope,
+                dry_run=record.dry_run,
+            )
+        # No scope set — default to TENANT with mode.
+        return compute_scope_key(
+            record.tenant_id,
+            record.idempotency_key,
+            IdempotencyScope.TENANT,
+            dry_run=record.dry_run,
+        )
 
     @staticmethod
     def _state_for_receipt(receipt: ActionExecutionReceipt) -> IdempotencyState:
@@ -483,9 +524,13 @@ class InMemoryExecutionStore:
                     f"idempotency key {key!r} already used with a different "
                     f"execution fingerprint",
                 )
-            if existing.state == IdempotencyState.CALL_STARTED:
+            if existing.state in (
+                IdempotencyState.READY_TO_CALL,
+                IdempotencyState.CALL_DISPATCHED,
+            ):
                 raise ExecutionAlreadyInProgressError(
-                    f"idempotency key {key!r} is already CALL_STARTED",
+                    f"idempotency key {key!r} is already in-flight "
+                    f"(state={existing.state.value!r})",
                 )
             # RESERVED / SUCCEEDED / FAILED / UNKNOWN / DRY_RUN_SUCCEEDED —
             # return the existing record so the caller can decide what to do.
@@ -500,7 +545,7 @@ class InMemoryExecutionStore:
         record: IdempotencyRecord,
         command_id: str,
     ) -> IdempotencyRecord:
-        """Transition RESERVED (or FAILED, for safe retry) → CALL_STARTED.
+        """Transition RESERVED (or FAILED, for safe retry) → READY_TO_CALL.
 
         P0-9: the current stored state MUST be ``RESERVED`` or ``FAILED``;
         any other state is an illegal transition.
@@ -517,12 +562,12 @@ class InMemoryExecutionStore:
                 raise IdempotencyConflictError(
                     "fingerprint mismatch on mark_started",
                 )
-            _assert_transition(existing.state, IdempotencyState.CALL_STARTED)
+            _assert_transition(existing.state, IdempotencyState.READY_TO_CALL)
             updated = IdempotencyRecord(
                 tenant_id=existing.tenant_id,
                 idempotency_key=existing.idempotency_key,
                 execution_fingerprint=existing.execution_fingerprint,
-                state=IdempotencyState.CALL_STARTED,
+                state=IdempotencyState.READY_TO_CALL,
                 command_id=command_id,
                 receipt_id=existing.receipt_id,
                 dry_run=existing.dry_run,
@@ -536,22 +581,18 @@ class InMemoryExecutionStore:
             return updated
 
     # ------------------------------------------------------------------
-    # complete (deprecated) — P0-9
+    # mark_dispatched (P0-4 R3) — READY_TO_CALL → CALL_DISPATCHED
     # ------------------------------------------------------------------
 
-    async def _complete_deprecated(
+    async def mark_dispatched(
         self,
         record: IdempotencyRecord,
-        receipt_id: str,
-        *,
-        succeeded: bool,
     ) -> IdempotencyRecord:
-        """DEPRECATED terminal commit (no receipt verification).
+        """P0-4 R3: transition READY_TO_CALL → CALL_DISPATCHED.
 
-        Retained for backward compatibility only.  New callers MUST
-        use :meth:`complete_with_receipt` which atomically commits the
-        full :class:`ActionExecutionReceipt`.  P0-9: the current stored
-        state MUST be ``CALL_STARTED``.
+        This MUST be called immediately before ``adapter.execute()``.
+        Only after this state may an uncertain outcome become UNKNOWN
+        (P0-4 R3 call-boundary rule).
         """
         async with self._lock:
             ck = self._record_store_key(record)
@@ -563,19 +604,16 @@ class InMemoryExecutionStore:
                 )
             if existing.execution_fingerprint != record.execution_fingerprint:
                 raise IdempotencyConflictError(
-                    "fingerprint mismatch on complete",
+                    "fingerprint mismatch on mark_dispatched",
                 )
-            new_state = (
-                IdempotencyState.SUCCEEDED if succeeded else IdempotencyState.FAILED
-            )
-            _assert_transition(existing.state, new_state)
+            _assert_transition(existing.state, IdempotencyState.CALL_DISPATCHED)
             updated = IdempotencyRecord(
                 tenant_id=existing.tenant_id,
                 idempotency_key=existing.idempotency_key,
                 execution_fingerprint=existing.execution_fingerprint,
-                state=new_state,
+                state=IdempotencyState.CALL_DISPATCHED,
                 command_id=existing.command_id,
-                receipt_id=receipt_id,
+                receipt_id=existing.receipt_id,
                 dry_run=existing.dry_run,
                 scope=existing.scope,
                 reservation_id=existing.reservation_id,
@@ -599,7 +637,7 @@ class InMemoryExecutionStore:
         """Mark an in-flight record as UNKNOWN (fail-closed).
 
         Phase 5B Section 17: UNKNOWN outcomes are NEVER auto-retried.
-        P0-9: the current stored state MUST be ``CALL_STARTED``.
+        P0-9: the current stored state MUST be ``CALL_DISPATCHED``.
         """
         async with self._lock:
             ck = self._record_store_key(record)
@@ -650,7 +688,7 @@ class InMemoryExecutionStore:
         P0-7: a ``DRY_RUN_SUCCEEDED`` receipt transitions the record to
         ``DRY_RUN_SUCCEEDED`` (never ``SUCCEEDED``).
 
-        P0-9: the current stored state MUST be ``CALL_STARTED`` and the
+        P0-9: the current stored state MUST be ``CALL_DISPATCHED`` and the
         receipt is independently verified against the record.
         """
         async with self._lock:
@@ -665,7 +703,7 @@ class InMemoryExecutionStore:
                 raise IdempotencyConflictError(
                     "fingerprint mismatch on complete_with_receipt",
                 )
-            # P0-9: strict CAS — current state MUST be CALL_STARTED.
+            # P0-9: strict CAS — current state MUST be CALL_DISPATCHED.
             target = self._state_for_receipt(receipt)
             _assert_transition(existing.state, target)
             # P0-6 / P0-9: independently verify the trusted receipt.
@@ -709,6 +747,9 @@ class InMemoryExecutionStore:
             )
             self._records[ck] = updated
             self._receipts[ck] = receipt
+            # P0-7 R3: append-only storage by command_id so retry
+            # attempts never overwrite a previous attempt's receipt.
+            self._receipts_by_command[receipt.command_id] = receipt
             return updated
 
     # ------------------------------------------------------------------
@@ -774,6 +815,44 @@ class InMemoryExecutionStore:
         async with self._lock:
             ck = self._lookup_key(tenant_id, key, dry_run=dry_run, scope=scope)
             return self._receipts.get(ck)
+
+    async def get_receipt_by_command(
+        self,
+        command_id: str,
+    ) -> ActionExecutionReceipt | None:
+        """P0-7 R3: return the append-only receipt for a specific
+        command_id (attempt).  Never overwritten by a later retry.
+        """
+        async with self._lock:
+            return self._receipts_by_command.get(command_id)
+
+    async def get_all_receipts_by_key(
+        self,
+        tenant_id: str,
+        key: str,
+        *,
+        dry_run: bool = False,
+        scope: IdempotencyScope | None = None,
+    ) -> tuple[ActionExecutionReceipt, ...]:
+        """P0-7 R3: return ALL receipts for an idempotency key, in
+        insertion order.  Used to build the append-only attempt trail.
+        """
+        async with self._lock:
+            ck = self._lookup_key(tenant_id, key, dry_run=dry_run, scope=scope)
+            slot_receipt = self._receipts.get(ck)
+            if slot_receipt is None:
+                return ()
+            # Return ALL per-command receipts for this slot, in
+            # insertion order.  Filter _receipts_by_command by matching
+            # idempotency_key so only receipts for this key are returned.
+            per_command = tuple(
+                r
+                for r in self._receipts_by_command.values()
+                if r.idempotency_key == key
+            )
+            if not per_command:
+                return (slot_receipt,)
+            return per_command
 
 
 __all__ = [

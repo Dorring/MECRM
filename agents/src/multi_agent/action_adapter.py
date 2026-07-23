@@ -25,6 +25,7 @@ Design rules (Phase 5B Section 9)
 
 from __future__ import annotations
 
+import threading
 from enum import StrEnum
 from hmac import compare_digest
 from typing import Any, Protocol, runtime_checkable
@@ -513,6 +514,15 @@ class ActionAdapterRegistry:
         # is NOT a global sink: it lives on the registry instance the
         # caller constructed and injected.
         self._live_adapters: dict[str, ActionAdapter] = {}
+        # P0-12 R3: a single re-entrant lock guards BOTH ``_bindings``
+        # and ``_live_adapters`` so ``freeze_for_execution`` can
+        # atomically capture the metadata snapshot, the live adapter
+        # instances, and the registry hash under ONE lock.  A
+        # snapshot-then-copy race (where a concurrent ``register``
+        # mutates ``_live_adapters`` between the snapshot and the dict
+        # copy) would otherwise let a frozen handle observe a binding
+        # whose adapter instance was swapped mid-freeze.
+        self._lock = threading.RLock()
 
     def register(
         self,
@@ -527,51 +537,70 @@ class ActionAdapterRegistry:
         """
         if not adapter.supported_action_types:
             raise ValueError(f"Adapter {adapter.adapter_id!r} supports no action types")
-        # Keep the live instance so the executor can look it up.
-        self._live_adapters[adapter.adapter_id] = adapter
-        binding = ActionAdapterBinding(
-            action_type=next(iter(adapter.supported_action_types)),
-            adapter_id=adapter.adapter_id,
-            adapter_version=adapter.adapter_version,
-            supports_dry_run=adapter.supports_dry_run,
-            retry_safe=adapter.retry_safe,
-            idempotency_scope=adapter.idempotency_scope,
-        )
-        for action_type in adapter.supported_action_types:
-            at = action_type.strip()
-            if not at:
-                raise ValueError("action_type must not be blank")
-            self._bindings[at] = ActionAdapterBinding(
-                action_type=at,
+        with self._lock:
+            # Keep the live instance so the executor can look it up.
+            self._live_adapters[adapter.adapter_id] = adapter
+            binding = ActionAdapterBinding(
+                action_type=next(iter(adapter.supported_action_types)),
                 adapter_id=adapter.adapter_id,
                 adapter_version=adapter.adapter_version,
                 supports_dry_run=adapter.supports_dry_run,
                 retry_safe=adapter.retry_safe,
                 idempotency_scope=adapter.idempotency_scope,
             )
-        return binding
+            for action_type in adapter.supported_action_types:
+                at = action_type.strip()
+                if not at:
+                    raise ValueError("action_type must not be blank")
+                self._bindings[at] = ActionAdapterBinding(
+                    action_type=at,
+                    adapter_id=adapter.adapter_id,
+                    adapter_version=adapter.adapter_version,
+                    supports_dry_run=adapter.supports_dry_run,
+                    retry_safe=adapter.retry_safe,
+                    idempotency_scope=adapter.idempotency_scope,
+                )
+            return binding
 
     def freeze_snapshot(self) -> ActionAdapterRegistrySnapshot:
         """Return an immutable snapshot of the current bindings."""
-        bindings = tuple(self._bindings[k] for k in sorted(self._bindings))
-        return ActionAdapterRegistrySnapshot(
-            registry_version=self._registry_version,
-            bindings=bindings,
-        )
+        with self._lock:
+            bindings = tuple(self._bindings[k] for k in sorted(self._bindings))
+            return ActionAdapterRegistrySnapshot(
+                registry_version=self._registry_version,
+                bindings=bindings,
+            )
 
     def freeze_for_execution(self) -> FrozenActionAdapterRegistry:
-        """P0-4: atomically freeze the snapshot AND the live adapter instances.
+        """P0-4 / P0-12 R3: atomically freeze the snapshot AND the live
+        adapter instances.
 
-        After this call, ``register()`` on the live registry does NOT
-        affect the returned frozen handle — the current batch reads only
-        from the frozen instances.
+        R3 fix: the metadata snapshot, the live adapter instance
+        mapping, and the registry hash are ALL captured under the
+        registry lock in ONE critical section.  Previously the snapshot
+        was built first and the live-adapters dict was copied second
+        without holding the lock, so a concurrent ``register()`` could
+        mutate ``_live_adapters`` between the two reads — yielding a
+        frozen handle whose binding metadata and live instance
+        disagreed.  The lock is re-entrant so ``freeze_snapshot``
+        (which also acquires it) can be called from inside this method.
         """
-        snapshot = self.freeze_snapshot()
-        # Copy the live adapters dict so later register() calls don't
-        # mutate what the frozen handle sees.
+        with self._lock:
+            # Build the snapshot under the lock so _bindings cannot
+            # change between here and the live-adapters copy below.
+            snapshot = self.freeze_snapshot()
+            # Copy the live adapters dict WHILE STILL HOLDING THE LOCK
+            # so a concurrent register() cannot swap an instance
+            # mid-freeze.  The dict() copy is the only mutable state
+            # the frozen handle retains; after this point the live
+            # registry is free to mutate without affecting the freeze.
+            # ``snapshot.registry_hash`` is derived from the bindings
+            # captured above, so it is consistent with the live
+            # instance mapping under the same critical section.
+            runtime_bindings = dict(self._live_adapters)
         return FrozenActionAdapterRegistry(
             snapshot=snapshot,
-            runtime_bindings=dict(self._live_adapters),
+            runtime_bindings=runtime_bindings,
         )
 
     def get_binding(

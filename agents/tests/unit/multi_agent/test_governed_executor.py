@@ -31,8 +31,10 @@ from multi_agent.execution_authorization import (
 from multi_agent.execution_error_codes import (
     AUTHORIZATION_INTEGRITY_FAILED,
 )
+from multi_agent.execution_receipts import ActionExecutionReceipt
 from multi_agent.execution_store import InMemoryExecutionStore
 from multi_agent.governed_executor import (
+    ActionExecutionRecord,
     ExecutionBatchResult,
     ExecutionOptions,
     ExecutionRetryPolicy,
@@ -342,6 +344,31 @@ class TestExecutionBatchResult:
         request, result, _ = make_approved_request_result()
         registry = make_recording_registry([])
         snap = registry.freeze_snapshot()
+        receipt = ActionExecutionReceipt(
+            receipt_id="rcpt-bind",
+            command_id="cmd-bind",
+            tenant_id=TENANT,
+            run_id=RUN_ID,
+            proposal_id="prop-test-001",
+            authorization_hash="a" * 64,
+            adapter_id="noop",
+            adapter_version="1.0.0",
+            adapter_registry_hash=snap.registry_hash,
+            idempotency_key="idem-bind",
+            execution_fingerprint="f" * 64,
+            status=ExecutionStatus.SUCCEEDED,
+            executed=True,
+            started_at=TS,
+            completed_at=TS,
+        )
+        record = ActionExecutionRecord(
+            proposal_id="prop-test-001",
+            status=ExecutionStatus.SUCCEEDED,
+            receipt=receipt,
+            executed=True,
+            adapter_call_started=True,
+            adapter_call_dispatched=True,
+        )
         batch = ExecutionBatchResult(
             review_id=request.review_id,
             run_id=request.run_id,
@@ -350,6 +377,10 @@ class TestExecutionBatchResult:
             result_hash=result.result_hash,
             governance_spec_hash=request.governance_spec_hash,
             adapter_registry_hash=snap.registry_hash,
+            receipts=(receipt,),
+            action_records=(record,),
+            succeeded_proposal_ids=("prop-test-001",),
+            batch_status=BatchExecutionStatus.SUCCEEDED,
             started_at=TS,
             completed_at=TS,
         )

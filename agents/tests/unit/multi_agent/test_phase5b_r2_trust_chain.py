@@ -195,6 +195,9 @@ def _make_appr_request(
     action_type: str = "crm.owner.assign",
     requested_at: datetime = _APPR_TS,
 ) -> ApprovalRequest:
+    # P0-1 R3: the request binds to approval_subject_hash (what the
+    # human approves), NOT the final authorization_hash.
+    subject_hash = auth.approval_subject_hash or auth.authorization_hash
     return ApprovalRequest(
         approval_id=approval_id,
         authorization_id=auth.authorization_id,
@@ -203,7 +206,7 @@ def _make_appr_request(
         proposal_id=auth.proposal_id,
         review_request_hash="r" * 64,
         review_result_hash="s" * 64,
-        authorization_hash=auth.authorization_hash,
+        authorization_hash=subject_hash,
         risk_level=risk_level,
         action_type=action_type,
         action_summary="test action",
@@ -222,6 +225,8 @@ def _make_appr_decision(
     decided_at: datetime = _APPR_TS,
     authorization_hash: str | None = None,
 ) -> ApprovalDecision:
+    # P0-1 R3: the decision binds to approval_subject_hash (same as
+    # the request), NOT the final authorization_hash.
     ah = authorization_hash or request.authorization_hash
     return ApprovalDecision(
         approval_id=request.approval_id,
@@ -307,10 +312,12 @@ class TestP01PreApprovalAuthorizationHashChain:
     pre-approval -> post-approval transition is verifiable."""
 
     def test_pre_approval_hash_is_none_before_binding(self) -> None:
-        """A freshly built PENDING_APPROVAL authorization has
-        ``pre_approval_authorization_hash=None`` (no approval bound yet)."""
+        """R3: ``pre_approval_authorization_hash`` is a deprecated alias
+        of ``base_authorization_hash`` — it is always set (never None)
+        and equals the base hash before approval binding."""
         auth = _make_auth()
-        assert auth.pre_approval_authorization_hash is None
+        assert auth.pre_approval_authorization_hash is not None
+        assert auth.pre_approval_authorization_hash == auth.base_authorization_hash
 
     def test_bind_approval_captures_pre_approval_hash(self) -> None:
         """``_bind_approval`` saves the pre-binding authorization_hash
@@ -393,17 +400,17 @@ class TestP02ValidateConsumeTwoPhaseSplit:
             store.consume_for_command(
                 "appr-001",
                 authorization=auth,
-                command_id="cmd-001",
+                command_family_id="cfam-001",
                 execution_fingerprint="fp-001",
                 now=_APPR_TS,
             )
         )
         assert consumption.approval_id == "appr-001"
-        assert consumption.command_id == "cmd-001"
+        assert consumption.command_family_id == "cfam-001"
 
-    def test_consume_for_command_binds_to_command_id(self) -> None:
-        """``consume_for_command`` records the exact command_id so a
-        replay of the SAME command returns the SAME consumption."""
+    def test_consume_for_command_binds_to_command_family(self) -> None:
+        """``consume_for_command`` records the exact command_family_id
+        so a replay of the SAME family returns the SAME consumption."""
         store = InMemoryApprovalStore()
         auth = _make_auth(approval_id="appr-001")
         _seed_approved_approval(store, auth=auth)
@@ -412,7 +419,7 @@ class TestP02ValidateConsumeTwoPhaseSplit:
             store.consume_for_command(
                 "appr-001",
                 authorization=auth,
-                command_id="cmd-001",
+                command_family_id="cfam-001",
                 execution_fingerprint="fp-001",
                 now=_APPR_TS,
             )
@@ -421,19 +428,19 @@ class TestP02ValidateConsumeTwoPhaseSplit:
             store.consume_for_command(
                 "appr-001",
                 authorization=auth,
-                command_id="cmd-001",
+                command_family_id="cfam-001",
                 execution_fingerprint="fp-001",
                 now=_APPR_TS,
             )
         )
-        # Same command replay → original consumption returned (NOT a
-        # second illegal consume).
+        # Same command family replay → original consumption returned
+        # (NOT a second illegal consume).
         assert first.consumption_hash == second.consumption_hash
-        assert first.command_id == "cmd-001"
+        assert first.command_family_id == "cfam-001"
 
-    def test_different_command_cannot_reuse_consumption(self) -> None:
-        """A consumption bound to ``cmd-A`` CANNOT be reused for a
-        different ``cmd-B`` — the approval is single-use per command."""
+    def test_different_command_family_cannot_reuse_consumption(self) -> None:
+        """A consumption bound to ``cfam-A`` CANNOT be reused for a
+        different ``cfam-B`` — the approval is single-use per family."""
         store = InMemoryApprovalStore()
         auth = _make_auth(approval_id="appr-001")
         _seed_approved_approval(store, auth=auth)
@@ -442,7 +449,7 @@ class TestP02ValidateConsumeTwoPhaseSplit:
             store.consume_for_command(
                 "appr-001",
                 authorization=auth,
-                command_id="cmd-A",
+                command_family_id="cfam-A",
                 execution_fingerprint="fp-A",
                 now=_APPR_TS,
             )
@@ -452,7 +459,7 @@ class TestP02ValidateConsumeTwoPhaseSplit:
                 store.consume_for_command(
                     "appr-001",
                     authorization=auth,
-                    command_id="cmd-B",
+                    command_family_id="cfam-B",
                     execution_fingerprint="fp-B",
                     now=_APPR_TS,
                 )
@@ -460,7 +467,7 @@ class TestP02ValidateConsumeTwoPhaseSplit:
 
     def test_consume_for_command_rejects_unapproved_status(self) -> None:
         """A REJECTED decision cannot be consumed — the approval is
-        NOT bound to any command."""
+        NOT bound to any command family."""
         store = InMemoryApprovalStore()
         auth = _make_auth(approval_id="appr-001")
         request = _make_appr_request(auth=auth)
@@ -473,7 +480,7 @@ class TestP02ValidateConsumeTwoPhaseSplit:
                 store.consume_for_command(
                     "appr-001",
                     authorization=auth,
-                    command_id="cmd-001",
+                    command_family_id="cfam-001",
                     execution_fingerprint="fp-001",
                     now=_APPR_TS,
                 )
@@ -491,7 +498,7 @@ class TestP03ApprovalConsumptionRecord:
 
     def test_consumption_record_carries_all_binding_fields(self) -> None:
         """The consumption record carries approval_id, decision_hash,
-        authorization_hash, command_id, and execution_fingerprint."""
+        authorization_hash, command_family_id, and execution_fingerprint."""
         store = InMemoryApprovalStore()
         auth = _make_auth(approval_id="appr-001")
         _request, decision = _seed_approved_approval(store, auth=auth)
@@ -500,7 +507,7 @@ class TestP03ApprovalConsumptionRecord:
             store.consume_for_command(
                 "appr-001",
                 authorization=auth,
-                command_id="cmd-001",
+                command_family_id="cfam-001",
                 execution_fingerprint="fp-001",
                 now=_APPR_TS,
             )
@@ -508,7 +515,7 @@ class TestP03ApprovalConsumptionRecord:
         assert consumption.approval_id == "appr-001"
         assert consumption.decision_hash == decision.decision_hash
         assert consumption.authorization_hash == auth.authorization_hash
-        assert consumption.command_id == "cmd-001"
+        assert consumption.command_family_id == "cfam-001"
         assert consumption.execution_fingerprint == "fp-001"
 
     def test_consumption_hash_is_computed_and_verified(self) -> None:
@@ -522,7 +529,7 @@ class TestP03ApprovalConsumptionRecord:
             store.consume_for_command(
                 "appr-001",
                 authorization=auth,
-                command_id="cmd-001",
+                command_family_id="cfam-001",
                 execution_fingerprint="fp-001",
                 now=_APPR_TS,
             )
@@ -531,7 +538,7 @@ class TestP03ApprovalConsumptionRecord:
         consumption.verify_integrity()
 
     def test_tampering_with_consumption_field_breaks_hash(self) -> None:
-        """Forging any binding field (command_id) breaks the
+        """Forging any binding field (command_family_id) breaks the
         ``consumption_hash`` integrity check."""
         store = InMemoryApprovalStore()
         auth = _make_auth(approval_id="appr-001")
@@ -541,12 +548,12 @@ class TestP03ApprovalConsumptionRecord:
             store.consume_for_command(
                 "appr-001",
                 authorization=auth,
-                command_id="cmd-001",
+                command_family_id="cfam-001",
                 execution_fingerprint="fp-001",
                 now=_APPR_TS,
             )
         )
-        forged = consumption.model_copy(update={"command_id": "cmd-forged"})
+        forged = consumption.model_copy(update={"command_family_id": "cfam-forged"})
         with pytest.raises(ValueError):
             forged.verify_integrity()
 
@@ -803,6 +810,7 @@ class TestP07DryRunIdempotencyIsolation:
             idempotency_key="idem-shared-001",
         )
         dry_record = run_async(store.mark_started(dry_record, "cmd-dry"))
+        dry_record = run_async(store.mark_dispatched(dry_record))
         run_async(store.complete_with_receipt(dry_record, dry_receipt))
         # The dry-run slot is now DRY_RUN_SUCCEEDED.
         stored_dry = store._records[store._record_store_key(dry_record)]
@@ -839,6 +847,7 @@ class TestP07DryRunIdempotencyIsolation:
             idempotency_key="idem-dry-002",
         )
         record = run_async(store.mark_started(record, "cmd"))
+        record = run_async(store.mark_dispatched(record))
         run_async(store.complete_with_receipt(record, receipt))
         stored = store._records[store._record_store_key(record)]
         assert stored.state == IdempotencyState.DRY_RUN_SUCCEEDED
@@ -861,6 +870,7 @@ class TestP07DryRunIdempotencyIsolation:
             idempotency_key="idem-real-003",
         )
         record = run_async(store.mark_started(record, "cmd"))
+        record = run_async(store.mark_dispatched(record))
         run_async(store.complete_with_receipt(record, receipt))
         stored = store._records[store._record_store_key(record)]
         assert stored.state == IdempotencyState.SUCCEEDED
@@ -882,7 +892,7 @@ class TestP08IdempotencyScopeSemantics:
         key_a = compute_scope_key("tenant-A", "idem-g", IdempotencyScope.GLOBAL)
         key_b = compute_scope_key("tenant-B", "idem-g", IdempotencyScope.GLOBAL)
         assert key_a == key_b
-        assert key_a == ("global", "idem-g")
+        assert key_a == ("global", "real", "idem-g")
 
     def test_tenant_scope_isolates_per_tenant(self) -> None:
         """``compute_scope_key`` with TENANT produces a per-tenant key —
@@ -890,8 +900,8 @@ class TestP08IdempotencyScopeSemantics:
         key_a = compute_scope_key("tenant-A", "idem-t", IdempotencyScope.TENANT)
         key_b = compute_scope_key("tenant-B", "idem-t", IdempotencyScope.TENANT)
         assert key_a != key_b
-        assert key_a == ("tenant-A", "idem-t")
-        assert key_b == ("tenant-B", "idem-t")
+        assert key_a == ("tenant-A", "real", "idem-t")
+        assert key_b == ("tenant-B", "real", "idem-t")
 
     def test_none_scope_always_creates_fresh_record(self) -> None:
         """``reserve`` with scope=NONE ALWAYS creates a fresh record —
@@ -956,32 +966,35 @@ class TestP09StrictCasStateMachine:
     """P0-9: every state transition is validated against the
     legal-transition table."""
 
-    def test_reserved_to_call_started_is_legal(self) -> None:
-        """RESERVED -> CALL_STARTED is a legal transition (no raise)."""
+    def test_reserved_to_ready_to_call_is_legal(self) -> None:
+        """RESERVED -> READY_TO_CALL is a legal transition (no raise)."""
         _assert_transition(
-            IdempotencyState.RESERVED, IdempotencyState.CALL_STARTED
+            IdempotencyState.RESERVED, IdempotencyState.READY_TO_CALL
         )  # no raise
 
     def test_succeeded_terminal_rejects_any_transition(self) -> None:
         """SUCCEEDED is terminal — any transition is rejected."""
         for target in (
-            IdempotencyState.CALL_STARTED,
+            IdempotencyState.READY_TO_CALL,
             IdempotencyState.FAILED,
             IdempotencyState.UNKNOWN,
         ):
             with pytest.raises(ValueError):
                 _assert_transition(IdempotencyState.SUCCEEDED, target)
 
-    def test_call_started_to_all_terminal_states_is_legal(self) -> None:
-        """CALL_STARTED -> SUCCEEDED / FAILED / UNKNOWN / DRY_RUN_SUCCEEDED
-        are all legal terminal transitions."""
+    def test_call_dispatched_to_all_terminal_states_is_legal(self) -> None:
+        """CALL_DISPATCHED -> SUCCEEDED / FAILED / UNKNOWN / DRY_RUN_SUCCEEDED
+        are all legal terminal transitions (R3 P0-13: the legacy
+        CALL_STARTED / IN_PROGRESS aliases have been REMOVED;
+        READY_TO_CALL can only transition to CALL_DISPATCHED or FAILED —
+        not directly to terminal states)."""
         for target in (
             IdempotencyState.SUCCEEDED,
             IdempotencyState.FAILED,
             IdempotencyState.UNKNOWN,
             IdempotencyState.DRY_RUN_SUCCEEDED,
         ):
-            _assert_transition(IdempotencyState.CALL_STARTED, target)  # no raise
+            _assert_transition(IdempotencyState.CALL_DISPATCHED, target)  # no raise
 
     def test_legal_transitions_table_marks_terminals_empty(self) -> None:
         """The legal-transition table marks terminal states (SUCCEEDED,
@@ -999,6 +1012,7 @@ class TestP09StrictCasStateMachine:
         store = InMemoryExecutionStore()
         record = run_async(store.reserve(TENANT, "idem-cas-001", "fp", "cmd"))
         record = run_async(store.mark_started(record, "cmd"))
+        record = run_async(store.mark_dispatched(record))
         receipt = _make_receipt(
             receipt_id="r-cas",
             command_id="cmd",

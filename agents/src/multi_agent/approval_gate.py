@@ -72,13 +72,15 @@ class ApprovalStore(Protocol):
 
     All methods are async so a future DB-backed adapter can poll
     without changing call sites.  Implementations MUST be safe under
-    concurrent ``decide`` / ``consume`` calls (compare-and-set).
+    concurrent ``decide`` / ``consume_for_command`` calls
+    (compare-and-set).
 
-    P0-3: ``validate_and_consume`` is the ONLY atomic consume path —
-    it validates tenant, run, proposal, authorization hash, request
-    hash, approver role, expiry, and status ALL under the store lock
-    before marking CONSUMED.  The separate ``consume`` method is
-    DEPRECATED and MUST NOT be used by the executor.
+    R3 P0-13: the legacy ``consume`` / ``validate_and_consume`` methods
+    have been REMOVED from the Protocol.  The ONLY consume path is
+    :meth:`consume_for_command`, which validates tenant, run, proposal,
+    ``approval_subject_hash``, approver role, expiry, and status ALL
+    under the store lock before marking CONSUMED and binding the
+    consumption to a ``command_family_id``.
     """
 
     async def create(self, request: ApprovalRequest) -> ApprovalRequest: ...
@@ -91,20 +93,6 @@ class ApprovalStore(Protocol):
         decision: ApprovalDecision,
     ) -> ApprovalRequest: ...
 
-    async def consume(
-        self,
-        approval_id: str,
-        authorization_hash: str,
-    ) -> ApprovalDecision: ...
-
-    async def validate_and_consume(
-        self,
-        approval_id: str,
-        *,
-        authorization: ExecutionAuthorization,
-        now: datetime,
-    ) -> ApprovalDecision: ...
-
     async def validate_decision(
         self,
         approval_id: str,
@@ -114,9 +102,10 @@ class ApprovalStore(Protocol):
     ) -> ApprovalDecision:
         """P0-2: read-only validation of the approval decision.
 
-        Validates tenant, run, proposal, authorization_hash, approver role,
-        expiry, and status — but does NOT consume the approval.  The
-        approval remains available for consumption or rejection.
+        Validates tenant, run, proposal, ``approval_subject_hash``,
+        approver role, expiry, and status — but does NOT consume the
+        approval.  The approval remains available for consumption or
+        rejection.
         """
         ...
 
@@ -125,16 +114,19 @@ class ApprovalStore(Protocol):
         approval_id: str,
         *,
         authorization: ExecutionAuthorization,
-        command_id: str,
+        command_family_id: str,
         execution_fingerprint: str,
         now: datetime,
     ) -> ApprovalConsumptionRecord:
-        """P0-2: consume the approval and bind it to a specific command.
+        """P0-1 / P0-2 R3: consume the approval and bind it to a
+        command family.
 
-        The consumption record binds the approval to the exact command_id
-        and execution_fingerprint.  A replay of the same command can read
-        the original consumption (not a second illegal consume).  A different
-        command cannot reuse the consumption.
+        The consumption record binds the approval to the exact
+        ``command_family_id`` + ``execution_fingerprint`` (what the
+        human approved, via ``approval_subject_hash``).  A replay of
+        the same command family + fingerprint returns the original
+        consumption (NOT a second illegal consume).  A different
+        command family cannot reuse the consumption.
         """
         ...
 
@@ -158,7 +150,7 @@ class InMemoryApprovalStore:
 
     Concurrency-safe via a single :class:`asyncio.Lock`.
 
-    Semantics (P0-3 + P1-1):
+    Semantics (P0-1 R3 + P1-1):
 
     * ``create`` — stores a PENDING request.  Same ``approval_id`` +
       same ``approval_request_hash`` → idempotent return.  Same
@@ -166,14 +158,17 @@ class InMemoryApprovalStore:
       :class:`ApprovalConflictError` (P1-1).
     * ``decide`` — applies a terminal decision; only ONE terminal
       decision is allowed per approval.
-    * ``validate_and_consume`` — the ONLY atomic consume path (P0-3):
-      validates tenant, run, proposal, authorization_hash,
-      approval_request_hash, approver role, expiry (vs ``now``), and
-      status ALL under the store lock before marking CONSUMED.  Any
-      validation failure does NOT consume the approval.
-    * ``consume`` — DEPRECATED; delegates to ``validate_and_consume``
-      with minimal checks (kept for backwards compatibility with
-      tests that pre-construct decisions).
+    * ``consume_for_command`` — the ONLY atomic consume path
+      (R3 P0-13): validates tenant, run, proposal,
+      ``approval_subject_hash`` (the hash the human approved, NOT the
+      final ``authorization_hash`` which includes the decision),
+      approver role, expiry (vs ``now``), and status ALL under the
+      store lock before marking CONSUMED and binding the consumption
+      to a ``command_family_id``.  Any validation failure does NOT
+      consume the approval.
+    * ``consume`` / ``validate_and_consume`` — REMOVED (R3 P0-13).
+      The legacy non-atomic consume paths are no longer available;
+      the executor MUST use ``consume_for_command``.
     """
 
     def __init__(self) -> None:
@@ -237,179 +232,6 @@ class InMemoryApprovalStore:
             self._decisions[approval_id] = decision
             return request
 
-    async def consume(
-        self,
-        approval_id: str,
-        authorization_hash: str,
-    ) -> ApprovalDecision:
-        """DEPRECATED — use ``validate_and_consume`` instead (P0-3).
-
-        Kept for backwards compatibility; performs the old non-atomic
-        consume.  The executor MUST use ``validate_and_consume``.
-        """
-        async with self._lock:
-            request = self._requests.get(approval_id)
-            if request is None:
-                raise ApprovalValidationError(
-                    f"approval {approval_id!r} not found",
-                )
-            if approval_id in self._consumed:
-                raise ApprovalValidationError(
-                    f"approval {approval_id!r} already consumed",
-                )
-            decision = self._decisions.get(approval_id)
-            if decision is None:
-                raise ApprovalRequiredError(
-                    f"approval {approval_id!r} has no decision yet",
-                )
-            if decision.status == ApprovalStatus.REJECTED:
-                raise ApprovalValidationError(
-                    f"approval {approval_id!r} was REJECTED",
-                )
-            if decision.status == ApprovalStatus.EXPIRED:
-                raise ApprovalValidationError(
-                    f"approval {approval_id!r} EXPIRED",
-                )
-            if decision.status == ApprovalStatus.REVOKED:
-                raise ApprovalValidationError(
-                    f"approval {approval_id!r} was REVOKED",
-                )
-            if decision.status != ApprovalStatus.APPROVED:
-                raise ApprovalValidationError(
-                    f"approval {approval_id!r} status is "
-                    f"{decision.status.value!r}, cannot consume",
-                )
-            if decision.authorization_hash != authorization_hash:
-                raise ApprovalValidationError(
-                    "decision.authorization_hash does not match the "
-                    "execution authorization",
-                )
-            self._consumed.add(approval_id)
-            return decision
-
-    async def validate_and_consume(
-        self,
-        approval_id: str,
-        *,
-        authorization: ExecutionAuthorization,
-        now: datetime,
-    ) -> ApprovalDecision:
-        """P0-3: atomically validate and consume an approval.
-
-        ALL checks run under the store lock.  Any failure does NOT
-        consume the approval — it remains available for correction
-        and a subsequent valid consume.
-
-        Checks (in order):
-        1. Request exists.
-        2. Decision exists (APPROVED).
-        3. Not already consumed.
-        4. Tenant matches authorization.
-        5. Run matches authorization.
-        6. Proposal matches authorization.
-        7. Authorization ID matches request.
-        8. Authorization hash matches decision.
-        9. Approval request hash matches decision.
-        10. Decision status is APPROVED.
-        11. ``now`` <= ``request.expires_at`` (P0-3: uses execution
-            clock, NOT ``decision.decided_at``).
-        12. Approver holds at least one required role.
-        """
-        async with self._lock:
-            request = self._requests.get(approval_id)
-            if request is None:
-                raise ApprovalValidationError(
-                    f"approval {approval_id!r} not found",
-                )
-            if approval_id in self._consumed:
-                raise ApprovalValidationError(
-                    f"approval {approval_id!r} already consumed",
-                )
-            decision = self._decisions.get(approval_id)
-            if decision is None:
-                raise ApprovalRequiredError(
-                    f"approval {approval_id!r} has no decision yet",
-                )
-
-            # --- Identity checks (fail-closed, no consume) ---
-            if request.tenant_id != authorization.tenant_id:
-                raise ApprovalValidationError(
-                    f"approval {approval_id!r}: tenant_id "
-                    f"{request.tenant_id!r} != authorization "
-                    f"{authorization.tenant_id!r}",
-                )
-            if request.run_id != authorization.run_id:
-                raise ApprovalValidationError(
-                    f"approval {approval_id!r}: run_id mismatch",
-                )
-            if request.proposal_id != authorization.proposal_id:
-                raise ApprovalValidationError(
-                    f"approval {approval_id!r}: proposal_id "
-                    f"{request.proposal_id!r} != authorization "
-                    f"{authorization.proposal_id!r}",
-                )
-            if request.authorization_id != authorization.authorization_id:
-                raise ApprovalValidationError(
-                    f"approval {approval_id!r}: authorization_id mismatch",
-                )
-            if request.authorization_hash != authorization.authorization_hash:
-                raise ApprovalValidationError(
-                    f"approval {approval_id!r}: request.authorization_hash "
-                    f"does not match authorization",
-                )
-            if decision.authorization_hash != authorization.authorization_hash:
-                raise ApprovalValidationError(
-                    f"approval {approval_id!r}: decision.authorization_hash "
-                    f"does not match authorization",
-                )
-            if decision.approval_request_hash != request.approval_request_hash:
-                raise ApprovalValidationError(
-                    f"approval {approval_id!r}: decision.approval_request_hash "
-                    f"does not match request",
-                )
-            if decision.approval_id != approval_id:
-                raise ApprovalValidationError(
-                    f"approval {approval_id!r}: decision.approval_id mismatch",
-                )
-            if decision.status != ApprovalStatus.APPROVED:
-                raise ApprovalValidationError(
-                    f"approval {approval_id!r}: decision status is "
-                    f"{decision.status.value!r}, not APPROVED",
-                )
-
-            # P0-3: expiry check uses the EXECUTION clock (``now``),
-            # NOT ``decision.decided_at``.  An approval decided before
-            # expiry but consumed after expiry is INVALID.
-            if request.expires_at is not None:
-                now_utc = now
-                if now_utc.tzinfo is None:
-                    now_utc = now_utc.replace(tzinfo=timezone.utc)
-                now_utc = now_utc.astimezone(timezone.utc)
-                if now_utc > request.expires_at:
-                    raise ApprovalValidationError(
-                        f"approval {approval_id!r}: expired at execution time "
-                        f"(now={now_utc.isoformat()}, "
-                        f"expires_at={request.expires_at.isoformat()})",
-                    )
-
-            # Approver role check.
-            if not request.required_approver_roles:
-                raise ApprovalValidationError(
-                    f"approval {approval_id!r}: required_approver_roles is empty",
-                )
-            held = set(decision.approver_roles)
-            required = set(request.required_approver_roles)
-            if not (held & required):
-                raise ApprovalValidationError(
-                    f"approval {approval_id!r}: approver roles "
-                    f"{sorted(held)!r} do not include any required role "
-                    f"{sorted(required)!r}",
-                )
-
-            # All checks passed → atomically mark CONSUMED.
-            self._consumed.add(approval_id)
-            return decision
-
     async def validate_decision(
         self,
         approval_id: str,
@@ -417,7 +239,15 @@ class InMemoryApprovalStore:
         authorization: ExecutionAuthorization,
         now: datetime,
     ) -> ApprovalDecision:
-        """P0-2: read-only validation — does NOT consume the approval."""
+        """P0-1 R3: read-only validation — does NOT consume the approval.
+
+        R3 fix: the binding check uses ``approval_subject_hash`` (what
+        the human approved) instead of the final ``authorization_hash``
+        (which includes the approval decision and could be forged
+        post-decision).  The Approval Request and Decision both bind to
+        ``approval_subject_hash``; the final ``authorization_hash`` is
+        only checked for internal consistency (decision == request).
+        """
         async with self._lock:
             request = self._requests.get(approval_id)
             if request is None:
@@ -432,7 +262,7 @@ class InMemoryApprovalStore:
                     f"approval {approval_id!r} has no decision yet"
                 )
 
-            # All the same identity checks as validate_and_consume
+            # --- Identity checks (fail-closed, no consume) ---
             if request.tenant_id != authorization.tenant_id:
                 raise ApprovalValidationError(
                     f"approval {approval_id!r}: tenant_id mismatch"
@@ -449,13 +279,28 @@ class InMemoryApprovalStore:
                 raise ApprovalValidationError(
                     f"approval {approval_id!r}: authorization_id mismatch"
                 )
-            if request.authorization_hash != authorization.authorization_hash:
+            # P0-1 R3: the request and decision bind to
+            # ``approval_subject_hash`` (what the human approved), NOT
+            # the final ``authorization_hash`` (which changes after the
+            # decision is bound).  This is the core R3 fix: a forged
+            # post-decision authorization that re-derives a new
+            # ``authorization_hash`` cannot reuse the approval because
+            # the subject hash is stable (base + approval_id).
+            subject_hash = authorization.approval_subject_hash
+            if subject_hash is None:
                 raise ApprovalValidationError(
-                    f"approval {approval_id!r}: authorization_hash mismatch"
+                    f"approval {approval_id!r}: authorization has no "
+                    f"approval_subject_hash (approval_id missing)"
                 )
-            if decision.authorization_hash != authorization.authorization_hash:
+            if request.authorization_hash != subject_hash:
                 raise ApprovalValidationError(
-                    f"approval {approval_id!r}: decision.authorization_hash mismatch"
+                    f"approval {approval_id!r}: request.authorization_hash "
+                    f"does not match approval_subject_hash"
+                )
+            if decision.authorization_hash != subject_hash:
+                raise ApprovalValidationError(
+                    f"approval {approval_id!r}: decision.authorization_hash "
+                    f"does not match approval_subject_hash"
                 )
             if decision.approval_request_hash != request.approval_request_hash:
                 raise ApprovalValidationError(
@@ -530,33 +375,43 @@ class InMemoryApprovalStore:
         approval_id: str,
         *,
         authorization: ExecutionAuthorization,
-        command_id: str,
+        command_family_id: str,
         execution_fingerprint: str,
         now: datetime,
     ) -> ApprovalConsumptionRecord:
-        """P0-2: consume the approval bound to a specific command.
+        """P0-1 / P0-2 R3: consume the approval bound to a command family.
+
+        R3 fixes:
+
+        * The binding check uses ``approval_subject_hash`` (what the
+          human approved) instead of the final ``authorization_hash``.
+        * The consumption record carries ``command_family_id`` (not a
+          single ``command_id``) so safe retries within the same family
+          can reuse the consumption.
+        * Replay logic: same ``command_family_id`` + same
+          ``execution_fingerprint`` → return the ORIGINAL consumption
+          (NOT a second consume).  Different ``command_family_id`` →
+          cannot reuse (fail-closed).
 
         First validates (read-only), then atomically marks consumed and
-        creates a ConsumptionRecord bound to the command.
-
-        If the same command replays, the original ConsumptionRecord is
-        returned (not a second consume).  A different command_id cannot
-        reuse the consumption.
+        creates a ConsumptionRecord bound to the command family.
         """
         async with self._lock:
-            # Check for existing consumption (replay of same command)
+            # P0-1 R3: replay logic keyed on command_family_id.
             existing = self._consumptions.get(approval_id)
             if existing is not None:
                 if (
-                    existing.command_id == command_id
+                    existing.command_family_id == command_family_id
                     and existing.execution_fingerprint == execution_fingerprint
                 ):
-                    # Same command replay — return original consumption
+                    # Same command family + fingerprint replay — return
+                    # the original consumption (NOT a second consume).
                     return existing
-                # Different command — cannot reuse
+                # Different command family — cannot reuse the approval.
                 raise ApprovalValidationError(
                     f"approval {approval_id!r}: already consumed by command "
-                    f"{existing.command_id!r}, cannot reuse for {command_id!r}"
+                    f"family {existing.command_family_id!r}, cannot reuse "
+                    f"for {command_family_id!r}"
                 )
 
             # Validate (inline, not calling validate_decision to avoid
@@ -590,13 +445,29 @@ class InMemoryApprovalStore:
                 raise ApprovalValidationError(
                     f"approval {approval_id!r}: authorization_id mismatch"
                 )
-            if request.authorization_hash != authorization.authorization_hash:
+            # P0-1 R3: the request and decision BOTH bind to
+            # ``approval_subject_hash`` (what the human approved), NOT
+            # the final ``authorization_hash`` (which changes after the
+            # decision is bound via _bind_approval).  This is the core
+            # R3 fix: a forged post-decision authorization that
+            # re-derives a new authorization_hash cannot reuse the
+            # approval because the subject hash is stable
+            # (base_authorization_hash + approval_id).
+            subject_hash = authorization.approval_subject_hash
+            if subject_hash is None:
                 raise ApprovalValidationError(
-                    f"approval {approval_id!r}: authorization_hash mismatch"
+                    f"approval {approval_id!r}: authorization has no "
+                    f"approval_subject_hash (approval_id missing)"
                 )
-            if decision.authorization_hash != authorization.authorization_hash:
+            if request.authorization_hash != subject_hash:
                 raise ApprovalValidationError(
-                    f"approval {approval_id!r}: decision.authorization_hash mismatch"
+                    f"approval {approval_id!r}: request.authorization_hash "
+                    f"does not match approval_subject_hash"
+                )
+            if decision.authorization_hash != subject_hash:
+                raise ApprovalValidationError(
+                    f"approval {approval_id!r}: decision.authorization_hash "
+                    f"does not match approval_subject_hash"
                 )
             if decision.approval_request_hash != request.approval_request_hash:
                 raise ApprovalValidationError(
@@ -657,13 +528,15 @@ class InMemoryApprovalStore:
             request.verify_integrity()
             decision.verify_integrity()
 
-            # Atomically consume + create consumption record
+            # P0-1 R3: atomically consume + create consumption record
+            # bound to command_family_id via approval_subject_hash.
             self._consumed.add(approval_id)
             consumption = ApprovalConsumptionRecord(
                 approval_id=approval_id,
                 decision_hash=decision.decision_hash,
+                approval_subject_hash=subject_hash,
                 authorization_hash=authorization.authorization_hash,
-                command_id=command_id,
+                command_family_id=command_family_id,
                 execution_fingerprint=execution_fingerprint,
             )
             self._consumptions[approval_id] = consumption
@@ -747,8 +620,11 @@ class ApprovalGate:
         * ``decision.approval_id`` matches ``request.approval_id``.
         * ``decision.approval_request_hash`` matches
           ``request.approval_request_hash``.
-        * ``decision.authorization_hash`` matches
-          ``authorization.authorization_hash``.
+        * P0-1 R3: ``request.authorization_hash`` AND
+          ``decision.authorization_hash`` BOTH match
+          ``authorization.approval_subject_hash`` (what the human
+          approved), NOT the final ``authorization.authorization_hash``
+          (which changes after the decision is bound).
         * ``request.proposal_id`` matches ``authorization.proposal_id``.
         * ``request.authorization_id`` matches
           ``authorization.authorization_id``.
@@ -767,10 +643,9 @@ class ApprovalGate:
             raise ApprovalValidationError(
                 "decision.approval_request_hash does not match request",
             )
-        if decision.authorization_hash != authorization.authorization_hash:
-            raise ApprovalValidationError(
-                "decision.authorization_hash does not match authorization",
-            )
+        # Identity checks FIRST (before hash checks) so a mismatched
+        # proposal / tenant / authorization_id is reported clearly
+        # rather than being masked by a subject-hash mismatch.
         if request.proposal_id != authorization.proposal_id:
             raise ApprovalValidationError(
                 f"request.proposal_id {request.proposal_id!r} != "
@@ -785,6 +660,22 @@ class ApprovalGate:
             raise ApprovalValidationError(
                 f"request.tenant_id {request.tenant_id!r} != authorization "
                 f"{authorization.tenant_id!r}",
+            )
+        # P0-1 R3: the request and decision bind to
+        # ``approval_subject_hash`` (what the human approved), NOT the
+        # final ``authorization_hash``.
+        subject_hash = authorization.approval_subject_hash
+        if subject_hash is None:
+            raise ApprovalValidationError(
+                "authorization has no approval_subject_hash (approval_id missing)",
+            )
+        if request.authorization_hash != subject_hash:
+            raise ApprovalValidationError(
+                "request.authorization_hash does not match approval_subject_hash",
+            )
+        if decision.authorization_hash != subject_hash:
+            raise ApprovalValidationError(
+                "decision.authorization_hash does not match approval_subject_hash",
             )
         if decision.status != ApprovalStatus.APPROVED:
             raise ApprovalValidationError(

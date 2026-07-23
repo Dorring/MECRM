@@ -531,6 +531,16 @@ class NoKillSwitch:
     async def is_kill_switch_active(self, tenant_id: str) -> bool:
         return False
 
+    async def is_kill_switch_active_for_scope(
+        self,
+        *,
+        tenant_id: str,
+        run_id: str,
+        action_type: str | None = None,
+        adapter_id: str | None = None,
+    ) -> bool:
+        return False
+
 
 class AlwaysKillSwitch:
     """Kill switch that is always active for a given tenant."""
@@ -544,6 +554,16 @@ class AlwaysKillSwitch:
     async def is_kill_switch_active(self, tenant_id: str) -> bool:
         return tenant_id == self._tenant_id
 
+    async def is_kill_switch_active_for_scope(
+        self,
+        *,
+        tenant_id: str,
+        run_id: str,
+        action_type: str | None = None,
+        adapter_id: str | None = None,
+    ) -> bool:
+        return True
+
 
 class CancelledRun:
     """Kill switch that reports a specific run as cancelled."""
@@ -555,6 +575,16 @@ class CancelledRun:
         return run_id == self._run_id
 
     async def is_kill_switch_active(self, tenant_id: str) -> bool:
+        return False
+
+    async def is_kill_switch_active_for_scope(
+        self,
+        *,
+        tenant_id: str,
+        run_id: str,
+        action_type: str | None = None,
+        adapter_id: str | None = None,
+    ) -> bool:
         return False
 
 

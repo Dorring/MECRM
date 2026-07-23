@@ -317,27 +317,33 @@ class ApprovalDecision(StrictContract):
 
 
 class ApprovalConsumptionRecord(StrictContract):
-    """P0-2: record of an approval consumption bound to a specific command.
+    """P0-2 / P0-6 R3: record of an approval consumption bound to a
+    command family.
 
-    The consumption is bound to the exact command_id and execution_fingerprint
-    so a replay of the same command can read the original consumption (not a
-    second illegal consume), while a different command cannot reuse it.
+    R3 changes: consumption is now bound to ``command_family_id`` (not
+    a single ``command_id``) so that safe retries within the same family
+    can reuse the consumption.  The record also carries
+    ``approval_subject_hash`` (the hash the human approved) alongside
+    ``authorization_hash`` (the final execution authorization hash) so
+    the full approval → execution chain is verifiable.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     approval_id: str
     decision_hash: str
+    approval_subject_hash: str
     authorization_hash: str
-    command_id: str
+    command_family_id: str
     execution_fingerprint: str
     consumption_hash: str = ""
 
     @field_validator(
         "approval_id",
         "decision_hash",
+        "approval_subject_hash",
         "authorization_hash",
-        "command_id",
+        "command_family_id",
         "execution_fingerprint",
     )
     @classmethod

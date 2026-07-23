@@ -590,11 +590,35 @@ class ExecutionCancellation(Protocol):
 
     Both methods are async so a future Redis-backed adapter can poll
     the real switch without changing the call sites.
+
+    R3 P0-11: :meth:`is_kill_switch_active_for_scope` checks all 5
+    scopes (global, tenant, run, action_type, adapter_id) in one call.
+    Implementations MUST fail-closed (return True) on any internal
+    exception.  Protocol methods with bodies are allowed in Python 3.12+
+    but for backward compat with 3.10 this method uses ``...`` body;
+    implementers provide the body.
     """
 
     async def is_cancelled(self, run_id: str) -> bool: ...
 
     async def is_kill_switch_active(self, tenant_id: str) -> bool: ...
+
+    async def is_kill_switch_active_for_scope(
+        self,
+        *,
+        tenant_id: str,
+        run_id: str,
+        action_type: str | None = None,
+        adapter_id: str | None = None,
+    ) -> bool:
+        """R3 P0-11: aggregate kill-switch check across 5 scopes:
+        global, tenant, run, action_type, adapter_id.
+
+        Implementations MUST fail-closed (return True) on any
+        internal exception.  Default implementation falls back to
+        tenant-scoped check for backward compatibility.
+        """
+        ...
 
 
 class FakeExecutionCancellation:
@@ -602,11 +626,19 @@ class FakeExecutionCancellation:
 
     Starts inactive; tests flip ``cancelled_runs`` /
     ``kill_switch_tenants`` to simulate a cancel or kill-switch event.
+
+    R3 P0-11: supports the 5-scope kill switch via
+    ``global_kill_switch``, ``kill_switch_action_types``, and
+    ``kill_switch_adapter_ids``.  :meth:`is_kill_switch_active_for_scope`
+    returns True if ANY of the 5 scopes is active.
     """
 
     def __init__(self) -> None:
         self.cancelled_runs: set[str] = set()
         self.kill_switch_tenants: set[str] = set()
+        self.kill_switch_action_types: set[str] = set()
+        self.kill_switch_adapter_ids: set[str] = set()
+        self.global_kill_switch: bool = False
 
     def cancel_run(self, run_id: str) -> None:
         self.cancelled_runs.add(run_id)
@@ -619,6 +651,27 @@ class FakeExecutionCancellation:
 
     async def is_kill_switch_active(self, tenant_id: str) -> bool:
         return tenant_id in self.kill_switch_tenants
+
+    async def is_kill_switch_active_for_scope(
+        self,
+        *,
+        tenant_id: str,
+        run_id: str,
+        action_type: str | None = None,
+        adapter_id: str | None = None,
+    ) -> bool:
+        """R3 P0-11: return True if ANY of the 5 scopes is active."""
+        if self.global_kill_switch:
+            return True
+        if tenant_id in self.kill_switch_tenants:
+            return True
+        if run_id in self.cancelled_runs:
+            return True
+        if action_type is not None and action_type in self.kill_switch_action_types:
+            return True
+        if adapter_id is not None and adapter_id in self.kill_switch_adapter_ids:
+            return True
+        return False
 
 
 # ---------------------------------------------------------------------------

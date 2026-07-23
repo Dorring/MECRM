@@ -318,6 +318,9 @@ def _make_appr_request(
     risk_level: ReviewRiskLevel = ReviewRiskLevel.HIGH,
     action_type: str = "crm.owner.assign",
 ) -> ApprovalRequest:
+    # P0-1 R3: the request binds to approval_subject_hash (what the
+    # human approves), NOT the final authorization_hash.
+    subject_hash = auth.approval_subject_hash or auth.authorization_hash
     return ApprovalRequest(
         approval_id=approval_id,
         authorization_id=auth.authorization_id,
@@ -326,7 +329,7 @@ def _make_appr_request(
         proposal_id=auth.proposal_id,
         review_request_hash="r" * 64,
         review_result_hash="s" * 64,
-        authorization_hash=auth.authorization_hash,
+        authorization_hash=subject_hash,
         risk_level=risk_level,
         action_type=action_type,
         action_summary="test action",
@@ -345,6 +348,8 @@ def _make_appr_decision(
     decided_at: datetime = _APPR_TS,
     authorization_hash: str | None = None,
 ) -> ApprovalDecision:
+    # P0-1 R3: the decision binds to approval_subject_hash (same as
+    # the request), NOT the final authorization_hash.
     ah = authorization_hash or request.authorization_hash
     return ApprovalDecision(
         approval_id=request.approval_id,
@@ -576,12 +581,13 @@ class TestPhase5BR1TrustChain:
         assert batch.batch_status == BatchExecutionStatus.SUCCEEDED
 
     # ------------------------------------------------------------------
-    # P0-3: Atomic validate-and-consume (4 tests)
+    # P0-3: Atomic consume_for_command (4 tests)
     # ------------------------------------------------------------------
 
     def test_wrong_authorization_hash_leaves_approval_available(self) -> None:
-        """A consume with a wrong authorization_hash fails WITHOUT
-        consuming the approval — a subsequent valid consume succeeds."""
+        """P0-1 R3: a consume with a wrong approval_subject_hash fails
+        WITHOUT consuming the approval — a subsequent valid consume
+        succeeds."""
         auth = _make_auth(approval_id="appr-001")
         request = _make_appr_request(auth=auth, required_roles=("manager",))
         decision = _make_appr_decision(request=request, approver_roles=("manager",))
@@ -589,20 +595,31 @@ class TestPhase5BR1TrustChain:
         run_async(store.create(request))
         run_async(store.decide("appr-001", decision))
 
-        # Consume with wrong authorization_hash → fails.
-        auth_wrong = _make_auth(approval_id="appr-001", authorization_hash="w" * 64)
+        # Consume with wrong approval_subject_hash → fails.
+        auth_wrong = _make_auth(approval_id="appr-001")
+        object.__setattr__(auth_wrong, "approval_subject_hash", "w" * 64)
         with pytest.raises(ApprovalValidationError):
             run_async(
-                store.validate_and_consume(
-                    "appr-001", authorization=auth_wrong, now=_APPR_TS
+                store.consume_for_command(
+                    "appr-001",
+                    authorization=auth_wrong,
+                    command_family_id="cfam-001",
+                    execution_fingerprint="fp-001",
+                    now=_APPR_TS,
                 )
             )
 
         # Consume with correct auth → succeeds (approval was NOT consumed).
         consumed = run_async(
-            store.validate_and_consume("appr-001", authorization=auth, now=_APPR_TS)
+            store.consume_for_command(
+                "appr-001",
+                authorization=auth,
+                command_family_id="cfam-001",
+                execution_fingerprint="fp-001",
+                now=_APPR_TS,
+            )
         )
-        assert consumed.status == ApprovalStatus.APPROVED
+        assert consumed.approval_id == "appr-001"
 
     def test_expired_at_consume_time_leaves_approval_available(self) -> None:
         """An approval decided before expiry but consumed after expiry
@@ -622,16 +639,26 @@ class TestPhase5BR1TrustChain:
         # Consume AFTER expiry → fails (P0-3: uses execution clock).
         with pytest.raises(ApprovalValidationError):
             run_async(
-                store.validate_and_consume(
-                    "appr-001", authorization=auth, now=_APPR_TS_EXPIRED
+                store.consume_for_command(
+                    "appr-001",
+                    authorization=auth,
+                    command_family_id="cfam-001",
+                    execution_fingerprint="fp-001",
+                    now=_APPR_TS_EXPIRED,
                 )
             )
 
         # Consume BEFORE expiry → succeeds (approval was NOT consumed).
         consumed = run_async(
-            store.validate_and_consume("appr-001", authorization=auth, now=_APPR_TS)
+            store.consume_for_command(
+                "appr-001",
+                authorization=auth,
+                command_family_id="cfam-001",
+                execution_fingerprint="fp-001",
+                now=_APPR_TS,
+            )
         )
-        assert consumed.status == ApprovalStatus.APPROVED
+        assert consumed.approval_id == "appr-001"
 
     def test_wrong_tenant_leaves_approval_available(self) -> None:
         """A consume with a mismatched tenant_id fails WITHOUT consuming
@@ -649,20 +676,32 @@ class TestPhase5BR1TrustChain:
 
         with pytest.raises(ApprovalValidationError):
             run_async(
-                store.validate_and_consume(
-                    "appr-001", authorization=auth_wrong_tenant, now=_APPR_TS
+                store.consume_for_command(
+                    "appr-001",
+                    authorization=auth_wrong_tenant,
+                    command_family_id="cfam-001",
+                    execution_fingerprint="fp-001",
+                    now=_APPR_TS,
                 )
             )
 
         # Correct auth → succeeds (approval was NOT consumed).
         consumed = run_async(
-            store.validate_and_consume("appr-001", authorization=auth, now=_APPR_TS)
+            store.consume_for_command(
+                "appr-001",
+                authorization=auth,
+                command_family_id="cfam-001",
+                execution_fingerprint="fp-001",
+                now=_APPR_TS,
+            )
         )
-        assert consumed.status == ApprovalStatus.APPROVED
+        assert consumed.approval_id == "appr-001"
 
     def test_successful_consume_blocks_second_consume(self) -> None:
         """A valid consume marks the approval CONSUMED; a second consume
-        attempt is rejected (single-consume rule)."""
+        with a DIFFERENT command family is rejected (single-consume rule).
+        A replay with the SAME family + fingerprint returns the original
+        consumption (NOT a second consume)."""
         auth = _make_auth(approval_id="appr-001")
         request = _make_appr_request(auth=auth, required_roles=("manager",))
         decision = _make_appr_decision(request=request, approver_roles=("manager",))
@@ -672,14 +711,39 @@ class TestPhase5BR1TrustChain:
 
         # First consume → succeeds.
         consumed = run_async(
-            store.validate_and_consume("appr-001", authorization=auth, now=_APPR_TS)
+            store.consume_for_command(
+                "appr-001",
+                authorization=auth,
+                command_family_id="cfam-001",
+                execution_fingerprint="fp-001",
+                now=_APPR_TS,
+            )
         )
-        assert consumed.status == ApprovalStatus.APPROVED
+        assert consumed.approval_id == "appr-001"
 
-        # Second consume → fails (already consumed).
+        # Replay with SAME family + fingerprint → returns original (NOT
+        # a second illegal consume).
+        replay = run_async(
+            store.consume_for_command(
+                "appr-001",
+                authorization=auth,
+                command_family_id="cfam-001",
+                execution_fingerprint="fp-001",
+                now=_APPR_TS,
+            )
+        )
+        assert replay.consumption_hash == consumed.consumption_hash
+
+        # Second consume with DIFFERENT family → fails (already consumed).
         with pytest.raises(ApprovalValidationError):
             run_async(
-                store.validate_and_consume("appr-001", authorization=auth, now=_APPR_TS)
+                store.consume_for_command(
+                    "appr-001",
+                    authorization=auth,
+                    command_family_id="cfam-002",
+                    execution_fingerprint="fp-002",
+                    now=_APPR_TS,
+                )
             )
 
     # ------------------------------------------------------------------
@@ -1026,9 +1090,11 @@ class TestPhase5BR1TrustChain:
     # P0-8: Deadline / concurrency / retry (3 tests)
     # ------------------------------------------------------------------
 
-    def test_batch_deadline_exceeded_returns_unknown(self) -> None:
-        """When the batch deadline is exceeded before an action starts,
-        the result is UNKNOWN with EXECUTION_DEADLINE_EXCEEDED (P0-8)."""
+    def test_batch_deadline_exceeded_returns_cancelled(self) -> None:
+        """P0-4 R3: when the batch deadline is exceeded before an action
+        starts, the result is CANCELLED (NOT UNKNOWN) with
+        EXECUTION_DEADLINE_EXCEEDED — pre-dispatch failures must never
+        be UNKNOWN."""
         request, result, _ = make_approved_request_result()
         sink: list = []
         registry = make_recording_registry(sink)
@@ -1040,7 +1106,8 @@ class TestPhase5BR1TrustChain:
             options=ExecutionOptions(dry_run=False, batch_deadline_seconds=0.5),
             clock=_AdvancingClock(TS, timedelta(seconds=1)),
         )
-        assert batch.batch_status == BatchExecutionStatus.UNKNOWN
+        # R3 P0-4: pre-dispatch deadline → CANCELLED, NOT UNKNOWN.
+        assert batch.batch_status == BatchExecutionStatus.CANCELLED
         assert len(sink) == 0
 
     def test_retry_succeeds_for_confirmed_not_executed_failed(self) -> None:

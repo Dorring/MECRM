@@ -168,6 +168,9 @@ class TestReceiptHashCoversEveryField:
         # Build a different proposal_id authorization.
         a2_data = auth2.model_dump(mode="python")
         a2_data["proposal_id"] = "prop-002"
+        a2_data["base_authorization_hash"] = ""  # recompute (R3 three-tier)
+        a2_data["approval_subject_hash"] = None  # recompute
+        a2_data["pre_approval_authorization_hash"] = None  # recompute
         a2_data["authorization_hash"] = ""  # recompute
         auth2 = ExecutionAuthorization.model_validate(a2_data)
         r2 = _make_receipt(authorization=auth2)

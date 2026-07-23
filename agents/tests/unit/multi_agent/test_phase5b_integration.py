@@ -202,6 +202,9 @@ class TestPhase5BEndToEnd:
         )
 
         # Step 3: Create an approval request bound to this authorization.
+        # P0-1 R3: request.authorization_hash binds to
+        # approval_subject_hash (what the human approves), NOT the final
+        # authorization_hash.
         approval_request = ApprovalRequest(
             approval_id="appr-001",
             authorization_id=auth.authorization_id,
@@ -210,7 +213,7 @@ class TestPhase5BEndToEnd:
             proposal_id=review.proposal_id,
             review_request_hash=request.request_hash,
             review_result_hash=result.result_hash,
-            authorization_hash=auth.authorization_hash,
+            authorization_hash=auth.approval_subject_hash or auth.authorization_hash,
             risk_level=ReviewRiskLevel.HIGH,
             action_type=auth.action_type,
             action_summary="test high-risk action",
@@ -230,16 +233,24 @@ class TestPhase5BEndToEnd:
             decision_reason="approved by test",
             decided_at=TS,
             approval_request_hash=approval_request.approval_request_hash,
-            authorization_hash=auth.authorization_hash,
+            authorization_hash=approval_request.authorization_hash,
         )
         run_async(approval_store.decide("appr-001", decision))
 
         # Step 5: Consume the approval — the lifecycle succeeds.
-        consumed = run_async(
-            approval_store.consume("appr-001", auth.authorization_hash)
+        # R3: use consume_for_command (bound to command_family_id) instead
+        # of the deprecated consume().
+        consumption = run_async(
+            approval_store.consume_for_command(
+                "appr-001",
+                authorization=auth,
+                command_family_id="cfam-integration-001",
+                execution_fingerprint="fp-integration-001",
+                now=TS,
+            )
         )
-        assert consumed.status == ApprovalStatus.APPROVED
-        assert consumed.approval_id == "appr-001"
+        assert consumption.approval_id == "appr-001"
+        assert consumption.command_family_id == "cfam-integration-001"
 
     def test_full_pipeline_rejected_skipped(self) -> None:
         """A REJECTED Proposal is never executed — batch is BLOCKED

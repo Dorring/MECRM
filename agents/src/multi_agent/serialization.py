@@ -110,7 +110,7 @@ def deserialize_contract(raw: str, model_cls: type[BaseModel]) -> Any:
     return model_cls.model_validate(data)
 
 
-def stable_hash(obj: Any, *, exclude: set[str] | None = None) -> str:
+def stable_hash(obj: Any, *, exclude: frozenset[str] | set[str] | None = None) -> str:
     """Return a SHA-256 hex digest of *obj*'s canonical form.
 
     When *obj* is a BaseModel its fields named in *exclude* are dropped first.

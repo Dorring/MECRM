@@ -676,6 +676,16 @@ class _DelayedCancellation:
     async def is_kill_switch_active(self, tenant_id: str) -> bool:
         return False
 
+    async def is_kill_switch_active_for_scope(
+        self,
+        *,
+        tenant_id: str,
+        run_id: str,
+        action_type: str | None = None,
+        adapter_id: str | None = None,
+    ) -> bool:
+        return False
+
 
 # ===========================================================================
 # P0-1: Pre-cancelled Run must pass full Pre-flight

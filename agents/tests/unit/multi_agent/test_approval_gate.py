@@ -109,11 +109,15 @@ def _make_approval_request(
 ) -> ApprovalRequest:
     auth = _make_authorization(
         authorization_id=authorization_id,
+        approval_id=approval_id,
         proposal_id=proposal_id,
         action_type=action_type,
         risk_level=risk_level,
     )
-    ah = authorization_hash or auth.authorization_hash
+    # P0-1 R3: the request binds to approval_subject_hash (what the
+    # human approves), NOT the final authorization_hash.
+    default_hash = auth.approval_subject_hash or auth.authorization_hash
+    ah = authorization_hash or default_hash
     return ApprovalRequest(
         approval_id=approval_id,
         authorization_id=authorization_id,
@@ -146,6 +150,8 @@ def _make_decision(
 ) -> ApprovalDecision:
     request = _make_approval_request(approval_id=approval_id)
     arh = approval_request_hash or request.approval_request_hash
+    # P0-1 R3: the decision binds to approval_subject_hash (same as the
+    # request), NOT the final authorization_hash.
     ah = authorization_hash or request.authorization_hash
     return ApprovalDecision(
         approval_id=approval_id,
@@ -396,17 +402,16 @@ class TestValidateDecisionFailClosed:
             gate.validate_decision(forged_decision, request, auth)
 
     def test_authorization_hash_mismatch_blocks(self) -> None:
-        """The decision's ``authorization_hash`` MUST match the
-        authorization being executed."""
+        """P0-1 R3: the decision's ``authorization_hash`` MUST match
+        the authorization's ``approval_subject_hash`` (what the human
+        approved).  Forging the subject hash blocks the decision."""
         request = _make_approval_request()
         decision = _make_decision()
-        # Authorization with a different authorization_hash.
+        # Authorization with a forged approval_subject_hash.
         auth = _make_authorization(
             approval_id=request.approval_id,
-            # authorization_hash will be auto-computed; we then forge a
-            # different value to create the mismatch.
         )
-        object.__setattr__(auth, "authorization_hash", "z" * 64)
+        object.__setattr__(auth, "approval_subject_hash", "z" * 64)
         gate = ApprovalGate()
         with pytest.raises(ApprovalValidationError):
             gate.validate_decision(decision, request, auth)
@@ -493,24 +498,52 @@ class TestValidateDecisionFailClosed:
 
 class TestApprovalStoreSingleConsume:
     def test_approval_can_only_be_consumed_once(self) -> None:
-        """An APPROVED decision can be consumed exactly ONCE."""
+        """An APPROVED decision can be consumed exactly ONCE per command
+        family.  A replay with the SAME family returns the original
+        consumption; a DIFFERENT family is rejected."""
         store = InMemoryApprovalStore()
         request = _make_approval_request()
         run_async(store.create(request))
         decision = _make_decision()
         run_async(store.decide(request.approval_id, decision))
+        auth = _make_authorization(approval_id=request.approval_id)
 
         # First consume succeeds.
         consumed = run_async(
-            store.consume(request.approval_id, request.authorization_hash)
+            store.consume_for_command(
+                request.approval_id,
+                authorization=auth,
+                command_family_id="cfam-001",
+                execution_fingerprint="fp-001",
+                now=_TS,
+            )
         )
-        assert consumed.status == ApprovalStatus.APPROVED
+        assert consumed.approval_id == request.approval_id
 
-        # Second consume MUST fail — the store marks it as already consumed.
-        # ApprovalValidationError carries error_code=APPROVAL_REJECTED (the
-        # class default); the specific cause is reflected in the message.
+        # Replay with SAME family + fingerprint → returns original (NOT
+        # a second illegal consume).
+        replay = run_async(
+            store.consume_for_command(
+                request.approval_id,
+                authorization=auth,
+                command_family_id="cfam-001",
+                execution_fingerprint="fp-001",
+                now=_TS,
+            )
+        )
+        assert replay.consumption_hash == consumed.consumption_hash
+
+        # Consume with a DIFFERENT family → MUST fail.
         with pytest.raises(ApprovalValidationError) as exc:
-            run_async(store.consume(request.approval_id, request.authorization_hash))
+            run_async(
+                store.consume_for_command(
+                    request.approval_id,
+                    authorization=auth,
+                    command_family_id="cfam-002",
+                    execution_fingerprint="fp-002",
+                    now=_TS,
+                )
+            )
         assert "already consumed" in str(exc.value).lower()
 
     def test_consume_without_decision_blocks(self) -> None:
@@ -519,13 +552,31 @@ class TestApprovalStoreSingleConsume:
         store = InMemoryApprovalStore()
         request = _make_approval_request()
         run_async(store.create(request))
+        auth = _make_authorization(approval_id=request.approval_id)
         with pytest.raises(ApprovalRequiredError):
-            run_async(store.consume(request.approval_id, request.authorization_hash))
+            run_async(
+                store.consume_for_command(
+                    request.approval_id,
+                    authorization=auth,
+                    command_family_id="cfam-001",
+                    execution_fingerprint="fp-001",
+                    now=_TS,
+                )
+            )
 
     def test_consume_unknown_approval_blocks(self) -> None:
         store = InMemoryApprovalStore()
+        auth = _make_authorization(approval_id="appr-unknown")
         with pytest.raises(ApprovalValidationError):
-            run_async(store.consume("appr-unknown", "a" * 64))
+            run_async(
+                store.consume_for_command(
+                    "appr-unknown",
+                    authorization=auth,
+                    command_family_id="cfam-001",
+                    execution_fingerprint="fp-001",
+                    now=_TS,
+                )
+            )
 
     def test_decide_twice_blocks(self) -> None:
         """Only ONE terminal decision may be applied per approval."""
@@ -547,8 +598,17 @@ class TestApprovalStoreSingleConsume:
         run_async(store.create(request))
         decision = _make_decision(status=ApprovalStatus.EXPIRED)
         run_async(store.decide(request.approval_id, decision))
+        auth = _make_authorization(approval_id=request.approval_id)
         with pytest.raises(ApprovalValidationError) as exc:
-            run_async(store.consume(request.approval_id, request.authorization_hash))
+            run_async(
+                store.consume_for_command(
+                    request.approval_id,
+                    authorization=auth,
+                    command_family_id="cfam-001",
+                    execution_fingerprint="fp-001",
+                    now=_TS,
+                )
+            )
         assert "expired" in str(exc.value).lower()
 
     def test_revoked_decision_cannot_be_consumed(self) -> None:
@@ -558,8 +618,17 @@ class TestApprovalStoreSingleConsume:
         run_async(store.create(request))
         decision = _make_decision(status=ApprovalStatus.REVOKED)
         run_async(store.decide(request.approval_id, decision))
+        auth = _make_authorization(approval_id=request.approval_id)
         with pytest.raises(ApprovalValidationError) as exc:
-            run_async(store.consume(request.approval_id, request.authorization_hash))
+            run_async(
+                store.consume_for_command(
+                    request.approval_id,
+                    authorization=auth,
+                    command_family_id="cfam-001",
+                    execution_fingerprint="fp-001",
+                    now=_TS,
+                )
+            )
         assert "revoked" in str(exc.value).lower()
 
     def test_rejected_decision_cannot_be_consumed(self) -> None:
@@ -569,23 +638,39 @@ class TestApprovalStoreSingleConsume:
         run_async(store.create(request))
         decision = _make_decision(status=ApprovalStatus.REJECTED)
         run_async(store.decide(request.approval_id, decision))
+        auth = _make_authorization(approval_id=request.approval_id)
         with pytest.raises(ApprovalValidationError) as exc:
-            run_async(store.consume(request.approval_id, request.authorization_hash))
+            run_async(
+                store.consume_for_command(
+                    request.approval_id,
+                    authorization=auth,
+                    command_family_id="cfam-001",
+                    execution_fingerprint="fp-001",
+                    now=_TS,
+                )
+            )
         assert exc.value.error_code == APPROVAL_REJECTED
 
     def test_consume_with_mismatched_authorization_hash_blocks(self) -> None:
-        """The consume call's ``authorization_hash`` MUST match the
-        decision's ``authorization_hash``."""
+        """P0-1 R3: the consume call's ``approval_subject_hash`` MUST
+        match the request / decision's ``authorization_hash``.  Forging
+        the subject hash blocks consumption."""
         store = InMemoryApprovalStore()
         request = _make_approval_request()
         run_async(store.create(request))
         decision = _make_decision()
         run_async(store.decide(request.approval_id, decision))
+        # Forge an auth with a different approval_subject_hash.
+        auth = _make_authorization(approval_id=request.approval_id)
+        object.__setattr__(auth, "approval_subject_hash", "z" * 64)
         with pytest.raises(ApprovalValidationError):
             run_async(
-                store.consume(
+                store.consume_for_command(
                     request.approval_id,
-                    "different-authorization-hash",
+                    authorization=auth,
+                    command_family_id="cfam-001",
+                    execution_fingerprint="fp-001",
+                    now=_TS,
                 )
             )
 
