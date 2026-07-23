@@ -16,7 +16,6 @@ from __future__ import annotations
 from typing import Protocol
 
 from multi_agent.contracts import AgentAuthority, ComplexityDecision
-from multi_agent.registry import AgentRegistry
 from multi_agent.planning import (
     PlanningRequest,
     PlanningSignals,
@@ -29,6 +28,7 @@ from multi_agent.planning_errors import (
     RegistryVersionMismatchError,
     UnsupportedCapabilityError,
 )
+from multi_agent.registry import AgentRegistry
 
 # ---------------------------------------------------------------------------
 # Deterministic event allowlist
@@ -340,7 +340,6 @@ class RuleBasedComplexityGate:
 
 __all__ = [
     "CUSTOMER_RECOVERY_OBJECTIVE_KIND",
-    "ComplexityGate",
     "DETERMINISTIC_EVENT_TYPES",
     "KAFKA_TOPIC_TO_EVENT_TYPE",
     "REASON_CONFLICTING_SIGNALS",
@@ -353,5 +352,6 @@ __all__ = [
     "REASON_NO_CAPABLE_AGENT",
     "REASON_REGISTRY_VERSION_MISMATCH",
     "REASON_SINGLE_DOMAIN_SINGLE_TASK",
+    "ComplexityGate",
     "RuleBasedComplexityGate",
 ]

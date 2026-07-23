@@ -65,7 +65,6 @@ from multi_agent.review_errors import (
 )
 from multi_agent.reviewer import ProposalReviewer
 
-
 # ---------------------------------------------------------------------------
 # Graph state
 # ---------------------------------------------------------------------------

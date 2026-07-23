@@ -1,0 +1,216 @@
+"""Phase 5B — Stable execution error codes and exception hierarchy.
+
+All execution-path errors use these stable string codes (not free-form
+strings) and typed exception classes.  This module is the single
+source of truth for Phase 5B error semantics.
+
+Design rules
+------------
+
+* Error codes are stable string constants — they enter receipts,
+  trace events, and audit logs.  Renaming a code is a breaking change.
+* Exception classes carry the ``error_code`` attribute so consumers
+  can switch on it without parsing messages.
+* Unknown-outcome errors use ``ExecutionUnknownOutcomeError`` and
+  MUST NOT be retried automatically (Phase 5B Section 17).
+"""
+
+from __future__ import annotations
+
+# ---------------------------------------------------------------------------
+# Stable error codes — Phase 5B Section 26
+# ---------------------------------------------------------------------------
+
+EXECUTION_NOT_AUTHORIZED = "execution_not_authorized"
+APPROVAL_REQUIRED = "approval_required"
+APPROVAL_REJECTED = "approval_rejected"
+APPROVAL_EXPIRED = "approval_expired"
+APPROVAL_REVOKED = "approval_revoked"
+APPROVAL_ALREADY_CONSUMED = "approval_already_consumed"
+APPROVAL_CONFLICT = "approval_conflict"
+AUTHORIZATION_INTEGRITY_FAILED = "authorization_integrity_failed"
+REVIEW_BINDING_MISMATCH = "review_binding_mismatch"
+GOVERNANCE_SPEC_MISMATCH = "governance_spec_mismatch"
+GOVERNANCE_SPEC_DRIFT = "governance_spec_drift"
+ADAPTER_NOT_FOUND = "adapter_not_found"
+ADAPTER_VERSION_MISMATCH = "adapter_version_mismatch"
+ADAPTER_BINDING_DRIFT = "adapter_binding_drift"
+ACTION_NOT_SUPPORTED = "action_not_supported"
+KILL_SWITCH_ACTIVE = "kill_switch_active"
+IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+EXECUTION_ALREADY_IN_PROGRESS = "execution_already_in_progress"
+EXECUTION_OUTCOME_UNKNOWN = "execution_outcome_unknown"
+EXECUTION_TIMEOUT = "execution_timeout"
+EXECUTION_CANCELLED = "execution_cancelled"
+EXECUTION_CANCELLED_BEFORE_CALL = "execution_cancelled_before_call"
+INVALID_ADAPTER_OUTCOME = "invalid_adapter_outcome"
+INVALID_EXECUTION_RECEIPT = "invalid_execution_receipt"
+TENANT_MISMATCH = "tenant_mismatch"
+EXECUTION_DEADLINE_EXCEEDED = "execution_deadline_exceeded"
+DRY_RUN_NOT_SUPPORTED = "dry_run_not_supported"
+
+# Phase 5B R2 — additional error codes
+APPROVAL_ALREADY_CONSUMED_BY_OTHER_COMMAND = (
+    "approval_already_consumed_by_other_command"
+)
+EXECUTION_NOT_CONSUMED = "execution_not_consumed"
+ILLEGAL_STATE_TRANSITION = "illegal_state_transition"
+DRY_RUN_BLOCKED_REAL_EXECUTION = "dry_run_blocked_real_execution"
+
+
+# ---------------------------------------------------------------------------
+# Exception hierarchy
+# ---------------------------------------------------------------------------
+
+
+class ExecutionError(Exception):
+    """Base class for all Phase 5B execution errors.
+
+    Every subclass carries a stable ``error_code`` string so audit
+    consumers can switch on it without parsing messages.
+    """
+
+    error_code: str = "execution_error"
+
+    def __init__(self, message: str, *, proposal_id: str | None = None) -> None:
+        super().__init__(message)
+        self.proposal_id = proposal_id
+
+
+class ExecutionAuthorizationError(ExecutionError):
+    """Authorization is missing, invalid, or fails integrity check."""
+
+    error_code = AUTHORIZATION_INTEGRITY_FAILED
+
+
+class ApprovalRequiredError(ExecutionError):
+    """Proposal needs human approval before execution can proceed."""
+
+    error_code = APPROVAL_REQUIRED
+
+
+class ApprovalValidationError(ExecutionError):
+    """Approval decision is invalid (wrong role, expired, revoked,
+    already consumed, or hash mismatch)."""
+
+    error_code = APPROVAL_REJECTED
+
+
+class AdapterBindingError(ExecutionError):
+    """Adapter is not found, version mismatch, or action not supported."""
+
+    error_code = ADAPTER_NOT_FOUND
+
+
+class IdempotencyConflictError(ExecutionError):
+    """Same idempotency key with a different execution fingerprint."""
+
+    error_code = IDEMPOTENCY_CONFLICT
+
+
+class ExecutionAlreadyInProgressError(ExecutionError):
+    """Same idempotency key is already IN_PROGRESS."""
+
+    error_code = EXECUTION_ALREADY_IN_PROGRESS
+
+
+class ExecutionTimeoutError(ExecutionError):
+    """Adapter call exceeded the per-action timeout or batch deadline."""
+
+    error_code = EXECUTION_TIMEOUT
+
+
+class ExecutionUnknownOutcomeError(ExecutionError):
+    """Adapter outcome could not be confirmed (timeout, cancellation,
+    or connection loss before a definitive result).
+
+    Phase 5B Section 17: UNKNOWN outcomes MUST NOT be automatically
+    retried.  The idempotency record is marked UNKNOWN and requires
+    human intervention.
+    """
+
+    error_code = EXECUTION_OUTCOME_UNKNOWN
+
+
+class ExecutionReceiptError(ExecutionError):
+    """Receipt fails integrity or cross-binding verification."""
+
+    error_code = INVALID_EXECUTION_RECEIPT
+
+
+class ExecutionIntegrityError(ExecutionError):
+    """Review result, governance spec, or tenant identity mismatch."""
+
+    error_code = REVIEW_BINDING_MISMATCH
+
+
+class KillSwitchExecutionBlockedError(ExecutionError):
+    """Kill Switch is active for the tenant, action type, adapter, or
+    globally.  No Adapter call is permitted."""
+
+    error_code = KILL_SWITCH_ACTIVE
+
+
+class GovernanceSpecDriftError(ExecutionError):
+    """P0-9: live governance spec hash does not match the request."""
+
+    error_code = GOVERNANCE_SPEC_DRIFT
+
+
+class AdapterBindingDriftError(ExecutionError):
+    """P0-4: live adapter does not match the frozen binding snapshot."""
+
+    error_code = ADAPTER_BINDING_DRIFT
+
+
+# Re-export for convenience
+__all__ = [
+    "ACTION_NOT_SUPPORTED",
+    "ADAPTER_BINDING_DRIFT",
+    "ADAPTER_NOT_FOUND",
+    "ADAPTER_VERSION_MISMATCH",
+    "APPROVAL_ALREADY_CONSUMED",
+    # Phase 5B R2 — additional error codes
+    "APPROVAL_ALREADY_CONSUMED_BY_OTHER_COMMAND",
+    "APPROVAL_CONFLICT",
+    "APPROVAL_EXPIRED",
+    "APPROVAL_REJECTED",
+    "APPROVAL_REQUIRED",
+    "APPROVAL_REVOKED",
+    "AUTHORIZATION_INTEGRITY_FAILED",
+    "DRY_RUN_BLOCKED_REAL_EXECUTION",
+    "DRY_RUN_NOT_SUPPORTED",
+    "EXECUTION_ALREADY_IN_PROGRESS",
+    "EXECUTION_CANCELLED",
+    "EXECUTION_CANCELLED_BEFORE_CALL",
+    "EXECUTION_DEADLINE_EXCEEDED",
+    # Error codes
+    "EXECUTION_NOT_AUTHORIZED",
+    "EXECUTION_NOT_CONSUMED",
+    "EXECUTION_OUTCOME_UNKNOWN",
+    "EXECUTION_TIMEOUT",
+    "GOVERNANCE_SPEC_DRIFT",
+    "GOVERNANCE_SPEC_MISMATCH",
+    "IDEMPOTENCY_CONFLICT",
+    "ILLEGAL_STATE_TRANSITION",
+    "INVALID_ADAPTER_OUTCOME",
+    "INVALID_EXECUTION_RECEIPT",
+    "KILL_SWITCH_ACTIVE",
+    "REVIEW_BINDING_MISMATCH",
+    "TENANT_MISMATCH",
+    "AdapterBindingDriftError",
+    "AdapterBindingError",
+    "ApprovalRequiredError",
+    "ApprovalValidationError",
+    "ExecutionAlreadyInProgressError",
+    "ExecutionAuthorizationError",
+    # Exception classes
+    "ExecutionError",
+    "ExecutionIntegrityError",
+    "ExecutionReceiptError",
+    "ExecutionTimeoutError",
+    "ExecutionUnknownOutcomeError",
+    "GovernanceSpecDriftError",
+    "IdempotencyConflictError",
+    "KillSwitchExecutionBlockedError",
+]

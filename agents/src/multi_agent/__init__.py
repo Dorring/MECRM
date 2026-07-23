@@ -1,5 +1,65 @@
 """Multi-agent contracts, registry, state merge, serialization, and planning."""
 
+from multi_agent.action_adapter import (
+    ActionAdapter,
+    ActionAdapterBinding,
+    ActionAdapterRegistry,
+    ActionAdapterRegistrySnapshot,
+    AdapterExecutionOutcome,
+    DeterministicNoopAdapter,
+    ExecutionCommand,
+    IdempotencyScope,
+    RecordingActionAdapter,
+    build_default_registry,
+    build_default_registry_snapshot,
+    compute_execution_fingerprint,
+)
+from multi_agent.action_governance import (
+    ACTION_GOVERNANCE_REGISTRY,
+    ACTION_GOVERNANCE_SPEC_HASH,
+    ACTION_GOVERNANCE_SPEC_VERSION,
+    ActionGovernanceSpec,
+    compute_live_governance_spec_hash,
+    get_action_governance_spec,
+    verify_governance_spec_integrity,
+)
+from multi_agent.approval_contracts import (
+    ApprovalDecision,
+    ApprovalRequest,
+    ApprovalStatus,
+    Clock,
+    FrozenClock,
+    SystemClock,
+)
+from multi_agent.approval_gate import (
+    ApprovalGate,
+    ApprovalRequirement,
+    ApprovalStore,
+    InMemoryApprovalStore,
+)
+
+# Phase 3 — planning
+from multi_agent.complexity_gate import (
+    DETERMINISTIC_EVENT_TYPES,
+    KAFKA_TOPIC_TO_EVENT_TYPE,
+    REASON_CONFLICTING_SIGNALS,
+    REASON_CROSS_DOMAIN_OBJECTIVE,
+    REASON_CUSTOMER_RECOVERY_TEMPLATE,
+    REASON_FIXED_EVENT_ALLOWLIST,
+    REASON_MULTIPLE_TASK_TYPES,
+    REASON_SINGLE_DOMAIN_SINGLE_TASK,
+    RuleBasedComplexityGate,
+)
+from multi_agent.conflict_resolution import (
+    ConflictGroup,
+    ConflictResult,
+    DeduplicationResult,
+    DuplicateGroup,
+    compute_canonical_key,
+    detect_conflicts,
+    detect_duplicates,
+    detect_idempotency_key_conflicts,
+)
 from multi_agent.contracts import (
     ActionProposal,
     ActionRiskLevel,
@@ -41,36 +101,139 @@ from multi_agent.errors import (
     UnknownAgentError,
     UnknownToolError,
 )
-from multi_agent.integrity import compute_proposal_hash
-from multi_agent.registry import (
-    AgentHandler,
-    AgentRegistry,
-    RegistrySnapshot,
-    ToolCatalog,
+from multi_agent.evidence_review import (
+    build_evidence_index,
+    compute_review_evidence_hash,
+    detect_dangling_evidence,
+    detect_duplicate_evidence,
+    validate_evidence_for_proposal,
 )
-from multi_agent.serialization import (
-    canonicalize,
-    content_hash,
-    deserialize_contract,
-    serialize_contract,
-    serialize_set_for_json,
-    stable_hash,
-    validate_strict_json,
-)
-from multi_agent.state import MergeConflict, MergedState, merge_parallel_results
 
-# Phase 3 — planning
-from multi_agent.complexity_gate import (
-    DETERMINISTIC_EVENT_TYPES,
-    KAFKA_TOPIC_TO_EVENT_TYPE,
-    REASON_CONFLICTING_SIGNALS,
-    REASON_CROSS_DOMAIN_OBJECTIVE,
-    REASON_CUSTOMER_RECOVERY_TEMPLATE,
-    REASON_FIXED_EVENT_ALLOWLIST,
-    REASON_MULTIPLE_TASK_TYPES,
-    REASON_SINGLE_DOMAIN_SINGLE_TASK,
-    RuleBasedComplexityGate,
+# Phase 4 — Supervisor Runtime
+from multi_agent.execution import (
+    TRACE_BUDGET_EXCEEDED,
+    TRACE_PLAN_VALIDATED,
+    TRACE_RESULTS_MERGED,
+    TRACE_RUN_CANCELLED,
+    TRACE_RUN_COMPLETED,
+    TRACE_RUN_STARTED,
+    TRACE_TASK_COMPLETED,
+    TRACE_TASK_FAILED,
+    TRACE_TASK_NEEDS_INPUT,
+    TRACE_TASK_READY,
+    TRACE_TASK_RETRYING,
+    TRACE_TASK_SKIPPED,
+    TRACE_TASK_STARTED,
+    TRACE_TASK_TIMED_OUT,
+    ExecutionBinding,
+    ExecutionCancellation,
+    ExecutionCapabilitySnapshot,
+    ExecutionRunIdentity,
+    ExecutionTraceEvent,
+    FakeExecutionCancellation,
+    ResultOriginSnapshot,
+    SupervisorConfig,
+    SupervisorRunResult,
+    SupervisorRunStatus,
+    TaskAttemptRecord,
+    TaskExecutionRecord,
+    build_execution_context,
+    final_status_priority,
+    utc_now,
+    validate_agent_result,
 )
+from multi_agent.execution_authorization import (
+    BatchExecutionStatus,
+    ExecutionAuthorization,
+    ExecutionStatus,
+    batch_execution_status_priority,
+)
+
+# Phase 5B — Governed Executor & Human Approval Gate
+from multi_agent.execution_error_codes import (
+    ACTION_NOT_SUPPORTED,
+    ADAPTER_NOT_FOUND,
+    ADAPTER_VERSION_MISMATCH,
+    APPROVAL_ALREADY_CONSUMED,
+    APPROVAL_EXPIRED,
+    APPROVAL_REJECTED,
+    APPROVAL_REQUIRED,
+    APPROVAL_REVOKED,
+    AUTHORIZATION_INTEGRITY_FAILED,
+    EXECUTION_ALREADY_IN_PROGRESS,
+    EXECUTION_CANCELLED,
+    EXECUTION_DEADLINE_EXCEEDED,
+    EXECUTION_NOT_AUTHORIZED,
+    EXECUTION_OUTCOME_UNKNOWN,
+    EXECUTION_TIMEOUT,
+    GOVERNANCE_SPEC_MISMATCH,
+    IDEMPOTENCY_CONFLICT,
+    INVALID_ADAPTER_OUTCOME,
+    INVALID_EXECUTION_RECEIPT,
+    KILL_SWITCH_ACTIVE,
+    REVIEW_BINDING_MISMATCH,
+    TENANT_MISMATCH,
+    AdapterBindingError,
+    ApprovalRequiredError,
+    ApprovalValidationError,
+    ExecutionAlreadyInProgressError,
+    ExecutionAuthorizationError,
+    ExecutionError,
+    ExecutionIntegrityError,
+    ExecutionReceiptError,
+    ExecutionTimeoutError,
+    ExecutionUnknownOutcomeError,
+    IdempotencyConflictError,
+    KillSwitchExecutionBlockedError,
+)
+from multi_agent.execution_errors import (
+    ExecutionUsageUnavailableError,
+    InvalidAgentResultError,
+    InvalidInvocationReceiptError,
+    NonRetryableAgentError,
+    RetryableAgentError,
+    RunAlreadyInProgressError,
+    RunPlanConflictError,
+    SupervisorError,
+)
+from multi_agent.execution_evaluation import (
+    ExecutionExpectedOutcome,
+    ExecutionFixture,
+    ExecutionMetrics,
+    build_execution_fixtures,
+    compute_execution_metrics,
+)
+from multi_agent.execution_graph import (
+    ExecutionGraphState,
+    build_execution_graph,
+)
+from multi_agent.execution_receipts import ActionExecutionReceipt
+from multi_agent.execution_store import (
+    ExecutionStore,
+    IdempotencyRecord,
+    IdempotencyState,
+    InMemoryExecutionStore,
+)
+from multi_agent.governed_executor import (
+    ExecutionBatchResult,
+    ExecutionOptions,
+    ExecutionRetryPolicy,
+    GovernedExecutor,
+    build_authorization,
+    select_executable_reviews,
+)
+from multi_agent.integrity import compute_proposal_hash
+from multi_agent.invocation import (
+    AgentInvocationFailure,
+    AgentInvocationOutcome,
+    AgentInvocationReceipt,
+    AgentInvoker,
+    DeterministicFakeInvoker,
+    RegistryAgentInvoker,
+    validate_invocation_receipt,
+)
+from multi_agent.plan_validator import PlanValidator
+from multi_agent.planner import DeterministicPlanner
 from multi_agent.planning import (
     CODE_APPROVAL_REQUEST_MISSING_PROPOSE,
     CODE_INTENT_CYCLE,
@@ -80,16 +243,16 @@ from multi_agent.planning import (
     MAX_ASSIGNMENT_COMBINATIONS,
     NEVER_RETRYABLE_ERROR_CODES,
     PLANNER_VERSION,
+    TOOL_TO_AGENT_AUTHORITY,
     PlanDraft,
-    PlanValidationIssue,
-    PlanValidationReport,
     PlannedTask,
     PlanningRequest,
     PlanningSignals,
+    PlanValidationIssue,
+    PlanValidationReport,
     RequestedTask,
     RetryPolicy,
     TaskIntent,
-    TOOL_TO_AGENT_AUTHORITY,
     build_expected_planned_tasks,
     canonical_complexity_payload,
     canonical_request_payload,
@@ -111,151 +274,37 @@ from multi_agent.planning_errors import (
     InsufficientContextError,
     PlanCycleError,
     PlanIntegrityError,
-    PlanValidationError,
     PlanningError,
     PlanningInputError,
+    PlanValidationError,
     RegistryVersionMismatchError,
     UnsupportedCapabilityError,
 )
 from multi_agent.planning_templates import (
     CUSTOMER_RECOVERY_DOMAIN,
     DEFAULT_CUSTOMER_RECOVERY_TEMPLATE,
-    CustomerRecoveryTemplate,
     INTENT_CUSTOMER_CONTEXT,
     INTENT_KNOWLEDGE_RECOMMENDATION,
     INTENT_RECOVERY_METRICS,
     INTENT_SALES_RISK_ANALYSIS,
     INTENT_SUPPORT_ANALYSIS,
+    CustomerRecoveryTemplate,
 )
-from multi_agent.plan_validator import PlanValidator
-from multi_agent.planner import DeterministicPlanner
-
-# Phase 4 — Supervisor Runtime
-from multi_agent.execution import (
-    ExecutionBinding,
-    ExecutionCancellation,
-    ExecutionCapabilitySnapshot,
-    ExecutionRunIdentity,
-    ExecutionTraceEvent,
-    FakeExecutionCancellation,
-    ResultOriginSnapshot,
-    SupervisorConfig,
-    SupervisorRunResult,
-    SupervisorRunStatus,
-    TaskAttemptRecord,
-    TaskExecutionRecord,
-    TRACE_BUDGET_EXCEEDED,
-    TRACE_PLAN_VALIDATED,
-    TRACE_RESULTS_MERGED,
-    TRACE_RUN_CANCELLED,
-    TRACE_RUN_COMPLETED,
-    TRACE_RUN_STARTED,
-    TRACE_TASK_COMPLETED,
-    TRACE_TASK_FAILED,
-    TRACE_TASK_NEEDS_INPUT,
-    TRACE_TASK_READY,
-    TRACE_TASK_RETRYING,
-    TRACE_TASK_SKIPPED,
-    TRACE_TASK_STARTED,
-    TRACE_TASK_TIMED_OUT,
-    build_execution_context,
-    final_status_priority,
-    utc_now,
-    validate_agent_result,
+from multi_agent.policy import (
+    DeterministicPolicyEvaluator,
+    FakePolicyEvaluator,
+    OPAReviewAdapter,
+    OPAReviewAdapterConfig,
+    PolicyDecision,
+    PolicyEvaluationRequest,
+    PolicyEvaluationResult,
+    PolicyEvaluator,
 )
-from multi_agent.execution_errors import (
-    ExecutionUsageUnavailableError,
-    InvalidAgentResultError,
-    InvalidInvocationReceiptError,
-    NonRetryableAgentError,
-    RetryableAgentError,
-    RunAlreadyInProgressError,
-    RunPlanConflictError,
-    SupervisorError,
-)
-from multi_agent.invocation import (
-    AgentInvocationReceipt,
-    AgentInvocationFailure,
-    AgentInvocationOutcome,
-    AgentInvoker,
-    DeterministicFakeInvoker,
-    RegistryAgentInvoker,
-    validate_invocation_receipt,
-)
-
-# R10 Sync 1: Usage types are now imported directly from
-# :mod:`multi_agent.usage` (the canonical source) rather than through
-# :mod:`multi_agent.invocation`'s compatibility re-export.  This
-# ensures ``multi_agent.AttemptUsageRecord is multi_agent.usage.AttemptUsageRecord``
-# — there is exactly one definition source.
-from multi_agent.usage import (
-    ERROR_EXECUTION_USAGE_UNAVAILABLE,
-    ERROR_INFRASTRUCTURE_EXCEPTION,
-    ERROR_INVALID_INVOCATION_OUTCOME,
-    ERROR_TOOL_USAGE_UNAVAILABLE,
-    ERROR_USAGE_SOURCE_MISMATCH,
-    AttemptUsageDisposition,
-    AttemptUsageRecord,
-    ProviderUsageVerifier,
-    UsageProvenance,
-    # R7 P1-1: DEPRECATED — ``UsageTrustLevel`` is retained for
-    # backwards compatibility but new code must use ``UsageProvenance``
-    # and ``AttemptUsageDisposition``.  The legacy ``usage_trust`` field
-    # on ``AgentInvocationReceipt`` is auto-derived from
-    # ``usage_provenance`` and will be removed in the next incompatible
-    # version.
-    UsageTrustLevel,
-    UsageVerificationCapabilities,
-    VerifiedUsage,
-    get_usage_capabilities,
-    validate_usage_dimension,
-)
-from multi_agent.run_store import (
-    InMemoryRunStore,
-    RunIdentity,
-    RunIdentityStatus,
-    RunLease,
-    RunStore,
-    defensive_copy_result,
-)
-from multi_agent.scheduler import (
-    AgentCallPermit,
-    BeforeWave,
-    DagScheduler,
-    DispatchDecision,
-    PreDispatch,
-    TaskOutcome,
-    WaveCallback,
-    WaveStartedCallback,
-)
-from multi_agent.supervisor import SupervisorRuntime
-from multi_agent.supervisor_graph import (
-    FakeSupervisorRuntime,
-    SupervisorGraphState,
-    build_supervisor_graph,
-)
-
-# Phase 5A — Reviewer & Governance Decision Layer
-from multi_agent.review_errors import (
-    AuthorityViolationError,
-    InvalidEvidenceReferenceError,
-    InvalidProposalIdentityError,
-    InvalidReviewRequestError,
-    InvalidReviewResultError,
-    PolicyEvaluationError,
-    ReviewConflictError,
-    ReviewError,
-    ReviewIntegrityError,
-    UnknownActionError,
-)
-from multi_agent.action_governance import (
-    ACTION_GOVERNANCE_REGISTRY,
-    ACTION_GOVERNANCE_SPEC_HASH,
-    ACTION_GOVERNANCE_SPEC_VERSION,
-    ActionGovernanceSpec,
-    compute_live_governance_spec_hash,
-    get_action_governance_spec,
-    verify_governance_spec_integrity,
+from multi_agent.registry import (
+    AgentHandler,
+    AgentRegistry,
+    RegistrySnapshot,
+    ToolCatalog,
 )
 from multi_agent.review_contracts import (
     CODE_ACTION_CATEGORY_NOT_REVIEWABLE,
@@ -309,8 +358,8 @@ from multi_agent.review_contracts import (
     ReviewBatchResult,
     ReviewBatchStatus,
     ReviewDecisionStatus,
-    ReviewExpectedOutcome,
     ReviewEvidenceSnapshot,
+    ReviewExpectedOutcome,
     ReviewFinding,
     ReviewFindingSeverity,
     ReviewGraphError,
@@ -326,41 +375,19 @@ from multi_agent.review_contracts import (
     frozen_value_to_json,
     proposal_status_to_batch,
 )
-from multi_agent.policy import (
-    DeterministicPolicyEvaluator,
-    FakePolicyEvaluator,
-    OPAReviewAdapter,
-    OPAReviewAdapterConfig,
-    PolicyDecision,
-    PolicyEvaluationRequest,
-    PolicyEvaluationResult,
-    PolicyEvaluator,
-)
-from multi_agent.evidence_review import (
-    build_evidence_index,
-    compute_review_evidence_hash,
-    detect_dangling_evidence,
-    detect_duplicate_evidence,
-    validate_evidence_for_proposal,
-)
-from multi_agent.conflict_resolution import (
-    ConflictGroup,
-    ConflictResult,
-    DeduplicationResult,
-    DuplicateGroup,
-    compute_canonical_key,
-    detect_conflicts,
-    detect_duplicates,
-    detect_idempotency_key_conflicts,
-)
-from multi_agent.reviewer import (
-    ProposalReviewer,
-    classify_risk,
-    validate_action_allowlist,
-    validate_authority,
-    validate_idempotency,
-    validate_identity,
-    validate_tenant_safety,
+
+# Phase 5A — Reviewer & Governance Decision Layer
+from multi_agent.review_errors import (
+    AuthorityViolationError,
+    InvalidEvidenceReferenceError,
+    InvalidProposalIdentityError,
+    InvalidReviewRequestError,
+    InvalidReviewResultError,
+    PolicyEvaluationError,
+    ReviewConflictError,
+    ReviewError,
+    ReviewIntegrityError,
+    UnknownActionError,
 )
 from multi_agent.review_evaluation import (
     ReviewFixture,
@@ -374,6 +401,77 @@ from multi_agent.review_graph import (
     FakeProposalReviewer,
     ReviewGraphState,
     build_review_graph,
+)
+from multi_agent.reviewer import (
+    ProposalReviewer,
+    classify_risk,
+    validate_action_allowlist,
+    validate_authority,
+    validate_idempotency,
+    validate_identity,
+    validate_tenant_safety,
+)
+from multi_agent.run_store import (
+    InMemoryRunStore,
+    RunIdentity,
+    RunIdentityStatus,
+    RunLease,
+    RunStore,
+    defensive_copy_result,
+)
+from multi_agent.scheduler import (
+    AgentCallPermit,
+    BeforeWave,
+    DagScheduler,
+    DispatchDecision,
+    PreDispatch,
+    TaskOutcome,
+    WaveCallback,
+    WaveStartedCallback,
+)
+from multi_agent.serialization import (
+    canonicalize,
+    content_hash,
+    deserialize_contract,
+    serialize_contract,
+    serialize_set_for_json,
+    stable_hash,
+    validate_strict_json,
+)
+from multi_agent.state import MergeConflict, MergedState, merge_parallel_results
+from multi_agent.supervisor import SupervisorRuntime
+from multi_agent.supervisor_graph import (
+    FakeSupervisorRuntime,
+    SupervisorGraphState,
+    build_supervisor_graph,
+)
+
+# R10 Sync 1: Usage types are now imported directly from
+# :mod:`multi_agent.usage` (the canonical source) rather than through
+# :mod:`multi_agent.invocation`'s compatibility re-export.  This
+# ensures ``multi_agent.AttemptUsageRecord is multi_agent.usage.AttemptUsageRecord``
+# — there is exactly one definition source.
+from multi_agent.usage import (
+    ERROR_EXECUTION_USAGE_UNAVAILABLE,
+    ERROR_INFRASTRUCTURE_EXCEPTION,
+    ERROR_INVALID_INVOCATION_OUTCOME,
+    ERROR_TOOL_USAGE_UNAVAILABLE,
+    ERROR_USAGE_SOURCE_MISMATCH,
+    AttemptUsageDisposition,
+    AttemptUsageRecord,
+    ProviderUsageVerifier,
+    UsageProvenance,
+    # R7 P1-1: DEPRECATED — ``UsageTrustLevel`` is retained for
+    # backwards compatibility but new code must use ``UsageProvenance``
+    # and ``AttemptUsageDisposition``.  The legacy ``usage_trust`` field
+    # on ``AgentInvocationReceipt`` is auto-derived from
+    # ``usage_provenance`` and will be removed in the next incompatible
+    # version.
+    UsageTrustLevel,
+    UsageVerificationCapabilities,
+    VerifiedUsage,
+    get_usage_capabilities,
+    validate_usage_dimension,
 )
 
 __all__ = [
@@ -712,4 +810,94 @@ __all__ = [
     "FakeProposalReviewer",
     "ReviewGraphState",
     "build_review_graph",
+    # Phase 5B — Governed Executor & Human Approval Gate
+    # Error codes
+    "ACTION_NOT_SUPPORTED",
+    "ADAPTER_NOT_FOUND",
+    "ADAPTER_VERSION_MISMATCH",
+    "APPROVAL_ALREADY_CONSUMED",
+    "APPROVAL_EXPIRED",
+    "APPROVAL_REJECTED",
+    "APPROVAL_REQUIRED",
+    "APPROVAL_REVOKED",
+    "AUTHORIZATION_INTEGRITY_FAILED",
+    "EXECUTION_ALREADY_IN_PROGRESS",
+    "EXECUTION_CANCELLED",
+    "EXECUTION_DEADLINE_EXCEEDED",
+    "EXECUTION_NOT_AUTHORIZED",
+    "EXECUTION_OUTCOME_UNKNOWN",
+    "EXECUTION_TIMEOUT",
+    "GOVERNANCE_SPEC_MISMATCH",
+    "IDEMPOTENCY_CONFLICT",
+    "INVALID_ADAPTER_OUTCOME",
+    "INVALID_EXECUTION_RECEIPT",
+    "KILL_SWITCH_ACTIVE",
+    "REVIEW_BINDING_MISMATCH",
+    "TENANT_MISMATCH",
+    # Exception classes
+    "AdapterBindingError",
+    "ApprovalRequiredError",
+    "ApprovalValidationError",
+    "ExecutionAlreadyInProgressError",
+    "ExecutionAuthorizationError",
+    "ExecutionError",
+    "ExecutionIntegrityError",
+    "ExecutionReceiptError",
+    "ExecutionTimeoutError",
+    "ExecutionUnknownOutcomeError",
+    "IdempotencyConflictError",
+    "KillSwitchExecutionBlockedError",
+    # Approval contracts
+    "ApprovalDecision",
+    "ApprovalRequest",
+    "ApprovalStatus",
+    "Clock",
+    "FrozenClock",
+    "SystemClock",
+    # Execution authorization
+    "BatchExecutionStatus",
+    "ExecutionAuthorization",
+    "ExecutionStatus",
+    "batch_execution_status_priority",
+    # Action adapter
+    "ActionAdapter",
+    "ActionAdapterBinding",
+    "ActionAdapterRegistry",
+    "ActionAdapterRegistrySnapshot",
+    "AdapterExecutionOutcome",
+    "DeterministicNoopAdapter",
+    "ExecutionCommand",
+    "IdempotencyScope",
+    "RecordingActionAdapter",
+    "build_default_registry",
+    "build_default_registry_snapshot",
+    "compute_execution_fingerprint",
+    # Execution store
+    "ExecutionStore",
+    "IdempotencyRecord",
+    "IdempotencyState",
+    "InMemoryExecutionStore",
+    # Approval gate
+    "ApprovalGate",
+    "ApprovalRequirement",
+    "ApprovalStore",
+    "InMemoryApprovalStore",
+    # Execution receipts
+    "ActionExecutionReceipt",
+    # Governed executor
+    "ExecutionBatchResult",
+    "ExecutionOptions",
+    "ExecutionRetryPolicy",
+    "GovernedExecutor",
+    "build_authorization",
+    "select_executable_reviews",
+    # Execution graph
+    "ExecutionGraphState",
+    "build_execution_graph",
+    # Execution evaluation
+    "ExecutionExpectedOutcome",
+    "ExecutionFixture",
+    "ExecutionMetrics",
+    "build_execution_fixtures",
+    "compute_execution_metrics",
 ]

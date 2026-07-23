@@ -156,7 +156,7 @@ class UsageProvenance(StrictContract):
     source_id: str = "unverified"
 
     @model_validator(mode="after")
-    def _enforce_per_dimension_source(self) -> "UsageProvenance":
+    def _enforce_per_dimension_source(self) -> UsageProvenance:
         # R9 Section 6: VERIFIED requires the corresponding per-dimension
         # source_id.  No fallback to the legacy ``source_id`` field.
         if self.tokens_verified and not self.token_source_id:
@@ -304,7 +304,7 @@ class AttemptUsageRecord(StrictContract):
     cost_source_id: str | None = None
 
     @model_validator(mode="after")
-    def _enforce_token_invariants(self) -> "AttemptUsageRecord":
+    def _enforce_token_invariants(self) -> AttemptUsageRecord:
         validate_usage_dimension(
             "token",
             self.token_disposition,
@@ -314,7 +314,7 @@ class AttemptUsageRecord(StrictContract):
         return self
 
     @model_validator(mode="after")
-    def _enforce_cost_invariants(self) -> "AttemptUsageRecord":
+    def _enforce_cost_invariants(self) -> AttemptUsageRecord:
         validate_usage_dimension(
             "cost",
             self.cost_disposition,
@@ -400,7 +400,7 @@ class UsageVerificationCapabilities(StrictContract):
     bound_source_ids: frozenset[str] = Field(default_factory=frozenset)
 
     @model_validator(mode="after")
-    def _enforce_capabilities(self) -> "UsageVerificationCapabilities":
+    def _enforce_capabilities(self) -> UsageVerificationCapabilities:
         # R10 P1-2: NO mirroring from ``bound_source_ids`` into the
         # per-dimension sets.  The two per-dimension sets are the sole
         # authority.  Contract invariant — declaring ``verifies_*=True``
@@ -490,7 +490,7 @@ class VerifiedUsage(StrictContract):
     verified: bool = False
 
     @model_validator(mode="after")
-    def _enforce_per_dimension_invariants(self) -> "VerifiedUsage":
+    def _enforce_per_dimension_invariants(self) -> VerifiedUsage:
         if self.tokens_verified and self.tokens_used is None:
             raise ValueError(
                 "VerifiedUsage.tokens_verified=True requires tokens_used to be non-None"
@@ -547,13 +547,13 @@ class ProviderUsageVerifier(Protocol):
 
 
 __all__ = [
-    "AttemptUsageDisposition",
-    "AttemptUsageRecord",
     "ERROR_EXECUTION_USAGE_UNAVAILABLE",
     "ERROR_INFRASTRUCTURE_EXCEPTION",
     "ERROR_INVALID_INVOCATION_OUTCOME",
     "ERROR_TOOL_USAGE_UNAVAILABLE",
     "ERROR_USAGE_SOURCE_MISMATCH",
+    "AttemptUsageDisposition",
+    "AttemptUsageRecord",
     "ProviderUsageVerifier",
     "UsageProvenance",
     "UsageTrustLevel",
@@ -580,6 +580,6 @@ import multi_agent.contracts as _contracts  # noqa: E402
 # reference in ``ExecutionUsage.attempt_usage_records``.  ``setattr`` is
 # used (rather than direct assignment) to satisfy mypy — the contracts
 # module has no static attribute with this name.
-setattr(_contracts, "AttemptUsageRecord", AttemptUsageRecord)
+_contracts.AttemptUsageRecord = AttemptUsageRecord
 _contracts.ExecutionUsage.model_rebuild()
 del _contracts

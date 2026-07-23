@@ -68,7 +68,7 @@ class ToolCatalog:
         return sorted(self._tools.values(), key=lambda t: t.tool_name)
 
     @classmethod
-    def default_catalog(cls) -> "ToolCatalog":
+    def default_catalog(cls) -> ToolCatalog:
         """Factory for the built-in Phase 2 tool catalog."""
         return cls(
             tools=[

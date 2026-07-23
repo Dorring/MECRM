@@ -61,7 +61,6 @@ from multi_agent.execution_errors import (
     SupervisorError,
 )
 
-
 # ---------------------------------------------------------------------------
 # Lease — R3 P0-3: frozen StrictContract
 # ---------------------------------------------------------------------------
@@ -224,7 +223,7 @@ class _RunEntry:
     does not match is rejected so it cannot corrupt a newer run.
     """
 
-    __slots__ = ("run_id", "plan_hash", "lease_id", "in_progress", "result")
+    __slots__ = ("in_progress", "lease_id", "plan_hash", "result", "run_id")
 
     def __init__(
         self,

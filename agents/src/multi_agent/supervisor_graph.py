@@ -38,7 +38,6 @@ from multi_agent.planning import PlanDraft
 from multi_agent.registry import AgentRegistry
 from multi_agent.run_store import RunStore
 
-
 # ---------------------------------------------------------------------------
 # Graph state
 # ---------------------------------------------------------------------------
@@ -136,7 +135,7 @@ def build_supervisor_graph(runtime: _SupervisorLike):
                 config=state.config,
                 cancellation=state.cancellation,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # Capture so ``finalize_run`` can re-raise cleanly
             # rather than aborting LangGraph's executor.
             #

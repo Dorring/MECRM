@@ -39,7 +39,7 @@ from *state propagation* (which must not):
 from __future__ import annotations
 
 import asyncio
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
 
 from pydantic import ConfigDict, Field
 
@@ -48,7 +48,6 @@ from multi_agent.execution import (
     SupervisorConfig,
     TaskExecutionRecord,
 )
-
 
 # ---------------------------------------------------------------------------
 # Outcome — what run_task returns to the Scheduler
@@ -582,9 +581,9 @@ __all__ = [
     "DagScheduler",
     "DispatchDecision",
     "PreDispatch",
+    "ShouldStop",
     "TaskOutcome",
     "TaskRunner",
     "WaveCallback",
     "WaveStartedCallback",
-    "ShouldStop",
 ]

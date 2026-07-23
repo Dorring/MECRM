@@ -73,7 +73,6 @@ from multi_agent.review_errors import (
 )
 from multi_agent.serialization import canonicalize, content_hash, stable_hash
 
-
 # ---------------------------------------------------------------------------
 # R2.1 P0-1: Deep Frozen JSON — recursive immutable JSON-like value.
 # ---------------------------------------------------------------------------
@@ -441,7 +440,7 @@ class ReviewProposalSnapshot(StrictContract):
         return tuple(v)
 
     @model_validator(mode="after")
-    def _verify_snapshot_hash(self) -> "ReviewProposalSnapshot":
+    def _verify_snapshot_hash(self) -> ReviewProposalSnapshot:
         expected = self.compute_snapshot_hash()
         if self.snapshot_hash != expected:
             raise ValueError(
@@ -480,7 +479,7 @@ class ReviewProposalSnapshot(StrictContract):
         return stable_hash(payload)
 
     @classmethod
-    def from_proposal(cls, proposal: ActionProposal) -> "ReviewProposalSnapshot":
+    def from_proposal(cls, proposal: ActionProposal) -> ReviewProposalSnapshot:
         """Build a deep-frozen snapshot from a Phase 2 :class:`ActionProposal`.
 
         Used by the Phase 5A Adapter when constructing
@@ -615,7 +614,7 @@ class ReviewProposalEnvelope(StrictContract):
         return v
 
     @model_validator(mode="after")
-    def _verify_origin_hash(self) -> "ReviewProposalEnvelope":
+    def _verify_origin_hash(self) -> ReviewProposalEnvelope:
         from multi_agent.serialization import stable_hash
 
         expected = stable_hash(
@@ -689,7 +688,7 @@ class ReviewEvidenceSnapshot(StrictContract):
         return freeze_json_value(v)
 
     @model_validator(mode="after")
-    def _verify_snapshot_hash(self) -> "ReviewEvidenceSnapshot":
+    def _verify_snapshot_hash(self) -> ReviewEvidenceSnapshot:
         from multi_agent.evidence_review import compute_review_evidence_hash
 
         expected = compute_review_evidence_hash(self.evidence)
@@ -806,7 +805,7 @@ class PolicyDecisionAudit(StrictContract):
         return v
 
     @model_validator(mode="after")
-    def _verify_evaluation_hash(self) -> "PolicyDecisionAudit":
+    def _verify_evaluation_hash(self) -> PolicyDecisionAudit:
         expected = stable_hash(
             {
                 "evaluator_source_id": self.evaluator_source_id,
@@ -849,7 +848,7 @@ class EvidenceDeduplicationAudit(StrictContract):
     audit_hash: str
 
     @model_validator(mode="after")
-    def _verify_audit_hash(self) -> "EvidenceDeduplicationAudit":
+    def _verify_audit_hash(self) -> EvidenceDeduplicationAudit:
         expected = stable_hash(
             {
                 "deduped_evidence_ids": sorted(self.deduped_evidence_ids),
@@ -1068,7 +1067,7 @@ class PolicyContext(StrictContract):
         return freeze_json_value(validated)
 
     @model_validator(mode="after")
-    def _validate_rule_version_and_uniqueness(self) -> "PolicyContext":
+    def _validate_rule_version_and_uniqueness(self) -> PolicyContext:
         # R2.1 P0-6: every rule_version must equal policy_version.
         for rule in self.rules:
             if rule.rule_version != self.policy_version:
@@ -1262,7 +1261,7 @@ class ReviewRequest(StrictContract):
         return v
 
     @model_validator(mode="after")
-    def _populate_and_verify_request_hash(self) -> "ReviewRequest":
+    def _populate_and_verify_request_hash(self) -> ReviewRequest:
         # Single hash computation path: always call compute_hash() so
         # the value populated on first construction is identical to
         # the value verified on round-trip.  Using object.__setattr__
@@ -1279,7 +1278,7 @@ class ReviewRequest(StrictContract):
         return self
 
     @model_validator(mode="after")
-    def _validate_identity_uniqueness(self) -> "ReviewRequest":
+    def _validate_identity_uniqueness(self) -> ReviewRequest:
         """Fail-closed identity uniqueness checks.
 
         R2 P0-1: every Proposal MUST have exactly one matching
@@ -1677,7 +1676,7 @@ class ProposalReview(StrictContract):
         return v
 
     @model_validator(mode="after")
-    def _populate_and_verify_review_hash(self) -> "ProposalReview":
+    def _populate_and_verify_review_hash(self) -> ProposalReview:
         expected = self.compute_hash()
         if not self.review_hash:
             object.__setattr__(self, "review_hash", expected)
@@ -1995,7 +1994,7 @@ class ReviewBatchResult(StrictContract):
         return v
 
     @model_validator(mode="after")
-    def _populate_and_verify_result_hash(self) -> "ReviewBatchResult":
+    def _populate_and_verify_result_hash(self) -> ReviewBatchResult:
         expected = self.compute_hash()
         if not self.result_hash:
             object.__setattr__(self, "result_hash", expected)
@@ -2260,6 +2259,9 @@ __all__ = [
     "CODE_TENANT_CROSS_REFERENCE",
     "CODE_TENANT_PII_EGRESS",
     "CODE_TENANT_SECRET_FIELD",
+    "REJECTION_FINDING_CODES",
+    "REVIEWER_VERSION",
+    "REVIEW_SCHEMA_VERSION",
     "CapabilitySnapshot",
     "EvidenceDeduplicationAudit",
     "FrozenJsonValue",
@@ -2268,15 +2270,12 @@ __all__ = [
     "PolicyDecisionAudit",
     "PolicyMatchedRule",
     "PolicyRule",
-    "REJECTION_FINDING_CODES",
-    "REVIEW_SCHEMA_VERSION",
-    "REVIEWER_VERSION",
     "ResultOriginSnapshot",
     "ReviewBatchResult",
     "ReviewBatchStatus",
     "ReviewDecisionStatus",
-    "ReviewExpectedOutcome",
     "ReviewEvidenceSnapshot",
+    "ReviewExpectedOutcome",
     "ReviewFinding",
     "ReviewFindingSeverity",
     "ReviewGraphError",

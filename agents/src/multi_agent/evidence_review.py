@@ -46,7 +46,8 @@ R2 changes:
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from multi_agent.action_governance import get_action_governance_spec
 from multi_agent.contracts import (

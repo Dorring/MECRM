@@ -40,7 +40,6 @@ from multi_agent.review_contracts import (
 )
 from multi_agent.serialization import canonicalize, content_hash
 
-
 # ---------------------------------------------------------------------------
 # R2.1 P0-7: conflict-family → conflict-type mapping.
 #

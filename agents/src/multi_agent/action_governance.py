@@ -38,12 +38,11 @@ from multi_agent.contracts import AgentAuthority, EvidenceType, StrictContract
 from multi_agent.review_contracts import ReviewRiskLevel
 from multi_agent.serialization import stable_hash
 
-
 # ---------------------------------------------------------------------------
 # Spec version — bumped on every registry change.
 # ---------------------------------------------------------------------------
 
-ACTION_GOVERNANCE_SPEC_VERSION = "ma-05a.action-governance.1.0"
+ACTION_GOVERNANCE_SPEC_VERSION = "ma-05a.action-governance.2.0"
 
 
 # ---------------------------------------------------------------------------
@@ -72,12 +71,52 @@ class ActionGovernanceSpec(StrictContract):
     conflict_family: str | None = None
     parameter_schema_id: str = "default"
 
+    # Phase 5B R3 — execution safety fields (P0-5 / P0-9 / P0-3).
+    # These enter the spec hash so a change is detectable at the
+    # Review / Executor boundary.
+    execution_retry_allowed: bool = False
+    max_execution_retries: int = 0
+    retryable_error_codes: frozenset[str] = frozenset()
+    required_approver_roles: tuple[str, ...] = ()
+    minimum_approver_count: int = 1
+    approval_ttl_seconds: int = 86400
+    resource_type: str | None = None
+    resource_id_fields: tuple[str, ...] = ()
+
     @field_validator("action_type")
     @classmethod
     def _action_type_non_blank(cls, v: str) -> str:
         v = v.strip()
         if not v:
             raise ValueError("action_type must not be blank")
+        return v
+
+    @field_validator("required_approver_roles")
+    @classmethod
+    def _freeze_approver_roles(cls, v: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+        if isinstance(v, (list, tuple)):
+            return tuple(sorted({str(r).strip() for r in v if str(r).strip()}))
+        raise TypeError("required_approver_roles must be a list or tuple")
+
+    @field_validator("max_execution_retries")
+    @classmethod
+    def _non_negative_retries(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("max_execution_retries must be >= 0")
+        return v
+
+    @field_validator("minimum_approver_count")
+    @classmethod
+    def _non_negative_count(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("minimum_approver_count must be >= 1")
+        return v
+
+    @field_validator("approval_ttl_seconds")
+    @classmethod
+    def _positive_ttl(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("approval_ttl_seconds must be > 0")
         return v
 
 
@@ -91,6 +130,9 @@ def _build_registry() -> dict[str, ActionGovernanceSpec]:
 
     Order does not matter — the registry is keyed by ``action_type``
     and the spec hash is computed over a canonical (sorted) form.
+
+    R3: every approval / retry / resource field is explicit per action
+    type so the executor never falls back to hardcoded defaults.
     """
     specs: list[ActionGovernanceSpec] = [
         # --- Read-only / report proposals ----------------------------------
@@ -104,6 +146,13 @@ def _build_registry() -> dict[str, ActionGovernanceSpec]:
             idempotency_required=False,
             always_needs_approval=False,
             conflict_family=None,
+            required_approver_roles=("manager",),
+            approval_ttl_seconds=86400,
+            resource_type=None,
+            resource_id_fields=(),
+            execution_retry_allowed=True,
+            max_execution_retries=1,
+            retryable_error_codes=frozenset({"transient_failure"}),
         ),
         ActionGovernanceSpec(
             action_type="summary.compile",
@@ -115,6 +164,8 @@ def _build_registry() -> dict[str, ActionGovernanceSpec]:
             idempotency_required=False,
             always_needs_approval=False,
             conflict_family=None,
+            required_approver_roles=("manager",),
+            approval_ttl_seconds=86400,
         ),
         ActionGovernanceSpec(
             action_type="metric.query",
@@ -126,6 +177,8 @@ def _build_registry() -> dict[str, ActionGovernanceSpec]:
             idempotency_required=False,
             always_needs_approval=False,
             conflict_family=None,
+            required_approver_roles=("manager",),
+            approval_ttl_seconds=86400,
         ),
         # --- CRM propose (no execute) --------------------------------------
         ActionGovernanceSpec(
@@ -145,6 +198,10 @@ def _build_registry() -> dict[str, ActionGovernanceSpec]:
             idempotency_required=True,
             always_needs_approval=False,
             conflict_family="crm_field_update",
+            required_approver_roles=("manager",),
+            approval_ttl_seconds=43200,
+            resource_type="customer",
+            resource_id_fields=("customer_id", "target_id"),
         ),
         ActionGovernanceSpec(
             action_type="crm.status.update",
@@ -162,6 +219,10 @@ def _build_registry() -> dict[str, ActionGovernanceSpec]:
             idempotency_required=True,
             always_needs_approval=False,
             conflict_family="crm_status_activate",
+            required_approver_roles=("manager",),
+            approval_ttl_seconds=43200,
+            resource_type="customer",
+            resource_id_fields=("customer_id", "target_id"),
         ),
         ActionGovernanceSpec(
             action_type="crm.note.add",
@@ -180,6 +241,10 @@ def _build_registry() -> dict[str, ActionGovernanceSpec]:
             idempotency_required=True,
             always_needs_approval=False,
             conflict_family="crm_create",
+            required_approver_roles=("manager",),
+            approval_ttl_seconds=43200,
+            resource_type="customer",
+            resource_id_fields=("customer_id", "target_id"),
         ),
         ActionGovernanceSpec(
             action_type="crm.owner.assign",
@@ -191,6 +256,11 @@ def _build_registry() -> dict[str, ActionGovernanceSpec]:
             idempotency_required=True,
             always_needs_approval=True,
             conflict_family="crm_owner_reassign",
+            required_approver_roles=("admin", "owner_manager"),
+            minimum_approver_count=1,
+            approval_ttl_seconds=21600,
+            resource_type="customer",
+            resource_id_fields=("customer_id", "target_id"),
         ),
         ActionGovernanceSpec(
             action_type="crm.escalate",
@@ -204,6 +274,10 @@ def _build_registry() -> dict[str, ActionGovernanceSpec]:
             idempotency_required=True,
             always_needs_approval=True,
             conflict_family="crm_status_activate",
+            required_approver_roles=("admin", "support_lead"),
+            approval_ttl_seconds=21600,
+            resource_type="customer",
+            resource_id_fields=("customer_id", "target_id"),
         ),
         # --- Recovery actions (high-risk, always needs_approval) ----------
         ActionGovernanceSpec(
@@ -222,6 +296,10 @@ def _build_registry() -> dict[str, ActionGovernanceSpec]:
             idempotency_required=True,
             always_needs_approval=True,
             conflict_family=None,
+            required_approver_roles=("finance_admin", "admin"),
+            approval_ttl_seconds=7200,
+            resource_type="deal",
+            resource_id_fields=("deal_id", "target_id"),
         ),
         ActionGovernanceSpec(
             action_type="contract.amend",
@@ -235,6 +313,10 @@ def _build_registry() -> dict[str, ActionGovernanceSpec]:
             idempotency_required=True,
             always_needs_approval=True,
             conflict_family=None,
+            required_approver_roles=("legal_admin", "admin"),
+            approval_ttl_seconds=7200,
+            resource_type="deal",
+            resource_id_fields=("deal_id", "target_id"),
         ),
         ActionGovernanceSpec(
             action_type="notification.bulk_send",
@@ -248,6 +330,10 @@ def _build_registry() -> dict[str, ActionGovernanceSpec]:
             idempotency_required=True,
             always_needs_approval=True,
             conflict_family="notification_mutex",
+            required_approver_roles=("admin", "marketing_lead"),
+            approval_ttl_seconds=21600,
+            resource_type="notification",
+            resource_id_fields=("campaign_id",),
         ),
         ActionGovernanceSpec(
             action_type="permission.change",
@@ -261,6 +347,11 @@ def _build_registry() -> dict[str, ActionGovernanceSpec]:
             idempotency_required=True,
             always_needs_approval=True,
             conflict_family="crm_status_activate",
+            required_approver_roles=("security_admin",),
+            minimum_approver_count=1,
+            approval_ttl_seconds=7200,
+            resource_type="permission",
+            resource_id_fields=("target_id",),
         ),
     ]
     return {s.action_type: s for s in specs}

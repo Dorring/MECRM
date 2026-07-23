@@ -65,7 +65,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from multi_agent.registry import AgentRegistry
+from multi_agent.complexity_gate import RuleBasedComplexityGate
 from multi_agent.planning import (
     PLANNER_VERSION,
     PlanDraft,
@@ -84,11 +84,11 @@ from multi_agent.planning_errors import (
     BudgetExceededPlanningError,
     PlanCycleError,
     PlanIntegrityError,
-    PlanValidationError,
     PlanningInputError,
+    PlanValidationError,
     RegistryVersionMismatchError,
 )
-from multi_agent.complexity_gate import RuleBasedComplexityGate
+from multi_agent.registry import AgentRegistry
 
 # Validation issue codes that map to specific error types.
 _BUDGET_CODES = {
