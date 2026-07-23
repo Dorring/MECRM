@@ -44,14 +44,17 @@ from multi_agent.contracts import (
     Evidence,
     EvidenceType,
 )
+from multi_agent.evidence_review import compute_review_evidence_hash
 from multi_agent.execution import (
     ExecutionCapabilitySnapshot,
     ExecutionRunIdentity,
     ResultOriginSnapshot,
     SupervisorRunResult,
 )
-from multi_agent.evidence_review import compute_review_evidence_hash
+from multi_agent.policy import DeterministicPolicyEvaluator, PolicyEvaluator
 from multi_agent.review_contracts import (
+    REVIEW_SCHEMA_VERSION,
+    REVIEWER_VERSION,
     EvidenceDeduplicationAudit,
     PolicyContext,
     PolicyDecision,
@@ -61,16 +64,12 @@ from multi_agent.review_contracts import (
     ReviewProposalEnvelope,
     ReviewProposalSnapshot,
     ReviewRequest,
-    REVIEW_SCHEMA_VERSION,
     TaskRecordSummary,
     TraceSummary,
-    REVIEWER_VERSION,
 )
 from multi_agent.review_errors import InvalidReviewRequestError
-from multi_agent.policy import DeterministicPolicyEvaluator, PolicyEvaluator
 from multi_agent.reviewer import ProposalReviewer
 from multi_agent.serialization import stable_hash
-
 
 # ---------------------------------------------------------------------------
 # Default PolicyContext — used by fixtures and the default adapter path.

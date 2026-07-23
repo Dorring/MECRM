@@ -27,6 +27,7 @@ from multi_agent.execution_authorization import BatchExecutionStatus
 from multi_agent.execution_error_codes import AUTHORIZATION_INTEGRITY_FAILED
 from multi_agent.execution_graph import (
     ExecutionGraphState,
+    RuntimeDependencies,
     build_execution_graph,
 )
 from multi_agent.execution_store import InMemoryExecutionStore
@@ -51,23 +52,12 @@ from phase5b_helpers import (
 def _build_graph_state(
     request,
     result,
-    *,
-    registry,
-    kill_switch,
-    execution_store=None,
-    approval_store=None,
-    options=None,
 ) -> ExecutionGraphState:
-    """Build a fully-populated ExecutionGraphState for ainvoke."""
+    """Build an ExecutionGraphState for ainvoke (P1-1: runtime deps
+    live in RuntimeDependencies, not in graph state)."""
     return ExecutionGraphState(
         request=request,
         review_result=result,
-        approval_store=approval_store or InMemoryApprovalStore(),
-        execution_store=execution_store or InMemoryExecutionStore(),
-        adapter_registry=registry,
-        kill_switch=kill_switch,
-        clock=FrozenClock(TS),
-        options=options or ExecutionOptions(dry_run=False),
     )
 
 
@@ -105,16 +95,18 @@ def _graph_execute(
     approval_store=None,
     options=None,
 ):
-    graph = build_execution_graph()
-    state = _build_graph_state(
-        request,
-        result,
-        registry=registry,
+    # P1-1: runtime deps injected via RuntimeDependencies closure.
+    deps = RuntimeDependencies(
+        approval_store=approval_store or InMemoryApprovalStore(),
+        execution_store=execution_store or InMemoryExecutionStore(),
+        adapter_registry=registry,
         kill_switch=kill_switch,
-        execution_store=execution_store,
-        approval_store=approval_store,
-        options=options,
+        clock=FrozenClock(TS),
+        executor=GovernedExecutor(),
+        options=options or ExecutionOptions(dry_run=False),
     )
+    graph = build_execution_graph(deps)
+    state = _build_graph_state(request, result)
     return run_async(graph.ainvoke(state))
 
 
@@ -154,15 +146,11 @@ class TestExecutionGraphState:
             registry=registry,
             kill_switch=NoKillSwitch(),
         )
-        # Build a state with a concrete result.
+        # Build a state with a concrete result (P1-1: runtime deps are
+        # NOT stored in graph state).
         state = ExecutionGraphState(
             request=request,
             review_result=result,
-            approval_store=InMemoryApprovalStore(),
-            execution_store=InMemoryExecutionStore(),
-            adapter_registry=registry,
-            kill_switch=NoKillSwitch(),
-            clock=FrozenClock(TS),
         )
         # Place the batch into result.
         object.__setattr__(state, "result", batch)
@@ -247,6 +235,10 @@ class TestDirectGraphParity:
         assert direct_batch.error_code == AUTHORIZATION_INTEGRITY_FAILED
 
         # Graph — captures a ReviewGraphError.
+        # P1-1: verify_review is a no-op so the executor produces the
+        # BLOCKED batch (same as direct); finalize_execution then catches
+        # the verify_against_review failure on the tampered request and
+        # surfaces it as execution.graph.finalize_failed.
         graph_state = _graph_execute(
             request,
             result,
@@ -256,10 +248,12 @@ class TestDirectGraphParity:
         graph_error = graph_state["graph_error"]
         assert graph_error is not None
         assert isinstance(graph_error, ReviewGraphError)
-        # The graph error indicates a review-verify failure.
-        assert graph_error.error_code == "execution.graph.review_verify"
-        # No result was produced.
-        assert graph_state["result"] is None
+        # The graph error surfaces the finalize-stage integrity failure.
+        assert graph_error.error_code == "execution.graph.finalize_failed"
+        # The executor still produced a BLOCKED batch (parity with direct).
+        graph_batch = graph_state["result"]
+        assert graph_batch is not None
+        assert graph_batch.batch_status == BatchExecutionStatus.BLOCKED
 
     def test_direct_and_graph_kill_switch_parity(self) -> None:
         """When the kill switch is active, both paths produce a

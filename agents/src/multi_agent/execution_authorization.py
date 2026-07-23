@@ -33,7 +33,6 @@ from multi_agent.review_contracts import (
 )
 from multi_agent.serialization import stable_hash
 
-
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
@@ -158,6 +157,9 @@ class ExecutionAuthorization(StrictContract):
     approval_required: bool = False
     approval_id: str | None = None
     approval_decision_hash: str | None = None
+    # P0-1: hash of the authorization before approval was bound, so the
+    # pre-approval → post-approval hash chain is verifiable.
+    pre_approval_authorization_hash: str | None = None
 
     risk_level: ReviewRiskLevel = ReviewRiskLevel.LOW
     idempotency_key: str = ""

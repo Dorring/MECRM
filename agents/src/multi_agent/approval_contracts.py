@@ -31,7 +31,6 @@ from multi_agent.execution_error_codes import ExecutionError
 from multi_agent.review_contracts import ReviewRiskLevel
 from multi_agent.serialization import stable_hash
 
-
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
@@ -313,6 +312,64 @@ class ApprovalDecision(StrictContract):
 
 
 # ---------------------------------------------------------------------------
+# ApprovalConsumptionRecord — P0-2: consumption bound to a command.
+# ---------------------------------------------------------------------------
+
+
+class ApprovalConsumptionRecord(StrictContract):
+    """P0-2: record of an approval consumption bound to a specific command.
+
+    The consumption is bound to the exact command_id and execution_fingerprint
+    so a replay of the same command can read the original consumption (not a
+    second illegal consume), while a different command cannot reuse it.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    approval_id: str
+    decision_hash: str
+    authorization_hash: str
+    command_id: str
+    execution_fingerprint: str
+    consumption_hash: str = ""
+
+    @field_validator(
+        "approval_id",
+        "decision_hash",
+        "authorization_hash",
+        "command_id",
+        "execution_fingerprint",
+    )
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError(
+                "ApprovalConsumptionRecord identity fields must not be blank"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _verify_consumption_hash(self) -> ApprovalConsumptionRecord:
+        expected = self.compute_hash()
+        if not self.consumption_hash:
+            object.__setattr__(self, "consumption_hash", expected)
+        elif not compare_digest(self.consumption_hash, expected):
+            raise ValueError("ApprovalConsumptionRecord.consumption_hash mismatch")
+        return self
+
+    def compute_hash(self) -> str:
+        return stable_hash(self, exclude={"consumption_hash"})
+
+    def verify_integrity(self) -> None:
+        if not compare_digest(self.consumption_hash, self.compute_hash()):
+            raise ValueError(
+                f"ApprovalConsumptionRecord {self.approval_id!r}: "
+                f"consumption_hash does not match recomputed content"
+            )
+
+
+# ---------------------------------------------------------------------------
 # ApprovalConflictError — same approval_id with a different request hash (P1-1).
 # ---------------------------------------------------------------------------
 
@@ -330,6 +387,7 @@ class ApprovalConflictError(ExecutionError):
 
 __all__ = [
     "ApprovalConflictError",
+    "ApprovalConsumptionRecord",
     "ApprovalDecision",
     "ApprovalRequest",
     "ApprovalStatus",

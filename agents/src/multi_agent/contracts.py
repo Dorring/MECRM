@@ -264,7 +264,7 @@ class TokenUsage(StrictContract):
     total_tokens: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
-    def _total_sane(self) -> "TokenUsage":
+    def _total_sane(self) -> TokenUsage:
         if self.total_tokens < 0:
             raise ValueError("total_tokens must be >= 0")
         return self
@@ -484,7 +484,7 @@ class ActionProposal(StrictContract):
         return data
 
     @model_validator(mode="after")
-    def _verify_hash(self) -> "ActionProposal":
+    def _verify_hash(self) -> ActionProposal:
         expected = self.compute_hash()
         if self.proposal_hash and not compare_digest(self.proposal_hash, expected):
             raise ValueError(
@@ -494,7 +494,7 @@ class ActionProposal(StrictContract):
         return self
 
     @model_validator(mode="after")
-    def _high_risk_requires_evidence(self) -> "ActionProposal":
+    def _high_risk_requires_evidence(self) -> ActionProposal:
         if self.risk_level == ActionRiskLevel.HIGH:
             if not self.evidence_ids:
                 raise ValueError(
@@ -534,7 +534,7 @@ class ActionProposal(StrictContract):
                 raise ValueError("high-risk proposal must require approval")
 
     @classmethod
-    def create(cls, **data: Any) -> "ActionProposal":
+    def create(cls, **data: Any) -> ActionProposal:
         data.pop("proposal_hash", None)
         return cls.model_validate(data)
 
@@ -655,7 +655,7 @@ class AgentTask(StrictContract):
         return v
 
     @model_validator(mode="after")
-    def _no_self_dependency(self) -> "AgentTask":
+    def _no_self_dependency(self) -> AgentTask:
         if self.task_id and self.task_id in self.dependencies:
             raise ValueError("AgentTask cannot depend on itself")
         return self
@@ -745,7 +745,7 @@ class AgentResult(StrictContract):
         return v
 
     @model_validator(mode="after")
-    def _failed_requires_errors(self) -> "AgentResult":
+    def _failed_requires_errors(self) -> AgentResult:
         if self.status == "failed" and not self.errors:
             raise ValueError(
                 "status 'failed' requires at least one AgentError in errors list"
@@ -753,13 +753,13 @@ class AgentResult(StrictContract):
         return self
 
     @model_validator(mode="after")
-    def _completed_no_errors(self) -> "AgentResult":
+    def _completed_no_errors(self) -> AgentResult:
         if self.status == "completed" and self.errors:
             raise ValueError("status 'completed' must not have errors")
         return self
 
     @model_validator(mode="after")
-    def _tenant_homogeneity(self) -> "AgentResult":
+    def _tenant_homogeneity(self) -> AgentResult:
         for ev in self.evidence:
             if ev.tenant_id != self.tenant_id:
                 raise ValueError(
@@ -846,7 +846,7 @@ class ExecutionBudget(StrictContract):
     deadline_ms: int = Field(default=300_000, ge=1)
 
     @model_validator(mode="after")
-    def _positive_deadline(self) -> "ExecutionBudget":
+    def _positive_deadline(self) -> ExecutionBudget:
         if self.deadline_ms <= 0:
             raise ValueError("deadline_ms must be > 0")
         return self
@@ -920,7 +920,7 @@ class ExecutionUsage(StrictContract):
     elapsed_ms: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
-    def _sync_usage_status_booleans(self) -> "ExecutionUsage":
+    def _sync_usage_status_booleans(self) -> ExecutionUsage:
         """R6 P1: derive legacy booleans from the three-state status."""
         object.__setattr__(
             self,
@@ -997,7 +997,7 @@ class MultiAgentState(StrictContract):
         return v
 
     @model_validator(mode="after")
-    def _tenant_homogeneity_and_integrity(self) -> "MultiAgentState":
+    def _tenant_homogeneity_and_integrity(self) -> MultiAgentState:
         for task in self.plan:
             if task.tenant_id != self.tenant_id:
                 raise ValueError(

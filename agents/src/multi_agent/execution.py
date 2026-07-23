@@ -59,7 +59,6 @@ from multi_agent.planning import PlanDraft
 from multi_agent.state import MergedState
 from multi_agent.usage import AttemptUsageDisposition, validate_usage_dimension
 
-
 # ---------------------------------------------------------------------------
 # Run status
 # ---------------------------------------------------------------------------
@@ -162,7 +161,7 @@ class TaskAttemptRecord(StrictContract):
         return v
 
     @model_validator(mode="after")
-    def _enforce_usage_dimension_invariants(self) -> "TaskAttemptRecord":
+    def _enforce_usage_dimension_invariants(self) -> TaskAttemptRecord:
         # R10 P0-5: enforce per-dimension invariants via the shared
         # function so TaskAttemptRecord follows the SAME rules as
         # AttemptUsageRecord, AgentInvocationOutcome, and
@@ -315,7 +314,7 @@ class SupervisorRunResult(StrictContract):
         return v
 
     @model_validator(mode="after")
-    def _verify_run_identity_consistency(self) -> "SupervisorRunResult":
+    def _verify_run_identity_consistency(self) -> SupervisorRunResult:
         # R2 S2: if run_identity is present, its frozen identity
         # fields MUST match the top-level fields.  This catches a
         # buggy Runtime that builds the identity from one source and
@@ -414,7 +413,7 @@ class ExecutionCapabilitySnapshot(StrictContract):
         return v
 
     @model_validator(mode="after")
-    def _verify_binding_hash(self) -> "ExecutionCapabilitySnapshot":
+    def _verify_binding_hash(self) -> ExecutionCapabilitySnapshot:
         from multi_agent.serialization import stable_hash
 
         expected = stable_hash(
@@ -468,7 +467,7 @@ class ExecutionRunIdentity(StrictContract):
         return v
 
     @model_validator(mode="after")
-    def _verify_identity_hash(self) -> "ExecutionRunIdentity":
+    def _verify_identity_hash(self) -> ExecutionRunIdentity:
         from multi_agent.serialization import stable_hash
 
         expected = stable_hash(
@@ -557,7 +556,7 @@ class ResultOriginSnapshot(StrictContract):
         return tuple(cleaned)
 
     @model_validator(mode="after")
-    def _verify_origin_hash(self) -> "ResultOriginSnapshot":
+    def _verify_origin_hash(self) -> ResultOriginSnapshot:
         from multi_agent.serialization import stable_hash
 
         expected = stable_hash(
@@ -831,18 +830,6 @@ def utc_now() -> datetime:
 
 
 __all__ = [
-    "ExecutionBinding",
-    "ExecutionCapabilitySnapshot",
-    "ExecutionCancellation",
-    "ExecutionRunIdentity",
-    "ExecutionTraceEvent",
-    "FakeExecutionCancellation",
-    "ResultOriginSnapshot",
-    "SupervisorConfig",
-    "SupervisorRunResult",
-    "SupervisorRunStatus",
-    "TaskAttemptRecord",
-    "TaskExecutionRecord",
     "TRACE_BUDGET_EXCEEDED",
     "TRACE_PLAN_VALIDATED",
     "TRACE_RESULTS_MERGED",
@@ -857,6 +844,18 @@ __all__ = [
     "TRACE_TASK_SKIPPED",
     "TRACE_TASK_STARTED",
     "TRACE_TASK_TIMED_OUT",
+    "ExecutionBinding",
+    "ExecutionCancellation",
+    "ExecutionCapabilitySnapshot",
+    "ExecutionRunIdentity",
+    "ExecutionTraceEvent",
+    "FakeExecutionCancellation",
+    "ResultOriginSnapshot",
+    "SupervisorConfig",
+    "SupervisorRunResult",
+    "SupervisorRunStatus",
+    "TaskAttemptRecord",
+    "TaskExecutionRecord",
     "build_execution_context",
     "final_status_priority",
     "utc_now",

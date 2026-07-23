@@ -17,7 +17,6 @@ Design rules
 
 from __future__ import annotations
 
-
 # ---------------------------------------------------------------------------
 # Stable error codes — Phase 5B Section 26
 # ---------------------------------------------------------------------------
@@ -49,6 +48,14 @@ INVALID_EXECUTION_RECEIPT = "invalid_execution_receipt"
 TENANT_MISMATCH = "tenant_mismatch"
 EXECUTION_DEADLINE_EXCEEDED = "execution_deadline_exceeded"
 DRY_RUN_NOT_SUPPORTED = "dry_run_not_supported"
+
+# Phase 5B R2 — additional error codes
+APPROVAL_ALREADY_CONSUMED_BY_OTHER_COMMAND = (
+    "approval_already_consumed_by_other_command"
+)
+EXECUTION_NOT_CONSUMED = "execution_not_consumed"
+ILLEGAL_STATE_TRANSITION = "illegal_state_transition"
+DRY_RUN_BLOCKED_REAL_EXECUTION = "dry_run_blocked_real_execution"
 
 
 # ---------------------------------------------------------------------------
@@ -158,47 +165,52 @@ class AdapterBindingDriftError(ExecutionError):
 
 # Re-export for convenience
 __all__ = [
-    # Error codes
-    "EXECUTION_NOT_AUTHORIZED",
-    "APPROVAL_REQUIRED",
-    "APPROVAL_REJECTED",
-    "APPROVAL_EXPIRED",
-    "APPROVAL_REVOKED",
-    "APPROVAL_ALREADY_CONSUMED",
-    "APPROVAL_CONFLICT",
-    "AUTHORIZATION_INTEGRITY_FAILED",
-    "REVIEW_BINDING_MISMATCH",
-    "GOVERNANCE_SPEC_MISMATCH",
-    "GOVERNANCE_SPEC_DRIFT",
+    "ACTION_NOT_SUPPORTED",
+    "ADAPTER_BINDING_DRIFT",
     "ADAPTER_NOT_FOUND",
     "ADAPTER_VERSION_MISMATCH",
-    "ADAPTER_BINDING_DRIFT",
-    "ACTION_NOT_SUPPORTED",
-    "KILL_SWITCH_ACTIVE",
-    "IDEMPOTENCY_CONFLICT",
+    "APPROVAL_ALREADY_CONSUMED",
+    # Phase 5B R2 — additional error codes
+    "APPROVAL_ALREADY_CONSUMED_BY_OTHER_COMMAND",
+    "APPROVAL_CONFLICT",
+    "APPROVAL_EXPIRED",
+    "APPROVAL_REJECTED",
+    "APPROVAL_REQUIRED",
+    "APPROVAL_REVOKED",
+    "AUTHORIZATION_INTEGRITY_FAILED",
+    "DRY_RUN_BLOCKED_REAL_EXECUTION",
+    "DRY_RUN_NOT_SUPPORTED",
     "EXECUTION_ALREADY_IN_PROGRESS",
-    "EXECUTION_OUTCOME_UNKNOWN",
-    "EXECUTION_TIMEOUT",
     "EXECUTION_CANCELLED",
     "EXECUTION_CANCELLED_BEFORE_CALL",
+    "EXECUTION_DEADLINE_EXCEEDED",
+    # Error codes
+    "EXECUTION_NOT_AUTHORIZED",
+    "EXECUTION_NOT_CONSUMED",
+    "EXECUTION_OUTCOME_UNKNOWN",
+    "EXECUTION_TIMEOUT",
+    "GOVERNANCE_SPEC_DRIFT",
+    "GOVERNANCE_SPEC_MISMATCH",
+    "IDEMPOTENCY_CONFLICT",
+    "ILLEGAL_STATE_TRANSITION",
     "INVALID_ADAPTER_OUTCOME",
     "INVALID_EXECUTION_RECEIPT",
+    "KILL_SWITCH_ACTIVE",
+    "REVIEW_BINDING_MISMATCH",
     "TENANT_MISMATCH",
-    "EXECUTION_DEADLINE_EXCEEDED",
-    "DRY_RUN_NOT_SUPPORTED",
-    # Exception classes
-    "ExecutionError",
-    "ExecutionAuthorizationError",
+    "AdapterBindingDriftError",
+    "AdapterBindingError",
     "ApprovalRequiredError",
     "ApprovalValidationError",
-    "AdapterBindingError",
-    "IdempotencyConflictError",
     "ExecutionAlreadyInProgressError",
+    "ExecutionAuthorizationError",
+    # Exception classes
+    "ExecutionError",
+    "ExecutionIntegrityError",
+    "ExecutionReceiptError",
     "ExecutionTimeoutError",
     "ExecutionUnknownOutcomeError",
-    "ExecutionReceiptError",
-    "ExecutionIntegrityError",
-    "KillSwitchExecutionBlockedError",
     "GovernanceSpecDriftError",
-    "AdapterBindingDriftError",
+    "IdempotencyConflictError",
+    "KillSwitchExecutionBlockedError",
 ]

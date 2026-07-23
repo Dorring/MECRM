@@ -36,7 +36,6 @@ from multi_agent.execution_authorization import ExecutionAuthorization, Executio
 from multi_agent.review_contracts import FrozenJsonValue, freeze_json_value
 from multi_agent.serialization import stable_hash
 
-
 # ---------------------------------------------------------------------------
 # Idempotency scope — how aggressively the adapter dedups.
 # ---------------------------------------------------------------------------
@@ -393,6 +392,103 @@ class ActionAdapterRegistrySnapshot(StrictContract):
 
 
 # ---------------------------------------------------------------------------
+# Frozen runtime handle (P0-4)
+# ---------------------------------------------------------------------------
+
+
+class FrozenActionAdapterRegistry:
+    """P0-4: frozen snapshot + live adapter instances, captured atomically.
+
+    Built by :meth:`ActionAdapterRegistry.freeze_for_execution`.  The
+    frozen registry captures both the metadata snapshot (bindings) AND
+    the actual adapter instances in one atomic operation.  After
+    freezing, ``register()`` on the live registry does NOT affect this
+    frozen handle — the current batch reads only from the frozen
+    instances.
+
+    The executor MUST use this instead of accessing
+    ``registry._live_adapters`` directly.
+
+    This is a plain Python class (NOT a Pydantic model) with
+    ``__slots__`` because it holds :class:`ActionAdapter` protocol
+    instances which are not serializable.
+    """
+
+    __slots__ = ("_registry_hash", "_runtime", "_snapshot")
+
+    def __init__(
+        self,
+        snapshot: ActionAdapterRegistrySnapshot,
+        runtime_bindings: dict[str, ActionAdapter],
+    ) -> None:
+        self._snapshot = snapshot
+        # Defensive copy — the live registry cannot mutate this.
+        self._runtime: dict[str, ActionAdapter] = dict(runtime_bindings)
+        self._registry_hash = snapshot.registry_hash
+
+    @property
+    def snapshot(self) -> ActionAdapterRegistrySnapshot:
+        """The frozen metadata snapshot."""
+        return self._snapshot
+
+    @property
+    def registry_hash(self) -> str:
+        """Shortcut to the snapshot's registry_hash."""
+        return self._registry_hash
+
+    def get_adapter(self, adapter_id: str) -> ActionAdapter | None:
+        """Return the frozen adapter instance for *adapter_id*, or None.
+
+        This is the ONLY way the executor may obtain an adapter instance.
+        After freezing, re-registering an adapter with the same metadata
+        on the live registry does NOT change what this method returns.
+        """
+        return self._runtime.get(adapter_id)
+
+    def get_binding(
+        self,
+        action_type: str,
+    ) -> ActionAdapterBinding:
+        """Look up the binding for *action_type* in the frozen snapshot.
+
+        Raises :class:`KeyError` if the action type is not bound.
+        """
+        at = action_type.strip()
+        for binding in self._snapshot.bindings:
+            if binding.action_type == at:
+                return binding
+        raise KeyError(f"action_type {at!r} not bound in frozen registry")
+
+    def verify_adapter_matches_binding(
+        self,
+        binding: ActionAdapterBinding,
+        dry_run: bool,
+    ) -> ActionAdapter | None:
+        """Verify the frozen adapter matches the frozen binding on every
+        safety-relevant field.  Returns the adapter instance or None.
+
+        Checks: adapter_id, adapter_version, supported_action_types,
+        supports_dry_run, retry_safe, idempotency_scope.
+        """
+        adapter = self._runtime.get(binding.adapter_id)
+        if adapter is None:
+            return None
+        if adapter.adapter_id != binding.adapter_id:
+            return None
+        if adapter.adapter_version != binding.adapter_version:
+            return None
+        if binding.action_type not in adapter.supported_action_types:
+            return None
+        if dry_run and not adapter.supports_dry_run:
+            return None
+        if adapter.retry_safe != binding.retry_safe:
+            return None
+        if adapter.idempotency_scope != binding.idempotency_scope:
+            return None
+        return adapter
+
+
+# ---------------------------------------------------------------------------
 # Registry builder
 # ---------------------------------------------------------------------------
 
@@ -461,6 +557,21 @@ class ActionAdapterRegistry:
         return ActionAdapterRegistrySnapshot(
             registry_version=self._registry_version,
             bindings=bindings,
+        )
+
+    def freeze_for_execution(self) -> FrozenActionAdapterRegistry:
+        """P0-4: atomically freeze the snapshot AND the live adapter instances.
+
+        After this call, ``register()`` on the live registry does NOT
+        affect the returned frozen handle — the current batch reads only
+        from the frozen instances.
+        """
+        snapshot = self.freeze_snapshot()
+        # Copy the live adapters dict so later register() calls don't
+        # mutate what the frozen handle sees.
+        return FrozenActionAdapterRegistry(
+            snapshot=snapshot,
+            runtime_bindings=dict(self._live_adapters),
         )
 
     def get_binding(
@@ -709,6 +820,7 @@ __all__ = [
     "AdapterExecutionOutcome",
     "DeterministicNoopAdapter",
     "ExecutionCommand",
+    "FrozenActionAdapterRegistry",
     "IdempotencyScope",
     "RecordingActionAdapter",
     "build_default_registry",

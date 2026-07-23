@@ -19,9 +19,10 @@ pipeline so they are stable across processes and platforms.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from hmac import compare_digest
 from types import MappingProxyType
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Literal
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
@@ -301,13 +302,13 @@ class RequestedTask(StrictContract):
         return validate_strict_json(v)  # type: ignore[return-value]
 
     @model_validator(mode="after")
-    def _no_self_dependency(self) -> "RequestedTask":
+    def _no_self_dependency(self) -> RequestedTask:
         if self.intent_id and self.intent_id in self.dependencies:
             raise ValueError("RequestedTask cannot depend on itself")
         return self
 
     @model_validator(mode="after")
-    def _tool_calls_cover_required_tools(self) -> "RequestedTask":
+    def _tool_calls_cover_required_tools(self) -> RequestedTask:
         """R2 P0-5: a task that requires tools must not declare zero
         tool calls.  The minimum estimate is one call per required tool.
         """
@@ -377,7 +378,7 @@ class PlanningSignals(StrictContract):
         return frozenset(cleaned)
 
     @model_validator(mode="after")
-    def _requested_tasks_consistency(self) -> "PlanningSignals":
+    def _requested_tasks_consistency(self) -> PlanningSignals:
         """If requested_tasks is non-empty, ``domains`` and
         ``requested_task_types`` (when explicitly provided) must equal
         the sets derived from the tasks.
@@ -578,13 +579,13 @@ class TaskIntent(StrictContract):
         return validate_strict_json(v)  # type: ignore[return-value]
 
     @model_validator(mode="after")
-    def _no_self_dependency(self) -> "TaskIntent":
+    def _no_self_dependency(self) -> TaskIntent:
         if self.intent_id and self.intent_id in self.dependencies:
             raise ValueError("TaskIntent cannot depend on itself")
         return self
 
     @model_validator(mode="after")
-    def _tool_calls_cover_required_tools(self) -> "TaskIntent":
+    def _tool_calls_cover_required_tools(self) -> TaskIntent:
         """R2 P0-5: a task that requires tools must not declare zero
         tool calls.  The minimum estimate is one call per required tool.
         """
@@ -1421,7 +1422,7 @@ class PlannedTask(StrictContract):
         return validate_strict_json(v)  # type: ignore[return-value]
 
     @model_validator(mode="after")
-    def _task_no_self_dependency(self) -> "PlannedTask":
+    def _task_no_self_dependency(self) -> PlannedTask:
         if self.task.task_id and self.task.task_id in self.task.dependencies:
             raise ValueError("PlannedTask.task cannot depend on itself")
         return self
@@ -1817,7 +1818,7 @@ class PlanDraft(StrictContract):
         return out
 
     @model_validator(mode="after")
-    def _verify_request_hash(self) -> "PlanDraft":
+    def _verify_request_hash(self) -> PlanDraft:
         expected = compute_request_hash(self.request)
         if not compare_digest(self.request_hash, expected):
             raise ValueError(
@@ -1827,7 +1828,7 @@ class PlanDraft(StrictContract):
         return self
 
     @model_validator(mode="after")
-    def _auto_compute_and_verify_hash(self) -> "PlanDraft":
+    def _auto_compute_and_verify_hash(self) -> PlanDraft:
         """Auto-compute plan_hash if empty; verify if provided."""
         expected = self.compute_plan_hash()
         if not self.plan_hash:
@@ -1840,7 +1841,7 @@ class PlanDraft(StrictContract):
         return self
 
     @model_validator(mode="after")
-    def _tenant_homogeneity(self) -> "PlanDraft":
+    def _tenant_homogeneity(self) -> PlanDraft:
         for pt in self.tasks:
             if pt.task.tenant_id != self.tenant_id:
                 raise ValueError(
@@ -1929,7 +1930,7 @@ class PlanValidationReport(StrictContract):
     estimated_deadline_ms: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
-    def _valid_implies_no_errors(self) -> "PlanValidationReport":
+    def _valid_implies_no_errors(self) -> PlanValidationReport:
         if self.valid:
             for issue in self.issues:
                 if issue.severity == "error":
@@ -1947,6 +1948,7 @@ __all__ = [
     "CODE_WRITE_REQUEST_MISSING_PROPOSE",
     "MAX_ASSIGNMENT_COMBINATIONS",
     "PLANNER_VERSION",
+    "TOOL_TO_AGENT_AUTHORITY",
     "PlanDraft",
     "PlanValidationIssue",
     "PlanValidationReport",
@@ -1954,7 +1956,6 @@ __all__ = [
     "PlanningRequest",
     "PlanningSignals",
     "RequestedTask",
-    "TOOL_TO_AGENT_AUTHORITY",
     "TaskIntent",
     "build_expected_planned_tasks",
     "canonical_complexity_payload",

@@ -38,7 +38,6 @@ from multi_agent.contracts import AgentAuthority, EvidenceType, StrictContract
 from multi_agent.review_contracts import ReviewRiskLevel
 from multi_agent.serialization import stable_hash
 
-
 # ---------------------------------------------------------------------------
 # Spec version — bumped on every registry change.
 # ---------------------------------------------------------------------------

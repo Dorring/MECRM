@@ -39,7 +39,6 @@ from multi_agent.contracts import (
 from multi_agent.errors import ProposalHashMismatchError
 from multi_agent.serialization import content_hash
 
-
 # ---------------------------------------------------------------------------
 # Merge output models
 # ---------------------------------------------------------------------------

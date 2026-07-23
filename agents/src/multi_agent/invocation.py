@@ -20,8 +20,9 @@ Supervisor stay unchanged.
 from __future__ import annotations
 
 import warnings
+from collections.abc import Callable
 from decimal import Decimal
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from pydantic import Field, model_validator
 
@@ -43,7 +44,11 @@ from multi_agent.registry import AgentHandler, AgentRegistry
 # ``ExecutionUsage.attempt_usage_records``) and
 # :mod:`multi_agent.invocation` (which defines the Receipt/Invoker).
 # We import them here and re-export for backwards compatibility.
+# R9 Section 7: legacy trust↔provenance conversion helpers are now
+# imported from :mod:`multi_agent.usage` so the Receipt's
+# ``_sync_trust_provenance`` validator can use them.
 from multi_agent.usage import (
+    _TRUST_TO_PROVENANCE,
     AttemptUsageDisposition,
     AttemptUsageRecord,
     ProviderUsageVerifier,
@@ -51,15 +56,10 @@ from multi_agent.usage import (
     UsageTrustLevel,
     UsageVerificationCapabilities,
     VerifiedUsage,
+    _provenance_to_trust,
     get_usage_capabilities,
     validate_usage_dimension,
 )
-
-# R9 Section 7: legacy trust↔provenance conversion helpers are now
-# imported from :mod:`multi_agent.usage` so the Receipt's
-# ``_sync_trust_provenance`` validator can use them.
-from multi_agent.usage import _provenance_to_trust, _TRUST_TO_PROVENANCE
-
 
 # ---------------------------------------------------------------------------
 # R9 Section 2: Unified Invocation Outcome (success + failure)
@@ -130,7 +130,7 @@ class AgentInvocationOutcome(StrictContract):
     cost_source_id: str | None = None
 
     @model_validator(mode="after")
-    def _enforce_outcome_invariants(self) -> "AgentInvocationOutcome":
+    def _enforce_outcome_invariants(self) -> AgentInvocationOutcome:
         # R10.1 P1-3: when a Result is present, observed_tool_calls
         # MUST be non-None.  The Result already carries its
         # ``tool_calls`` list, so the Invoker MUST report the exact
@@ -285,7 +285,7 @@ class AgentInvocationReceipt(StrictContract):
     usage_trust: UsageTrustLevel = Field(default="unverified", exclude=True)
 
     @model_validator(mode="after")
-    def _enforce_receipt_dimension_invariants(self) -> "AgentInvocationReceipt":
+    def _enforce_receipt_dimension_invariants(self) -> AgentInvocationReceipt:
         # R10 P0-5: enforce per-dimension invariants via the shared
         # function so the Receipt follows the SAME rules as
         # AttemptUsageRecord, AgentInvocationOutcome, and
@@ -833,9 +833,9 @@ def validate_invocation_receipt(receipt: AgentInvocationReceipt) -> None:
 
 
 __all__ = [
-    "AgentInvocationReceipt",
     "AgentInvocationFailure",
     "AgentInvocationOutcome",
+    "AgentInvocationReceipt",
     "AgentInvoker",
     "AttemptUsageDisposition",
     "AttemptUsageRecord",

@@ -36,6 +36,22 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 import pytest
+from phase5b_helpers import (
+    RUN_ID,
+    TENANT,
+    TS,
+    AlwaysKillSwitch,
+    CancelledRun,
+    NoKillSwitch,
+    make_approved_request_result,
+    make_evidence,
+    make_proposal,
+    make_recording_registry,
+    make_request,
+    make_result,
+    make_review,
+    run_async,
+)
 
 from multi_agent.action_adapter import (
     ActionAdapterBinding,
@@ -78,24 +94,6 @@ from multi_agent.review_contracts import (
     ReviewDecisionStatus,
     ReviewRiskLevel,
 )
-
-from phase5b_helpers import (
-    AlwaysKillSwitch,
-    CancelledRun,
-    NoKillSwitch,
-    RUN_ID,
-    TS,
-    TENANT,
-    make_approved_request_result,
-    make_evidence,
-    make_proposal,
-    make_recording_registry,
-    make_request,
-    make_result,
-    make_review,
-    run_async,
-)
-
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -224,6 +222,10 @@ class _RetryableFailAdapter:
     async def execute(self, command: ExecutionCommand) -> AdapterExecutionOutcome:
         self._call_count += 1
         if self._call_count == 1:
+            # P0-8 / Retry-safety: the FAILED outcome MUST carry
+            # retryable=True so _execute_one_with_retry's gate
+            # (``if not result.retryable: return result``) permits the
+            # retry.  executed=False confirms no side-effect occurred.
             return AdapterExecutionOutcome(
                 command_id=command.command_id,
                 adapter_id=self.adapter_id,
@@ -232,6 +234,7 @@ class _RetryableFailAdapter:
                 executed=False,
                 error_code="transient_failure",
                 error_message="simulated transient failure",
+                retryable=True,
             )
         return AdapterExecutionOutcome(
             command_id=command.command_id,
@@ -684,7 +687,7 @@ class TestPhase5BR1TrustChain:
     # ------------------------------------------------------------------
 
     def test_live_adapter_id_mismatch_rejected(self) -> None:
-        """_lookup_and_verify_adapter returns None when the live
+        """verify_adapter_matches_binding returns None when the live
         adapter's adapter_id does not match the frozen binding."""
         registry = ActionAdapterRegistry()
         adapter = RecordingActionAdapter(
@@ -692,16 +695,16 @@ class TestPhase5BR1TrustChain:
             supported_action_types=frozenset({"report.generate"}),
         )
         registry.register(adapter)
+        frozen = registry.freeze_for_execution()
         binding = _make_binding(
             action_type="report.generate",
             adapter_id="different-adapter",
         )
-        executor = GovernedExecutor()
-        result = executor._lookup_and_verify_adapter(registry, binding, dry_run=False)
+        result = frozen.verify_adapter_matches_binding(binding, dry_run=False)
         assert result is None
 
     def test_live_adapter_version_mismatch_rejected(self) -> None:
-        """_lookup_and_verify_adapter returns None when the live
+        """verify_adapter_matches_binding returns None when the live
         adapter's adapter_version does not match the frozen binding."""
         registry = ActionAdapterRegistry()
         adapter = RecordingActionAdapter(
@@ -709,25 +712,25 @@ class TestPhase5BR1TrustChain:
             supported_action_types=frozenset({"report.generate"}),
         )
         registry.register(adapter)
+        frozen = registry.freeze_for_execution()
         binding = _make_binding(
             action_type="report.generate",
             adapter_id="recording-adapter",
             adapter_version="2.0.0",
         )
-        executor = GovernedExecutor()
-        result = executor._lookup_and_verify_adapter(registry, binding, dry_run=False)
+        result = frozen.verify_adapter_matches_binding(binding, dry_run=False)
         assert result is None
 
     def test_dry_run_unsupported_by_live_adapter_rejected(self) -> None:
-        """_lookup_and_verify_adapter returns None when dry_run=True
+        """verify_adapter_matches_binding returns None when dry_run=True
         but the live adapter does not support dry-run mode."""
         registry = ActionAdapterRegistry()
         adapter = _NoDryRunAdapter()
         registry.register(adapter)
-        snap = registry.freeze_snapshot()
+        frozen = registry.freeze_for_execution()
+        snap = frozen.snapshot
         binding = next(b for b in snap.bindings if b.action_type == "report.generate")
-        executor = GovernedExecutor()
-        result = executor._lookup_and_verify_adapter(registry, binding, dry_run=True)
+        result = frozen.verify_adapter_matches_binding(binding, dry_run=True)
         assert result is None
 
     def test_outcome_verify_against_binding_detects_drift(self) -> None:
@@ -883,7 +886,19 @@ class TestPhase5BR1TrustChain:
             execution_store=execution_store,
             approval_store=approval_store,
         )
-        receipt = run_async(execution_store.get_receipt(TENANT, "idem-test-001"))
+        # P0-8: the executor reserves + commits the receipt under
+        # scope=binding.idempotency_scope (TENANT here), so the lookup
+        # MUST pass the same scope — otherwise the key namespace
+        # (tenant_id, idempotency_key) does not match the default
+        # (tenant_id, "real", idempotency_key) and the receipt is not
+        # found.
+        receipt = run_async(
+            execution_store.get_receipt(
+                TENANT,
+                "idem-test-001",
+                scope=IdempotencyScope.TENANT,
+            )
+        )
         assert receipt is not None
         assert receipt.status == ExecutionStatus.SUCCEEDED
         assert receipt.executed is True

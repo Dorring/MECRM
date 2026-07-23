@@ -44,14 +44,14 @@ from typing import Any, Protocol
 
 from pydantic import Field, field_validator
 
+from multi_agent.action_governance import (
+    get_action_governance_spec,
+)
 from multi_agent.contracts import (
     AgentAuthority,
     JsonValue,
     StrictContract,
     _reject_sensitive_keys,
-)
-from multi_agent.serialization import (
-    validate_strict_json,
 )
 from multi_agent.review_contracts import (
     CODE_POLICY_DENIED,
@@ -64,14 +64,13 @@ from multi_agent.review_contracts import (
     ReviewFinding,
     ReviewFindingSeverity,
 )
-from multi_agent.action_governance import (
-    get_action_governance_spec,
-)
 from multi_agent.review_errors import (
     InvalidReviewResultError,
     PolicyEvaluationError,
 )
-
+from multi_agent.serialization import (
+    validate_strict_json,
+)
 
 # ---------------------------------------------------------------------------
 # Policy Evaluation Request / Result contracts
@@ -536,7 +535,7 @@ class OPAReviewAdapter:
         self._config = config
         self._transport: Any = None
 
-    def with_transport(self, transport: Any) -> "OPAReviewAdapter":
+    def with_transport(self, transport: Any) -> OPAReviewAdapter:
         """Inject a custom HTTP transport (test hook)."""
         self._transport = transport
         return self
@@ -754,7 +753,7 @@ class FakePolicyEvaluator:
         self,
         proposal_id: str,
         result: PolicyEvaluationResult,
-    ) -> "FakePolicyEvaluator":
+    ) -> FakePolicyEvaluator:
         self.presets[proposal_id] = result
         return self
 

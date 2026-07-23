@@ -24,8 +24,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Sequence
 from decimal import Decimal
-from typing import Any, Sequence
+from typing import Any
 
 from multi_agent.contracts import (
     AgentError,
@@ -36,24 +37,7 @@ from multi_agent.contracts import (
     ExecutionUsage,
     UsageAvailabilityStatus,
 )
-from multi_agent.planning import (
-    NEVER_RETRYABLE_ERROR_CODES,
-    PlannedTask,
-    RetryPolicy,
-)
 from multi_agent.execution import (
-    ExecutionBinding,
-    ExecutionCapabilitySnapshot,
-    ExecutionCancellation,
-    ExecutionRunIdentity,
-    ExecutionTraceEvent,
-    FakeExecutionCancellation,
-    ResultOriginSnapshot,
-    SupervisorConfig,
-    SupervisorRunResult,
-    SupervisorRunStatus,
-    TaskAttemptRecord,
-    TaskExecutionRecord,
     TRACE_BUDGET_EXCEEDED,
     TRACE_PLAN_VALIDATED,
     TRACE_RESULTS_MERGED,
@@ -68,6 +52,18 @@ from multi_agent.execution import (
     TRACE_TASK_SKIPPED,
     TRACE_TASK_STARTED,
     TRACE_TASK_TIMED_OUT,
+    ExecutionBinding,
+    ExecutionCancellation,
+    ExecutionCapabilitySnapshot,
+    ExecutionRunIdentity,
+    ExecutionTraceEvent,
+    FakeExecutionCancellation,
+    ResultOriginSnapshot,
+    SupervisorConfig,
+    SupervisorRunResult,
+    SupervisorRunStatus,
+    TaskAttemptRecord,
+    TaskExecutionRecord,
     build_execution_context,
     final_status_priority,
     utc_now,
@@ -83,6 +79,7 @@ from multi_agent.execution_errors import (
     RunPlanConflictError,
     SupervisorError,
 )
+from multi_agent.integrity import compute_evidence_hash_from_payload
 from multi_agent.invocation import (
     AgentInvocationFailure,
     AgentInvocationOutcome,
@@ -94,13 +91,13 @@ from multi_agent.invocation import (
     get_usage_capabilities,
     validate_invocation_receipt,
 )
-from multi_agent.usage import (
-    ERROR_EXECUTION_USAGE_UNAVAILABLE,
-    ERROR_INFRASTRUCTURE_EXCEPTION,
-    ERROR_TOOL_USAGE_UNAVAILABLE,
-)
 from multi_agent.plan_validator import PlanValidator
-from multi_agent.planning import PlanDraft
+from multi_agent.planning import (
+    NEVER_RETRYABLE_ERROR_CODES,
+    PlanDraft,
+    PlannedTask,
+    RetryPolicy,
+)
 from multi_agent.registry import AgentHandler, AgentRegistry
 from multi_agent.run_store import InMemoryRunStore, RunLease, RunStore
 from multi_agent.scheduler import (
@@ -110,10 +107,13 @@ from multi_agent.scheduler import (
     PreDispatch,
     TaskOutcome,
 )
-from multi_agent.integrity import compute_evidence_hash_from_payload
-from multi_agent.state import merge_parallel_results
 from multi_agent.serialization import stable_hash
-
+from multi_agent.state import merge_parallel_results
+from multi_agent.usage import (
+    ERROR_EXECUTION_USAGE_UNAVAILABLE,
+    ERROR_INFRASTRUCTURE_EXCEPTION,
+    ERROR_TOOL_USAGE_UNAVAILABLE,
+)
 
 # ---------------------------------------------------------------------------
 # R6 P0-2: Executable RetryPolicy — pure retry decision function
@@ -1614,7 +1614,7 @@ class SupervisorRuntime:
         plan: PlanDraft,
         registry: AgentRegistry,
     ) -> tuple[
-        dict[str, "ExecutionBinding"],
+        dict[str, ExecutionBinding],
         dict[str, AgentHandler],
     ]:
         """Build immutable (capability, handler) bindings for every task.
@@ -2894,9 +2894,9 @@ class SupervisorRuntime:
         # Return as a simple namespace so call sites read clearly.
         class _Callbacks:
             __slots__ = (
-                "on_wave_started",
-                "on_wave_completed",
                 "on_tasks_skipped",
+                "on_wave_completed",
+                "on_wave_started",
             )
 
             def __init__(self, ws, wc, ts):

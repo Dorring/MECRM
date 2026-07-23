@@ -25,8 +25,11 @@ from __future__ import annotations
 from collections import deque
 from typing import Any
 
+from multi_agent.complexity_gate import (
+    ComplexityGate,
+    RuleBasedComplexityGate,
+)
 from multi_agent.contracts import AgentAuthority, ToolAuthority
-from multi_agent.registry import AgentRegistry
 from multi_agent.planning import (
     PLANNER_VERSION,
     PlanDraft,
@@ -43,11 +46,8 @@ from multi_agent.planning import (
     validate_intent_tool_authority,
     validate_write_approval_requirements,
 )
-from multi_agent.complexity_gate import (
-    ComplexityGate,
-    RuleBasedComplexityGate,
-)
 from multi_agent.planning_errors import PlanningError, PlanningInputError
+from multi_agent.registry import AgentRegistry
 
 # ---------------------------------------------------------------------------
 # Issue codes (stable strings surfaced over HTTP / logs)

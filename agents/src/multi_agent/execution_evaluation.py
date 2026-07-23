@@ -28,9 +28,10 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any
 
 from pydantic import ConfigDict
 
@@ -72,6 +73,7 @@ from multi_agent.review_contracts import (
     CODE_DUPLICATE_DEDUPED,
     CODE_EVIDENCE_MISSING,
     CODE_POLICY_DENIED,
+    REVIEWER_VERSION,
     PolicyContext,
     PolicyDecision,
     PolicyDecisionAudit,
@@ -86,12 +88,10 @@ from multi_agent.review_contracts import (
     ReviewProposalSnapshot,
     ReviewRequest,
     ReviewRiskLevel,
-    REVIEWER_VERSION,
     TaskRecordSummary,
     TraceSummary,
 )
 from multi_agent.serialization import stable_hash
-
 
 # ---------------------------------------------------------------------------
 # Expected outcome + fixture
@@ -109,10 +109,17 @@ class ExecutionExpectedOutcome(StrictContract):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    expected_status_by_proposal: dict[str, str] = {}
+    expected_status_by_proposal: tuple[tuple[str, str], ...] = ()
     expected_batch_status: str | None = None
     expected_error_code: str | None = None
     expected_adapter_call_count: int | None = None
+
+    @property
+    def status_map(self) -> dict[str, str]:
+        """Convenience accessor returning a fresh dict (P1-3: the
+        underlying tuple is immutable; this returns a mutable copy
+        for read-only lookup)."""
+        return dict(self.expected_status_by_proposal)
 
 
 @dataclass(frozen=True)
@@ -468,7 +475,7 @@ def _make_request(
         governance_spec_hash=ACTION_GOVERNANCE_SPEC_HASH,
         reviewer_version=REVIEWER_VERSION,
     )
-    return req
+    return req  # noqa: RET504
 
 
 def _make_review(
@@ -623,9 +630,9 @@ def build_execution_fixtures() -> list[ExecutionFixture]:
             request=r1,
             review_result=res1,
             expected_outcome=ExecutionExpectedOutcome(
-                expected_status_by_proposal={
-                    "prop-exec-001": ExecutionStatus.SUCCEEDED.value
-                },
+                expected_status_by_proposal=(
+                    ("prop-exec-001", ExecutionStatus.SUCCEEDED.value),
+                ),
                 expected_batch_status=BatchExecutionStatus.SUCCEEDED.value,
                 expected_adapter_call_count=1,
             ),
@@ -662,7 +669,7 @@ def build_execution_fixtures() -> list[ExecutionFixture]:
             request=r2,
             review_result=res2,
             expected_outcome=ExecutionExpectedOutcome(
-                expected_status_by_proposal={},
+                expected_status_by_proposal=(),
                 expected_batch_status=BatchExecutionStatus.NO_ACTIONS.value,
                 expected_adapter_call_count=0,
             ),
@@ -699,7 +706,7 @@ def build_execution_fixtures() -> list[ExecutionFixture]:
             request=r3,
             review_result=res3,
             expected_outcome=ExecutionExpectedOutcome(
-                expected_status_by_proposal={},
+                expected_status_by_proposal=(),
                 expected_batch_status=BatchExecutionStatus.NO_ACTIONS.value,
                 expected_adapter_call_count=0,
             ),
@@ -732,7 +739,7 @@ def build_execution_fixtures() -> list[ExecutionFixture]:
             request=r4,
             review_result=res4,
             expected_outcome=ExecutionExpectedOutcome(
-                expected_status_by_proposal={},
+                expected_status_by_proposal=(),
                 expected_batch_status=BatchExecutionStatus.NO_ACTIONS.value,
                 expected_adapter_call_count=0,
             ),
@@ -766,7 +773,7 @@ def build_execution_fixtures() -> list[ExecutionFixture]:
             request=r5,
             review_result=res5,
             expected_outcome=ExecutionExpectedOutcome(
-                expected_status_by_proposal={},
+                expected_status_by_proposal=(),
                 expected_batch_status=BatchExecutionStatus.NO_ACTIONS.value,
                 expected_adapter_call_count=0,
             ),
@@ -783,7 +790,7 @@ def build_execution_fixtures() -> list[ExecutionFixture]:
             request=r6,
             review_result=res6,
             expected_outcome=ExecutionExpectedOutcome(
-                expected_status_by_proposal={},
+                expected_status_by_proposal=(),
                 expected_batch_status=BatchExecutionStatus.NO_ACTIONS.value,
                 expected_adapter_call_count=0,
             ),
@@ -818,9 +825,9 @@ def build_execution_fixtures() -> list[ExecutionFixture]:
             request=r7,
             review_result=res7,
             expected_outcome=ExecutionExpectedOutcome(
-                expected_status_by_proposal={
-                    "prop-exec-007": ExecutionStatus.PENDING_APPROVAL.value
-                },
+                expected_status_by_proposal=(
+                    ("prop-exec-007", ExecutionStatus.PENDING_APPROVAL.value),
+                ),
                 expected_batch_status=BatchExecutionStatus.PENDING_APPROVAL.value,
                 expected_adapter_call_count=0,
             ),
@@ -847,10 +854,10 @@ def build_execution_fixtures() -> list[ExecutionFixture]:
             request=r8,
             review_result=res8,
             expected_outcome=ExecutionExpectedOutcome(
-                expected_status_by_proposal={
-                    "prop-exec-008a": ExecutionStatus.SUCCEEDED.value,
-                    "prop-exec-008b": ExecutionStatus.SUCCEEDED.value,
-                },
+                expected_status_by_proposal=(
+                    ("prop-exec-008a", ExecutionStatus.SUCCEEDED.value),
+                    ("prop-exec-008b", ExecutionStatus.SUCCEEDED.value),
+                ),
                 expected_batch_status=BatchExecutionStatus.SUCCEEDED.value,
                 expected_adapter_call_count=2,
             ),
@@ -891,9 +898,9 @@ def build_execution_fixtures() -> list[ExecutionFixture]:
             request=r9,
             review_result=res9,
             expected_outcome=ExecutionExpectedOutcome(
-                expected_status_by_proposal={
-                    "prop-exec-009a": ExecutionStatus.SUCCEEDED.value
-                },
+                expected_status_by_proposal=(
+                    ("prop-exec-009a", ExecutionStatus.SUCCEEDED.value),
+                ),
                 expected_batch_status=BatchExecutionStatus.SUCCEEDED.value,
                 expected_adapter_call_count=1,
             ),
@@ -908,9 +915,9 @@ def build_execution_fixtures() -> list[ExecutionFixture]:
             request=r1,
             review_result=res1,
             expected_outcome=ExecutionExpectedOutcome(
-                expected_status_by_proposal={
-                    "prop-exec-001": ExecutionStatus.SUCCEEDED.value
-                },
+                expected_status_by_proposal=(
+                    ("prop-exec-001", ExecutionStatus.SUCCEEDED.value),
+                ),
                 expected_batch_status=BatchExecutionStatus.SUCCEEDED.value,
                 expected_adapter_call_count=1,
             ),
@@ -1056,11 +1063,12 @@ def compute_execution_metrics(
         # 5. receipt_atomicity_rate: every receipt has a matching
         #    idempotency state (no orphan receipts).
         receipt_total += len(result.receipts)
-        if result.receipts:
-            # If batch has receipts and no error about receipt/store
-            # atomicity, count as atomic.
-            if not (result.error_code and "receipt" in result.error_code.lower()):
-                receipt_atomic_committed += len(result.receipts)
+        # If batch has receipts and no error about receipt/store
+        # atomicity, count as atomic.
+        if result.receipts and not (
+            result.error_code and "receipt" in result.error_code.lower()
+        ):
+            receipt_atomic_committed += len(result.receipts)
         # 6. unknown_batch_preservation_rate: UNKNOWN stays UNKNOWN.
         if result.unknown_proposal_ids:
             unknown_total += 1

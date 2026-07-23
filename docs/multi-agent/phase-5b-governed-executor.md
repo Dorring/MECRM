@@ -1,5 +1,26 @@
 # Phase 5B: Governed Executor & Human Approval Gate
 
+> **R2 (Revision 2)** — Fixes 10 P0 blocking issues and 2 P1 sync items
+> from the R1 review.  Key changes: (P0-1) `pre_approval_authorization_hash`
+> chain captures the pre-approval hash so the binding transition is
+> verifiable; (P0-2) Approval gate split into read-only
+> `validate_decision()` + atomic `consume_for_command()` so the approval
+> is consumed only after ALL pre-call checks pass; (P0-3)
+> `ApprovalConsumptionRecord` records every consumption with a
+> content-bound hash; (P0-4) `FrozenActionAdapterRegistry` freezes the
+> live adapter instance atomically with the binding snapshot; (P0-5)
+> call-boundary reordering so pre-call blocks return NOT_AUTHORIZED /
+> CANCELLED (never UNKNOWN) and never touch the idempotency store;
+> (P0-7) dry-run idempotency isolation via separate `"dry-run"` / `"real"`
+> namespaces and a new `DRY_RUN_SUCCEEDED` state; (P0-8) idempotency
+> scope semantics (`GLOBAL` / `TENANT` / `NONE`) produce distinct store
+> keys and replay rules; (P0-9) strict CAS state machine with a
+> legal-transition table; (P0-10) batch summary fields derived from
+> per-action `ActionExecutionRecord` with `verify_semantics()`;
+> (P1-1) `ExecutionGraphState` is serializable — runtime deps moved to a
+> `RuntimeDependencies` closure; (P1-3) `ExecutionExpectedOutcome`
+> deep immutability via tuple-typed `expected_status_by_proposal`.
+
 > **R1 (Revision 1)** — Fixes 9 P0 issues from the first review:
 > Noop Adapter no longer claims real execution success; Approval is
 > atomically validated-and-consumed; Adapter Binding is enforced at
@@ -103,6 +124,15 @@ R1 P1-1/P1-2: `approval_id` and `command_id` are also deterministic
 (derived from `authorization_hash` + `fingerprint` + `attempt`), so a
 replay produces byte-identical IDs — no random UUIDs.
 
+R2 P0-1: `pre_approval_authorization_hash` captures the authorization
+hash BEFORE approval binding.  When the approval is consumed, the
+executor binds the decision and produces a NEW `authorization_hash`
+(different content), while `pre_approval_authorization_hash` preserves
+the pre-binding value.  The pre-approval hash participates in the new
+`authorization_hash` computation — forging it breaks integrity
+verification.  The status transitions `PENDING_APPROVAL → READY` on a
+successful bind.
+
 ## Human Approval Gate
 
 ### Approval State Machine
@@ -131,10 +161,21 @@ CONSUMED      (after successful execution, terminal)
 - APPROVED can only be consumed once
 - REJECTED / EXPIRED / REVOKED can never be consumed
 - `create()` rejects hash-conflicting ApprovalRequests (R1 P1-1)
-- **Atomic `validate_and_consume()`** (R1 P0-3): ALL checks (tenant,
-  run, proposal, authorization_hash, request_hash, approver role,
-  expiry, status) run under the store lock BEFORE the approval is
-  marked CONSUMED — no partial consume, no invalid approval consumed
+- **R2 P0-2: Two-phase validate / consume split** —
+  `validate_decision()` is read-only (tenant, run, proposal, auth hash,
+  request hash, approver role, expiry, status, AND time semantics:
+  `decided_at >= requested_at`, `decided_at <= now`).  It does NOT mark
+  the approval consumed.  `consume_for_command()` atomically binds the
+  approval to a specific `command_id` + `execution_fingerprint` under
+  the store lock — the approval is consumed ONLY after ALL pre-call
+  checks (deadline, adapter binding, kill switch, idempotency
+  reservation) have passed.
+- **R2 P0-3: `ApprovalConsumptionRecord`** — every consumption is
+  recorded with a content-bound `consumption_hash` covering
+  `approval_id`, `decision_hash`, `authorization_hash`, `command_id`,
+  and `execution_fingerprint`.  Re-consuming the same approval with the
+  same command + fingerprint returns the existing record (idempotent);
+  re-consuming with a different command/fingerprint is rejected.
 - Returns defensive copies
 
 ## Adapter Registry
@@ -147,6 +188,15 @@ CONSUMED      (after successful execution, terminal)
 - Action Type has exactly one binding
 - Registry hash enters Authorization, Command, and Receipt
 - During execution, the Executor reads only from the frozen snapshot
+- **R2 P0-4: `FrozenActionAdapterRegistry`** — captures the live
+  adapter instance AND the binding snapshot atomically via
+  `freeze_for_execution()`.  The executor resolves adapters only from
+  the frozen registry; `verify_adapter_matches_binding()` enforces
+  `adapter_id`, `adapter_version`, `supports_dry_run`, `retry_safe`,
+  and `idempotency_scope` match the frozen binding — drift is
+  fail-closed (returns `None` → `NOT_AUTHORIZED`).  The runtime
+  bindings are defensively copied so post-freeze mutation of the
+  live registry cannot affect an in-flight execution.
 
 ### Default Adapters
 - `DeterministicNoopAdapter`: **dry-run only** (R1 P0-1).  Accepts
@@ -161,12 +211,54 @@ CONSUMED      (after successful execution, terminal)
 ## Idempotency State Machine
 
 ```
-RESERVED      (key claimed, fingerprint verified)
-IN_PROGRESS   (adapter call started)
-SUCCEEDED     (adapter returned SUCCEEDED, receipt cached)
-FAILED        (adapter returned FAILED, key released)
-UNKNOWN       (timeout / cancellation, NO auto-retry, human intervention)
+RESERVED             (key claimed, fingerprint verified)
+CALL_STARTED         (adapter call in flight; fka IN_PROGRESS)
+SUCCEEDED            (adapter returned real SUCCEEDED, receipt cached)
+DRY_RUN_SUCCEEDED    (dry-run success — NEVER blocks real execution, P0-7)
+FAILED               (adapter returned FAILED, key may be retried)
+UNKNOWN              (timeout / cancellation, NO auto-retry, human intervention)
 ```
+
+### R2 P0-9: Strict CAS State Machine
+
+Every state transition is validated against a legal-transition table:
+
+```
+RESERVED          → CALL_STARTED
+CALL_STARTED      → SUCCEEDED | FAILED | UNKNOWN | DRY_RUN_SUCCEEDED
+FAILED            → CALL_STARTED (only for safe retry)
+SUCCEEDED         → (terminal)
+DRY_RUN_SUCCEEDED → (terminal)
+UNKNOWN           → (terminal)
+```
+
+Any illegal transition raises `ValueError`.  `IN_PROGRESS` is retained
+as a backward-compatible alias for `CALL_STARTED`.
+
+### R2 P0-7: Dry-run Idempotency Isolation
+
+Dry-run and real executions use **separate store namespaces**:
+- Dry-run key: `(tenant_id, "dry-run", idempotency_key)`
+- Real key: `(tenant_id, "real", idempotency_key)`
+
+A `dry_run=True` success transitions to `DRY_RUN_SUCCEEDED` (never
+`SUCCEEDED`), so a subsequent real execution with the same
+idempotency key is NOT blocked and gets a fresh `RESERVED` record.
+
+### R2 P0-8: Idempotency Scope Semantics
+
+`IdempotencyScope` (declared per-adapter in the binding) controls the
+store key shape and replay semantics:
+
+| Scope | Store key | Replay |
+|-------|-----------|--------|
+| `GLOBAL` | `("global", idempotency_key)` | unique across all tenants |
+| `TENANT` | `(tenant_id, idempotency_key)` | unique within a tenant |
+| `NONE` | `(tenant_id, idempotency_key, "none")` + unique `reservation_id` | no replay, no retry — every attempt is a fresh record |
+
+`compute_scope_key()` and `compute_resource_key()` produce stable
+store keys.  `NONE` always creates a fresh record (non-idempotent
+adapter) and never collides with itself.
 
 ### Rules
 - Same key + same fingerprint + SUCCEEDED → return **original cached
@@ -175,7 +267,7 @@ UNKNOWN       (timeout / cancellation, NO auto-retry, human intervention)
 - Same key + SUCCEEDED but no stored receipt → UNKNOWN (crash-window
   detection)
 - Same key + different fingerprint → `IdempotencyConflictError` (Fail-Closed)
-- Same key + IN_PROGRESS → `ExecutionAlreadyInProgressError`
+- Same key + CALL_STARTED → `ExecutionAlreadyInProgressError`
 - Same key + UNKNOWN → no auto-retry, requires human handling
 - Idempotency reservation is established BEFORE any adapter call
 - **Atomic commit** (R1 P0-6): terminal state and Receipt are committed
@@ -184,29 +276,42 @@ UNKNOWN       (timeout / cancellation, NO auto-retry, human intervention)
 
 ## Governed Executor
 
-18-step fixed-order pipeline (R1 updated):
+18-step fixed-order pipeline (R2 call-boundary reordered):
 1. verify ReviewRequest integrity
 2. verify ReviewBatchResult against Request
 3. verify **live** Governance Spec hash matches module constant,
    request, and result (R1 P0-9)
-4. freeze Adapter Registry Snapshot
+4. freeze Adapter Registry Snapshot (R2 P0-4: `FrozenActionAdapterRegistry`
+   captures live instances)
 5. select executable Proposal Reviews
-6. build and verify ExecutionAuthorization
+6. build and verify ExecutionAuthorization; capture
+   `pre_approval_authorization_hash` (R2 P0-1)
 7. resolve Approval Requirement; **create ApprovalRequest** if
    needed (R1 P0-2)
-8. **atomically validate-and-consume** Approval Decision (R1 P0-3)
+8. **`validate_decision()`** — read-only approval validation (R2 P0-2)
 9. check Kill Switch **before** Idempotency reservation (R1 P0-5)
-10. reserve Idempotency Key
-11. re-check Kill Switch after reservation, before call (R1 P0-5)
+10. reserve Idempotency Key (R2 P0-7/P0-8: dry-run namespace + scope)
+11. **`consume_for_command()`** — atomically consume approval binding to
+    `command_id` + `execution_fingerprint` (R2 P0-2/P0-3)
 12. build immutable ExecutionCommand with **deterministic command_id**
-    (R1 P1-2)
-13. mark execution IN_PROGRESS
-14. invoke Adapter with timeout/cancellation; **verify live adapter
-    matches frozen binding** (R1 P0-4)
+    (R1 P1-2); **verify live adapter matches frozen binding** (R1 P0-4)
+13. re-check Kill Switch after reservation, before call (R1 P0-5);
+    mark `CALL_STARTED` (R2 P0-9)
+14. invoke Adapter with timeout/cancellation; handle `CancelledError`
 15. validate Adapter Outcome against command AND binding (R1 P0-4)
 16. build trusted ExecutionReceipt
 17. **atomically** commit Idempotency Record + Receipt (R1 P0-6)
 18. finalize Batch Result + verify against original inputs
+
+### R2 P0-5: Call-boundary Ordering
+
+Pre-call blocks (steps 4–13) return `NOT_AUTHORIZED` / `CANCELLED` /
+`BLOCKED` — **never `UNKNOWN`** — and do NOT touch the idempotency
+store.  The idempotency slot is reserved (step 10) and the approval is
+consumed (step 11) only after ALL pre-call checks pass.  `CALL_STARTED`
+is marked (step 13) only when the adapter call is actually about to
+start; if the call raises `CancelledError`, the outcome transitions to
+`UNKNOWN`.
 
 ## Timeout / Cancellation / Unknown Outcome
 
@@ -275,6 +380,15 @@ Credential, full PII, DB connection, HTTP client, handler.
 - No cross-action database transaction illusion
 - Partial success/failure → `PARTIAL_SUCCESS` (no rollback)
 - Compensation requires new Proposal (not auto-executed in Phase 5B)
+- **R2 P0-10: `ActionExecutionRecord`** — every action in the batch is
+  recorded with `proposal_id`, `status`, `receipt`, `approval_request`,
+  `approval_consumption_hash`, `error_code`, `adapter_call_started`,
+  `replayed`, `retryable`, `executed`, `skipped`, `dry_run_succeeded`.
+  All summary ID lists (`succeeded_proposal_ids`, `failed_proposal_ids`,
+  `blocked_proposal_ids`, `unknown_proposal_ids`, etc.) are **derived**
+  from `action_records`, never assembled independently.  `verify_semantics()`
+  validates that summary lists match `action_records`, no duplicates,
+  no orphans, and `batch_status` is consistent with the per-action statuses.
 
 ### Batch Status Priority (R1 P0-7)
 ```
@@ -323,12 +437,25 @@ Graph only calls `GovernedExecutor` public methods — does NOT
 copy authorization, approval, idempotency, adapter, receipt, hash, or
 decision algorithms.
 
-`ExecutionGraphState` contains only: request, review_result, stores,
-registry, kill_switch, clock, options, result, graph_error.
-No raw Exception or Adapter objects.
+**R2 P1-1: Serializable state + closure-injected deps.**
+`ExecutionGraphState` contains ONLY serializable fields: `request`,
+`review_result`, `result`, `graph_error`.  Runtime dependencies
+(`ApprovalStore`, `ExecutionStore`, `ActionAdapterRegistry`,
+`KillSwitch`, `Clock`, `GovernedExecutor`, `ExecutionOptions`) are
+injected via a `RuntimeDependencies` dataclass captured in the graph
+closure by `build_execution_graph(deps)`.  This ensures the state
+survives LangGraph checkpointing without dragging live stores into
+the checkpoint.
 
-Direct Executor and Graph produce identical: Result, Receipt, Error
-Code, Batch Status, Trace.
+The `verify_review` node is a no-op (P1-1 Direct/Graph Error Parity):
+`GovernedExecutor.execute` already performs all ReviewRequest /
+ReviewBatchResult verification (pipeline steps 1–4), so both paths
+return the same BLOCKED batch on invalid inputs instead of the graph
+short-circuiting to END with `graph_error` and `result=None`.
+
+No raw Exception or Adapter objects enter the state.  Direct Executor
+and Graph produce identical: Result, Receipt, Error Code, Batch Status,
+Trace.
 
 ## Side-effect Guard
 
@@ -376,6 +503,12 @@ R1 P0-8 adds 7 new metrics:
 
 Evaluation reads `ExecutionExpectedOutcome` — never infers from
 fixture name, Proposal ID, or test file name.
+
+**R2 P1-3: Deep immutability.** `ExecutionExpectedOutcome.expected_status_by_proposal`
+is a `tuple[tuple[str, str], ...]` (not a `dict`), so the expected
+outcome is frozen at construction and cannot be mutated by a fixture
+or metric computation.  The `status_map` property returns a fresh
+mutable `dict` for read-only lookup convenience.
 
 ## Known Limitations
 

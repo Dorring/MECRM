@@ -11,17 +11,27 @@ Covers the idempotency invariants enforced by
 * The same key + a DIFFERENT fingerprint is a fail-closed
   :class:`IdempotencyConflictError`
   (``reserve_different_fingerprint_raises_conflict``).
-* An IN_PROGRESS key blocks a second reservation
+* A CALL_STARTED key blocks a second reservation
   (``reserve_in_progress_raises_already_in_progress``).
 * An UNKNOWN outcome is returned as-is — NEVER auto-retried
   (``reserve_unknown_returns_record_without_retry``).
 * A FAILED key + the same fingerprint returns the FAILED record so the
   caller may retry explicitly
   (``reserve_failed_same_fingerprint_returns_failed``).
-* ``mark_started`` transitions RESERVED → IN_PROGRESS
-  (``mark_started_transitions_to_in_progress``).
-* ``complete`` with ``succeeded=True`` → SUCCEEDED, ``succeeded=False``
-  → FAILED (``complete_succeeded_sets_succeeded_state``).
+* ``mark_started`` transitions RESERVED → CALL_STARTED
+  (``mark_started_transitions_to_call_started``).
+
+Phase 5B R2 (P0-7 / P0-8 / P0-9) additions:
+
+* ``IN_PROGRESS`` is an alias for ``CALL_STARTED`` (P0-9).
+* ``complete_with_receipt`` atomically commits terminal state + the
+  full :class:`ActionExecutionReceipt` (P0-6); the receipt is
+  independently verified against the record (tenant / idempotency_key /
+  fingerprint / command_id).
+* A ``DRY_RUN_SUCCEEDED`` receipt transitions to
+  ``DRY_RUN_SUCCEEDED`` (never ``SUCCEEDED``) — P0-7.
+* Strict CAS transitions are enforced — RESERVED → SUCCEEDED is illegal
+  (P0-9).
 * ``mark_unknown`` sets the UNKNOWN terminal state
   (``mark_unknown_sets_unknown_state``).
 * :class:`IdempotencyRecord` is frozen and hash-stable — a tampered
@@ -32,27 +42,33 @@ Covers the idempotency invariants enforced by
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
+from phase5b_helpers import TENANT, run_async
 from pydantic import ValidationError
 
+from multi_agent.execution_authorization import ExecutionStatus
 from multi_agent.execution_error_codes import (
     ExecutionAlreadyInProgressError,
+    ExecutionReceiptError,
     IdempotencyConflictError,
 )
+from multi_agent.execution_receipts import ActionExecutionReceipt
 from multi_agent.execution_store import (
     IdempotencyRecord,
     IdempotencyState,
     InMemoryExecutionStore,
 )
 
-from phase5b_helpers import TENANT, run_async
-
-
 _FP_1 = "fp-aaa" + "0" * 59
 _FP_2 = "fp-bbb" + "0" * 59
 _CMD_1 = "cmd-001"
 _CMD_2 = "cmd-002"
 _KEY_1 = "idem-001"
+
+_TS = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+_TS_LATER = _TS + timedelta(seconds=1)
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +95,58 @@ def _make_record(
     )
 
 
+def _make_receipt_for_record(
+    record: IdempotencyRecord,
+    *,
+    receipt_id: str = "rcpt-001",
+    status: ExecutionStatus = ExecutionStatus.SUCCEEDED,
+    run_id: str = "run-test",
+    proposal_id: str = "prop-test",
+    authorization_hash: str = "auth" + "0" * 60,
+    adapter_id: str = "noop-adapter",
+    adapter_version: str = "1.0.0",
+    adapter_registry_hash: str = "reg" + "0" * 60,
+    started_at: datetime | None = None,
+    completed_at: datetime | None = None,
+) -> ActionExecutionReceipt:
+    """Build a valid :class:`ActionExecutionReceipt` matching a record.
+
+    The receipt's ``tenant_id``, ``idempotency_key``,
+    ``execution_fingerprint`` and ``command_id`` are copied from the
+    record so :meth:`complete_with_receipt` (P0-9) accepts it.  The
+    ``executed`` flag is derived from ``status`` to satisfy the
+    receipt's own status ↔ executed invariant.
+    """
+    started = started_at or _TS
+    completed = completed_at or _TS_LATER
+    if status is ExecutionStatus.SUCCEEDED:
+        executed: bool | None = True
+    elif status in (
+        ExecutionStatus.FAILED,
+        ExecutionStatus.DRY_RUN_SUCCEEDED,
+    ):
+        executed = False
+    else:
+        executed = None
+    return ActionExecutionReceipt(
+        receipt_id=receipt_id,
+        command_id=record.command_id,
+        tenant_id=record.tenant_id,
+        run_id=run_id,
+        proposal_id=proposal_id,
+        authorization_hash=authorization_hash,
+        adapter_id=adapter_id,
+        adapter_version=adapter_version,
+        adapter_registry_hash=adapter_registry_hash,
+        idempotency_key=record.idempotency_key,
+        execution_fingerprint=record.execution_fingerprint,
+        status=status,
+        executed=executed,
+        started_at=started,
+        completed_at=completed,
+    )
+
+
 # ---------------------------------------------------------------------------
 # IdempotencyState enum
 # ---------------------------------------------------------------------------
@@ -86,14 +154,23 @@ def _make_record(
 
 class TestIdempotencyState:
     def test_states_have_distinct_values(self) -> None:
+        # P0-9: IN_PROGRESS renamed to CALL_STARTED; DRY_RUN_SUCCEEDED
+        # added (P0-7).  Aliases are NOT yielded by iteration.
         values = {s.value for s in IdempotencyState}
         assert values == {
             "reserved",
-            "in_progress",
+            "call_started",
             "succeeded",
+            "dry_run_succeeded",
             "failed",
             "unknown",
         }
+
+    def test_in_progress_is_backwards_compatible_alias(self) -> None:
+        # P0-9: IN_PROGRESS is retained as an alias for CALL_STARTED so
+        # legacy callers keep resolving.
+        assert IdempotencyState.IN_PROGRESS is IdempotencyState.CALL_STARTED
+        assert IdempotencyState.IN_PROGRESS.value == "call_started"
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +186,7 @@ class TestIdempotencyRecord:
 
     def test_record_is_frozen(self) -> None:
         record = _make_record()
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             record.state = IdempotencyState.SUCCEEDED  # type: ignore[misc]
 
     def test_record_verify_integrity_passes(self) -> None:
@@ -173,7 +250,10 @@ class TestReserve:
         store = InMemoryExecutionStore()
         r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
         run_async(store.mark_started(r1, _CMD_1))
-        run_async(store.complete(r1, "rcpt-001", succeeded=True))
+        receipt = _make_receipt_for_record(
+            r1, receipt_id="rcpt-001", status=ExecutionStatus.SUCCEEDED
+        )
+        run_async(store.complete_with_receipt(r1, receipt))
         # Replay with same fingerprint → returns SUCCEEDED record.
         replay = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_2))
         assert replay.state == IdempotencyState.SUCCEEDED
@@ -208,7 +288,10 @@ class TestReserve:
         store = InMemoryExecutionStore()
         r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
         run_async(store.mark_started(r1, _CMD_1))
-        run_async(store.complete(r1, "rcpt-fail", succeeded=False))
+        receipt = _make_receipt_for_record(
+            r1, receipt_id="rcpt-fail", status=ExecutionStatus.FAILED
+        )
+        run_async(store.complete_with_receipt(r1, receipt))
         replay = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_2))
         assert replay.state == IdempotencyState.FAILED
 
@@ -236,12 +319,21 @@ class TestReserve:
 
 
 class TestMarkStarted:
-    def test_mark_started_transitions_to_in_progress(self) -> None:
+    def test_mark_started_transitions_to_call_started(self) -> None:
+        # P0-9: RESERVED → CALL_STARTED (renamed from IN_PROGRESS).
         store = InMemoryExecutionStore()
         r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
         updated = run_async(store.mark_started(r1, _CMD_1))
-        assert updated.state == IdempotencyState.IN_PROGRESS
+        assert updated.state == IdempotencyState.CALL_STARTED
         assert updated.command_id == _CMD_1
+
+    def test_mark_started_on_call_started_is_illegal_transition(self) -> None:
+        # P0-9: strict CAS — CALL_STARTED → CALL_STARTED is illegal.
+        store = InMemoryExecutionStore()
+        r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
+        started = run_async(store.mark_started(r1, _CMD_1))
+        with pytest.raises(ValueError, match="illegal idempotency state transition"):
+            run_async(store.mark_started(started, _CMD_1))
 
     def test_mark_started_fingerprint_mismatch_raises_conflict(self) -> None:
         store = InMemoryExecutionStore()
@@ -258,16 +350,19 @@ class TestMarkStarted:
 
 
 # ---------------------------------------------------------------------------
-# InMemoryExecutionStore — complete
+# InMemoryExecutionStore — complete_with_receipt (P0-6 / P0-7 / P0-9)
 # ---------------------------------------------------------------------------
 
 
-class TestComplete:
+class TestCompleteWithReceipt:
     def test_complete_succeeded_sets_succeeded_state(self) -> None:
         store = InMemoryExecutionStore()
         r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
         run_async(store.mark_started(r1, _CMD_1))
-        completed = run_async(store.complete(r1, "rcpt-001", succeeded=True))
+        receipt = _make_receipt_for_record(
+            r1, receipt_id="rcpt-001", status=ExecutionStatus.SUCCEEDED
+        )
+        completed = run_async(store.complete_with_receipt(r1, receipt))
         assert completed.state == IdempotencyState.SUCCEEDED
         assert completed.receipt_id == "rcpt-001"
 
@@ -275,22 +370,96 @@ class TestComplete:
         store = InMemoryExecutionStore()
         r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
         run_async(store.mark_started(r1, _CMD_1))
-        completed = run_async(store.complete(r1, "rcpt-fail", succeeded=False))
+        receipt = _make_receipt_for_record(
+            r1, receipt_id="rcpt-fail", status=ExecutionStatus.FAILED
+        )
+        completed = run_async(store.complete_with_receipt(r1, receipt))
         assert completed.state == IdempotencyState.FAILED
         assert completed.receipt_id == "rcpt-fail"
+
+    def test_complete_dry_run_sets_dry_run_succeeded_state(self) -> None:
+        # P0-7: a DRY_RUN_SUCCEEDED receipt transitions to
+        # DRY_RUN_SUCCEEDED (never SUCCEEDED).
+        store = InMemoryExecutionStore()
+        r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1, dry_run=True))
+        run_async(store.mark_started(r1, _CMD_1))
+        receipt = _make_receipt_for_record(
+            r1,
+            receipt_id="rcpt-dry",
+            status=ExecutionStatus.DRY_RUN_SUCCEEDED,
+        )
+        completed = run_async(store.complete_with_receipt(r1, receipt))
+        assert completed.state == IdempotencyState.DRY_RUN_SUCCEEDED
+        assert completed.receipt_id == "rcpt-dry"
+
+    def test_complete_stores_receipt_for_replay(self) -> None:
+        # P0-6: the original trusted receipt is retrievable via
+        # get_receipt for deterministic replay.
+        store = InMemoryExecutionStore()
+        r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
+        run_async(store.mark_started(r1, _CMD_1))
+        receipt = _make_receipt_for_record(
+            r1, receipt_id="rcpt-replay", status=ExecutionStatus.SUCCEEDED
+        )
+        run_async(store.complete_with_receipt(r1, receipt))
+        fetched = run_async(store.get_receipt(TENANT, _KEY_1))
+        assert fetched is not None
+        assert fetched.receipt_id == "rcpt-replay"
 
     def test_complete_fingerprint_mismatch_raises_conflict(self) -> None:
         store = InMemoryExecutionStore()
         run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
         tampered = _make_record(fingerprint=_FP_2)
+        receipt = _make_receipt_for_record(tampered)
         with pytest.raises(IdempotencyConflictError):
-            run_async(store.complete(tampered, "rcpt-001", succeeded=True))
+            run_async(store.complete_with_receipt(tampered, receipt))
 
     def test_complete_unknown_key_raises_keyerror(self) -> None:
         store = InMemoryExecutionStore()
         phantom = _make_record()
+        receipt = _make_receipt_for_record(phantom)
         with pytest.raises(KeyError):
-            run_async(store.complete(phantom, "rcpt-001", succeeded=True))
+            run_async(store.complete_with_receipt(phantom, receipt))
+
+    def test_complete_from_reserved_is_illegal_transition(self) -> None:
+        # P0-9: strict CAS — RESERVED → SUCCEEDED is illegal (must go
+        # through CALL_STARTED first).
+        store = InMemoryExecutionStore()
+        r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
+        receipt = _make_receipt_for_record(r1)
+        with pytest.raises(ValueError, match="illegal idempotency state transition"):
+            run_async(store.complete_with_receipt(r1, receipt))
+
+    def test_complete_receipt_tenant_mismatch_raises(self) -> None:
+        # P0-9: receipt is independently verified against the record.
+        store = InMemoryExecutionStore()
+        r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
+        run_async(store.mark_started(r1, _CMD_1))
+        receipt = _make_receipt_for_record(r1)
+        object.__setattr__(receipt, "tenant_id", "tenant-other")
+        object.__setattr__(receipt, "receipt_hash", receipt.compute_hash())
+        with pytest.raises(ExecutionReceiptError, match="tenant_id"):
+            run_async(store.complete_with_receipt(r1, receipt))
+
+    def test_complete_receipt_idempotency_key_mismatch_raises(self) -> None:
+        store = InMemoryExecutionStore()
+        r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
+        run_async(store.mark_started(r1, _CMD_1))
+        receipt = _make_receipt_for_record(r1)
+        object.__setattr__(receipt, "idempotency_key", "wrong-key")
+        object.__setattr__(receipt, "receipt_hash", receipt.compute_hash())
+        with pytest.raises(ExecutionReceiptError, match="idempotency_key"):
+            run_async(store.complete_with_receipt(r1, receipt))
+
+    def test_complete_receipt_command_id_mismatch_raises(self) -> None:
+        store = InMemoryExecutionStore()
+        r1 = run_async(store.reserve(TENANT, _KEY_1, _FP_1, _CMD_1))
+        run_async(store.mark_started(r1, _CMD_1))
+        receipt = _make_receipt_for_record(r1)
+        object.__setattr__(receipt, "command_id", "wrong-cmd")
+        object.__setattr__(receipt, "receipt_hash", receipt.compute_hash())
+        with pytest.raises(ExecutionReceiptError, match="command_id"):
+            run_async(store.complete_with_receipt(r1, receipt))
 
 
 # ---------------------------------------------------------------------------

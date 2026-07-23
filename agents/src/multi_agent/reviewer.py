@@ -42,12 +42,28 @@ from multi_agent.action_governance import (
     get_action_governance_spec,
     verify_governance_spec_integrity,
 )
+from multi_agent.conflict_resolution import (
+    detect_conflicts,
+    detect_duplicates,
+)
 from multi_agent.contracts import (
     ActionProposal,
     AgentAuthority,
     Evidence,
 )
+from multi_agent.evidence_review import (
+    build_evidence_index,
+    detect_dangling_evidence,
+    detect_duplicate_evidence,
+    validate_evidence_for_proposal,
+)
 from multi_agent.execution import ExecutionCapabilitySnapshot
+from multi_agent.policy import (
+    PolicyDecision,
+    PolicyEvaluationRequest,
+    PolicyEvaluationResult,
+    PolicyEvaluator,
+)
 from multi_agent.review_contracts import (
     CODE_ACTION_TOOL_FORBIDDEN,
     CODE_ACTION_UNKNOWN_TYPE,
@@ -92,24 +108,7 @@ from multi_agent.review_errors import (
     ReviewError,
     ReviewIntegrityError,
 )
-from multi_agent.policy import (
-    PolicyDecision,
-    PolicyEvaluationRequest,
-    PolicyEvaluationResult,
-    PolicyEvaluator,
-)
-from multi_agent.evidence_review import (
-    build_evidence_index,
-    detect_dangling_evidence,
-    detect_duplicate_evidence,
-    validate_evidence_for_proposal,
-)
-from multi_agent.conflict_resolution import (
-    detect_conflicts,
-    detect_duplicates,
-)
 from multi_agent.serialization import stable_hash
-
 
 # ---------------------------------------------------------------------------
 # Risk classification — Phase 5A Section 9
