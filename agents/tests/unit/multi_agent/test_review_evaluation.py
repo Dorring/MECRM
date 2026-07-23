@@ -47,6 +47,8 @@ from multi_agent.execution import (
 from multi_agent.state import MergedState
 from multi_agent.review_contracts import (
     PolicyContext,
+    PolicyDecision,
+    PolicyRule,
     REVIEWER_VERSION,
 )
 from multi_agent.review_errors import InvalidReviewRequestError
@@ -211,7 +213,8 @@ class TestDefaultPolicyContext:
         ctx_b = default_policy_context()
         assert ctx_a == ctx_b
         assert ctx_a.policy_version == "ma-05a-default"
-        assert ctx_a.rules == []
+        # R2 P0-6: rules is a tuple[PolicyRule, ...]
+        assert ctx_a.rules == ()
         assert ctx_a.tenant_overrides == {}
 
     def test_default_policy_context_is_frozen(self):
@@ -254,7 +257,8 @@ class TestBuildReviewRequest:
         assert len(request.proposals) == 1
         assert request.proposals[0].proposal_id == "prop-preserve-001"
         assert len(request.evidence) == 1
-        assert request.evidence[0].evidence_id == "ev-preserve-001"
+        # R2 P0-3: evidence is wrapped in ReviewEvidenceSnapshot
+        assert request.evidence[0].evidence.evidence_id == "ev-preserve-001"
 
     def test_carries_task_records_and_trace(self):
         result = _make_supervisor_result()
@@ -345,9 +349,18 @@ class TestBuildReviewRequest:
         assert request.capability_bindings[0].agent_id == "agent_test"
 
     def test_accepts_custom_policy_context(self):
+        # R2 P0-6: rules are strictly-typed PolicyRule, not raw dicts.
         ctx = PolicyContext(
             policy_version="custom-001",
-            rules=[{"rule_id": "r1", "effect": "allowed"}],
+            rules=(
+                PolicyRule(
+                    rule_id="r1",
+                    rule_version="custom-001",
+                    priority=50,
+                    effect=PolicyDecision.ALLOWED,
+                    action_type="report.generate",
+                ),
+            ),
         )
         result = _make_supervisor_result()
         request = build_review_request(

@@ -1,4 +1,4 @@
-"""Phase 5A LangGraph Thin Adapter.
+"""Phase 5A LangGraph Thin Adapter (R2).
 
 A 4-node LangGraph that wraps :class:`ProposalReviewer` so callers
 that already use LangGraph can compose the Reviewer uniformly.
@@ -10,7 +10,8 @@ Nodes (Phase 5A Section 14):
 * ``resolve_conflicts`` — no-op pass-through (conflict resolution is
   already inside :class:`ProposalReviewer`; this node exists for
   trace clarity and future extension points).
-* ``finalize_review`` — run :meth:`ReviewBatchResult.verify_integrity`.
+* ``finalize_review`` — run :meth:`ReviewBatchResult.verify_integrity`
+  + :meth:`verify_semantics` + :meth:`verify_against_request`.
 
 Important: the graph **does not** re-implement any Policy, Conflict,
 or Hash algorithm.  Every node delegates to :class:`ProposalReviewer`.
@@ -23,18 +24,29 @@ will wire it into the orchestrator.
 Graph output is byte-for-byte identical to direct
 :meth:`ProposalReviewer.review` output — verified by
 :func:`test_review_graph.py`.
+
+R2 changes (S8, S12):
+
+* ``finalize_review`` now calls :meth:`verify_against_request` so a
+  tampered or mis-routed Result is detected at the graph boundary.
+* :class:`ReviewGraphError` is imported so graph nodes can surface
+  persistable error records instead of raw :class:`Exception` objects.
+* ``_ReviewerLike`` is a strict :class:`typing.Protocol` (not ``Any``)
+  so static type checkers catch signature drift between
+  :class:`ProposalReviewer` and :class:`FakeProposalReviewer`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from langgraph.graph import END, StateGraph
 
 from multi_agent.policy import PolicyEvaluator
 from multi_agent.review_contracts import (
     ReviewBatchResult,
+    ReviewGraphError,
     ReviewRequest,
 )
 from multi_agent.review_errors import (
@@ -57,6 +69,10 @@ class ReviewGraphState:
     The graph intentionally reuses the Reviewer's return value rather
     than mirroring fields — the state just carries inputs and the
     final result.
+
+    R2 S12: ``graph_error`` carries a persistable
+    :class:`ReviewGraphError` when a node fails, so downstream
+    consumers can replay or persist the failure deterministically.
     """
 
     request: ReviewRequest
@@ -64,6 +80,7 @@ class ReviewGraphState:
     reviewer: ProposalReviewer | None = None
     result: ReviewBatchResult | None = None
     error: Exception | None = None
+    graph_error: ReviewGraphError | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -97,13 +114,31 @@ class FakeProposalReviewer:
 
 
 # ---------------------------------------------------------------------------
-# Graph builder
+# R2 S12: strict Protocol for reviewer-like objects
 # ---------------------------------------------------------------------------
 
 
-# Type alias for any object that quacks like ProposalReviewer.review.
-# We accept the fake too, so tests do not need to monkeypatch.
-_ReviewerLike = Any  # ProposalReviewer | FakeProposalReviewer
+@runtime_checkable
+class _ReviewerLike(Protocol):
+    """R2 S12: strict protocol for any object that can substitute for
+    :class:`ProposalReviewer` in the graph.
+
+    Replaces the ``_ReviewerLike = Any`` alias so static type checkers
+    catch signature drift between :class:`ProposalReviewer` and
+    :class:`FakeProposalReviewer`.
+    """
+
+    async def review(
+        self,
+        request: ReviewRequest,
+        *,
+        policy_evaluator: PolicyEvaluator,
+    ) -> ReviewBatchResult: ...
+
+
+# ---------------------------------------------------------------------------
+# Graph builder
+# ---------------------------------------------------------------------------
 
 
 def build_review_graph(reviewer: _ReviewerLike | None = None):
@@ -127,12 +162,20 @@ def build_review_graph(reviewer: _ReviewerLike | None = None):
             state.error = InvalidReviewRequestError(
                 "ReviewGraphState.request must not be None"
             )
-            return {"error": state.error}
+            state.graph_error = ReviewGraphError(
+                error_code="review.graph.missing_request",
+                message="ReviewGraphState.request must not be None",
+            )
+            return {"error": state.error, "graph_error": state.graph_error}
         try:
             state.request.verify_integrity()
         except ReviewError as e:
             state.error = e
-            return {"error": e}
+            state.graph_error = ReviewGraphError(
+                error_code="review.graph.request_integrity",
+                message=str(e),
+            )
+            return {"error": e, "graph_error": state.graph_error}
         return {}
 
     async def review_proposals(state: ReviewGraphState) -> dict[str, Any]:
@@ -149,7 +192,11 @@ def build_review_graph(reviewer: _ReviewerLike | None = None):
             )
         except ReviewError as e:
             state.error = e
-            return {"error": e}
+            state.graph_error = ReviewGraphError(
+                error_code="review.graph.review_failed",
+                message=str(e),
+            )
+            return {"error": e, "graph_error": state.graph_error}
         state.result = result
         return {"result": result}
 
@@ -170,7 +217,11 @@ def build_review_graph(reviewer: _ReviewerLike | None = None):
             state.error = InvalidReviewResultError(
                 "ReviewGraphState.result is None at finalize_review"
             )
-            return {"error": state.error}
+            state.graph_error = ReviewGraphError(
+                error_code="review.graph.missing_result",
+                message="ReviewGraphState.result is None at finalize_review",
+            )
+            return {"error": state.error, "graph_error": state.graph_error}
         try:
             state.result.verify_integrity()
             # R1: also enforce semantic invariants (decision ↔ findings,
@@ -178,9 +229,16 @@ def build_review_graph(reviewer: _ReviewerLike | None = None):
             # cannot ship a result that passes integrity but violates
             # the trust-chain semantic contract.
             state.result.verify_semantics()
+            # R2 S8: bind the Result back to its Request so a tampered
+            # or mis-routed Result is detected at the graph boundary.
+            state.result.verify_against_request(state.request)
         except ReviewError as e:
             state.error = e
-            return {"error": e}
+            state.graph_error = ReviewGraphError(
+                error_code="review.graph.finalize_failed",
+                message=str(e),
+            )
+            return {"error": e, "graph_error": state.graph_error}
         return {"result": state.result}
 
     def _should_continue_after_validate(state: ReviewGraphState) -> str:

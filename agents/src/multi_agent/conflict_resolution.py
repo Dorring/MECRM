@@ -22,6 +22,7 @@ same output regardless of insertion order or ``PYTHONHASHSEED``.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from multi_agent.contracts import ActionProposal
@@ -147,7 +148,7 @@ class DeduplicationResult:
 
 
 def detect_duplicates(
-    proposals: list[ActionProposal],
+    proposals: Sequence[ActionProposal],
 ) -> DeduplicationResult:
     """Detect exact-duplicate Proposals and choose a deterministic primary.
 
@@ -311,7 +312,7 @@ def _is_owner_reassign(p1: ActionProposal, p2: ActionProposal) -> bool:
 
 
 def detect_idempotency_key_conflicts(
-    proposals: list[ActionProposal],
+    proposals: Sequence[ActionProposal],
 ) -> list[tuple[str, str]]:
     """Return pairs of Proposal IDs that share an idempotency_key but
     have different canonical keys.
@@ -344,7 +345,7 @@ def detect_idempotency_key_conflicts(
 
 
 def detect_conflicts(
-    proposals: list[ActionProposal],
+    proposals: Sequence[ActionProposal],
     *,
     excluded_proposal_ids: set[str] | None = None,
 ) -> ConflictResult:

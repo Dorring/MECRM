@@ -27,6 +27,7 @@ from multi_agent.policy import (
 from multi_agent.review_contracts import (
     CODE_POLICY_DENIED,
     PolicyContext,
+    PolicyRule,
 )
 from multi_agent.review_errors import PolicyEvaluationError
 
@@ -123,12 +124,15 @@ class TestDeterministicPolicyEvaluator:
     @pytest.mark.asyncio
     async def test_explicit_deny_rule(self):
         ev = DeterministicPolicyEvaluator()
+        # R2 P0-6: rules are strictly-typed PolicyRule, not raw dicts.
         rules = [
-            {
-                "rule_id": "deny-reports",
-                "effect": "denied",
-                "action_type": "report.generate",
-            }
+            PolicyRule(
+                rule_id="deny-reports",
+                rule_version="test-v1",
+                priority=100,
+                effect=PolicyDecision.DENIED,
+                action_type="report.generate",
+            )
         ]
         result = await ev.evaluate(_req(rules=rules))
         assert result.decision == PolicyDecision.DENIED
@@ -137,11 +141,13 @@ class TestDeterministicPolicyEvaluator:
     async def test_needs_input_rule(self):
         ev = DeterministicPolicyEvaluator()
         rules = [
-            {
-                "rule_id": "needs-input-reports",
-                "effect": "needs_input",
-                "action_type": "report.generate",
-            }
+            PolicyRule(
+                rule_id="needs-input-reports",
+                rule_version="test-v1",
+                priority=100,
+                effect=PolicyDecision.NEEDS_INPUT,
+                action_type="report.generate",
+            )
         ]
         result = await ev.evaluate(_req(rules=rules))
         assert result.decision == PolicyDecision.NEEDS_INPUT
@@ -165,17 +171,22 @@ class TestDeterministicPolicyEvaluator:
     @pytest.mark.asyncio
     async def test_matched_rules_sorted_by_rule_id(self):
         ev = DeterministicPolicyEvaluator()
+        # R2 P0-6: rules are strictly-typed PolicyRule, not raw dicts.
         rules = [
-            {
-                "rule_id": "z-rule",
-                "effect": "allowed",
-                "action_type": "report.generate",
-            },
-            {
-                "rule_id": "a-rule",
-                "effect": "allowed",
-                "action_type": "report.generate",
-            },
+            PolicyRule(
+                rule_id="z-rule",
+                rule_version="test-v1",
+                priority=50,
+                effect=PolicyDecision.ALLOWED,
+                action_type="report.generate",
+            ),
+            PolicyRule(
+                rule_id="a-rule",
+                rule_version="test-v1",
+                priority=50,
+                effect=PolicyDecision.ALLOWED,
+                action_type="report.generate",
+            ),
         ]
         result = await ev.evaluate(_req(rules=rules))
         # The category-allowlist + authority-floor rules are also matched;
@@ -258,8 +269,13 @@ class TestOPAReviewAdapterEvaluation:
                     {
                         "result": {
                             "decision": "denied",
+                            "policy_version": "test-v1",
                             "matched_rules": [
-                                {"rule_id": "rule-1", "effect": "denied"}
+                                {
+                                    "rule_id": "rule-1",
+                                    "rule_version": "test-v1",
+                                    "effect": "denied",
+                                }
                             ],
                         }
                     },

@@ -21,6 +21,10 @@ from datetime import datetime, timezone
 
 import pytest
 
+from multi_agent.action_governance import (
+    ACTION_GOVERNANCE_SPEC_HASH,
+    ACTION_GOVERNANCE_SPEC_VERSION,
+)
 from multi_agent.contracts import (
     ActionProposal,
     ActionRiskLevel,
@@ -29,16 +33,20 @@ from multi_agent.contracts import (
     Evidence,
     EvidenceType,
 )
+from multi_agent.evidence_review import compute_review_evidence_hash
 from multi_agent.execution import ExecutionCapabilitySnapshot
 from multi_agent.policy import DeterministicPolicyEvaluator
 from multi_agent.review_contracts import (
     PolicyContext,
     ReviewBatchResult,
     ReviewBatchStatus,
+    ReviewEvidenceSnapshot,
     ReviewProposalEnvelope,
     ReviewRequest,
+    REVIEW_SCHEMA_VERSION,
     TaskRecordSummary,
     TraceSummary,
+    REVIEWER_VERSION,
 )
 from multi_agent.review_errors import (
     ReviewError,
@@ -184,6 +192,15 @@ def _make_request(
     capability_bindings: list[ExecutionCapabilitySnapshot] | None = None,
 ) -> ReviewRequest:
     props = proposals or [_make_proposal()]
+    raw_evidence = evidence or [_make_evidence()]
+    # R2 P0-3: wrap evidence in ReviewEvidenceSnapshot
+    evidence_snapshots = [
+        ReviewEvidenceSnapshot(
+            evidence=ev,
+            snapshot_hash=compute_review_evidence_hash(ev),
+        )
+        for ev in raw_evidence
+    ]
     return ReviewRequest(
         review_id=review_id,
         run_id="run-graph-001",
@@ -191,7 +208,7 @@ def _make_request(
         plan_hash="plan-graph-hash",
         registry_version="registry-graph-v1",
         proposals=props,
-        evidence=evidence or [_make_evidence()],
+        evidence=evidence_snapshots,
         task_records=[
             TaskRecordSummary(
                 task_id="task-graph-001",
@@ -214,6 +231,10 @@ def _make_request(
             policy_version="graph-test-v1",
             rules=[],
         ),
+        governance_spec_version=ACTION_GOVERNANCE_SPEC_VERSION,
+        governance_spec_hash=ACTION_GOVERNANCE_SPEC_HASH,
+        review_schema_version=REVIEW_SCHEMA_VERSION,
+        reviewer_version=REVIEWER_VERSION,
     )
 
 
@@ -222,19 +243,24 @@ def _make_batch_result(
     review_id: str = "review-graph-001",
     request_hash: str = "fixed-request-hash",
 ) -> ReviewBatchResult:
-    """Build a minimal ReviewBatchResult for FakeProposalReviewer."""
+    """Build a minimal ReviewBatchResult for FakeProposalReviewer.
+
+    R2 S7: empty batch uses NO_ACTIONS (NOT APPROVED).  R2 S10:
+    ``reviewer_version`` is required on the Result.
+    """
     return ReviewBatchResult(
         review_id=review_id,
         run_id="run-graph-001",
         tenant_id="tenant-graph",
         request_hash=request_hash,
         proposal_reviews=[],
-        batch_status=ReviewBatchStatus.APPROVED,
+        batch_status=ReviewBatchStatus.NO_ACTIONS,
         approved_proposal_ids=[],
         rejected_proposal_ids=[],
         approval_required_proposal_ids=[],
         conflicted_proposal_ids=[],
         findings=[],
+        reviewer_version=REVIEWER_VERSION,
     )
 
 

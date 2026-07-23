@@ -742,3 +742,192 @@ Phase 5A symbols are now re-exported from `multi_agent.__init__`:
 (23 counter-examples + 1 public-API round-trip) covering all 8 P0
 defects. Async tests use `asyncio.run()` inside the test body rather
 than `@pytest.mark.asyncio` per the R1 spec.
+
+---
+
+## R2 Revision
+
+The R2 revision closes 8 P0 defects from the R1 audit plus 17
+supplementary requirements. R1 wrote trust information into Contracts
+but the Reviewer did not actually consume it; R2 ensures **envelope
+origin, per-task capability, evidence integrity, policy priority and
+result semantics all participate in every Proposal decision with no
+second interpretation**.
+
+### Reviewer Version
+
+`REVIEWER_VERSION` upgraded from `ma-05a.1.0` to `ma-05a.2.0`.
+`ReviewRequest.reviewer_version` and `ReviewBatchResult.reviewer_version`
+are now mandatory; a version mismatch raises
+`InvalidReviewRequestError`.
+
+### P0 Defects Closed (R2)
+
+1. **Proposal Envelope consumed by Reviewer** —
+   `ProposalReviewer.review()` now builds
+   `envelopes_by_proposal_id` and fail-closed validates that each
+   Proposal has exactly one Envelope, that `Envelope.proposal` equals
+   the Request Proposal, and that `run_id` / `agent_id` / `task_id` /
+   `agent_version` are consistent across Envelope ↔ TaskRecord ↔
+   CapabilityBinding ↔ ResultOriginSnapshot.
+
+2. **Per-task Capability binding** — Capability lookups now use
+   `capability_by_task_id[envelope.task_id]`, not
+   `capability_by_agent_id`. The same Agent may bind multiple Tasks;
+   the uniqueness key for `capability_bindings` is `task_id`.
+
+3. **ReviewEvidenceSnapshot** — Evidence is wrapped in a frozen
+   `ReviewEvidenceSnapshot(evidence, snapshot_hash)`. The
+   `snapshot_hash` covers all Reviewer-consumed fields (excluding the
+   self-referential `content_hash`) and is verified at construction —
+   even for single (non-duplicate) Evidence.
+
+4. **Strict Evidence Requirement** — `validate_evidence_for_proposal`
+   receives the Reviewer's canonical risk level (not the Agent's
+   self-reported `risk_level`). An Action with a non-empty
+   `required_evidence_types` and no compatible Evidence produces
+   `CODE_EVIDENCE_MISSING` → `needs_input`.
+
+5. **Policy decision priority** — Aggregation order is strictly
+   `denied > needs_input > needs_approval > allowed`. A
+   `needs_input` rule dominates both builtin `always_needs_approval`
+   and high-risk classification.
+
+6. **PolicyRule strict typing** — `PolicyContext.rules` is now
+   `tuple[PolicyRule, ...]` where `PolicyRule` is a frozen
+   `StrictContract`. Empty `rule_id`, invalid `effect`, invalid
+   `priority`, and `rule_version != policy_version` are all rejected
+   at the contract boundary — no silent skip.
+
+7. **Unique Batch Priority** — Every `ReviewBatchStatus` has a unique
+   weight: `approved=0, deduplicated=1, needs_approval=2,
+   needs_input=3, rejected=4, conflict=5`. The `max()` result no
+   longer depends on Proposal ID ordering.
+
+8. **ProposalReview semantic contract** — `APPROVED` requires
+   `authority_valid=True`, `policy_valid=True`,
+   `idempotency_valid=True`, `required_approval=False`, and no
+   blocking finding. `NEEDS_APPROVAL` requires valid authority and
+   policy. `ReviewBatchResult.verify_semantics()` checks
+   `reviewer_version == request.reviewer_version`.
+
+### Supplementary Requirements (S1–S14)
+
+- **S1 Deep Immutability** — All audit-boundary Contracts use `tuple`
+  / `frozenset` instead of `list` / `set`. Nested `ActionProposal`,
+  `Evidence`, `Payload`, and `Details` are defensively deep-copied at
+  construction.
+
+- **S2 ExecutionRunIdentity** — `SupervisorRunResult` now carries a
+  frozen `ExecutionRunIdentity(run_id, tenant_id, plan_hash,
+  registry_version, identity_hash)`. `build_review_request()` reads
+  tenant identity exclusively from this source; mixed-tenant input
+  raises `InvalidReviewRequestError` at the Adapter boundary.
+
+- **S3 Action Governance Spec** — A new `action_governance.py` module
+  defines `ActionGovernanceSpec` and a frozen registry covering all
+  reviewable Action types. `classify_risk`, `validate_authority`,
+  `validate_action_allowlist`, `validate_evidence_for_proposal`,
+  `DeterministicPolicyEvaluator`, and fixtures all read the same
+  Spec. `ACTION_GOVERNANCE_SPEC_VERSION` and
+  `ACTION_GOVERNANCE_SPEC_HASH` enter the ReviewRequest and Result
+  audit.
+
+- **S4 Policy Fail-Closed** — OPA responses missing `result`,
+  `decision`, or `policy_version` are rejected (no default-allow).
+  Malformed rules raise `PolicyEvaluationError`. Reviewer wraps
+  external Policy calls in `asyncio.wait_for(timeout=…)`; timeout /
+  cancellation fails closed. `PolicyEvaluationResult.verify_semantics()`
+  validates decision ↔ matched-effects consistency.
+
+- **S5 PolicyDecisionAudit** — Every `ProposalReview` carries a
+  `PolicyDecisionAudit` (including `skipped-authority-failure` cases).
+  Phase 5B no longer relies on a single boolean.
+
+- **S6 Evidence Deduplication Audit** — The Adapter deterministically
+  deduplicates identical `evidence_id` entries and records an
+  `EvidenceDeduplicationAudit`. Duplicate multiplicity does not affect
+  `request_hash`. Same-ID-different-content continues to exclude all
+  copies and block referencing Proposals.
+
+- **S7 Empty Batch NO_ACTIONS** — A zero-Proposal batch returns
+  `ReviewBatchStatus.NO_ACTIONS` (not `APPROVED`). Phase 5B must not
+  treat `NO_ACTIONS` as executable authorisation.
+
+- **S8 Result-to-Request Binding** —
+  `ReviewBatchResult.verify_against_request(request)` validates
+  `review_id`, `run_id`, `tenant_id`, `request_hash`,
+  `reviewer_version`, `governance_spec_hash`, and Proposal ID
+  coverage. Called at Graph Finalize and direct Reviewer return.
+
+- **S9 Evaluation Label Leakage** — `compute_review_metrics()` no
+  longer reads `fixture.name`. Ground truth comes from
+  `ReviewExpectedOutcome(expected_status_by_proposal,
+  expected_finding_codes_by_proposal)`. Per-status precision / recall,
+  false-approval / false-rejection rates, and an async entry point
+  `compute_review_metrics_async()` are provided.
+
+- **S11 Cache Round-trip** — `ExecutionRunIdentity`,
+  `ResultOriginSnapshot`, `ExecutionCapabilitySnapshot`, and
+  `ReviewEvidenceSnapshot` survive `model_dump` → `model_validate`
+  JSON round-trip and RunStore cache hits.
+
+- **S12 LangGraph Error Parity** — `_ReviewerLike = Any` replaced
+  with a `runtime_checkable Protocol`. Graph errors are carried as
+  `ReviewGraphError(error_code, message)` — no raw `Exception` as
+  persistent state. Direct Reviewer and Graph produce identical
+  results on success and error paths.
+
+- **S13 Side-effect Guard** — Reviewer creates no network clients,
+  reads no environment variables, uses no time / random, writes no
+  files, and spawns no subprocesses. OPA Adapter uses injected
+  Transport only.
+
+- **S14 Legacy Cleanup** — `seen_proposal_ids` dead logic removed.
+  Raw-dict Policy Rules replaced by `PolicyRule` StrictContract.
+  Action governance rules unified into a single `ActionGovernanceSpec`
+  registry.
+
+### New Contracts
+
+| Contract | Module | Purpose |
+|---|---|---|
+| `ExecutionRunIdentity` | `multi_agent.execution` | Frozen Phase 4 run identity (tenant权威) |
+| `ResultOriginSnapshot` | `multi_agent.execution` | Frozen Result origin (result_id, task_id, agent_id, agent_version) |
+| `ReviewEvidenceSnapshot` | `multi_agent.review_contracts` | Evidence + verified `snapshot_hash` |
+| `PolicyRule` | `multi_agent.review_contracts` | Strict frozen Policy rule |
+| `PolicyDecisionAudit` | `multi_agent.review_contracts` | Per-Proposal policy decision audit |
+| `EvidenceDeduplicationAudit` | `multi_agent.review_contracts` | Adapter evidence dedup audit |
+| `ActionGovernanceSpec` | `multi_agent.action_governance` | Unified Action governance rule |
+| `ReviewExpectedOutcome` | `multi_agent.review_contracts` | Evaluation ground truth |
+| `ReviewGraphError` | `multi_agent.review_contracts` | Persistent graph error |
+
+### Module Map (R2)
+
+```
+agents/src/multi_agent/
+├── review_errors.py
+├── review_contracts.py       # R2: deep immutability, PolicyRule, PolicyDecisionAudit, ReviewEvidenceSnapshot, verify_against_request, NO_ACTIONS
+├── action_governance.py      # R2: NEW — ActionGovernanceSpec registry
+├── policy.py                 # R2: PolicyRule strict, fail-closed, asyncio.wait_for, verify_semantics
+├── evidence_review.py        # R2: ReviewEvidenceSnapshot, snapshot_hash
+├── conflict_resolution.py    # R2: Sequence[ActionProposal] signature
+├── reviewer.py               # R2: envelope consumption, per-task capability, policy audit
+├── review_evaluation.py      # R2: ExecutionRunIdentity adapter, dedup audit, ReviewExpectedOutcome
+├── review_graph.py           # R2: ReviewGraphError, Protocol, verify_against_request
+├── execution.py              # R2: ExecutionRunIdentity, ResultOriginSnapshot
+└── supervisor.py             # R2: construct ExecutionRunIdentity
+
+agents/tests/unit/multi_agent/
+├── ... (existing R1 tests updated)
+└── test_r2_trust_chain.py    # R2: 58 tests covering all P0 + S1–S14
+```
+
+### Regression Coverage (R2)
+
+`agents/tests/unit/multi_agent/test_r2_trust_chain.py` adds 58 tests
+covering deep immutability, ExecutionRunIdentity, ResultOriginSnapshot,
+governance spec verification, PolicyDecisionAudit, evidence dedup
+audit, empty batch NO_ACTIONS, verify_against_request,
+ReviewExpectedOutcome, reviewer version, ReviewGraphError, action
+governance registry, PolicyRule strict typing, and JSON round-trip.

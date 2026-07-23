@@ -45,6 +45,7 @@ from multi_agent.execution import (
     ExecutionBinding,
     ExecutionCapabilitySnapshot,
     ExecutionCancellation,
+    ExecutionRunIdentity,
     ExecutionTraceEvent,
     FakeExecutionCancellation,
     SupervisorConfig,
@@ -3019,6 +3020,24 @@ class SupervisorRuntime:
             )
             for b in sorted(bindings.values(), key=lambda x: x.task_id)
         ]
+        # R2 S2: build the authoritative Run identity so the Phase 5A
+        # Adapter does not have to infer tenant_id from the first
+        # Proposal / Evidence / Result.  ``identity_hash`` is verified
+        # by ExecutionRunIdentity's model_validator.
+        run_identity = ExecutionRunIdentity(
+            run_id=plan.run_id,
+            tenant_id=plan.tenant_id,
+            plan_hash=plan.plan_hash,
+            registry_version=plan.registry_version,
+            identity_hash=stable_hash(
+                {
+                    "run_id": plan.run_id,
+                    "tenant_id": plan.tenant_id,
+                    "plan_hash": plan.plan_hash,
+                    "registry_version": plan.registry_version,
+                }
+            ),
+        )
         result = SupervisorRunResult(
             run_id=plan.run_id,
             plan_hash=plan.plan_hash,
@@ -3029,6 +3048,7 @@ class SupervisorRuntime:
             usage=accountant.usage,
             trace=trace.events,
             capability_bindings=capability_bindings,
+            run_identity=run_identity,
             started_at=started_at,
             completed_at=completed_at,
             duration_ms=duration_ms,

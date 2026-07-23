@@ -25,6 +25,10 @@ from datetime import datetime, timezone
 import pytest
 from pydantic import ValidationError
 
+from multi_agent.action_governance import (
+    ACTION_GOVERNANCE_SPEC_HASH,
+    ACTION_GOVERNANCE_SPEC_VERSION,
+)
 from multi_agent.contracts import (
     ActionProposal,
     ActionRiskLevel,
@@ -33,6 +37,7 @@ from multi_agent.contracts import (
     Evidence,
     EvidenceType,
 )
+from multi_agent.evidence_review import compute_review_evidence_hash
 from multi_agent.execution import ExecutionCapabilitySnapshot
 from multi_agent.review_contracts import (
     CODE_EVIDENCE_DANGLING,
@@ -41,10 +46,12 @@ from multi_agent.review_contracts import (
     ReviewBatchResult,
     ReviewBatchStatus,
     ReviewDecisionStatus,
+    ReviewEvidenceSnapshot,
     ReviewFinding,
     ReviewFindingSeverity,
     ReviewProposalEnvelope,
     ReviewRequest,
+    REVIEW_SCHEMA_VERSION,
     TaskRecordSummary,
     TraceSummary,
     REVIEWER_VERSION,
@@ -198,6 +205,16 @@ def _make_request(
     policy_context: PolicyContext | None = None,
     review_id: str = "review-tc-001",
 ) -> ReviewRequest:
+    # R2 P0-3: wrap raw Evidence in ReviewEvidenceSnapshot before sending
+    # to ReviewRequest so the snapshot_hash is verified by the contract.
+    raw_evidence = evidence or []
+    evidence_snapshots = [
+        ReviewEvidenceSnapshot(
+            evidence=ev,
+            snapshot_hash=compute_review_evidence_hash(ev),
+        )
+        for ev in raw_evidence
+    ]
     return ReviewRequest(
         review_id=review_id,
         run_id="run-tc",
@@ -205,7 +222,7 @@ def _make_request(
         plan_hash="plan-tc-hash",
         registry_version="registry-tc-v1",
         proposals=proposals,
-        evidence=evidence or [],
+        evidence=evidence_snapshots,
         task_records=task_records
         or [
             TaskRecordSummary(
@@ -221,6 +238,9 @@ def _make_request(
         ),
         policy_context=policy_context
         or PolicyContext(policy_version="tc-v1", rules=[]),
+        governance_spec_version=ACTION_GOVERNANCE_SPEC_VERSION,
+        governance_spec_hash=ACTION_GOVERNANCE_SPEC_HASH,
+        review_schema_version=REVIEW_SCHEMA_VERSION,
         reviewer_version=REVIEWER_VERSION,
     )
 
@@ -270,13 +290,28 @@ class TestIdentityUniqueness:
         with pytest.raises(InvalidReviewRequestError):
             _make_request([prop], task_records=[tr1, tr2])
 
-    def test_duplicate_agent_id_in_bindings_raises(self):
+    def test_duplicate_task_id_in_bindings_raises(self):
+        # R2 P0-2: capability_bindings are unique by task_id (NOT
+        # agent_id) — the same Agent may legitimately execute multiple
+        # Tasks in one Run.  Two bindings for the SAME task_id must
+        # still raise.
+        cap = _make_capability()
+        b1 = _make_capability_binding(cap, task_id="task-dup")
+        b2 = _make_capability_binding(cap, task_id="task-dup")
+        prop = _make_proposal("prop-bind-dup-001")
+        with pytest.raises(InvalidReviewRequestError):
+            _make_request([prop], capability_bindings=[b1, b2])
+
+    def test_same_agent_id_different_task_id_allowed(self):
+        # R2 P0-2: the same Agent may execute multiple Tasks — two
+        # bindings with the same agent_id but different task_id MUST
+        # NOT raise.
         cap = _make_capability()
         b1 = _make_capability_binding(cap, task_id="task-a")
         b2 = _make_capability_binding(cap, task_id="task-b")
         prop = _make_proposal("prop-bind-dup-001")
-        with pytest.raises(InvalidReviewRequestError):
-            _make_request([prop], capability_bindings=[b1, b2])
+        # Should not raise.
+        _make_request([prop], capability_bindings=[b1, b2])
 
     def test_duplicate_trace_sequence_raises(self):
         prop = _make_proposal("prop-trace-dup-001")

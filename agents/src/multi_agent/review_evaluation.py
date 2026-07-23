@@ -32,6 +32,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from multi_agent.action_governance import (
+    ACTION_GOVERNANCE_SPEC_HASH,
+    ACTION_GOVERNANCE_SPEC_VERSION,
+)
 from multi_agent.contracts import (
     ActionProposal,
     ActionRiskLevel,
@@ -42,13 +46,20 @@ from multi_agent.contracts import (
 )
 from multi_agent.execution import (
     ExecutionCapabilitySnapshot,
+    ResultOriginSnapshot,
     SupervisorRunResult,
 )
+from multi_agent.evidence_review import compute_review_evidence_hash
 from multi_agent.review_contracts import (
+    EvidenceDeduplicationAudit,
     PolicyContext,
+    PolicyDecision,
+    PolicyRule,
     ReviewDecisionStatus,
+    ReviewEvidenceSnapshot,
     ReviewProposalEnvelope,
     ReviewRequest,
+    REVIEW_SCHEMA_VERSION,
     TaskRecordSummary,
     TraceSummary,
     REVIEWER_VERSION,
@@ -73,7 +84,7 @@ def default_policy_context() -> PolicyContext:
     """
     return PolicyContext(
         policy_version="ma-05a-default",
-        rules=[],
+        rules=(),
         tenant_overrides={},
     )
 
@@ -118,6 +129,20 @@ def build_review_request(
         for ev in merged.merged_evidence
     ]
 
+    # R2 P0-3: wrap every Evidence in a ReviewEvidenceSnapshot so the
+    # snapshot_hash is verified at the Request boundary.
+    evidence_snapshots: list[ReviewEvidenceSnapshot] = [
+        ReviewEvidenceSnapshot(
+            evidence=ev,
+            snapshot_hash=compute_review_evidence_hash(ev),
+        )
+        for ev in evidence_copy
+    ]
+
+    # R2 S6: build EvidenceDeduplicationAudit recording the Adapter's
+    # deterministic dedup of identical-content Evidence.
+    evidence_dedup_audit = _build_evidence_dedup_audit(evidence_copy)
+
     # Task Record summaries — only identity + agent binding
     task_records: list[TaskRecordSummary] = []
     for tr in supervisor_result.task_records:
@@ -152,6 +177,31 @@ def build_review_request(
     # to the exact AgentResult that produced it.
     proposal_by_id = {p.proposal_id: p for p in proposals_copy}
     proposal_envelopes: list[ReviewProposalEnvelope] = []
+    # R2 P0-1: also build ResultOriginSnapshot for every result so the
+    # Reviewer can cross-check envelope origin fields independently.
+    # ``origin_hash`` is a per-result canonical hash over the result's
+    # identity fields (NOT per-proposal) so a single ResultOriginSnapshot
+    # is stable regardless of how many Proposals the result produced.
+    result_origins: list[ResultOriginSnapshot] = []
+    for result in merged.results:
+        result_origin_hash = stable_hash(
+            {
+                "run_id": supervisor_result.run_id,
+                "result_id": result.result_id,
+                "task_id": result.task_id,
+                "agent_id": result.agent_id,
+                "agent_version": result.agent_version,
+            }
+        )
+        result_origins.append(
+            ResultOriginSnapshot(
+                result_id=result.result_id,
+                task_id=result.task_id,
+                agent_id=result.agent_id,
+                agent_version=result.agent_version,
+                origin_hash=result_origin_hash,
+            )
+        )
     for result in merged.results:
         for ap in result.action_proposals:
             matching = proposal_by_id.get(ap.proposal_id)
@@ -179,19 +229,34 @@ def build_review_request(
                 )
             )
 
+    # R2 S2: use run_identity when available for authoritative identity
+    run_identity = supervisor_result.run_identity
+
+    # R2 S2: derive tenant_id from run_identity when available
+    if run_identity is not None:
+        tenant_id = run_identity.tenant_id
+    else:
+        tenant_id = _extract_tenant_id(supervisor_result)
+
     return ReviewRequest(
         review_id=review_id,
         run_id=supervisor_result.run_id,
-        tenant_id=_extract_tenant_id(supervisor_result),
+        tenant_id=tenant_id,
         plan_hash=supervisor_result.plan_hash,
         registry_version=supervisor_result.registry_version,
-        proposals=proposals_copy,
-        evidence=evidence_copy,
-        task_records=task_records,
-        trace=trace,
-        capability_bindings=capability_bindings,
-        proposal_envelopes=proposal_envelopes,
+        proposals=tuple(proposals_copy),
+        evidence=tuple(evidence_snapshots),
+        task_records=tuple(task_records),
+        trace=tuple(trace),
+        capability_bindings=tuple(capability_bindings),
+        proposal_envelopes=tuple(proposal_envelopes),
+        result_origins=tuple(result_origins),
         policy_context=policy_context or default_policy_context(),
+        run_identity=run_identity,
+        governance_spec_version=ACTION_GOVERNANCE_SPEC_VERSION,
+        governance_spec_hash=ACTION_GOVERNANCE_SPEC_HASH,
+        evidence_dedup_audit=evidence_dedup_audit,
+        review_schema_version=REVIEW_SCHEMA_VERSION,
         reviewer_version=REVIEWER_VERSION,
     )
 
@@ -204,6 +269,9 @@ def _extract_tenant_id(supervisor_result: SupervisorRunResult) -> str:
     We read it from the first available Proposal, then Evidence, then
     Task Record.  If they disagree, the Reviewer's identity
     validation will flag the mismatch.
+
+    R2 S2: when ``run_identity`` is present, the Adapter uses its
+    ``tenant_id`` instead of calling this function.
     """
     merged = supervisor_result.merged_state
     if merged.merged_proposals:
@@ -222,6 +290,44 @@ def _extract_tenant_id(supervisor_result: SupervisorRunResult) -> str:
     raise InvalidReviewRequestError(
         f"SupervisorRunResult {supervisor_result.run_id!r} is empty — "
         f"cannot derive tenant_id"
+    )
+
+
+def _build_evidence_dedup_audit(
+    evidence: list[Evidence],
+) -> EvidenceDeduplicationAudit:
+    """R2 S6: build an :class:`EvidenceDeduplicationAudit` recording
+    the Adapter's deterministic dedup of identical-content Evidence.
+
+    Same ``evidence_id`` + same content hash → benign dedup (recorded
+    in ``deduped_evidence_ids``).  Same ``evidence_id`` + different
+    content → NOT deduped (the contract violation is surfaced by the
+    ReviewRequest's identity-uniqueness validator).
+    """
+    from multi_agent.evidence_review import compute_review_evidence_hash
+
+    seen: dict[str, str] = {}  # evidence_id → content hash
+    deduped: set[str] = set()
+    for ev in evidence:
+        h = compute_review_evidence_hash(ev)
+        if ev.evidence_id in seen:
+            if seen[ev.evidence_id] == h:
+                deduped.add(ev.evidence_id)
+        else:
+            seen[ev.evidence_id] = h
+
+    audit_hash = stable_hash(
+        {
+            "deduped_evidence_ids": sorted(deduped),
+            "original_count": len(evidence),
+            "snapshot_count": len(seen),
+        }
+    )
+    return EvidenceDeduplicationAudit(
+        deduped_evidence_ids=frozenset(deduped),
+        original_count=len(evidence),
+        snapshot_count=len(seen),
+        audit_hash=audit_hash,
     )
 
 
@@ -389,6 +495,17 @@ def _make_envelope(
     )
 
 
+def _wrap_evidence(evidence: list[Evidence]) -> list[ReviewEvidenceSnapshot]:
+    """R2 P0-3: wrap raw Evidence in ReviewEvidenceSnapshot."""
+    return [
+        ReviewEvidenceSnapshot(
+            evidence=ev,
+            snapshot_hash=compute_review_evidence_hash(ev),
+        )
+        for ev in evidence
+    ]
+
+
 def _make_request(
     review_id: str,
     proposals: list[ActionProposal],
@@ -402,33 +519,44 @@ def _make_request(
     # R1: auto-build envelopes for every proposal if not supplied
     if proposal_envelopes is None:
         proposal_envelopes = [_make_envelope(p) for p in proposals]
+    # R2 P0-3: wrap evidence in ReviewEvidenceSnapshot
+    evidence_snapshots = _wrap_evidence(evidence)
+    # R2 S6: build evidence dedup audit
+    evidence_dedup_audit = _build_evidence_dedup_audit(evidence)
     return ReviewRequest(
         review_id=review_id,
         run_id="run-fixture",
         tenant_id="tenant-fixture",
         plan_hash="plan-fixture-hash",
         registry_version="registry-fixture-v1",
-        proposals=proposals,
-        evidence=evidence,
-        task_records=task_records
-        or [
-            TaskRecordSummary(
-                task_id="task-fixture",
-                agent_id="fixture_agent",
-                status="completed",
-            )
-        ],
-        trace=[
+        proposals=tuple(proposals),
+        evidence=tuple(evidence_snapshots),
+        task_records=tuple(
+            task_records
+            or [
+                TaskRecordSummary(
+                    task_id="task-fixture",
+                    agent_id="fixture_agent",
+                    status="completed",
+                )
+            ]
+        ),
+        trace=(
             TraceSummary(
                 sequence=0,
                 event_type="run_started",
                 task_id=None,
                 agent_id=None,
-            )
-        ],
-        capability_bindings=capability_bindings or [],
-        proposal_envelopes=proposal_envelopes,
+            ),
+        ),
+        capability_bindings=tuple(capability_bindings or []),
+        proposal_envelopes=tuple(proposal_envelopes),
         policy_context=policy_context or default_policy_context(),
+        governance_spec_version=ACTION_GOVERNANCE_SPEC_VERSION,
+        governance_spec_hash=ACTION_GOVERNANCE_SPEC_HASH,
+        evidence_dedup_audit=evidence_dedup_audit,
+        review_schema_version=REVIEW_SCHEMA_VERSION,
+        reviewer_version=REVIEWER_VERSION,
     )
 
 
@@ -671,15 +799,18 @@ def build_review_fixtures() -> list[ReviewFixture]:
 
     # 9. Explicit policy deny — uses a PolicyContext rule that denies
     #    the action_type explicitly.
+    # R2 P0-6: rules are strictly-typed PolicyRule, not raw dicts.
     deny_ctx = PolicyContext(
         policy_version="ma-05a-deny-fixture",
-        rules=[
-            {
-                "rule_id": "deny-report-generate",
-                "effect": "denied",
-                "action_type": "report.generate",
-            }
-        ],
+        rules=(
+            PolicyRule(
+                rule_id="deny-report-generate",
+                rule_version="ma-05a-deny-fixture",
+                priority=100,
+                effect=PolicyDecision.DENIED,
+                action_type="report.generate",
+            ),
+        ),
     )
     fixtures.append(
         ReviewFixture(

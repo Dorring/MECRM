@@ -1,4 +1,4 @@
-"""Phase 5A Policy Evaluator Boundary.
+"""Phase 5A Policy Evaluator Boundary (R2).
 
 Defines the :class:`PolicyEvaluator` Protocol and two implementations:
 
@@ -17,9 +17,19 @@ Defines the :class:`PolicyEvaluator` Protocol and two implementations:
       adapter.
     - Does NOT change existing OPA production paths under ``policies/``.
 
-A :class:`PolicyEvaluationRequest` / :class:`PolicyEvaluationResult`
-pair isolates the Policy contract from the Reviewer contract so the
-two can evolve independently.
+R2 changes:
+
+* :class:`PolicyDecision` and :class:`PolicyMatchedRule` moved to
+  :mod:`multi_agent.review_contracts` (re-imported here for compat).
+* :class:`PolicyEvaluationResult` uses ``tuple`` collections (S1) and
+  gains :meth:`verify_semantics` (P0-6).
+* :class:`DeterministicPolicyEvaluator` reads from
+  :data:`multi_agent.action_governance.ACTION_GOVERNANCE_REGISTRY`
+  instead of local lookup tables (S14).
+* Context-rule aggregation uses priority order
+  ``denied > needs_input > needs_approval > allowed`` (P0-6).
+* :class:`OPAReviewAdapter` fails closed on missing OPA response fields
+  and enforces ``asyncio.wait_for`` timeout (S11).
 
 Phase 5A Section 8 reminder: Policy NEVER directly executes an Action.
 Policy only returns ``allowed`` / ``denied`` / ``needs_approval`` /
@@ -28,8 +38,8 @@ Policy only returns ``allowed`` / ``denied`` / ``needs_approval`` /
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
-from enum import StrEnum
 from typing import Any, Protocol
 
 from pydantic import Field, field_validator
@@ -48,32 +58,19 @@ from multi_agent.review_contracts import (
     CODE_POLICY_NEEDS_APPROVAL,
     CODE_POLICY_NEEDS_INPUT,
     PolicyContext,
+    PolicyDecision,
+    PolicyMatchedRule,
+    PolicyRule,
     ReviewFinding,
     ReviewFindingSeverity,
 )
-from multi_agent.review_errors import PolicyEvaluationError
-
-
-# ---------------------------------------------------------------------------
-# Policy decision enum
-# ---------------------------------------------------------------------------
-
-
-class PolicyDecision(StrEnum):
-    """Possible Policy decisions for a single Proposal.
-
-    The Reviewer maps these to :class:`ReviewDecisionStatus`:
-
-    * ``ALLOWED`` → contributes to ``approved`` (subject to other checks)
-    * ``DENIED`` → ``rejected``
-    * ``NEEDS_APPROVAL`` → ``needs_approval``
-    * ``NEEDS_INPUT`` → ``needs_input``
-    """
-
-    ALLOWED = "allowed"
-    DENIED = "denied"
-    NEEDS_APPROVAL = "needs_approval"
-    NEEDS_INPUT = "needs_input"
+from multi_agent.action_governance import (
+    get_action_governance_spec,
+)
+from multi_agent.review_errors import (
+    InvalidReviewResultError,
+    PolicyEvaluationError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -127,43 +124,24 @@ class PolicyEvaluationRequest(StrictContract):
         return validate_strict_json(v)  # type: ignore[return-value]
 
 
-class PolicyMatchedRule(StrictContract):
-    """A single rule that matched during policy evaluation.
-
-    Frozen so audit consumers can hold references safely.
-    """
-
-    model_config = {"extra": "forbid", "frozen": True}
-
-    rule_id: str
-    rule_version: str = ""
-    effect: PolicyDecision
-    matched_fields: list[str] = Field(default_factory=list)
-
-    @field_validator("rule_id")
-    @classmethod
-    def _rule_id_non_blank(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("rule_id must not be blank")
-        return v
-
-
 class PolicyEvaluationResult(StrictContract):
     """Frozen output of :meth:`PolicyEvaluator.evaluate`.
 
     ``matched_rules`` is sorted by ``rule_id`` so the result hash is
     stable.  ``findings`` carries human-readable context for each
     non-allowed decision.
+
+    R2 S1: ``matched_rules`` and ``findings`` are ``tuple`` (deep
+    immutability).
     """
 
     model_config = {"extra": "forbid", "frozen": True}
 
     proposal_id: str
     decision: PolicyDecision
-    matched_rules: list[PolicyMatchedRule] = Field(default_factory=list)
+    matched_rules: tuple[PolicyMatchedRule, ...] = ()
     policy_version: str
-    findings: list[ReviewFinding] = Field(default_factory=list)
+    findings: tuple[ReviewFinding, ...] = ()
 
     @field_validator("proposal_id", "policy_version")
     @classmethod
@@ -172,6 +150,50 @@ class PolicyEvaluationResult(StrictContract):
         if not v:
             raise ValueError("PolicyEvaluationResult identity fields must not be blank")
         return v
+
+    def verify_semantics(self) -> None:
+        """R2 P0-6: validate decision ↔ finding consistency.
+
+        Raises :class:`InvalidReviewResultError` on any inconsistency.
+        """
+        finding_codes = {f.finding_code for f in self.findings}
+        has_error = any(
+            f.severity in (ReviewFindingSeverity.ERROR, ReviewFindingSeverity.CRITICAL)
+            for f in self.findings
+        )
+
+        # All findings must belong to this proposal
+        for f in self.findings:
+            if f.proposal_id != self.proposal_id:
+                raise InvalidReviewResultError(
+                    f"PolicyEvaluationResult {self.proposal_id!r}: finding "
+                    f"proposal_id {f.proposal_id!r} != result proposal_id"
+                )
+
+        if self.decision == PolicyDecision.DENIED:
+            if CODE_POLICY_DENIED not in finding_codes:
+                raise InvalidReviewResultError(
+                    f"PolicyEvaluationResult {self.proposal_id!r}: decision "
+                    f"DENIED but no {CODE_POLICY_DENIED!r} finding"
+                )
+        elif self.decision == PolicyDecision.NEEDS_INPUT:
+            if CODE_POLICY_NEEDS_INPUT not in finding_codes:
+                raise InvalidReviewResultError(
+                    f"PolicyEvaluationResult {self.proposal_id!r}: decision "
+                    f"NEEDS_INPUT but no {CODE_POLICY_NEEDS_INPUT!r} finding"
+                )
+        elif self.decision == PolicyDecision.NEEDS_APPROVAL:
+            if CODE_POLICY_NEEDS_APPROVAL not in finding_codes:
+                raise InvalidReviewResultError(
+                    f"PolicyEvaluationResult {self.proposal_id!r}: decision "
+                    f"NEEDS_APPROVAL but no {CODE_POLICY_NEEDS_APPROVAL!r} finding"
+                )
+        elif self.decision == PolicyDecision.ALLOWED:
+            if has_error:
+                raise InvalidReviewResultError(
+                    f"PolicyEvaluationResult {self.proposal_id!r}: decision "
+                    f"ALLOWED but has ERROR/CRITICAL findings"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -201,74 +223,6 @@ class PolicyEvaluator(Protocol):
 # ---------------------------------------------------------------------------
 
 
-# Action categories that are reviewable in Phase 5A.  Anything outside
-# this set is rejected with ``CODE_ACTION_CATEGORY_NOT_REVIEWABLE``.
-# This is deliberately conservative — Phase 5B may expand the set.
-_REVIEWABLE_ACTION_CATEGORIES: frozenset[str] = frozenset(
-    {
-        # Read-only / report proposals
-        "report.generate",
-        "summary.compile",
-        "metric.query",
-        # CRM propose (no execute)
-        "crm.tag.update",
-        "crm.status.update",
-        "crm.note.add",
-        "crm.owner.assign",
-        "crm.escalate",
-        # Recovery actions (high-risk, always needs_approval)
-        "refund.issue",
-        "contract.amend",
-        "notification.bulk_send",
-        "permission.change",
-    }
-)
-
-# Action categories that are explicitly NOT reviewable in Phase 5A
-# (they belong to Phase 5B Governed Executor).
-_EXECUTE_ONLY_CATEGORIES: frozenset[str] = frozenset(
-    {
-        "crm.record.delete",
-        "account.delete",
-        "credential.rotate",
-        "payment.capture",
-        "kafka.event.emit",
-    }
-)
-
-# Action categories → minimum authority required.
-# An Agent whose Capability Snapshot authority is below this bar is
-# rejected at the Policy layer too (defense-in-depth on top of the
-# Authority validator in :mod:`multi_agent.evidence_review`).
-_AUTHORITY_FLOOR: dict[str, AgentAuthority] = {
-    "report.generate": AgentAuthority.READ,
-    "summary.compile": AgentAuthority.READ,
-    "metric.query": AgentAuthority.READ,
-    "crm.tag.update": AgentAuthority.PROPOSE,
-    "crm.status.update": AgentAuthority.PROPOSE,
-    "crm.note.add": AgentAuthority.PROPOSE,
-    "crm.owner.assign": AgentAuthority.PROPOSE,
-    "crm.escalate": AgentAuthority.PROPOSE,
-    "refund.issue": AgentAuthority.PROPOSE,
-    "contract.amend": AgentAuthority.PROPOSE,
-    "notification.bulk_send": AgentAuthority.PROPOSE,
-    "permission.change": AgentAuthority.PROPOSE,
-}
-
-# Action categories that always require human approval regardless of
-# risk_level.  These are the high-impact / irreversible operations.
-_ALWAYS_NEEDS_APPROVAL: frozenset[str] = frozenset(
-    {
-        "refund.issue",
-        "contract.amend",
-        "notification.bulk_send",
-        "permission.change",
-        "crm.owner.assign",
-        "crm.escalate",
-    }
-)
-
-
 def _authority_rank(a: AgentAuthority) -> int:
     """READ=0, PROPOSE=1, EXECUTE=2."""
     return {
@@ -283,32 +237,26 @@ class DeterministicPolicyEvaluator:
 
     No network, no API keys, no I/O.  Decision is a function of:
 
-    1. ``action_type`` membership in :data:`_REVIEWABLE_ACTION_CATEGORIES`
-    2. Agent authority vs :data:`_AUTHORITY_FLOOR`
-    3. ``risk_level`` high → needs_approval
-    4. Action in :data:`_ALWAYS_NEEDS_APPROVAL` → needs_approval
-    5. ``PolicyContext.rules`` explicit deny / needs_input overrides
+    1. ``action_type`` registered in :data:`ACTION_GOVERNANCE_REGISTRY`
+       with ``reviewable=True`` (R2 S14 — no local lookup table).
+    2. Agent authority vs ``spec.minimum_authority``.
+    3. ``spec.always_needs_approval`` or high-risk → needs_approval.
+    4. ``PolicyContext.rules`` explicit deny / needs_input overrides
+       aggregated by priority ``denied > needs_input >
+       needs_approval > allowed`` (R2 P0-6).
 
     The evaluator reads ONLY from the frozen :class:`PolicyContext`
     on the request — it never reads a live registry, never reads the
     wall-clock, and never reads ``PYTHONHASHSEED``.
-
-    The same (request, policy_context) pair always produces the same
-    :class:`PolicyEvaluationResult`, including the same ``matched_rules``
-    list (sorted by ``rule_id``).
     """
 
     def __init__(self) -> None:
-        # No state — every decision is a pure function of the inputs.
         pass
 
     async def evaluate(
         self,
         request: PolicyEvaluationRequest,
     ) -> PolicyEvaluationResult:
-        # NOTE: this method is async per the Protocol, but the body is
-        # pure-function.  No ``await`` is used so the decision is
-        # deterministic and side-effect-free.
         return self._evaluate_pure(request)
 
     def _evaluate_pure(
@@ -319,61 +267,41 @@ class DeterministicPolicyEvaluator:
         matched: list[PolicyMatchedRule] = []
         findings: list[ReviewFinding] = []
 
-        # 1. Action category gate — built-in, can DENY and short-circuit.
-        if action in _EXECUTE_ONLY_CATEGORIES:
+        # 1. Action governance spec gate (R2 S14).
+        spec = get_action_governance_spec(action)
+        if spec is None or not spec.reviewable:
             findings.append(
                 ReviewFinding(
                     finding_code=CODE_POLICY_DENIED,
                     severity=ReviewFindingSeverity.ERROR,
                     message=(
-                        f"Action {action!r} is execute-only and not "
-                        f"reviewable in Phase 5A"
+                        f"Action {action!r} is not registered as reviewable "
+                        f"in the Action Governance Spec"
                     ),
                     proposal_id=request.proposal_id,
                     policy_source=f"deterministic@{ctx.policy_version}",
-                    details={"action_type": action, "category": "execute_only"},
+                    details={"action_type": action, "category": "not_reviewable"},
                 )
             )
             return PolicyEvaluationResult(
                 proposal_id=request.proposal_id,
                 decision=PolicyDecision.DENIED,
-                matched_rules=sorted(matched, key=lambda r: r.rule_id),
+                matched_rules=tuple(sorted(matched, key=lambda r: r.rule_id)),
                 policy_version=ctx.policy_version,
-                findings=findings,
-            )
-
-        if action not in _REVIEWABLE_ACTION_CATEGORIES:
-            findings.append(
-                ReviewFinding(
-                    finding_code=CODE_POLICY_DENIED,
-                    severity=ReviewFindingSeverity.ERROR,
-                    message=(
-                        f"Action {action!r} is not in the reviewable category allowlist"
-                    ),
-                    proposal_id=request.proposal_id,
-                    policy_source=f"deterministic@{ctx.policy_version}",
-                    details={"action_type": action, "category": "unknown"},
-                )
-            )
-            return PolicyEvaluationResult(
-                proposal_id=request.proposal_id,
-                decision=PolicyDecision.DENIED,
-                matched_rules=sorted(matched, key=lambda r: r.rule_id),
-                policy_version=ctx.policy_version,
-                findings=findings,
+                findings=tuple(findings),
             )
 
         matched.append(
             PolicyMatchedRule(
-                rule_id="category-allowlist",
+                rule_id="governance-spec-allowlist",
                 rule_version=ctx.policy_version,
                 effect=PolicyDecision.ALLOWED,
-                matched_fields=["action_type"],
+                matched_fields=("action_type",),
             )
         )
 
-        # 2. Authority floor — built-in, can DENY and short-circuit.
-        floor = _AUTHORITY_FLOOR.get(action, AgentAuthority.PROPOSE)
+        # 2. Authority floor — from governance spec (R2 S14).
+        floor = spec.minimum_authority
         try:
             agent_auth = AgentAuthority(request.agent_authority)
         except ValueError:
@@ -390,9 +318,9 @@ class DeterministicPolicyEvaluator:
             return PolicyEvaluationResult(
                 proposal_id=request.proposal_id,
                 decision=PolicyDecision.DENIED,
-                matched_rules=sorted(matched, key=lambda r: r.rule_id),
+                matched_rules=tuple(sorted(matched, key=lambda r: r.rule_id)),
                 policy_version=ctx.policy_version,
-                findings=findings,
+                findings=tuple(findings),
             )
 
         if _authority_rank(agent_auth) < _authority_rank(floor):
@@ -417,9 +345,9 @@ class DeterministicPolicyEvaluator:
             return PolicyEvaluationResult(
                 proposal_id=request.proposal_id,
                 decision=PolicyDecision.DENIED,
-                matched_rules=sorted(matched, key=lambda r: r.rule_id),
+                matched_rules=tuple(sorted(matched, key=lambda r: r.rule_id)),
                 policy_version=ctx.policy_version,
-                findings=findings,
+                findings=tuple(findings),
             )
 
         matched.append(
@@ -427,22 +355,20 @@ class DeterministicPolicyEvaluator:
                 rule_id="authority-floor",
                 rule_version=ctx.policy_version,
                 effect=PolicyDecision.ALLOWED,
-                matched_fields=["agent_authority", "action_type"],
+                matched_fields=("agent_authority", "action_type"),
             )
         )
 
-        # 3. Built-in needs-approval signals (always-needs-approval,
-        #    high-risk).  These do NOT short-circuit anymore — they
-        #    set a flag so context-rule DENIED can override them.
+        # 3. Built-in needs-approval signals from governance spec (R2 S14).
         builtin_needs_approval = False
-        if action in _ALWAYS_NEEDS_APPROVAL:
+        if spec.always_needs_approval:
             builtin_needs_approval = True
             matched.append(
                 PolicyMatchedRule(
                     rule_id="always-needs-approval",
                     rule_version=ctx.policy_version,
                     effect=PolicyDecision.NEEDS_APPROVAL,
-                    matched_fields=["action_type"],
+                    matched_fields=("action_type",),
                 )
             )
             findings.append(
@@ -463,7 +389,7 @@ class DeterministicPolicyEvaluator:
                     rule_id="high-risk-needs-approval",
                     rule_version=ctx.policy_version,
                     effect=PolicyDecision.NEEDS_APPROVAL,
-                    matched_fields=["risk_level"],
+                    matched_fields=("risk_level",),
                 )
             )
             findings.append(
@@ -479,95 +405,84 @@ class DeterministicPolicyEvaluator:
                 )
             )
 
-        # 4. PolicyContext.rules — collect ALL matching rules (no
-        #    first-match early return).  Sort by (-priority, rule_id)
-        #    so HIGHER priority number wins, ties broken by rule_id.
-        context_effects: list[tuple[int, str, PolicyDecision]] = []
+        # 4. PolicyContext.rules — strictly typed PolicyRule (R2 P0-6).
+        #    Collect ALL matching rules (no first-match early return).
+        context_effects: set[PolicyDecision] = set()
         for rule in ctx.rules:
-            rule_id = str(rule.get("rule_id", ""))
-            if not rule_id:
+            # R2 P0-6: rule is a strictly-typed PolicyRule, not a dict.
+            # Blank rule_id / illegal effect are already rejected at
+            # construction by PolicyRule's validators.
+            rule_action = rule.action_type
+            if rule_action is not None and rule_action != action:
                 continue
-            effect_raw = rule.get("effect", "allowed")
-            try:
-                effect = PolicyDecision(str(effect_raw))
-            except ValueError:
-                continue
-            # Match on action_type if the rule specifies one
-            rule_action = rule.get("action_type")
-            if rule_action is not None and str(rule_action) != action:
-                continue
-            priority = int(rule.get("priority", 0))
-            rule_version = str(rule.get("rule_version", "")) or ctx.policy_version
-            context_effects.append((priority, rule_id, effect))
+            context_effects.add(rule.effect)
             matched.append(
                 PolicyMatchedRule(
-                    rule_id=rule_id,
-                    rule_version=rule_version,
-                    effect=effect,
-                    matched_fields=["action_type"] if rule_action else [],
+                    rule_id=rule.rule_id,
+                    rule_version=rule.rule_version,
+                    effect=rule.effect,
+                    matched_fields=("action_type",) if rule_action else (),
                 )
             )
-            if effect == PolicyDecision.DENIED:
+            if rule.effect == PolicyDecision.DENIED:
                 findings.append(
                     ReviewFinding(
                         finding_code=CODE_POLICY_DENIED,
                         severity=ReviewFindingSeverity.ERROR,
-                        message=(f"Policy rule {rule_id!r} denied action {action!r}"),
+                        message=(
+                            f"Policy rule {rule.rule_id!r} denied action {action!r}"
+                        ),
                         proposal_id=request.proposal_id,
                         policy_source=f"deterministic@{ctx.policy_version}",
-                        details={"rule_id": rule_id, "action_type": action},
+                        details={"rule_id": rule.rule_id, "action_type": action},
                     )
                 )
-            elif effect == PolicyDecision.NEEDS_INPUT:
+            elif rule.effect == PolicyDecision.NEEDS_INPUT:
                 findings.append(
                     ReviewFinding(
                         finding_code=CODE_POLICY_NEEDS_INPUT,
                         severity=ReviewFindingSeverity.WARNING,
                         message=(
-                            f"Policy rule {rule_id!r} requires more input "
+                            f"Policy rule {rule.rule_id!r} requires more input "
                             f"for action {action!r}"
                         ),
                         proposal_id=request.proposal_id,
                         policy_source=f"deterministic@{ctx.policy_version}",
-                        details={"rule_id": rule_id, "action_type": action},
+                        details={"rule_id": rule.rule_id, "action_type": action},
                     )
                 )
-            elif effect == PolicyDecision.NEEDS_APPROVAL:
+            elif rule.effect == PolicyDecision.NEEDS_APPROVAL:
                 findings.append(
                     ReviewFinding(
                         finding_code=CODE_POLICY_NEEDS_APPROVAL,
                         severity=ReviewFindingSeverity.WARNING,
                         message=(
-                            f"Policy rule {rule_id!r} requires approval "
+                            f"Policy rule {rule.rule_id!r} requires approval "
                             f"for action {action!r}"
                         ),
                         proposal_id=request.proposal_id,
                         policy_source=f"deterministic@{ctx.policy_version}",
-                        details={"rule_id": rule_id, "action_type": action},
+                        details={"rule_id": rule.rule_id, "action_type": action},
                     )
                 )
 
-        # 5. Aggregate context-rule decision: denied > needs_input >
-        #    needs_approval > allowed.
-        context_effects_set = {e for _, _, e in context_effects}
-        if PolicyDecision.DENIED in context_effects_set:
+        # 5. R2 P0-6: aggregate by priority
+        #    denied > needs_input > needs_approval > allowed.
+        if PolicyDecision.DENIED in context_effects:
             final_decision = PolicyDecision.DENIED
-        elif (
-            builtin_needs_approval
-            or PolicyDecision.NEEDS_APPROVAL in context_effects_set
-        ):
-            final_decision = PolicyDecision.NEEDS_APPROVAL
-        elif PolicyDecision.NEEDS_INPUT in context_effects_set:
+        elif PolicyDecision.NEEDS_INPUT in context_effects:
             final_decision = PolicyDecision.NEEDS_INPUT
+        elif builtin_needs_approval or PolicyDecision.NEEDS_APPROVAL in context_effects:
+            final_decision = PolicyDecision.NEEDS_APPROVAL
         else:
             final_decision = PolicyDecision.ALLOWED
 
         return PolicyEvaluationResult(
             proposal_id=request.proposal_id,
             decision=final_decision,
-            matched_rules=sorted(matched, key=lambda r: r.rule_id),
+            matched_rules=tuple(sorted(matched, key=lambda r: r.rule_id)),
             policy_version=ctx.policy_version,
-            findings=findings,
+            findings=tuple(findings),
         )
 
 
@@ -608,38 +523,21 @@ class OPAReviewAdapterConfig:
 class OPAReviewAdapter:
     """Boundary adapter to a real OPA endpoint.
 
-    Phase 5A Section 8 constraints:
+    R2 S11: external Policy calls are wrapped in ``asyncio.wait_for``
+    so a hung OPA endpoint cannot block the Reviewer indefinitely.
+    The timeout is ``config.timeout_ms / 1000`` seconds.
 
-    * Never default-initialized — callers must construct explicitly
-      with a validated :class:`OPAReviewAdapterConfig`.
-    * Never connects on import — no module-level client is created.
-    * Fails fast on missing configuration (handled in
-      :meth:`OPAReviewAdapterConfig.__post_init__`).
-    * Phase 5A tests use :class:`FakePolicyEvaluator`, not this adapter.
-    * Does NOT change existing OPA production paths under ``policies/``.
-
-    The adapter is provided so Phase 5B can wire a real OPA endpoint
-    without re-opening the Reviewer boundary.  In Phase 5A it is only
-    exercised by unit tests that substitute a fake HTTP transport.
+    R2 fail-closed: missing ``result`` / ``decision`` / ``policy_version``
+    in the OPA response raise :class:`PolicyEvaluationError` rather
+    than silently defaulting to ``allowed``.
     """
 
     def __init__(self, config: OPAReviewAdapterConfig) -> None:
-        # Config validation already happened in __post_init__.
-        # We do NOT create an HTTP client here — that is deferred to
-        # evaluate() so import is side-effect-free.
         self._config = config
-        # ``_transport`` is injected by tests; production uses the
-        # real ``httpx.AsyncClient``.  We type it as Any so the module
-        # does not need ``httpx`` at import time.
         self._transport: Any = None
 
     def with_transport(self, transport: Any) -> "OPAReviewAdapter":
-        """Inject a custom HTTP transport (test hook).
-
-        Production code does NOT call this — ``evaluate()`` lazily
-        creates an ``httpx.AsyncClient``.  Tests inject a fake
-        transport so the adapter never touches the network.
-        """
+        """Inject a custom HTTP transport (test hook)."""
         self._transport = transport
         return self
 
@@ -647,12 +545,6 @@ class OPAReviewAdapter:
         self,
         request: PolicyEvaluationRequest,
     ) -> PolicyEvaluationResult:
-        """Evaluate the request against the configured OPA endpoint.
-
-        Phase 5A: this method is exercised ONLY by tests with an
-        injected fake transport.  Production wiring is a Phase 5B
-        concern.
-        """
         if self._transport is None:
             raise PolicyEvaluationError(
                 "OPAReviewAdapter.evaluate requires a transport; "
@@ -673,17 +565,27 @@ class OPAReviewAdapter:
                 "policy_version": request.policy_context.policy_version,
             }
         }
+
+        # R2 S11: enforce timeout via asyncio.wait_for.
         try:
-            response = await self._transport.post(
-                f"{self._config.endpoint}{self._config.policy_path}",
-                json=payload,
-                timeout=self._config.timeout_ms / 1000.0,
-                headers=(
-                    {"Authorization": f"Bearer {self._config.api_key}"}
-                    if self._config.api_key
-                    else {}
+            response = await asyncio.wait_for(
+                self._transport.post(
+                    f"{self._config.endpoint}{self._config.policy_path}",
+                    json=payload,
+                    timeout=self._config.timeout_ms / 1000.0,
+                    headers=(
+                        {"Authorization": f"Bearer {self._config.api_key}"}
+                        if self._config.api_key
+                        else {}
+                    ),
                 ),
+                timeout=self._config.timeout_ms / 1000.0,
             )
+        except asyncio.TimeoutError as e:
+            raise PolicyEvaluationError(
+                f"OPA request timed out after {self._config.timeout_ms}ms "
+                f"for proposal {request.proposal_id!r}"
+            ) from e
         except Exception as e:
             raise PolicyEvaluationError(
                 f"OPA transport error for proposal {request.proposal_id!r}: {e}"
@@ -702,8 +604,20 @@ class OPAReviewAdapter:
                 f"OPA returned non-JSON body for proposal {request.proposal_id!r}: {e}"
             ) from e
 
-        result_raw = body.get("result", {})
-        decision_raw = str(result_raw.get("decision", "allowed"))
+        # R2 fail-closed: require "result" key.
+        if "result" not in body or not isinstance(body["result"], dict):
+            raise PolicyEvaluationError(
+                f"OPA response missing 'result' object for proposal "
+                f"{request.proposal_id!r}"
+            )
+        result_raw = body["result"]
+
+        # R2 fail-closed: require "decision" key.
+        if "decision" not in result_raw:
+            raise PolicyEvaluationError(
+                f"OPA response missing 'decision' for proposal {request.proposal_id!r}"
+            )
+        decision_raw = str(result_raw["decision"])
         try:
             decision = PolicyDecision(decision_raw)
         except ValueError:
@@ -712,11 +626,32 @@ class OPAReviewAdapter:
                 f"proposal {request.proposal_id!r}"
             )
 
+        # R2 fail-closed: require "policy_version" and validate match.
+        opa_policy_version = result_raw.get("policy_version")
+        if not opa_policy_version or not str(opa_policy_version).strip():
+            raise PolicyEvaluationError(
+                f"OPA response missing 'policy_version' for proposal "
+                f"{request.proposal_id!r}"
+            )
+        if str(opa_policy_version) != request.policy_context.policy_version:
+            raise PolicyEvaluationError(
+                f"OPA policy_version {opa_policy_version!r} != request "
+                f"{request.policy_context.policy_version!r} for proposal "
+                f"{request.proposal_id!r}"
+            )
+
         matched_rules_raw = result_raw.get("matched_rules", [])
+        if not isinstance(matched_rules_raw, list):
+            raise PolicyEvaluationError(
+                f"OPA 'matched_rules' is not a list for proposal "
+                f"{request.proposal_id!r}"
+            )
         matched_rules: list[PolicyMatchedRule] = []
         for r in matched_rules_raw:
+            if not isinstance(r, dict):
+                continue
             rule_id = str(r.get("rule_id", ""))
-            if not rule_id:
+            if not rule_id.strip():
                 continue
             try:
                 effect = PolicyDecision(str(r.get("effect", "allowed")))
@@ -725,9 +660,9 @@ class OPAReviewAdapter:
             matched_rules.append(
                 PolicyMatchedRule(
                     rule_id=rule_id,
-                    rule_version=request.policy_context.policy_version,
+                    rule_version=str(r.get("rule_version", "")),
                     effect=effect,
-                    matched_fields=list(r.get("matched_fields", [])),
+                    matched_fields=tuple(r.get("matched_fields", [])),
                 )
             )
 
@@ -769,9 +704,9 @@ class OPAReviewAdapter:
         return PolicyEvaluationResult(
             proposal_id=request.proposal_id,
             decision=decision,
-            matched_rules=sorted(matched_rules, key=lambda r: r.rule_id),
+            matched_rules=tuple(sorted(matched_rules, key=lambda r: r.rule_id)),
             policy_version=request.policy_context.policy_version,
-            findings=findings,
+            findings=tuple(findings),
         )
 
 
@@ -786,9 +721,6 @@ class FakePolicyEvaluator:
 
     Returns a preset :class:`PolicyEvaluationResult` per proposal_id,
     or a default ``ALLOWED`` result if no preset is registered.
-
-    Phase 5A tests inject this into :class:`ProposalReviewer` so no
-    real policy engine (deterministic or OPA) is exercised.
     """
 
     presets: dict[str, PolicyEvaluationResult] = field(default_factory=dict)
@@ -815,9 +747,9 @@ class FakePolicyEvaluator:
         return PolicyEvaluationResult(
             proposal_id=request.proposal_id,
             decision=PolicyDecision.ALLOWED,
-            matched_rules=[],
+            matched_rules=(),
             policy_version=request.policy_context.policy_version,
-            findings=[],
+            findings=(),
         )
 
 
@@ -831,4 +763,5 @@ __all__ = [
     "PolicyEvaluationResult",
     "PolicyEvaluator",
     "PolicyMatchedRule",
+    "PolicyRule",
 ]

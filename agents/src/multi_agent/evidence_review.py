@@ -1,4 +1,4 @@
-"""Phase 5A Evidence Validation.
+"""Phase 5A Evidence Validation (R2).
 
 Pure-function Evidence reference validation.  No I/O, no network, no
 side-effects.
@@ -21,20 +21,40 @@ Validation checks (in order):
    must be a non-empty hex string; a tampered / empty hash is
    rejected.
 5. **Type compatibility** — the Evidence type must be compatible
-   with the Proposal's ``action_type`` per
-   :data:`_ACTION_EVIDENCE_REQUIREMENTS`.
+   with the Proposal's ``action_type`` per the
+   :data:`ACTION_GOVERNANCE_REGISTRY` (R2 S14 — no local lookup
+   table).
 6. **Duplicate references** — the same ``evidence_id`` appearing
    twice in the same Proposal's ``evidence_ids`` list is flagged.
 7. **Dangling references** — Evidence present in the index but
    referenced by no Proposal is flagged as ``INFO`` (informational,
    not a rejection).
+
+R2 changes:
+
+* :func:`build_evidence_index` / :func:`detect_duplicate_evidence` /
+  :func:`detect_dangling_evidence` now accept
+  :class:`ReviewEvidenceSnapshot` (the R2 Request carries snapshots,
+  not raw :class:`Evidence`).  The ``snapshot_hash`` is used for
+  duplicate-content detection instead of recomputing
+  :func:`compute_review_evidence_hash`.
+* :func:`validate_evidence_for_proposal` now accepts a
+  ``canonical_risk_level`` parameter (R2 — the Reviewer's canonical
+  risk, NOT the Proposal's self-declared risk) and reads evidence
+  requirements from :data:`ACTION_GOVERNANCE_REGISTRY` (R2 S14).
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
-from multi_agent.contracts import ActionProposal, Evidence, EvidenceType
+from multi_agent.action_governance import get_action_governance_spec
+from multi_agent.contracts import (
+    ActionProposal,
+    ActionRiskLevel,
+    Evidence,
+    EvidenceType,
+)
 from multi_agent.review_contracts import (
     CODE_EVIDENCE_DANGLING,
     CODE_EVIDENCE_DUPLICATE,
@@ -43,69 +63,11 @@ from multi_agent.review_contracts import (
     CODE_EVIDENCE_MISSING,
     CODE_EVIDENCE_TYPE_MISMATCH,
     CapabilitySnapshot,
+    ReviewEvidenceSnapshot,
     ReviewFinding,
     ReviewFindingSeverity,
+    ReviewRiskLevel,
 )
-
-
-# ---------------------------------------------------------------------------
-# Action → required Evidence type mapping.
-# ---------------------------------------------------------------------------
-
-# Each action_type maps to the set of EvidenceTypes that may legitimately
-# support it.  An empty set means "any evidence type is accepted" — used
-# for low-risk read-only actions.  A non-empty set means the Proposal
-# must reference at least one Evidence of a compatible type.
-_ACTION_EVIDENCE_REQUIREMENTS: dict[str, frozenset[EvidenceType]] = {
-    "report.generate": frozenset(),  # any
-    "summary.compile": frozenset(),  # any
-    "metric.query": frozenset({EvidenceType.METRIC}),
-    "crm.tag.update": frozenset(
-        {
-            EvidenceType.CUSTOMER,
-            EvidenceType.CONTACT,
-            EvidenceType.TICKET,
-            EvidenceType.DEAL,
-        }
-    ),
-    "crm.status.update": frozenset(
-        {
-            EvidenceType.CUSTOMER,
-            EvidenceType.TICKET,
-            EvidenceType.DEAL,
-        }
-    ),
-    "crm.note.add": frozenset(
-        {
-            EvidenceType.CUSTOMER,
-            EvidenceType.CONTACT,
-            EvidenceType.TICKET,
-            EvidenceType.DEAL,
-        }
-    ),
-    "crm.owner.assign": frozenset({EvidenceType.CUSTOMER}),
-    "crm.escalate": frozenset({EvidenceType.TICKET, EvidenceType.CUSTOMER}),
-    "refund.issue": frozenset(
-        {
-            EvidenceType.CUSTOMER,
-            EvidenceType.TICKET,
-            EvidenceType.DEAL,
-        }
-    ),
-    "contract.amend": frozenset({EvidenceType.DEAL, EvidenceType.CUSTOMER}),
-    "notification.bulk_send": frozenset(
-        {
-            EvidenceType.CUSTOMER,
-            EvidenceType.CONTACT,
-        }
-    ),
-    "permission.change": frozenset(
-        {
-            EvidenceType.CUSTOMER,
-            EvidenceType.AUDIT_EVENT,
-        }
-    ),
-}
 
 
 def _hex_hash_valid(value: str | None) -> bool:
@@ -125,7 +87,7 @@ def _make_finding(
     severity: ReviewFindingSeverity,
     message: str,
     proposal: ActionProposal,
-    evidence_ids: list[str] | None = None,
+    evidence_ids: tuple[str, ...] | None = None,
     details: dict[str, Any] | None = None,
 ) -> ReviewFinding:
     return ReviewFinding(
@@ -135,7 +97,7 @@ def _make_finding(
         proposal_id=proposal.proposal_id,
         task_id=None,
         agent_id=proposal.created_by_agent,
-        evidence_ids=evidence_ids or [],
+        evidence_ids=evidence_ids or (),
         policy_source="evidence_review@ma-05a",
         details=details or {},
     )
@@ -152,6 +114,10 @@ def compute_review_evidence_hash(evidence: Evidence) -> str:
     Hashes all canonical Evidence fields EXCEPT the self-referential
     ``content_hash`` field, so a tampered Evidence that keeps the old
     declared hash is detected.
+
+    R2 P0-3: this function is called by
+    :class:`ReviewEvidenceSnapshot._verify_snapshot_hash` to verify
+    the snapshot at the Request boundary.
     """
     from multi_agent.serialization import stable_hash
 
@@ -160,37 +126,70 @@ def compute_review_evidence_hash(evidence: Evidence) -> str:
     return stable_hash(payload)
 
 
+# ---------------------------------------------------------------------------
+# R2 P0-3: snapshot-aware helpers
+# ---------------------------------------------------------------------------
+
+
+def _extract_evidence(item: ReviewEvidenceSnapshot | Evidence) -> Evidence:
+    """Return the underlying :class:`Evidence` from a snapshot or pass
+    through if already an :class:`Evidence`."""
+    if isinstance(item, ReviewEvidenceSnapshot):
+        return item.evidence
+    return item
+
+
+def _extract_hash(item: ReviewEvidenceSnapshot | Evidence) -> str:
+    """Return the content hash for dedup detection.
+
+    For a :class:`ReviewEvidenceSnapshot` the verified ``snapshot_hash``
+    is used directly (R2 P0-3).  For a raw :class:`Evidence` the hash
+    is recomputed via :func:`compute_review_evidence_hash` (legacy
+    call sites / tests).
+    """
+    if isinstance(item, ReviewEvidenceSnapshot):
+        return item.snapshot_hash
+    return compute_review_evidence_hash(item)
+
+
 def build_evidence_index(
-    evidence: list[Evidence],
+    evidence: Sequence[ReviewEvidenceSnapshot | Evidence],
 ) -> tuple[dict[str, Evidence], set[str]]:
     """Return a deterministic ``evidence_id → Evidence`` mapping and a
     set of excluded evidence_ids.
 
     If the input contains duplicate evidence_ids with the SAME content
-    (compared via :func:`compute_review_evidence_hash`), one copy is
-    kept (benign deduplication).  If duplicates have DIFFERENT content,
-    ALL copies of that id are excluded from the index (fail closed) and
-    the id is added to the excluded set.  The caller is responsible for
-    surfacing the content-mismatch duplicate as a :class:`ReviewFinding`
-    via :func:`detect_duplicate_evidence`.
+    (compared via the snapshot_hash for
+    :class:`ReviewEvidenceSnapshot` or
+    :func:`compute_review_evidence_hash` for raw :class:`Evidence`),
+    one copy is kept (benign deduplication).  If duplicates have
+    DIFFERENT content, ALL copies of that id are excluded from the
+    index (fail closed) and the id is added to the excluded set.  The
+    caller is responsible for surfacing the content-mismatch duplicate
+    as a :class:`ReviewFinding` via :func:`detect_duplicate_evidence`.
+
+    R2 P0-3: accepts :class:`ReviewEvidenceSnapshot` (the R2 Request
+    carries snapshots).  Backward-compatible with raw
+    :class:`Evidence` for legacy call sites.
     """
     # Group by evidence_id to detect duplicates with different content.
-    seen: dict[str, list[Evidence]] = {}
-    for ev in evidence:
-        seen.setdefault(ev.evidence_id, []).append(ev)
+    seen: dict[str, list[ReviewEvidenceSnapshot | Evidence]] = {}
+    for item in evidence:
+        ev = _extract_evidence(item)
+        seen.setdefault(ev.evidence_id, []).append(item)
 
     index: dict[str, Evidence] = {}
     excluded: set[str] = set()
     for ev_id, group in seen.items():
         if len(group) == 1:
-            index[ev_id] = group[0]
+            index[ev_id] = _extract_evidence(group[0])
         else:
             # Multiple entries with the same evidence_id — check
-            # whether their review hashes all match.
-            hashes = {compute_review_evidence_hash(ev) for ev in group}
+            # whether their content hashes all match.
+            hashes = {_extract_hash(item) for item in group}
             if len(hashes) == 1:
                 # Same content — benign duplicate, keep one.
-                index[ev_id] = group[0]
+                index[ev_id] = _extract_evidence(group[0])
             else:
                 # Different content — fail closed: exclude all copies.
                 excluded.add(ev_id)
@@ -198,26 +197,30 @@ def build_evidence_index(
 
 
 def detect_duplicate_evidence(
-    evidence: list[Evidence],
+    evidence: Sequence[ReviewEvidenceSnapshot | Evidence],
 ) -> list[ReviewFinding]:
     """Return findings for evidence_ids that appear more than once
     with different content.
 
     Same evidence_id + same content is a benign duplicate (already
     deduplicated by Phase 4 merge).  Same evidence_id + different
-    content (compared via :func:`compute_review_evidence_hash`) is a
-    content_mismatch — all copies are flagged.
+    content (compared via the snapshot_hash for
+    :class:`ReviewEvidenceSnapshot`) is a content_mismatch — all
+    copies are flagged.
+
+    R2 P0-3: accepts :class:`ReviewEvidenceSnapshot`.
     """
     findings: list[ReviewFinding] = []
-    seen: dict[str, list[Evidence]] = {}
-    for ev in evidence:
-        seen.setdefault(ev.evidence_id, []).append(ev)
+    seen: dict[str, list[ReviewEvidenceSnapshot | Evidence]] = {}
+    for item in evidence:
+        ev = _extract_evidence(item)
+        seen.setdefault(ev.evidence_id, []).append(item)
 
     for ev_id in sorted(seen):
         group = seen[ev_id]
         if len(group) <= 1:
             continue
-        hashes = {compute_review_evidence_hash(ev) for ev in group}
+        hashes = {_extract_hash(item) for item in group}
         if len(hashes) > 1:
             findings.append(
                 ReviewFinding(
@@ -228,7 +231,7 @@ def detect_duplicate_evidence(
                         f"content hashes; all copies excluded"
                     ),
                     proposal_id="(evidence-index)",
-                    evidence_ids=[ev_id],
+                    evidence_ids=(ev_id,),
                     policy_source="evidence_review@ma-05a",
                     details={
                         "evidence_id": ev_id,
@@ -247,6 +250,7 @@ def validate_evidence_for_proposal(
     *,
     tenant_id: str,
     excluded_evidence_ids: set[str] | None = None,
+    canonical_risk_level: ReviewRiskLevel | None = None,
 ) -> list[ReviewFinding]:
     """Validate every Evidence reference on *proposal*.
 
@@ -259,6 +263,16 @@ def validate_evidence_for_proposal(
     from the index due to content mismatch (tamper detection).  Every
     Proposal referencing an excluded id gets a blocking
     ``CODE_EVIDENCE_HASH_MISMATCH`` ERROR finding.
+
+    R2: ``canonical_risk_level`` is the Reviewer's canonical risk
+    classification (NOT the Proposal's self-declared ``risk_level``).
+    When supplied, it replaces ``proposal.risk_level`` for the
+    "high-risk must reference evidence" check so a misbehaving Agent
+    cannot lower the approval bar by declaring ``risk_level=low``.
+
+    R2 S14: evidence type requirements are read from
+    :data:`ACTION_GOVERNANCE_REGISTRY` via
+    :func:`get_action_governance_spec` — no local lookup table.
     """
     findings: list[ReviewFinding] = []
     excluded = excluded_evidence_ids or set()
@@ -280,16 +294,20 @@ def validate_evidence_for_proposal(
                     f"duplicate evidence_ids: {duplicates!r}"
                 ),
                 proposal=proposal,
-                evidence_ids=duplicates,
+                evidence_ids=tuple(duplicates),
                 details={"duplicate_evidence_ids": duplicates},
             )
         )
 
     # 2. Per-reference checks
-    required_types = _ACTION_EVIDENCE_REQUIREMENTS.get(proposal.action_type)
-    # If action_type is unknown, required_types is None — we do NOT
-    # type-check, but the Policy evaluator will reject the action
-    # separately via CODE_ACTION_UNKNOWN_TYPE.
+    # R2 S14: read evidence requirements from the governance registry.
+    spec = get_action_governance_spec(proposal.action_type)
+    required_types: frozenset[EvidenceType] | None = None
+    if spec is not None:
+        required_types = spec.required_evidence_types
+    # If action_type is unknown, spec is None — we do NOT type-check,
+    # but the Policy evaluator will reject the action separately via
+    # CODE_ACTION_UNKNOWN_TYPE.
 
     matched_evidence: list[Evidence] = []
     for ev_id in proposal.evidence_ids:
@@ -305,7 +323,7 @@ def validate_evidence_for_proposal(
                         f"content mismatch (tamper detected)"
                     ),
                     proposal=proposal,
-                    evidence_ids=[ev_id],
+                    evidence_ids=(ev_id,),
                     details={
                         "evidence_id": ev_id,
                         "reason": "content_mismatch_excluded",
@@ -325,7 +343,7 @@ def validate_evidence_for_proposal(
                         f"missing evidence {ev_id!r}"
                     ),
                     proposal=proposal,
-                    evidence_ids=[ev_id],
+                    evidence_ids=(ev_id,),
                     details={"missing_evidence_id": ev_id},
                 )
             )
@@ -342,7 +360,7 @@ def validate_evidence_for_proposal(
                         f"expected {tenant_id!r}"
                     ),
                     proposal=proposal,
-                    evidence_ids=[ev_id],
+                    evidence_ids=(ev_id,),
                     details={
                         "evidence_id": ev_id,
                         "evidence_tenant": ev.tenant_id,
@@ -372,7 +390,7 @@ def validate_evidence_for_proposal(
                         f"nor a registered agent in the Capability Snapshots"
                     ),
                     proposal=proposal,
-                    evidence_ids=[ev_id],
+                    evidence_ids=(ev_id,),
                     details={
                         "evidence_id": ev_id,
                         "source_agent": ev.source_agent,
@@ -393,7 +411,7 @@ def validate_evidence_for_proposal(
                         f"{ev.content_hash!r}"
                     ),
                     proposal=proposal,
-                    evidence_ids=[ev_id],
+                    evidence_ids=(ev_id,),
                     details={
                         "evidence_id": ev_id,
                         "content_hash": ev.content_hash,
@@ -402,8 +420,8 @@ def validate_evidence_for_proposal(
             )
             continue
 
-        # 2d. Type compatibility
-        if required_types and required_types:
+        # 2d. Type compatibility (R2 S14: from governance registry)
+        if required_types:
             # Non-empty set — the Evidence type must be in the set.
             if ev.evidence_type not in required_types:
                 findings.append(
@@ -417,7 +435,7 @@ def validate_evidence_for_proposal(
                             f"required one of {sorted(t.value for t in required_types)!r}"
                         ),
                         proposal=proposal,
-                        evidence_ids=[ev_id],
+                        evidence_ids=(ev_id,),
                         details={
                             "evidence_id": ev_id,
                             "evidence_type": ev.evidence_type.value,
@@ -432,9 +450,22 @@ def validate_evidence_for_proposal(
 
     # 3. High-risk proposals must reference at least one valid Evidence
     # (after all invalid references have been filtered out).
-    from multi_agent.contracts import ActionRiskLevel
+    # R2: use canonical_risk_level when supplied (NOT proposal.risk_level).
+    effective_risk = canonical_risk_level
+    if effective_risk is None:
+        # Fallback for legacy callers that don't supply canonical_risk_level.
+        # ``ActionRiskLevel`` has no CRITICAL value — the Reviewer's
+        # canonical risk (from the governance spec) is the authoritative
+        # source for CRITICAL; this fallback only distinguishes HIGH.
+        if proposal.risk_level == ActionRiskLevel.HIGH:
+            effective_risk = ReviewRiskLevel.HIGH
+        else:
+            effective_risk = ReviewRiskLevel.LOW
 
-    if proposal.risk_level == ActionRiskLevel.HIGH and not matched_evidence:
+    if (
+        effective_risk in (ReviewRiskLevel.HIGH, ReviewRiskLevel.CRITICAL)
+        and not matched_evidence
+    ):
         findings.append(
             _make_finding(
                 code=CODE_EVIDENCE_MISSING,
@@ -444,9 +475,9 @@ def validate_evidence_for_proposal(
                     f"valid Evidence references after validation"
                 ),
                 proposal=proposal,
-                evidence_ids=list(proposal.evidence_ids),
+                evidence_ids=tuple(proposal.evidence_ids),
                 details={
-                    "risk_level": proposal.risk_level.value,
+                    "risk_level": effective_risk.value,
                     "referenced_count": len(proposal.evidence_ids),
                     "valid_count": len(matched_evidence),
                 },
@@ -457,7 +488,7 @@ def validate_evidence_for_proposal(
 
 
 def detect_dangling_evidence(
-    proposals: list[ActionProposal],
+    proposals: Sequence[ActionProposal],
     evidence_index: dict[str, Evidence],
 ) -> list[ReviewFinding]:
     """Return INFO findings for Evidence in the index that is not
@@ -483,7 +514,7 @@ def detect_dangling_evidence(
                     f"not referenced by any Proposal"
                 ),
                 proposal_id="(evidence-index)",
-                evidence_ids=[ev_id],
+                evidence_ids=(ev_id,),
                 policy_source="evidence_review@ma-05a",
                 details={"evidence_id": ev_id},
             )

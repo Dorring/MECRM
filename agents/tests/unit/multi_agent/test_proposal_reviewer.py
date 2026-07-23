@@ -20,6 +20,10 @@ from datetime import datetime, timezone
 
 import pytest
 
+from multi_agent.action_governance import (
+    ACTION_GOVERNANCE_SPEC_HASH,
+    ACTION_GOVERNANCE_SPEC_VERSION,
+)
 from multi_agent.contracts import (
     ActionProposal,
     ActionRiskLevel,
@@ -28,6 +32,7 @@ from multi_agent.contracts import (
     Evidence,
     EvidenceType,
 )
+from multi_agent.evidence_review import compute_review_evidence_hash
 from multi_agent.execution import ExecutionCapabilitySnapshot
 from multi_agent.policy import (
     DeterministicPolicyEvaluator,
@@ -39,8 +44,10 @@ from multi_agent.review_contracts import (
     PolicyContext,
     ReviewBatchStatus,
     ReviewDecisionStatus,
+    ReviewEvidenceSnapshot,
     ReviewProposalEnvelope,
     ReviewRequest,
+    REVIEW_SCHEMA_VERSION,
     TaskRecordSummary,
     TraceSummary,
     REVIEWER_VERSION,
@@ -178,6 +185,15 @@ def _make_request(
     policy_context: PolicyContext | None = None,
     review_id: str = "review-test-001",
 ) -> ReviewRequest:
+    # R2 P0-3: wrap evidence in ReviewEvidenceSnapshot
+    raw_evidence = evidence or []
+    evidence_snapshots = [
+        ReviewEvidenceSnapshot(
+            evidence=ev,
+            snapshot_hash=compute_review_evidence_hash(ev),
+        )
+        for ev in raw_evidence
+    ]
     return ReviewRequest(
         review_id=review_id,
         run_id="run-test-001",
@@ -185,7 +201,7 @@ def _make_request(
         plan_hash="plan-test-hash",
         registry_version="registry-test-v1",
         proposals=proposals,
-        evidence=evidence or [],
+        evidence=evidence_snapshots,
         task_records=[
             TaskRecordSummary(
                 task_id="task-test",
@@ -201,6 +217,9 @@ def _make_request(
             policy_version="test-v1",
             rules=[],
         ),
+        governance_spec_version=ACTION_GOVERNANCE_SPEC_VERSION,
+        governance_spec_hash=ACTION_GOVERNANCE_SPEC_HASH,
+        review_schema_version=REVIEW_SCHEMA_VERSION,
         reviewer_version=REVIEWER_VERSION,
     )
 
@@ -587,14 +606,16 @@ class TestBatchStatus:
         assert result.batch_status == ReviewBatchStatus.REJECTED
 
     @pytest.mark.asyncio
-    async def test_empty_request_batch_approved(self):
+    async def test_empty_request_batch_no_actions(self):
+        # R2 S7: empty batch uses NO_ACTIONS (NOT APPROVED).
         req = _make_request([])
         reviewer = ProposalReviewer()
         result = await reviewer.review(
             req, policy_evaluator=DeterministicPolicyEvaluator()
         )
-        assert result.batch_status == ReviewBatchStatus.APPROVED
-        assert result.proposal_reviews == []
+        assert result.batch_status == ReviewBatchStatus.NO_ACTIONS
+        # R2 S1: proposal_reviews is a tuple (deep immutability)
+        assert result.proposal_reviews == ()
 
 
 # ---------------------------------------------------------------------------

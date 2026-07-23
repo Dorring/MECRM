@@ -36,11 +36,17 @@ from __future__ import annotations
 
 from typing import Any
 
+from multi_agent.action_governance import (
+    ACTION_GOVERNANCE_SPEC_HASH,
+    ACTION_GOVERNANCE_SPEC_VERSION,
+    get_action_governance_spec,
+)
 from multi_agent.contracts import (
     ActionProposal,
     AgentAuthority,
     Evidence,
 )
+from multi_agent.execution import ExecutionCapabilitySnapshot
 from multi_agent.review_contracts import (
     CODE_ACTION_TOOL_FORBIDDEN,
     CODE_ACTION_UNKNOWN_TYPE,
@@ -62,13 +68,16 @@ from multi_agent.review_contracts import (
     CODE_TENANT_PII_EGRESS,
     CODE_TENANT_SECRET_FIELD,
     REJECTION_FINDING_CODES,
+    REVIEWER_VERSION,
     CapabilitySnapshot,
+    PolicyDecisionAudit,
     ProposalReview,
     ReviewBatchResult,
     ReviewBatchStatus,
     ReviewDecisionStatus,
     ReviewFinding,
     ReviewFindingSeverity,
+    ReviewProposalEnvelope,
     ReviewRequest,
     ReviewRiskLevel,
     TaskRecordSummary,
@@ -98,38 +107,30 @@ from multi_agent.conflict_resolution import (
     detect_conflicts,
     detect_duplicates,
 )
+from multi_agent.serialization import stable_hash
 
 
 # ---------------------------------------------------------------------------
 # Risk classification — Phase 5A Section 9
 # ---------------------------------------------------------------------------
 
-# Action categories → Reviewer-side risk level.  This is INDEPENDENT
-# of the Proposal's self-declared ``risk_level`` — a misbehaving Agent
-# cannot lower the approval bar by declaring ``risk_level=low``.
-_ACTION_RISK: dict[str, ReviewRiskLevel] = {
-    "report.generate": ReviewRiskLevel.LOW,
-    "summary.compile": ReviewRiskLevel.LOW,
-    "metric.query": ReviewRiskLevel.LOW,
-    "crm.tag.update": ReviewRiskLevel.MEDIUM,
-    "crm.status.update": ReviewRiskLevel.MEDIUM,
-    "crm.note.add": ReviewRiskLevel.MEDIUM,
-    "crm.owner.assign": ReviewRiskLevel.HIGH,
-    "crm.escalate": ReviewRiskLevel.HIGH,
-    "refund.issue": ReviewRiskLevel.CRITICAL,
-    "contract.amend": ReviewRiskLevel.CRITICAL,
-    "notification.bulk_send": ReviewRiskLevel.HIGH,
-    "permission.change": ReviewRiskLevel.CRITICAL,
-}
+# R2 S14: risk classification reads from ACTION_GOVERNANCE_REGISTRY —
+# no local lookup table.  A misbehaving Agent cannot lower the approval
+# bar by declaring ``risk_level=low``; the Reviewer recomputes a
+# canonical risk from the governance spec.
 
 
 def classify_risk(proposal: ActionProposal) -> ReviewRiskLevel:
     """Return the canonical Reviewer-side risk level for *proposal*.
 
-    Falls back to :class:`ReviewRiskLevel.MEDIUM` for unknown actions
-    (the Policy evaluator will reject them separately).
+    R2 S14: reads from :data:`ACTION_GOVERNANCE_REGISTRY`.  Falls back
+    to :class:`ReviewRiskLevel.MEDIUM` for unknown actions (the Policy
+    evaluator will reject them separately).
     """
-    return _ACTION_RISK.get(proposal.action_type, ReviewRiskLevel.MEDIUM)
+    spec = get_action_governance_spec(proposal.action_type)
+    if spec is None:
+        return ReviewRiskLevel.MEDIUM
+    return spec.canonical_risk
 
 
 # ---------------------------------------------------------------------------
@@ -145,47 +146,6 @@ def _authority_rank(a: AgentAuthority) -> int:
     }[a]
 
 
-# Map action_type → minimum AgentAuthority required to propose it.
-# These are stricter than the Tool authority floor in
-# :mod:`multi_agent.policy` because the Reviewer enforces the
-# Capability Snapshot authority, not just the Tool authority.
-_ACTION_AUTHORITY_FLOOR: dict[str, AgentAuthority] = {
-    "report.generate": AgentAuthority.READ,
-    "summary.compile": AgentAuthority.READ,
-    "metric.query": AgentAuthority.READ,
-    "crm.tag.update": AgentAuthority.PROPOSE,
-    "crm.status.update": AgentAuthority.PROPOSE,
-    "crm.note.add": AgentAuthority.PROPOSE,
-    "crm.owner.assign": AgentAuthority.PROPOSE,
-    "crm.escalate": AgentAuthority.PROPOSE,
-    "refund.issue": AgentAuthority.PROPOSE,
-    "contract.amend": AgentAuthority.PROPOSE,
-    "notification.bulk_send": AgentAuthority.PROPOSE,
-    "permission.change": AgentAuthority.PROPOSE,
-}
-
-
-# Tool name → action_type mapping for Tool/Action Allowlist validation.
-# Phase 5A only validates that the action_type is registered; it does
-# not invoke any Tool.  The mapping documents which Tool each
-# action_type corresponds to so the Reviewer can verify the Agent's
-# ``allowed_tools`` includes it.
-_ACTION_TO_TOOL: dict[str, str] = {
-    "report.generate": "crm_reader.get_customers",
-    "summary.compile": "crm_reader.get_customers",
-    "metric.query": "crm_reader.get_customers",
-    "crm.tag.update": "crm_writer.propose",
-    "crm.status.update": "crm_writer.propose",
-    "crm.note.add": "crm_writer.propose",
-    "crm.owner.assign": "crm_writer.propose",
-    "crm.escalate": "crm_writer.propose",
-    "refund.issue": "crm_writer.propose",
-    "contract.amend": "crm_writer.propose",
-    "notification.bulk_send": "crm_writer.propose",
-    "permission.change": "governance.approve",
-}
-
-
 def validate_authority(
     proposal: ActionProposal,
     capability: CapabilitySnapshot | None,
@@ -199,6 +159,9 @@ def validate_authority(
     * Agent authority must satisfy the Action's risk level
     * Read-only Agent cannot propose Write/Execute Actions
     * Proposal authority must not exceed the Capability Snapshot
+
+    R2 S14: authority floor and required tool are read from
+    :data:`ACTION_GOVERNANCE_REGISTRY` — no local lookup table.
 
     Returns a list of findings — empty means authority is valid.
     """
@@ -222,7 +185,10 @@ def validate_authority(
         return findings
 
     cap = capability.capability
-    floor = _ACTION_AUTHORITY_FLOOR.get(proposal.action_type)
+    # R2 S14: read authority floor + required tool from governance spec.
+    spec = get_action_governance_spec(proposal.action_type)
+    floor = spec.minimum_authority if spec is not None else None
+    tool_name = spec.required_tool if spec is not None else None
 
     if floor is not None and _authority_rank(cap.authority) < _authority_rank(floor):
         # Read-only agent proposing a Write/Execute action
@@ -290,7 +256,7 @@ def validate_authority(
             )
 
     # Verify the action's Tool is in the Agent's allowed_tools
-    tool_name = _ACTION_TO_TOOL.get(proposal.action_type)
+    # R2 S14: tool name from governance spec.
     if tool_name is not None and tool_name not in cap.allowed_tools:
         findings.append(
             ReviewFinding(
@@ -569,19 +535,22 @@ def validate_action_allowlist(
 ) -> list[ReviewFinding]:
     """Validate that the action_type is registered.
 
-    Phase 5A only validates shape — it never invokes the Tool.
-    The actual category allowlist is enforced by the Policy evaluator.
+    R2 S14: checks :data:`ACTION_GOVERNANCE_REGISTRY` instead of a
+    local lookup table.  Phase 5A only validates shape — it never
+    invokes the Tool.  The actual category allowlist is enforced by
+    the Policy evaluator.
     """
     findings: list[ReviewFinding] = []
 
-    if proposal.action_type not in _ACTION_TO_TOOL:
+    spec = get_action_governance_spec(proposal.action_type)
+    if spec is None:
         findings.append(
             ReviewFinding(
                 finding_code=CODE_ACTION_UNKNOWN_TYPE,
                 severity=ReviewFindingSeverity.ERROR,
                 message=(
                     f"Action type {proposal.action_type!r} is not "
-                    f"registered in the Reviewer allowlist"
+                    f"registered in the Action Governance Spec"
                 ),
                 proposal_id=proposal.proposal_id,
                 agent_id=proposal.created_by_agent,
@@ -624,6 +593,12 @@ class ProposalReviewer:
         :class:`ReviewBatchResult`.
 
         Execution order per Phase 5A Section 12.
+
+        R2: iterates over :class:`ReviewProposalEnvelope` (NOT raw
+        Proposals) so per-task capability binding is available for
+        every Proposal.  Builds a :class:`PolicyDecisionAudit` for
+        every Proposal (including skipped-authority-failure).  Calls
+        :meth:`verify_against_request` before returning.
         """
         # 1. Verify ReviewRequest integrity
         try:
@@ -636,8 +611,35 @@ class ProposalReviewer:
                 f"verification: {e}"
             ) from e
 
+        # R2 S3: verify governance spec version/hash match the live
+        # registry so a Request built against an older spec is rejected.
+        if request.governance_spec_version != ACTION_GOVERNANCE_SPEC_VERSION:
+            raise InvalidReviewRequestError(
+                f"ReviewRequest {request.review_id!r}: governance_spec_version "
+                f"{request.governance_spec_version!r} != live "
+                f"{ACTION_GOVERNANCE_SPEC_VERSION!r}"
+            )
+        if (
+            request.governance_spec_hash
+            and request.governance_spec_hash != ACTION_GOVERNANCE_SPEC_HASH
+        ):
+            raise InvalidReviewRequestError(
+                f"ReviewRequest {request.review_id!r}: governance_spec_hash "
+                f"{request.governance_spec_hash[:12]!r} != live "
+                f"{ACTION_GOVERNANCE_SPEC_HASH[:12]!r}"
+            )
+
         # 2. Build lookup indices
         evidence_index, excluded_evidence_ids = build_evidence_index(request.evidence)
+        # R2 P0-2: capability_bindings are unique by task_id (NOT
+        # agent_id).  The Reviewer looks up capability by
+        # envelope.task_id so a Proposal cannot borrow another Task's
+        # binding for the same Agent.
+        cap_by_task: dict[str, ExecutionCapabilitySnapshot] = {
+            cb.task_id: cb for cb in request.capability_bindings
+        }
+        # Agent-based lookup retained for evidence source-agent
+        # consistency validation (backward compat).
         capability_snapshots = {
             cb.agent_id: CapabilitySnapshot(
                 agent_id=cb.agent_id, capability=cb.capability
@@ -645,6 +647,11 @@ class ProposalReviewer:
             for cb in request.capability_bindings
         }
         task_records = {tr.task_id: tr for tr in request.task_records}
+        # R2 P0-1: envelope lookup by proposal_id for per-task
+        # capability binding.
+        envelope_by_pid = {
+            e.proposal.proposal_id: e for e in request.proposal_envelopes
+        }
 
         # 3. Detect duplicate Evidence (cross-Proposal)
         evidence_dup_findings = detect_duplicate_evidence(request.evidence)
@@ -661,8 +668,7 @@ class ProposalReviewer:
         # 6. Dangling evidence (informational)
         dangling_findings = detect_dangling_evidence(request.proposals, evidence_index)
 
-        # 7. Per-Proposal review
-        seen_proposal_ids: set[str] = set()
+        # 7. Per-Proposal review — iterate over envelopes (R2 P0-1)
         per_proposal_reviews: list[ProposalReview] = []
         all_findings: list[ReviewFinding] = []
         all_findings.extend(evidence_dup_findings)
@@ -671,68 +677,86 @@ class ProposalReviewer:
         all_findings.extend(dangling_findings)
 
         for proposal in sorted(request.proposals, key=lambda p: p.proposal_id):
-            seen_proposal_ids.add(proposal.proposal_id)
+            envelope = envelope_by_pid.get(proposal.proposal_id)
             review = await self._review_single_proposal(
                 proposal=proposal,
+                envelope=envelope,
                 request=request,
                 evidence_index=evidence_index,
                 excluded_evidence_ids=excluded_evidence_ids,
                 capability_snapshots=capability_snapshots,
+                cap_by_task=cap_by_task,
                 task_records=task_records,
                 policy_evaluator=policy_evaluator,
                 dedup_result=dedup_result,
                 conflict_result=conflict_result,
-                all_findings=all_findings,
             )
             per_proposal_reviews.append(review)
 
         # 8. Compute batch status
         batch_status = self._compute_batch_status(per_proposal_reviews)
 
-        # 9. Build sorted result lists
-        approved_ids = sorted(
-            r.proposal_id
-            for r in per_proposal_reviews
-            if r.status == ReviewDecisionStatus.APPROVED
+        # 9. Build sorted result lists (R2 S1: tuples)
+        approved_ids = tuple(
+            sorted(
+                r.proposal_id
+                for r in per_proposal_reviews
+                if r.status == ReviewDecisionStatus.APPROVED
+            )
         )
-        rejected_ids = sorted(
-            r.proposal_id
-            for r in per_proposal_reviews
-            if r.status == ReviewDecisionStatus.REJECTED
+        rejected_ids = tuple(
+            sorted(
+                r.proposal_id
+                for r in per_proposal_reviews
+                if r.status == ReviewDecisionStatus.REJECTED
+            )
         )
-        approval_required_ids = sorted(
-            r.proposal_id
-            for r in per_proposal_reviews
-            if r.status == ReviewDecisionStatus.NEEDS_APPROVAL
+        approval_required_ids = tuple(
+            sorted(
+                r.proposal_id
+                for r in per_proposal_reviews
+                if r.status == ReviewDecisionStatus.NEEDS_APPROVAL
+            )
         )
-        conflicted_ids = sorted(
-            r.proposal_id
-            for r in per_proposal_reviews
-            if r.status == ReviewDecisionStatus.CONFLICT
+        conflicted_ids = tuple(
+            sorted(
+                r.proposal_id
+                for r in per_proposal_reviews
+                if r.status == ReviewDecisionStatus.CONFLICT
+            )
         )
-        deduplicated_ids = sorted(
-            r.proposal_id
-            for r in per_proposal_reviews
-            if r.status == ReviewDecisionStatus.DEDUPLICATED
+        deduplicated_ids = tuple(
+            sorted(
+                r.proposal_id
+                for r in per_proposal_reviews
+                if r.status == ReviewDecisionStatus.DEDUPLICATED
+            )
         )
 
-        # 10. Build the final ReviewBatchResult
+        # 10. Build the final ReviewBatchResult (R2: governance_spec_hash +
+        #     reviewer_version)
         result = ReviewBatchResult(
             review_id=request.review_id,
             run_id=request.run_id,
             tenant_id=request.tenant_id,
             request_hash=request.request_hash,
-            proposal_reviews=sorted(per_proposal_reviews, key=lambda r: r.proposal_id),
+            proposal_reviews=tuple(
+                sorted(per_proposal_reviews, key=lambda r: r.proposal_id)
+            ),
             batch_status=batch_status,
             approved_proposal_ids=approved_ids,
             rejected_proposal_ids=rejected_ids,
             approval_required_proposal_ids=approval_required_ids,
             conflicted_proposal_ids=conflicted_ids,
             deduplicated_proposal_ids=deduplicated_ids,
-            findings=sorted(
-                all_findings,
-                key=lambda f: (f.proposal_id, f.finding_code, f.message),
+            findings=tuple(
+                sorted(
+                    all_findings,
+                    key=lambda f: (f.proposal_id, f.finding_code, f.message),
+                )
             ),
+            governance_spec_hash=ACTION_GOVERNANCE_SPEC_HASH,
+            reviewer_version=REVIEWER_VERSION,
         )
 
         # 11. Validate final result
@@ -748,13 +772,24 @@ class ProposalReviewer:
 
         # 12. Semantic validation — status/finding/flag consistency
         try:
-            result.verify_semantics()
+            result.verify_semantics(reviewer_version=request.reviewer_version)
         except InvalidReviewResultError:
             raise
         except Exception as e:
             raise InvalidReviewResultError(
                 f"ReviewBatchResult {result.review_id!r} failed semantic "
                 f"verification: {e}"
+            ) from e
+
+        # 13. R2 S8: bind Result back to Request
+        try:
+            result.verify_against_request(request)
+        except InvalidReviewResultError:
+            raise
+        except Exception as e:
+            raise InvalidReviewResultError(
+                f"ReviewBatchResult {result.review_id!r} failed "
+                f"verify_against_request: {e}"
             ) from e
 
         return result
@@ -767,15 +802,16 @@ class ProposalReviewer:
         self,
         *,
         proposal: ActionProposal,
+        envelope: ReviewProposalEnvelope | None,
         request: ReviewRequest,
         evidence_index: dict[str, Evidence],
         excluded_evidence_ids: set[str],
         capability_snapshots: dict[str, CapabilitySnapshot],
+        cap_by_task: dict[str, ExecutionCapabilitySnapshot],
         task_records: dict[str, TaskRecordSummary],
         policy_evaluator: PolicyEvaluator,
         dedup_result: Any,
         conflict_result: Any,
-        all_findings: list[ReviewFinding],
     ) -> ProposalReview:
         findings: list[ReviewFinding] = []
         matched_evidence_ids: list[str] = []
@@ -797,12 +833,16 @@ class ProposalReviewer:
         findings.extend(validate_action_allowlist(proposal))
 
         # 4. Evidence validation (with tamper-detection excluded set)
+        # R2: pass canonical_risk_level so a misbehaving Agent cannot
+        # lower the evidence bar by declaring risk_level=low.
+        risk_level = classify_risk(proposal)
         ev_findings = validate_evidence_for_proposal(
             proposal,
             evidence_index,
             capability_snapshots,
             tenant_id=request.tenant_id,
             excluded_evidence_ids=excluded_evidence_ids,
+            canonical_risk_level=risk_level,
         )
         findings.extend(ev_findings)
         # Matched evidence = referenced evidence that passed validation
@@ -816,12 +856,21 @@ class ProposalReviewer:
         }
         matched_evidence_ids = sorted(set(proposal.evidence_ids) - flagged_ev_ids)
 
-        # 5. Authority validation
-        cap_snapshot = capability_snapshots.get(proposal.created_by_agent)
+        # 5. Authority validation — R2 P0-2: per-task capability lookup
+        # via envelope.task_id (NOT proposal.created_by_agent).
+        cap_snapshot: CapabilitySnapshot | None = None
+        if envelope is not None:
+            ec = cap_by_task.get(envelope.task_id)
+            if ec is not None:
+                cap_snapshot = CapabilitySnapshot(
+                    agent_id=ec.agent_id, capability=ec.capability
+                )
+        if cap_snapshot is None:
+            # Fallback for legacy requests without envelope/task binding
+            cap_snapshot = capability_snapshots.get(proposal.created_by_agent)
         findings.extend(validate_authority(proposal, cap_snapshot))
 
         # 6. Idempotency validation
-        risk_level = classify_risk(proposal)
         findings.extend(validate_idempotency(proposal, risk_level=risk_level))
 
         # 7. Risk classification findings
@@ -867,13 +916,20 @@ class ProposalReviewer:
             f.finding_code.startswith("review.authority.") for f in findings
         )
         if not authority_valid:
-            # Skip policy evaluation if authority already failed
+            # R2 S5: skip policy evaluation if authority already failed,
+            # but still build a PolicyDecisionAudit with
+            # evaluator_source_id="skipped-authority-failure".
             policy_result = PolicyEvaluationResult(
                 proposal_id=proposal.proposal_id,
                 decision=PolicyDecision.DENIED,
-                matched_rules=[],
+                matched_rules=(),
                 policy_version=request.policy_context.policy_version,
-                findings=[],
+                findings=(),
+            )
+            policy_audit = self._build_policy_audit(
+                policy_result,
+                evaluator_source_id="skipped-authority-failure",
+                evaluator_version="reviewer-skipped",
             )
         else:
             policy_req = PolicyEvaluationRequest(
@@ -903,6 +959,11 @@ class ProposalReviewer:
             # R1 Section VI: validate policy result identity before
             # consuming it — fail-closed on any mismatch.
             self._validate_policy_result_identity(policy_result, proposal, request)
+            policy_audit = self._build_policy_audit(
+                policy_result,
+                evaluator_source_id=policy_evaluator.__class__.__name__,
+                evaluator_version=request.policy_context.policy_version,
+            )
         findings.extend(policy_result.findings)
 
         # R1: synthesize policy-decision findings if the policy
@@ -991,16 +1052,26 @@ class ProposalReviewer:
             ReviewDecisionStatus.NEEDS_APPROVAL,
         ) or risk_level in (ReviewRiskLevel.HIGH, ReviewRiskLevel.CRITICAL)
 
+        # R2 P0-8: DEDUPLICATED proposals carry the primary's id
+        primary_proposal_id: str | None = None
+        if is_duplicate:
+            for dg in dedup_result.duplicate_groups:
+                if proposal.proposal_id in dg.duplicate_proposal_ids:
+                    primary_proposal_id = dg.primary_proposal_id
+                    break
+
         return ProposalReview(
             proposal_id=proposal.proposal_id,
             status=status,
-            findings=sorted(findings, key=lambda f: (f.finding_code, f.message)),
-            matched_evidence_ids=matched_evidence_ids,
+            findings=tuple(sorted(findings, key=lambda f: (f.finding_code, f.message))),
+            matched_evidence_ids=tuple(matched_evidence_ids),
             required_approval=required_approval,
             risk_level=risk_level,
             authority_valid=authority_valid,
             policy_valid=policy_valid,
             idempotency_valid=idempotency_valid,
+            policy_audit=policy_audit,
+            primary_proposal_id=primary_proposal_id,
         )
 
     # -----------------------------------------------------------------
@@ -1039,6 +1110,45 @@ class ProposalReviewer:
                 raise PolicyEvaluationError(
                     f"Matched rule {rule.rule_id!r} has blank rule_version"
                 )
+
+    # -----------------------------------------------------------------
+    # R2 S5: Policy decision audit builder
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _build_policy_audit(
+        policy_result: PolicyEvaluationResult,
+        *,
+        evaluator_source_id: str,
+        evaluator_version: str,
+    ) -> PolicyDecisionAudit:
+        """Build a :class:`PolicyDecisionAudit` from a
+        :class:`PolicyEvaluationResult`.
+
+        R2 S5: every Proposal — including those that skipped external
+        Policy because Authority failed — MUST carry one audit.  The
+        ``evaluation_hash`` is computed over the same canonical fields
+        that :class:`PolicyDecisionAudit._verify_evaluation_hash`
+        checks, so a tampered audit is detectable at construction.
+        """
+        matched_rules = tuple(policy_result.matched_rules)
+        evaluation_hash = stable_hash(
+            {
+                "evaluator_source_id": evaluator_source_id,
+                "evaluator_version": evaluator_version,
+                "policy_version": policy_result.policy_version,
+                "decision": policy_result.decision.value,
+                "matched_rules": [r.model_dump(mode="python") for r in matched_rules],
+            }
+        )
+        return PolicyDecisionAudit(
+            evaluator_source_id=evaluator_source_id,
+            evaluator_version=evaluator_version,
+            policy_version=policy_result.policy_version,
+            decision=policy_result.decision,
+            matched_rules=matched_rules,
+            evaluation_hash=evaluation_hash,
+        )
 
     # -----------------------------------------------------------------
     # Decision logic — R1 Section VII
@@ -1102,8 +1212,10 @@ class ProposalReviewer:
         self,
         reviews: list[ProposalReview],
     ) -> ReviewBatchStatus:
+        # R2 S7: empty batch → NO_ACTIONS (NOT APPROVED) so Phase 5B
+        # cannot mis-treat an empty Review as authorisation.
         if not reviews:
-            return ReviewBatchStatus.APPROVED
+            return ReviewBatchStatus.NO_ACTIONS
         # Highest-priority status wins
         statuses = [proposal_status_to_batch(r.status) for r in reviews]
         return max(statuses, key=batch_status_priority)

@@ -252,6 +252,7 @@ class TestJsonRoundTrip:
             proposal_reviews=[review],
             batch_status=ReviewBatchStatus.APPROVED,
             approved_proposal_ids=["prop-test-001"],
+            reviewer_version=REVIEWER_VERSION,
         )
         rt = ReviewBatchResult.model_validate_json(result.model_dump_json())
         assert rt.result_hash == result.result_hash
@@ -288,6 +289,7 @@ class TestHashTamperDetection:
             request_hash="rh",
             proposal_reviews=[review],
             batch_status=ReviewBatchStatus.APPROVED,
+            reviewer_version=REVIEWER_VERSION,
         )
         tampered = result.model_copy(
             update={"batch_status": ReviewBatchStatus.REJECTED}

@@ -1,15 +1,19 @@
-"""Phase 5A Review Contracts.
+"""Phase 5A Review Contracts (R2).
 
 Strict, deterministically-hashable contracts for the Reviewer &
 Governance Decision Layer.
 
-Design rules (Phase 5A Section 5):
+Design rules (Phase 5A Section 5, reinforced by R2):
 
 * Every public contract inherits :class:`StrictContract`
   (``extra="forbid"``, ``validate_assignment=True``).
 * Frozen contracts (``ReviewFinding``, ``ProposalReview``,
   ``ReviewBatchResult``, ``ReviewRequest``) cannot be mutated after
   construction — audit records must be immutable.
+* R2 S1 (deep immutability): every audit-boundary collection is a
+  ``tuple`` (or ``frozenset``), never a ``list``/``set``.  This
+  prevents ``request.proposals.append(...)`` even though
+  ``frozen=True`` only blocks field re-assignment.
 * Stable serialization via :func:`stable_hash` (SHA-256 over the
   canonicalized form).  The same input MUST produce the same hash
   across processes, ``PYTHONHASHSEED`` values, and call order.
@@ -20,6 +24,25 @@ Design rules (Phase 5A Section 5):
 
 Phase 5A Section 3 reminder: ``approved`` means "Proposal has passed
 review".  It NEVER means "Proposal has been executed".
+
+R2 changes (P0-1 .. P0-9 + S1 .. S14):
+
+* ``REVIEWER_VERSION`` bumped to ``ma-05a.2.0``.
+* :class:`PolicyDecision` moved here (was in :mod:`multi_agent.policy`)
+  so :class:`PolicyRule` can reference it without a circular import.
+* :class:`PolicyRule` replaces the raw-dict ``rules`` on
+  :class:`PolicyContext` (P0-6).
+* :class:`ReviewEvidenceSnapshot` wraps every :class:`Evidence` with a
+  verified ``snapshot_hash`` (P0-3).
+* :class:`PolicyDecisionAudit` is carried on every
+  :class:`ProposalReview` (S5).
+* :class:`ReviewBatchStatus.NO_ACTIONS` for empty batches (S7).
+* :class:`ReviewBatchResult.verify_against_request` binds Result →
+  Request (S8).
+* All audit-boundary collections are ``tuple`` (S1).
+* ``batch_status_priority`` uses unique weights (P0-7).
+* :class:`ProposalReview.verify_semantics` enforces validity-flag
+  consistency (P0-8).
 """
 
 from __future__ import annotations
@@ -37,7 +60,11 @@ from multi_agent.contracts import (
     JsonValue,
     StrictContract,
 )
-from multi_agent.execution import ExecutionCapabilitySnapshot
+from multi_agent.execution import (
+    ExecutionCapabilitySnapshot,
+    ExecutionRunIdentity,
+    ResultOriginSnapshot,
+)
 from multi_agent.review_errors import (
     InvalidReviewRequestError,
     InvalidReviewResultError,
@@ -50,7 +77,11 @@ from multi_agent.serialization import canonicalize, content_hash, stable_hash
 # Version — bumped whenever the Reviewer algorithm changes.
 # ---------------------------------------------------------------------------
 
-REVIEWER_VERSION = "ma-05a.1.0"
+REVIEWER_VERSION = "ma-05a.2.0"
+
+# R2 S10: schema version carried in serialization / hash so a payload
+# built against an older schema is rejected at the boundary.
+REVIEW_SCHEMA_VERSION = "1"
 
 
 # ---------------------------------------------------------------------------
@@ -90,22 +121,24 @@ class ReviewFindingSeverity(StrEnum):
 class ReviewBatchStatus(StrEnum):
     """Highest-priority decision across all Proposals in a batch.
 
-    Priority (highest first): ``conflict`` > ``rejected`` >
-    ``needs_input`` > ``needs_approval`` > ``deduplicated`` >
-    ``approved``.
+    R2 P0-7 / S7 priority (highest first):
+
+        ``conflict`` > ``rejected`` > ``needs_input`` >
+        ``needs_approval`` > ``deduplicated`` > ``approved`` >
+        ``no_actions``.
+
+    ``no_actions`` is reserved for an empty batch — it is NEVER
+    equivalent to ``approved`` so Phase 5B cannot mis-treat an empty
+    Review as authorisation to execute nothing-as-everything.
     """
 
+    NO_ACTIONS = "no_actions"
     APPROVED = "approved"
     NEEDS_APPROVAL = "needs_approval"
     NEEDS_INPUT = "needs_input"
     REJECTED = "rejected"
     CONFLICT = "conflict"
     DEDUPLICATED = "deduplicated"
-
-
-# ---------------------------------------------------------------------------
-# Risk & Approval classification (Phase 5A Section 9)
-# ---------------------------------------------------------------------------
 
 
 class ReviewRiskLevel(StrEnum):
@@ -124,9 +157,33 @@ class ReviewRiskLevel(StrEnum):
     CRITICAL = "critical"
 
 
+class PolicyDecision(StrEnum):
+    """Possible Policy decisions for a single Proposal.
+
+    R2: moved here from :mod:`multi_agent.policy` so
+    :class:`PolicyRule` (in this module) can reference it without a
+    circular import.  :mod:`multi_agent.policy` re-imports it.
+
+    The Reviewer maps these to :class:`ReviewDecisionStatus`:
+
+    * ``ALLOWED`` → contributes to ``approved`` (subject to other checks)
+    * ``DENIED`` → ``rejected``
+    * ``NEEDS_APPROVAL`` → ``needs_approval``
+    * ``NEEDS_INPUT`` → ``needs_input``
+    """
+
+    ALLOWED = "allowed"
+    DENIED = "denied"
+    NEEDS_APPROVAL = "needs_approval"
+    NEEDS_INPUT = "needs_input"
+
+
 # ---------------------------------------------------------------------------
+# Risk & Approval classification (Phase 5A Section 9)
+# ---------------------------------------------------------------------------
+
+
 # Stable finding-code prefixes — audit consumers key off these strings.
-# ---------------------------------------------------------------------------
 
 CODE_IDENTITY_MISMATCH = "review.identity.mismatch"
 CODE_IDENTITY_DUPLICATE_PROPOSAL_ID = "review.identity.duplicate_proposal_id"
@@ -212,10 +269,13 @@ class CapabilitySnapshot(StrictContract):
     snapshot taken at Phase 4 pre-flight time.  It MUST NOT read a
     live registry to decide historical Proposal authority.
 
-    ``AgentCapability`` is already frozen, but wrapping it in a
-    dedicated snapshot type makes the boundary explicit and lets
-    the request hash include the agent_id → capability mapping as
-    a stable, sorted structure.
+    R2 S14: this remains as a Reviewer-internal convenience wrapper
+    over :class:`ExecutionCapabilitySnapshot` for legacy call sites
+    that look up capability by ``agent_id``.  R2 P0-2 changes the
+    Reviewer to look up by ``task_id`` via
+    :class:`ExecutionCapabilitySnapshot` directly —
+    :class:`CapabilitySnapshot` is retained for backwards
+    compatibility with :func:`validate_authority`'s public signature.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -230,7 +290,8 @@ class ReviewProposalEnvelope(StrictContract):
 
     Phase 5A must NOT accept a Proposal whose origin can be re-attached
     to an arbitrary Task.  The Reviewer validates every field below
-    against the ReviewRequest's task_records / capability_bindings.
+    against the ReviewRequest's task_records / capability_bindings /
+    result_origins (R2 P0-1).
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -273,6 +334,252 @@ class ReviewProposalEnvelope(StrictContract):
 
 
 # ---------------------------------------------------------------------------
+# R2 P0-3: ReviewEvidenceSnapshot — single-Evidence hash verification.
+# ---------------------------------------------------------------------------
+
+
+class ReviewEvidenceSnapshot(StrictContract):
+    """Frozen wrapper carrying one :class:`Evidence` plus its verified
+    ``snapshot_hash``.
+
+    R2 P0-3: previously the Reviewer only checked that
+    ``Evidence.content_hash`` was a hex string.  A tampered Evidence
+    that kept the old declared ``content_hash`` was accepted silently.
+    The ``snapshot_hash`` covers every canonical Evidence field
+    EXCEPT the self-referential ``content_hash`` (computed by
+    :func:`multi_agent.evidence_review.compute_review_evidence_hash`),
+    so a tampered Evidence is detected at the Request boundary.
+
+    The snapshot is constructed by the Phase 5A Adapter; the
+    Reviewer verifies ``snapshot_hash`` matches the carried Evidence
+    before consuming it.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    evidence: Evidence
+    snapshot_hash: str
+
+    @field_validator("snapshot_hash")
+    @classmethod
+    def _snapshot_hash_non_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("ReviewEvidenceSnapshot.snapshot_hash must not be blank")
+        return v
+
+    @model_validator(mode="after")
+    def _verify_snapshot_hash(self) -> "ReviewEvidenceSnapshot":
+        from multi_agent.evidence_review import compute_review_evidence_hash
+
+        expected = compute_review_evidence_hash(self.evidence)
+        if self.snapshot_hash != expected:
+            raise ValueError(
+                "ReviewEvidenceSnapshot.snapshot_hash does not match the carried "
+                "Evidence content — tamper detected at the Request boundary"
+            )
+        return self
+
+
+# ---------------------------------------------------------------------------
+# R2 P0-6 / S5: PolicyRule + PolicyDecisionAudit
+# ---------------------------------------------------------------------------
+
+
+class PolicyRule(StrictContract):
+    """Frozen, strictly-typed Policy rule descriptor.
+
+    R2 P0-6: replaces the raw ``dict[str, JsonValue]`` rule entries on
+    :class:`PolicyContext`.  Empty ``rule_id``, illegal ``effect``,
+    illegal ``priority`` etc. now raise ``ValidationError`` at
+    construction — they cannot be silently skipped by the
+    :class:`DeterministicPolicyEvaluator`.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    rule_id: str
+    rule_version: str
+    priority: int
+    effect: PolicyDecision
+    action_type: str | None = None
+
+    @field_validator("rule_id", "rule_version")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("PolicyRule.rule_id / rule_version must not be blank")
+        return v
+
+
+class PolicyMatchedRule(StrictContract):
+    """A single rule that matched during policy evaluation.
+
+    Frozen so audit consumers can hold references safely.  R2 S5:
+    carried inside :class:`PolicyDecisionAudit` so the Reviewer can
+    verify every matched rule's ID + Version came from the Request's
+    frozen :class:`PolicyContext.rules` snapshot.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    rule_id: str
+    rule_version: str = ""
+    effect: PolicyDecision
+    matched_fields: tuple[str, ...] = ()
+
+    @field_validator("rule_id", "rule_version")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError(
+                "PolicyMatchedRule.rule_id / rule_version must not be blank"
+            )
+        return v
+
+
+class PolicyDecisionAudit(StrictContract):
+    """R2 S5: per-Proposal audit of the Policy decision.
+
+    Every Proposal — including those that skipped external Policy
+    evaluation because Authority already failed — MUST carry one
+    :class:`PolicyDecisionAudit`.  ``evaluator_source_id`` records
+    which evaluator produced the decision
+    (``deterministic-policy``, ``opa``, ``skipped-authority-failure``).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    evaluator_source_id: str
+    evaluator_version: str
+    policy_version: str
+    decision: PolicyDecision
+    matched_rules: tuple[PolicyMatchedRule, ...] = ()
+    evaluation_hash: str
+
+    @field_validator(
+        "evaluator_source_id",
+        "evaluator_version",
+        "policy_version",
+        "evaluation_hash",
+    )
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("PolicyDecisionAudit identity fields must not be blank")
+        return v
+
+    @model_validator(mode="after")
+    def _verify_evaluation_hash(self) -> "PolicyDecisionAudit":
+        expected = stable_hash(
+            {
+                "evaluator_source_id": self.evaluator_source_id,
+                "evaluator_version": self.evaluator_version,
+                "policy_version": self.policy_version,
+                "decision": self.decision.value,
+                "matched_rules": [
+                    r.model_dump(mode="python") for r in self.matched_rules
+                ],
+            }
+        )
+        if self.evaluation_hash != expected:
+            raise ValueError("PolicyDecisionAudit.evaluation_hash mismatch")
+        return self
+
+
+# ---------------------------------------------------------------------------
+# R2 S6: EvidenceDeduplicationAudit
+# ---------------------------------------------------------------------------
+
+
+class EvidenceDeduplicationAudit(StrictContract):
+    """R2 S6: record of the Adapter's deterministic Evidence dedup.
+
+    Built by :func:`multi_agent.review_evaluation.build_review_request`
+    so the Reviewer can prove that identical duplicate Evidence was
+    collapsed to a single :class:`ReviewEvidenceSnapshot` rather than
+    silently retained.  Same ``evidence_id`` + different content is
+    NOT deduped — it remains a fail-closed contract violation.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    deduped_evidence_ids: frozenset[str] = frozenset()
+    original_count: int = Field(ge=0)
+    snapshot_count: int = Field(ge=0)
+    audit_hash: str
+
+    @model_validator(mode="after")
+    def _verify_audit_hash(self) -> "EvidenceDeduplicationAudit":
+        expected = stable_hash(
+            {
+                "deduped_evidence_ids": sorted(self.deduped_evidence_ids),
+                "original_count": self.original_count,
+                "snapshot_count": self.snapshot_count,
+            }
+        )
+        if self.audit_hash != expected:
+            raise ValueError("EvidenceDeduplicationAudit.audit_hash mismatch")
+        return self
+
+
+# ---------------------------------------------------------------------------
+# R2 S9: ReviewExpectedOutcome — fixture label without name leakage.
+# ---------------------------------------------------------------------------
+
+
+class ReviewExpectedOutcome(StrictContract):
+    """R2 S9: explicit expected outcome for a fixture Request.
+
+    Replaces the ``fixture.name``-based label leak in R1's
+    :func:`compute_review_metrics`.  The metrics computation reads
+    these per-Proposal expected statuses / finding codes rather than
+    inferring them from the fixture name.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    expected_status_by_proposal: dict[str, ReviewDecisionStatus] = Field(
+        default_factory=dict
+    )
+    expected_finding_codes_by_proposal: dict[str, frozenset[str]] = Field(
+        default_factory=dict
+    )
+
+
+# ---------------------------------------------------------------------------
+# R2 S12: ReviewGraphError — strict, persistable graph error.
+# ---------------------------------------------------------------------------
+
+
+class ReviewGraphError(StrictContract):
+    """R2 S12: persistable error captured by the LangGraph adapter.
+
+    The graph does NOT carry the raw :class:`Exception` as business
+    state — that would couple the audit trail to a non-serialisable
+    Python object.  Instead the graph node captures
+    ``error_code`` + ``message`` so downstream consumers can replay
+    or persist the failure deterministically.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    error_code: str
+    message: str
+
+    @field_validator("error_code", "message")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("ReviewGraphError fields must not be blank")
+        return v
+
+
+# ---------------------------------------------------------------------------
 # ReviewFinding
 # ---------------------------------------------------------------------------
 
@@ -283,6 +590,9 @@ class ReviewFinding(StrictContract):
     ``details`` is a restricted ``dict[str, JsonValue]`` — never
     ``Any``.  It must pass :func:`validate_strict_json` so that
     bytes / sets / Decimals / datetimes are rejected at construction.
+
+    R2 S1: ``evidence_ids`` is a ``tuple`` so a frozen
+    :class:`ProposalReview` cannot be mutated by appending to it.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -293,7 +603,7 @@ class ReviewFinding(StrictContract):
     proposal_id: str
     task_id: str | None = None
     agent_id: str | None = None
-    evidence_ids: list[str] = Field(default_factory=list)
+    evidence_ids: tuple[str, ...] = ()
     policy_source: str = ""
     details: dict[str, JsonValue] = Field(default_factory=dict)
 
@@ -334,7 +644,7 @@ class ReviewFinding(StrictContract):
 
 
 # ---------------------------------------------------------------------------
-# ReviewRequest
+# PolicyContext
 # ---------------------------------------------------------------------------
 
 
@@ -345,14 +655,17 @@ class PolicyContext(StrictContract):
     snapshot of the rules + version that the
     :class:`DeterministicPolicyEvaluator` should apply.
 
-    ``rules`` is a list of plain-dict rule descriptors so the request
-    hash is stable.  Each rule dict must be JSON-strict.
+    R2 P0-6: ``rules`` is now a ``tuple[PolicyRule, ...]`` so each
+    rule is strictly typed at the contract boundary.  Empty
+    ``rule_id``, illegal ``effect``, and illegal ``priority`` raise
+    ``ValidationError`` at construction — they can no longer be
+    silently skipped by the evaluator.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     policy_version: str
-    rules: list[dict[str, JsonValue]] = Field(default_factory=list)
+    rules: tuple[PolicyRule, ...] = ()
     tenant_overrides: dict[str, JsonValue] = Field(default_factory=dict)
 
     @field_validator("policy_version")
@@ -363,7 +676,7 @@ class PolicyContext(StrictContract):
             raise ValueError("policy_version must not be blank")
         return v
 
-    @field_validator("rules", "tenant_overrides")
+    @field_validator("tenant_overrides")
     @classmethod
     def _validate_json_strict(cls, v: Any) -> Any:
         from multi_agent.contracts import _reject_sensitive_keys
@@ -379,20 +692,27 @@ def canonical_review_request_payload(request: ReviewRequest) -> dict[str, Any]:
     Each list field is sorted by a stable key so that reordering the
     input lists does not change the request_hash (R1 P0-4).
     ``request_hash`` is excluded (self-referential).
+
+    R2: tuple fields are coerced to sorted lists for canonical
+    hashing.  ``governance_spec_version`` / ``governance_spec_hash``
+    / ``run_identity`` / ``result_origins`` / ``evidence_dedup_audit``
+    participate in the hash so a Request built against a different
+    governance spec or a different Run identity is rejected.
     """
     proposals = sorted(request.proposals, key=lambda p: p.proposal_id)
     proposal_envelopes = sorted(
         request.proposal_envelopes, key=lambda e: e.proposal.proposal_id
     )
-    evidence = sorted(request.evidence, key=lambda e: e.evidence_id)
+    evidence = sorted(request.evidence, key=lambda e: e.evidence.evidence_id)
     task_records = sorted(request.task_records, key=lambda t: t.task_id)
     capability_bindings = sorted(
         request.capability_bindings, key=lambda c: (c.task_id, c.agent_id)
     )
+    result_origins = sorted(request.result_origins, key=lambda r: r.result_id)
     trace = sorted(request.trace, key=lambda t: t.sequence)
     rules = sorted(
         request.policy_context.rules,
-        key=lambda r: (int(r.get("priority", 0)), str(r.get("rule_id", ""))),
+        key=lambda r: (r.priority, r.rule_id),
     )
 
     payload: dict[str, Any] = {
@@ -409,12 +729,22 @@ def canonical_review_request_payload(request: ReviewRequest) -> dict[str, Any]:
         "capability_bindings": [
             c.model_dump(mode="python") for c in capability_bindings
         ],
+        "result_origins": [r.model_dump(mode="python") for r in result_origins],
         "policy_context": {
             **request.policy_context.model_dump(mode="python"),
-            "rules": rules,
+            "rules": [r.model_dump(mode="python") for r in rules],
         },
         "reviewer_version": request.reviewer_version,
+        "review_schema_version": request.review_schema_version,
+        "governance_spec_version": request.governance_spec_version,
+        "governance_spec_hash": request.governance_spec_hash,
     }
+    if request.run_identity is not None:
+        payload["run_identity"] = request.run_identity.model_dump(mode="python")
+    if request.evidence_dedup_audit is not None:
+        payload["evidence_dedup_audit"] = request.evidence_dedup_audit.model_dump(
+            mode="python"
+        )
     return canonicalize(payload)
 
 
@@ -422,13 +752,23 @@ class ReviewRequest(StrictContract):
     """Frozen input to :meth:`ProposalReviewer.review`.
 
     Carries everything the Reviewer needs to make a deterministic
-    decision: Proposals, Evidence, Task Records, Trace, Policy
-    Context, Capability Snapshots, and the Phase 4 identity
-    (run_id / tenant_id / plan_hash / registry_version).
+    decision: Proposals, Evidence Snapshots, Task Records, Trace,
+    Policy Context, Capability Snapshots, Result Origins, the Phase 4
+    authoritative Run identity, and the Action Governance Spec hash.
 
-    The ``request_hash`` is computed over the canonical form and
-    verifies integrity on construction.  Mutating any field after
-    construction is impossible (``frozen=True``).
+    R2 S1: every collection is a ``tuple`` so the frozen model cannot
+    be mutated by appending / removing items.  ``request_hash`` is
+    computed over the canonical form and verifies integrity on
+    construction.  Mutating any field after construction is
+    impossible (``frozen=True``).
+
+    R2 P0-2: ``capability_bindings`` are unique by ``task_id`` (NOT
+    ``agent_id``) — the same Agent may legitimately execute multiple
+    Tasks in one Run.
+
+    R2 P0-3: ``evidence`` is a tuple of :class:`ReviewEvidenceSnapshot`
+    so every Evidence's ``snapshot_hash`` is verified at the Request
+    boundary.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -439,14 +779,39 @@ class ReviewRequest(StrictContract):
     plan_hash: str
     registry_version: str
 
-    proposals: list[ActionProposal] = Field(default_factory=list)
-    evidence: list[Evidence] = Field(default_factory=list)
-    task_records: list[TaskRecordSummary] = Field(default_factory=list)
-    trace: list[TraceSummary] = Field(default_factory=list)
-    proposal_envelopes: list[ReviewProposalEnvelope] = Field(default_factory=list)
-    capability_bindings: list[ExecutionCapabilitySnapshot] = Field(default_factory=list)
+    proposals: tuple[ActionProposal, ...] = ()
+    evidence: tuple[ReviewEvidenceSnapshot, ...] = ()
+    task_records: tuple[TaskRecordSummary, ...] = ()
+    trace: tuple[TraceSummary, ...] = ()
+    proposal_envelopes: tuple[ReviewProposalEnvelope, ...] = ()
+    capability_bindings: tuple[ExecutionCapabilitySnapshot, ...] = ()
+    result_origins: tuple[ResultOriginSnapshot, ...] = ()
     policy_context: PolicyContext
-    reviewer_version: str = REVIEWER_VERSION
+
+    # R2 S2: authoritative Run identity.  Optional so legacy fixtures
+    # can still construct a Request, but the Reviewer treats ``None``
+    # as a fail-closed contract violation when the Request carries
+    # any Proposals.
+    run_identity: ExecutionRunIdentity | None = None
+
+    # R2 S3: governance spec version + hash.  The Reviewer verifies
+    # these match the live :data:`ACTION_GOVERNANCE_SPEC_VERSION` /
+    # :data:`ACTION_GOVERNANCE_SPEC_HASH` so a Request built against
+    # an older spec is rejected at the boundary.
+    governance_spec_version: str = ""
+    governance_spec_hash: str = ""
+
+    # R2 S6: evidence dedup audit.  Optional so legacy fixtures can
+    # still construct a Request without dedup metadata.
+    evidence_dedup_audit: EvidenceDeduplicationAudit | None = None
+
+    # R2 S10: schema version (string, not int, so it sorts canonically).
+    review_schema_version: str = REVIEW_SCHEMA_VERSION
+
+    # R2 S10: reviewer_version is REQUIRED (no default) so a Request
+    # built against an older Reviewer cannot slip through with the
+    # current default.
+    reviewer_version: str
 
     request_hash: str = ""
 
@@ -460,12 +825,12 @@ class ReviewRequest(StrictContract):
             raise ValueError("ReviewRequest identity fields must not be blank")
         return v
 
-    @field_validator("reviewer_version")
+    @field_validator("reviewer_version", "review_schema_version")
     @classmethod
-    def _reviewer_version_non_blank(cls, v: str) -> str:
+    def _version_non_blank(cls, v: str) -> str:
         v = v.strip()
         if not v:
-            raise ValueError("reviewer_version must not be blank")
+            raise ValueError("ReviewRequest version fields must not be blank")
         return v
 
     @model_validator(mode="after")
@@ -489,13 +854,18 @@ class ReviewRequest(StrictContract):
     def _validate_identity_uniqueness(self) -> "ReviewRequest":
         """Fail-closed identity uniqueness checks.
 
-        Any duplicate-with-different-content, duplicate task_id,
-        duplicate agent_id in capability_bindings, duplicate trace
-        sequence, duplicate origin_hash, or envelope/proposal mismatch
-        raises :class:`InvalidReviewRequestError`.
-        """
-        from multi_agent.evidence_review import compute_review_evidence_hash
+        R2 P0-1: every Proposal MUST have exactly one matching
+        Envelope whose ``proposal`` field is byte-equal (model_dump
+        comparison) to the Request's Proposal.  ``run_id`` /
+        ``agent_id`` / ``task_id`` cross-checks are enforced here so
+        the Reviewer can trust the Envelope as the authoritative
+        origin.
 
+        R2 P0-2: ``capability_bindings`` are unique by ``task_id``
+        (NOT ``agent_id``) — the same Agent may be bound to multiple
+        Tasks.  Duplicate ``task_id`` with different content is a
+        fail-closed violation.
+        """
         # proposal_id uniqueness — same id (whether same or different
         # content) is an error: Phase 4 merge should have deduped.
         proposals_by_id: dict[str, list[ActionProposal]] = {}
@@ -517,14 +887,12 @@ class ReviewRequest(StrictContract):
 
         # evidence_id uniqueness — same id with different review-hash
         # → fail-closed raise.  Same id + same hash → benign, allow.
-        evidence_by_id: dict[str, list[Evidence]] = {}
-        for ev in self.evidence:
-            evidence_by_id.setdefault(ev.evidence_id, []).append(ev)
+        evidence_by_id: dict[str, list[ReviewEvidenceSnapshot]] = {}
+        for snap in self.evidence:
+            evidence_by_id.setdefault(snap.evidence.evidence_id, []).append(snap)
         for eid, evidence_group in evidence_by_id.items():
             if len(evidence_group) > 1:
-                hashes = {
-                    compute_review_evidence_hash(ev_item) for ev_item in evidence_group
-                }
+                hashes = {s.snapshot_hash for s in evidence_group}
                 if len(hashes) > 1:
                     raise InvalidReviewRequestError(
                         f"Duplicate evidence_id {eid!r} with different content "
@@ -533,22 +901,44 @@ class ReviewRequest(StrictContract):
 
         # task_id uniqueness across task_records
         task_ids: dict[str, int] = {}
-        for tr in self.task_records:
-            task_ids[tr.task_id] = task_ids.get(tr.task_id, 0) + 1
+        for task_rec in self.task_records:
+            task_ids[task_rec.task_id] = task_ids.get(task_rec.task_id, 0) + 1
         for tid, count in task_ids.items():
             if count > 1:
                 raise InvalidReviewRequestError(
                     f"Duplicate task_id {tid!r} in ReviewRequest {self.review_id!r}"
                 )
 
-        # agent_id uniqueness across capability_bindings
-        agent_ids: dict[str, int] = {}
-        for cb in self.capability_bindings:
-            agent_ids[cb.agent_id] = agent_ids.get(cb.agent_id, 0) + 1
-        for aid, count in agent_ids.items():
+        # R2 P0-2: capability_bindings are unique by task_id (NOT
+        # agent_id).  Duplicate task_id with different content is a
+        # fail-closed violation; the same Agent may legitimately be
+        # bound to multiple Tasks.
+        cap_by_task: dict[str, list[ExecutionCapabilitySnapshot]] = {}
+        for cap_snap in self.capability_bindings:
+            cap_by_task.setdefault(cap_snap.task_id, []).append(cap_snap)
+        for tid, cap_group in cap_by_task.items():
+            if len(cap_group) > 1:
+                hashes = {cb.binding_hash for cb in cap_group}
+                if len(hashes) > 1:
+                    raise InvalidReviewRequestError(
+                        f"Duplicate task_id {tid!r} with different capability "
+                        f"binding in ReviewRequest {self.review_id!r}"
+                    )
+                raise InvalidReviewRequestError(
+                    f"Duplicate task_id {tid!r} (same binding) in "
+                    f"capability_bindings of ReviewRequest {self.review_id!r}"
+                )
+
+        # result_id uniqueness across result_origins
+        result_ids: dict[str, int] = {}
+        for result_orig in self.result_origins:
+            result_ids[result_orig.result_id] = (
+                result_ids.get(result_orig.result_id, 0) + 1
+            )
+        for rid, count in result_ids.items():
             if count > 1:
                 raise InvalidReviewRequestError(
-                    f"Duplicate agent_id {aid!r} in capability_bindings of "
+                    f"Duplicate result_id {rid!r} in result_origins of "
                     f"ReviewRequest {self.review_id!r}"
                 )
 
@@ -576,23 +966,95 @@ class ReviewRequest(StrictContract):
 
         # Envelope ↔ Proposal bijection: every envelope's proposal_id
         # must match exactly one proposal, and every proposal must have
-        # a matching envelope.
-        proposal_ids = {p.proposal_id for p in self.proposals}
-        envelope_proposal_ids = {
-            env.proposal.proposal_id for env in self.proposal_envelopes
-        }
-        missing_envelopes = proposal_ids - envelope_proposal_ids
+        # a matching envelope.  R2 P0-1: the envelope's ``proposal``
+        # field must be byte-equal (model_dump comparison) to the
+        # Request's Proposal — not just share a proposal_id.
+        proposal_by_id = {p.proposal_id: p for p in self.proposals}
+        envelope_proposal_ids = set()
+        for env in self.proposal_envelopes:
+            pid = env.proposal.proposal_id
+            if pid not in proposal_by_id:
+                raise InvalidReviewRequestError(
+                    f"Envelope for proposal {pid!r} but no matching Proposal "
+                    f"in ReviewRequest {self.review_id!r}"
+                )
+            if env.proposal.model_dump(mode="python") != proposal_by_id[pid].model_dump(
+                mode="python"
+            ):
+                raise InvalidReviewRequestError(
+                    f"Envelope.proposal for {pid!r} does not equal the Request's "
+                    f"Proposal (model_dump mismatch) in ReviewRequest "
+                    f"{self.review_id!r}"
+                )
+            envelope_proposal_ids.add(pid)
+        missing_envelopes = set(proposal_by_id) - envelope_proposal_ids
         if missing_envelopes:
             raise InvalidReviewRequestError(
                 f"Proposals without matching envelope in ReviewRequest "
                 f"{self.review_id!r}: {sorted(missing_envelopes)!r}"
             )
-        orphan_envelopes = envelope_proposal_ids - proposal_ids
-        if orphan_envelopes:
-            raise InvalidReviewRequestError(
-                f"Envelopes without matching proposal in ReviewRequest "
-                f"{self.review_id!r}: {sorted(orphan_envelopes)!r}"
-            )
+
+        # R2 P0-1: Envelope identity cross-checks.
+        task_records_by_id = {tr.task_id: tr for tr in self.task_records}
+        cap_by_task_id = {cb.task_id: cb for cb in self.capability_bindings}
+        result_origins_by_id = {ro.result_id: ro for ro in self.result_origins}
+        for env in self.proposal_envelopes:
+            pid = env.proposal.proposal_id
+            proposal = proposal_by_id[pid]
+            if env.run_id != self.run_id:
+                raise InvalidReviewRequestError(
+                    f"Envelope for {pid!r} run_id {env.run_id!r} != request "
+                    f"{self.run_id!r}"
+                )
+            if env.agent_id != proposal.created_by_agent:
+                raise InvalidReviewRequestError(
+                    f"Envelope for {pid!r} agent_id {env.agent_id!r} != proposal "
+                    f"created_by_agent {proposal.created_by_agent!r}"
+                )
+            tr = task_records_by_id.get(env.task_id)
+            if tr is None:
+                raise InvalidReviewRequestError(
+                    f"Envelope for {pid!r} task_id {env.task_id!r} is not in "
+                    f"task_records of ReviewRequest {self.review_id!r}"
+                )
+            if tr.agent_id != env.agent_id:
+                raise InvalidReviewRequestError(
+                    f"Envelope for {pid!r}: task_record.agent_id {tr.agent_id!r} "
+                    f"!= envelope.agent_id {env.agent_id!r}"
+                )
+            # R2 P0-2: capability binding looked up by task_id (NOT agent_id).
+            cb = cap_by_task_id.get(env.task_id)
+            if cb is not None:
+                if cb.agent_id != env.agent_id:
+                    raise InvalidReviewRequestError(
+                        f"Envelope for {pid!r}: capability_binding.agent_id "
+                        f"{cb.agent_id!r} != envelope.agent_id {env.agent_id!r}"
+                    )
+                if cb.agent_version != env.agent_version:
+                    raise InvalidReviewRequestError(
+                        f"Envelope for {pid!r}: capability_binding.agent_version "
+                        f"{cb.agent_version!r} != envelope.agent_version "
+                        f"{env.agent_version!r}"
+                    )
+            # R2 P0-1: ResultOriginSnapshot cross-check (when present).
+            ro = result_origins_by_id.get(env.result_id)
+            if ro is not None:
+                if ro.task_id != env.task_id:
+                    raise InvalidReviewRequestError(
+                        f"Envelope for {pid!r}: result_origin.task_id "
+                        f"{ro.task_id!r} != envelope.task_id {env.task_id!r}"
+                    )
+                if ro.agent_id != env.agent_id:
+                    raise InvalidReviewRequestError(
+                        f"Envelope for {pid!r}: result_origin.agent_id "
+                        f"{ro.agent_id!r} != envelope.agent_id {env.agent_id!r}"
+                    )
+                if ro.agent_version != env.agent_version:
+                    raise InvalidReviewRequestError(
+                        f"Envelope for {pid!r}: result_origin.agent_version "
+                        f"{ro.agent_version!r} != envelope.agent_version "
+                        f"{env.agent_version!r}"
+                    )
 
         return self
 
@@ -656,25 +1118,53 @@ REJECTION_FINDING_CODES: frozenset[str] = frozenset(
 )
 
 
+# Finding codes that block an APPROVED decision regardless of severity.
+BLOCKING_FINDING_CODES: frozenset[str] = REJECTION_FINDING_CODES | frozenset(
+    {
+        CODE_EVIDENCE_MISSING,
+        CODE_POLICY_NEEDS_INPUT,
+        CODE_CONFLICT_FIELD_VALUE,
+        CODE_CONFLICT_ACTIVATE_DEACTIVATE,
+        CODE_CONFLICT_CREATE_DELETE,
+        CODE_CONFLICT_IDEMPOTENCY_MISMATCH,
+        CODE_CONFLICT_MUTEX_NOTIFICATION,
+        CODE_CONFLICT_OWNER_REASSIGN,
+    }
+)
+
+
 class ProposalReview(StrictContract):
     """Per-Proposal review outcome.
 
     Frozen so audit consumers can hold a reference without worrying
     about mutation.  The ``review_hash`` covers every field that
     affects the decision so a tampered review is detectable.
+
+    R2 P0-8 / S5: ``policy_audit`` carries the full Policy decision
+    audit so consumers can verify the Policy path even for Proposals
+    that were REJECTED before Policy was invoked (audit source
+    ``skipped-authority-failure``).
+
+    R2 S1: ``findings`` / ``matched_evidence_ids`` are tuples.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     proposal_id: str
     status: ReviewDecisionStatus
-    findings: list[ReviewFinding] = Field(default_factory=list)
-    matched_evidence_ids: list[str] = Field(default_factory=list)
+    findings: tuple[ReviewFinding, ...] = ()
+    matched_evidence_ids: tuple[str, ...] = ()
     required_approval: bool = False
     risk_level: ReviewRiskLevel = ReviewRiskLevel.LOW
     authority_valid: bool = False
     policy_valid: bool = False
     idempotency_valid: bool = False
+    # R2 S5: every Proposal carries a PolicyDecisionAudit — including
+    # Proposals that skipped external Policy because Authority failed.
+    policy_audit: PolicyDecisionAudit | None = None
+    # R2 P0-8: DEDUPLICATED proposals carry the primary's id so audit
+    # consumers can trace which Proposal survived dedup.
+    primary_proposal_id: str | None = None
     review_hash: str = ""
 
     @field_validator("proposal_id")
@@ -710,8 +1200,20 @@ class ProposalReview(StrictContract):
     def verify_semantics(self) -> None:
         """Validate that status and flags are consistent with findings.
 
+        R2 P0-8: stronger rules — APPROVED requires every validity
+        flag to be True and ``required_approval=False`` and no
+        blocking finding.  NEEDS_APPROVAL requires authority_valid
+        AND policy_valid AND required_approval.  DEDUPLICATED
+        requires ``primary_proposal_id`` audit info.
+
         Raises :class:`InvalidReviewResultError` on any inconsistency.
         """
+        has_blocking = any(
+            f.finding_code in BLOCKING_FINDING_CODES
+            and f.severity
+            in (ReviewFindingSeverity.ERROR, ReviewFindingSeverity.CRITICAL)
+            for f in self.findings
+        )
         has_error = any(
             f.severity in (ReviewFindingSeverity.ERROR, ReviewFindingSeverity.CRITICAL)
             for f in self.findings
@@ -719,22 +1221,56 @@ class ProposalReview(StrictContract):
         finding_codes = {f.finding_code for f in self.findings}
 
         if self.status == ReviewDecisionStatus.APPROVED:
-            if has_error:
+            # R2 P0-8: APPROVED requires every validity flag True,
+            # required_approval False, and no blocking finding.
+            if has_blocking or has_error:
                 raise InvalidReviewResultError(
                     f"ProposalReview {self.proposal_id!r}: status APPROVED but "
-                    f"has ERROR/CRITICAL findings"
+                    f"has ERROR/CRITICAL or blocking findings"
+                )
+            if not self.authority_valid:
+                raise InvalidReviewResultError(
+                    f"ProposalReview {self.proposal_id!r}: status APPROVED but "
+                    f"authority_valid is False"
+                )
+            if not self.policy_valid:
+                raise InvalidReviewResultError(
+                    f"ProposalReview {self.proposal_id!r}: status APPROVED but "
+                    f"policy_valid is False"
+                )
+            if not self.idempotency_valid:
+                raise InvalidReviewResultError(
+                    f"ProposalReview {self.proposal_id!r}: status APPROVED but "
+                    f"idempotency_valid is False"
+                )
+            if self.required_approval:
+                raise InvalidReviewResultError(
+                    f"ProposalReview {self.proposal_id!r}: status APPROVED but "
+                    f"required_approval is True"
+                )
+        elif self.status == ReviewDecisionStatus.NEEDS_APPROVAL:
+            # R2 P0-8: NEEDS_APPROVAL requires authority_valid AND
+            # policy_valid AND required_approval.
+            if not self.required_approval:
+                raise InvalidReviewResultError(
+                    f"ProposalReview {self.proposal_id!r}: status NEEDS_APPROVAL "
+                    f"but required_approval is False"
+                )
+            if not self.authority_valid:
+                raise InvalidReviewResultError(
+                    f"ProposalReview {self.proposal_id!r}: status NEEDS_APPROVAL "
+                    f"but authority_valid is False"
+                )
+            if not self.policy_valid:
+                raise InvalidReviewResultError(
+                    f"ProposalReview {self.proposal_id!r}: status NEEDS_APPROVAL "
+                    f"but policy_valid is False"
                 )
         elif self.status == ReviewDecisionStatus.REJECTED:
             if not (finding_codes & REJECTION_FINDING_CODES):
                 raise InvalidReviewResultError(
                     f"ProposalReview {self.proposal_id!r}: status REJECTED but "
                     f"no rejection-class finding"
-                )
-        elif self.status == ReviewDecisionStatus.NEEDS_APPROVAL:
-            if not self.required_approval:
-                raise InvalidReviewResultError(
-                    f"ProposalReview {self.proposal_id!r}: status NEEDS_APPROVAL "
-                    f"but required_approval is False"
                 )
         elif self.status == ReviewDecisionStatus.NEEDS_INPUT:
             if not (finding_codes & {CODE_EVIDENCE_MISSING, CODE_POLICY_NEEDS_INPUT}):
@@ -754,6 +1290,11 @@ class ProposalReview(StrictContract):
                 raise InvalidReviewResultError(
                     f"ProposalReview {self.proposal_id!r}: status DEDUPLICATED "
                     f"but no {CODE_DUPLICATE_DEDUPED!r} finding"
+                )
+            if not self.primary_proposal_id:
+                raise InvalidReviewResultError(
+                    f"ProposalReview {self.proposal_id!r}: status DEDUPLICATED "
+                    f"but primary_proposal_id is missing"
                 )
 
         # Flag ↔ finding consistency
@@ -794,16 +1335,21 @@ class ProposalReview(StrictContract):
 def batch_status_priority(status: ReviewBatchStatus) -> int:
     """Return priority weight — higher wins.
 
-    Priority order (Phase 5A Section 11):
-        conflict > rejected > needs_input > needs_approval > deduplicated > approved
+    R2 P0-7: unique weights so ``max()`` never has ties.
+
+    Priority order (Phase 5A Section 11, R2):
+
+        conflict(5) > rejected(4) > needs_input(3) > needs_approval(2)
+        > deduplicated(1) > approved(0) > no_actions(-1)
     """
     order = {
+        ReviewBatchStatus.NO_ACTIONS: -1,
         ReviewBatchStatus.APPROVED: 0,
         ReviewBatchStatus.DEDUPLICATED: 1,
-        ReviewBatchStatus.NEEDS_APPROVAL: 1,
-        ReviewBatchStatus.NEEDS_INPUT: 2,
-        ReviewBatchStatus.REJECTED: 3,
-        ReviewBatchStatus.CONFLICT: 4,
+        ReviewBatchStatus.NEEDS_APPROVAL: 2,
+        ReviewBatchStatus.NEEDS_INPUT: 3,
+        ReviewBatchStatus.REJECTED: 4,
+        ReviewBatchStatus.CONFLICT: 5,
     }
     return order[status]
 
@@ -824,15 +1370,23 @@ def proposal_status_to_batch(status: ReviewDecisionStatus) -> ReviewBatchStatus:
 class ReviewBatchResult(StrictContract):
     """Final output of :meth:`ProposalReviewer.review`.
 
-    Frozen, deterministically hashable, and sorted: every list field
-    is ordered by a stable key so the same input always produces the
-    same ``result_hash`` regardless of insertion order or
-    ``PYTHONHASHSEED``.
+    Frozen, deterministically hashable, and sorted: every collection
+    field is a tuple ordered by a stable key so the same input always
+    produces the same ``result_hash`` regardless of insertion order
+    or ``PYTHONHASHSEED``.
 
     The ``batch_status`` is the highest-priority decision across all
     per-Proposal reviews (Phase 5A Section 11).  A batch marked
     ``rejected`` does NOT mean every Proposal was rejected — each
     Proposal retains its own independent decision.
+
+    R2 S7: an empty batch returns ``NO_ACTIONS`` (NOT ``APPROVED``)
+    so Phase 5B cannot mis-treat an empty Review as authorisation.
+
+    R2 S1: every collection is a tuple.
+
+    R2 S8: :meth:`verify_against_request` binds the Result back to
+    its Request so a tampered or mis-routed Result is detected.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -842,17 +1396,23 @@ class ReviewBatchResult(StrictContract):
     tenant_id: str
     request_hash: str
 
-    proposal_reviews: list[ProposalReview] = Field(default_factory=list)
+    proposal_reviews: tuple[ProposalReview, ...] = ()
     batch_status: ReviewBatchStatus = ReviewBatchStatus.APPROVED
-    approved_proposal_ids: list[str] = Field(default_factory=list)
-    rejected_proposal_ids: list[str] = Field(default_factory=list)
-    approval_required_proposal_ids: list[str] = Field(default_factory=list)
-    conflicted_proposal_ids: list[str] = Field(default_factory=list)
-    deduplicated_proposal_ids: list[str] = Field(default_factory=list)
-    findings: list[ReviewFinding] = Field(default_factory=list)
+    approved_proposal_ids: tuple[str, ...] = ()
+    rejected_proposal_ids: tuple[str, ...] = ()
+    approval_required_proposal_ids: tuple[str, ...] = ()
+    conflicted_proposal_ids: tuple[str, ...] = ()
+    deduplicated_proposal_ids: tuple[str, ...] = ()
+    findings: tuple[ReviewFinding, ...] = ()
+
+    # R2 S3: governance spec hash carried on the Result so consumers
+    # can verify the Reviewer ran against the same spec the Request
+    # was built with.
+    governance_spec_hash: str = ""
 
     result_hash: str = ""
-    reviewer_version: str = REVIEWER_VERSION
+    # R2 S10: reviewer_version is REQUIRED on the Result.
+    reviewer_version: str
 
     @field_validator("review_id", "run_id", "tenant_id", "request_hash")
     @classmethod
@@ -892,15 +1452,25 @@ class ReviewBatchResult(StrictContract):
                 f"match recomputed content"
             )
 
-    def verify_semantics(self) -> None:
+    def verify_semantics(self, *, reviewer_version: str | None = None) -> None:
         """Validate that batch-level summaries are consistent with
         per-proposal reviews.
+
+        R2 P0-8: ``reviewer_version`` (when supplied) MUST equal the
+        Request's ``reviewer_version`` so a Result built by an older
+        Reviewer cannot be replayed against a newer Request.
 
         Raises :class:`InvalidReviewResultError` on any inconsistency.
         """
         if not self.reviewer_version.strip():
             raise InvalidReviewResultError(
                 f"ReviewBatchResult {self.review_id!r}: reviewer_version blank"
+            )
+        # R2 P0-8: reviewer_version matches the Request's reviewer_version.
+        if reviewer_version is not None and self.reviewer_version != reviewer_version:
+            raise InvalidReviewResultError(
+                f"ReviewBatchResult {self.review_id!r}: reviewer_version "
+                f"{self.reviewer_version!r} != request {reviewer_version!r}"
             )
 
         # proposal_ids unique
@@ -911,64 +1481,101 @@ class ReviewBatchResult(StrictContract):
                 f"in proposal_reviews"
             )
 
-        # batch_status recompute
-        if self.proposal_reviews:
+        # R2 S7: empty batch → NO_ACTIONS (NOT APPROVED).
+        if not self.proposal_reviews:
+            if self.batch_status != ReviewBatchStatus.NO_ACTIONS:
+                raise InvalidReviewResultError(
+                    f"ReviewBatchResult {self.review_id!r}: empty batch but "
+                    f"batch_status is {self.batch_status.value!r} (expected "
+                    f"NO_ACTIONS)"
+                )
+            if self.approved_proposal_ids:
+                raise InvalidReviewResultError(
+                    f"ReviewBatchResult {self.review_id!r}: empty batch but "
+                    f"approved_proposal_ids is non-empty"
+                )
+        else:
+            if self.batch_status == ReviewBatchStatus.NO_ACTIONS:
+                raise InvalidReviewResultError(
+                    f"ReviewBatchResult {self.review_id!r}: non-empty batch but "
+                    f"batch_status is NO_ACTIONS"
+                )
+            # batch_status recompute
             recomputed = max(
                 (proposal_status_to_batch(r.status) for r in self.proposal_reviews),
                 key=batch_status_priority,
             )
-        else:
-            recomputed = ReviewBatchStatus.APPROVED
-        if self.batch_status != recomputed:
-            raise InvalidReviewResultError(
-                f"ReviewBatchResult {self.review_id!r}: batch_status "
-                f"{self.batch_status.value!r} != recomputed "
-                f"{recomputed.value!r}"
-            )
+            if self.batch_status != recomputed:
+                raise InvalidReviewResultError(
+                    f"ReviewBatchResult {self.review_id!r}: batch_status "
+                    f"{self.batch_status.value!r} != recomputed "
+                    f"{recomputed.value!r}"
+                )
 
         # Summary id lists
-        expected_approved = sorted(
-            r.proposal_id
-            for r in self.proposal_reviews
-            if r.status == ReviewDecisionStatus.APPROVED
+        expected_approved = tuple(
+            sorted(
+                r.proposal_id
+                for r in self.proposal_reviews
+                if r.status == ReviewDecisionStatus.APPROVED
+            )
         )
         if self.approved_proposal_ids != expected_approved:
             raise InvalidReviewResultError(
                 f"ReviewBatchResult {self.review_id!r}: approved_proposal_ids mismatch"
             )
-        expected_rejected = sorted(
+        # R2 P0-8: DEDUPLICATED proposals must NOT appear in approved_proposal_ids.
+        deduped_set = {
             r.proposal_id
             for r in self.proposal_reviews
-            if r.status == ReviewDecisionStatus.REJECTED
+            if r.status == ReviewDecisionStatus.DEDUPLICATED
+        }
+        if deduped_set & set(self.approved_proposal_ids):
+            raise InvalidReviewResultError(
+                f"ReviewBatchResult {self.review_id!r}: DEDUPLICATED proposals "
+                f"leaked into approved_proposal_ids"
+            )
+        expected_rejected = tuple(
+            sorted(
+                r.proposal_id
+                for r in self.proposal_reviews
+                if r.status == ReviewDecisionStatus.REJECTED
+            )
         )
         if self.rejected_proposal_ids != expected_rejected:
             raise InvalidReviewResultError(
                 f"ReviewBatchResult {self.review_id!r}: rejected_proposal_ids mismatch"
             )
-        expected_approval = sorted(
-            r.proposal_id
-            for r in self.proposal_reviews
-            if r.status == ReviewDecisionStatus.NEEDS_APPROVAL
+        expected_approval = tuple(
+            sorted(
+                r.proposal_id
+                for r in self.proposal_reviews
+                if r.status == ReviewDecisionStatus.NEEDS_APPROVAL
+            )
         )
         if self.approval_required_proposal_ids != expected_approval:
             raise InvalidReviewResultError(
                 f"ReviewBatchResult {self.review_id!r}: "
                 f"approval_required_proposal_ids mismatch"
             )
-        expected_conflicted = sorted(
-            r.proposal_id
-            for r in self.proposal_reviews
-            if r.status == ReviewDecisionStatus.CONFLICT
+        expected_conflicted = tuple(
+            sorted(
+                r.proposal_id
+                for r in self.proposal_reviews
+                if r.status == ReviewDecisionStatus.CONFLICT
+            )
         )
         if self.conflicted_proposal_ids != expected_conflicted:
             raise InvalidReviewResultError(
                 f"ReviewBatchResult {self.review_id!r}: "
                 f"conflicted_proposal_ids mismatch"
             )
-        expected_deduped = sorted(
-            r.proposal_id
-            for r in self.proposal_reviews
-            if r.status == ReviewDecisionStatus.DEDUPLICATED
+        expected_deduped = tuple(
+            sorted(
+                r.proposal_id
+                for r in self.proposal_reviews
+                if r.status == ReviewDecisionStatus.DEDUPLICATED
+            )
         )
         if self.deduplicated_proposal_ids != expected_deduped:
             raise InvalidReviewResultError(
@@ -980,8 +1587,76 @@ class ReviewBatchResult(StrictContract):
         for r in self.proposal_reviews:
             r.verify_semantics()
 
+    def verify_against_request(self, request: ReviewRequest) -> None:
+        """R2 S8: bind this Result back to the Request it claims to
+        answer.
+
+        Verifies:
+
+        * ``review_id`` / ``run_id`` / ``tenant_id`` / ``request_hash``
+          / ``reviewer_version`` / ``governance_spec_hash`` match.
+        * Every :class:`ProposalReview` corresponds to exactly one
+          Proposal in the Request (no missing, no extra).
+        * :meth:`verify_semantics` passes with the Request's
+          ``reviewer_version``.
+
+        Raises :class:`InvalidReviewResultError` on any mismatch.
+        """
+        if self.review_id != request.review_id:
+            raise InvalidReviewResultError(
+                f"Result review_id {self.review_id!r} != request {request.review_id!r}"
+            )
+        if self.run_id != request.run_id:
+            raise InvalidReviewResultError(
+                f"Result run_id {self.run_id!r} != request {request.run_id!r}"
+            )
+        if self.tenant_id != request.tenant_id:
+            raise InvalidReviewResultError(
+                f"Result tenant_id {self.tenant_id!r} != request {request.tenant_id!r}"
+            )
+        if self.request_hash != request.request_hash:
+            raise InvalidReviewResultError(
+                f"Result request_hash {self.request_hash[:12]!r} != request "
+                f"{request.request_hash[:12]!r}"
+            )
+        if self.reviewer_version != request.reviewer_version:
+            raise InvalidReviewResultError(
+                f"Result reviewer_version {self.reviewer_version!r} != request "
+                f"{request.reviewer_version!r}"
+            )
+        if (
+            self.governance_spec_hash
+            and request.governance_spec_hash
+            and self.governance_spec_hash != request.governance_spec_hash
+        ):
+            raise InvalidReviewResultError(
+                f"Result governance_spec_hash {self.governance_spec_hash[:12]!r} "
+                f"!= request {request.governance_spec_hash[:12]!r}"
+            )
+
+        # Proposal ID coverage — every Request Proposal has exactly
+        # one Review, no extras.
+        request_proposal_ids = {p.proposal_id for p in request.proposals}
+        review_proposal_ids = {r.proposal_id for r in self.proposal_reviews}
+        missing = request_proposal_ids - review_proposal_ids
+        if missing:
+            raise InvalidReviewResultError(
+                f"Result {self.review_id!r} missing reviews for proposals: "
+                f"{sorted(missing)!r}"
+            )
+        extra = review_proposal_ids - request_proposal_ids
+        if extra:
+            raise InvalidReviewResultError(
+                f"Result {self.review_id!r} has reviews for unknown proposals: "
+                f"{sorted(extra)!r}"
+            )
+
+        # Re-run semantic validation with the Request's reviewer_version.
+        self.verify_semantics(reviewer_version=request.reviewer_version)
+
 
 __all__ = [
+    "BLOCKING_FINDING_CODES",
     "CODE_ACTION_CATEGORY_NOT_REVIEWABLE",
     "CODE_ACTION_PARAMETER_INVALID",
     "CODE_ACTION_TOOL_FORBIDDEN",
@@ -1020,15 +1695,24 @@ __all__ = [
     "CODE_TENANT_PII_EGRESS",
     "CODE_TENANT_SECRET_FIELD",
     "CapabilitySnapshot",
+    "EvidenceDeduplicationAudit",
     "PolicyContext",
-    "ProposalReview",
+    "PolicyDecision",
+    "PolicyDecisionAudit",
+    "PolicyMatchedRule",
+    "PolicyRule",
     "REJECTION_FINDING_CODES",
+    "REVIEW_SCHEMA_VERSION",
     "REVIEWER_VERSION",
+    "ResultOriginSnapshot",
     "ReviewBatchResult",
     "ReviewBatchStatus",
     "ReviewDecisionStatus",
+    "ReviewExpectedOutcome",
+    "ReviewEvidenceSnapshot",
     "ReviewFinding",
     "ReviewFindingSeverity",
+    "ReviewGraphError",
     "ReviewProposalEnvelope",
     "ReviewRequest",
     "ReviewRiskLevel",
