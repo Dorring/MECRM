@@ -376,6 +376,104 @@ from multi_agent.review_graph import (
     build_review_graph,
 )
 
+# Phase 5B — Governed Executor & Human Approval Gate
+from multi_agent.execution_error_codes import (
+    ACTION_NOT_SUPPORTED,
+    ADAPTER_NOT_FOUND,
+    ADAPTER_VERSION_MISMATCH,
+    APPROVAL_ALREADY_CONSUMED,
+    APPROVAL_EXPIRED,
+    APPROVAL_REJECTED,
+    APPROVAL_REQUIRED,
+    APPROVAL_REVOKED,
+    AUTHORIZATION_INTEGRITY_FAILED,
+    EXECUTION_ALREADY_IN_PROGRESS,
+    EXECUTION_CANCELLED,
+    EXECUTION_DEADLINE_EXCEEDED,
+    EXECUTION_NOT_AUTHORIZED,
+    EXECUTION_OUTCOME_UNKNOWN,
+    EXECUTION_TIMEOUT,
+    GOVERNANCE_SPEC_MISMATCH,
+    IDEMPOTENCY_CONFLICT,
+    INVALID_ADAPTER_OUTCOME,
+    INVALID_EXECUTION_RECEIPT,
+    KILL_SWITCH_ACTIVE,
+    REVIEW_BINDING_MISMATCH,
+    TENANT_MISMATCH,
+    AdapterBindingError,
+    ApprovalRequiredError,
+    ApprovalValidationError,
+    ExecutionAlreadyInProgressError,
+    ExecutionAuthorizationError,
+    ExecutionError,
+    ExecutionIntegrityError,
+    ExecutionReceiptError,
+    ExecutionTimeoutError,
+    ExecutionUnknownOutcomeError,
+    IdempotencyConflictError,
+    KillSwitchExecutionBlockedError,
+)
+from multi_agent.approval_contracts import (
+    ApprovalDecision,
+    ApprovalRequest,
+    ApprovalStatus,
+    Clock,
+    FrozenClock,
+    SystemClock,
+)
+from multi_agent.execution_authorization import (
+    BatchExecutionStatus,
+    ExecutionAuthorization,
+    ExecutionStatus,
+    batch_execution_status_priority,
+)
+from multi_agent.action_adapter import (
+    ActionAdapter,
+    ActionAdapterBinding,
+    ActionAdapterRegistry,
+    ActionAdapterRegistrySnapshot,
+    AdapterExecutionOutcome,
+    DeterministicNoopAdapter,
+    ExecutionCommand,
+    IdempotencyScope,
+    RecordingActionAdapter,
+    build_default_registry,
+    build_default_registry_snapshot,
+    compute_execution_fingerprint,
+)
+from multi_agent.execution_store import (
+    ExecutionStore,
+    IdempotencyRecord,
+    IdempotencyState,
+    InMemoryExecutionStore,
+)
+from multi_agent.approval_gate import (
+    ApprovalGate,
+    ApprovalRequirement,
+    ApprovalStore,
+    InMemoryApprovalStore,
+)
+from multi_agent.execution_receipts import ActionExecutionReceipt
+from multi_agent.governed_executor import (
+    ExecutionBatchResult,
+    ExecutionOptions,
+    ExecutionRetryPolicy,
+    GovernedExecutor,
+    build_authorization,
+    select_executable_reviews,
+)
+from multi_agent.execution_graph import (
+    ExecutionGraphState,
+    build_execution_graph,
+)
+from multi_agent.execution_evaluation import (
+    ExecutionExpectedOutcome,
+    ExecutionFixture,
+    ExecutionMetrics,
+    build_execution_fixtures,
+    compute_execution_metrics,
+)
+
 __all__ = [
     # Phase 2
     "ActionProposal",
@@ -712,4 +810,94 @@ __all__ = [
     "FakeProposalReviewer",
     "ReviewGraphState",
     "build_review_graph",
+    # Phase 5B — Governed Executor & Human Approval Gate
+    # Error codes
+    "ACTION_NOT_SUPPORTED",
+    "ADAPTER_NOT_FOUND",
+    "ADAPTER_VERSION_MISMATCH",
+    "APPROVAL_ALREADY_CONSUMED",
+    "APPROVAL_EXPIRED",
+    "APPROVAL_REJECTED",
+    "APPROVAL_REQUIRED",
+    "APPROVAL_REVOKED",
+    "AUTHORIZATION_INTEGRITY_FAILED",
+    "EXECUTION_ALREADY_IN_PROGRESS",
+    "EXECUTION_CANCELLED",
+    "EXECUTION_DEADLINE_EXCEEDED",
+    "EXECUTION_NOT_AUTHORIZED",
+    "EXECUTION_OUTCOME_UNKNOWN",
+    "EXECUTION_TIMEOUT",
+    "GOVERNANCE_SPEC_MISMATCH",
+    "IDEMPOTENCY_CONFLICT",
+    "INVALID_ADAPTER_OUTCOME",
+    "INVALID_EXECUTION_RECEIPT",
+    "KILL_SWITCH_ACTIVE",
+    "REVIEW_BINDING_MISMATCH",
+    "TENANT_MISMATCH",
+    # Exception classes
+    "AdapterBindingError",
+    "ApprovalRequiredError",
+    "ApprovalValidationError",
+    "ExecutionAlreadyInProgressError",
+    "ExecutionAuthorizationError",
+    "ExecutionError",
+    "ExecutionIntegrityError",
+    "ExecutionReceiptError",
+    "ExecutionTimeoutError",
+    "ExecutionUnknownOutcomeError",
+    "IdempotencyConflictError",
+    "KillSwitchExecutionBlockedError",
+    # Approval contracts
+    "ApprovalDecision",
+    "ApprovalRequest",
+    "ApprovalStatus",
+    "Clock",
+    "FrozenClock",
+    "SystemClock",
+    # Execution authorization
+    "BatchExecutionStatus",
+    "ExecutionAuthorization",
+    "ExecutionStatus",
+    "batch_execution_status_priority",
+    # Action adapter
+    "ActionAdapter",
+    "ActionAdapterBinding",
+    "ActionAdapterRegistry",
+    "ActionAdapterRegistrySnapshot",
+    "AdapterExecutionOutcome",
+    "DeterministicNoopAdapter",
+    "ExecutionCommand",
+    "IdempotencyScope",
+    "RecordingActionAdapter",
+    "build_default_registry",
+    "build_default_registry_snapshot",
+    "compute_execution_fingerprint",
+    # Execution store
+    "ExecutionStore",
+    "IdempotencyRecord",
+    "IdempotencyState",
+    "InMemoryExecutionStore",
+    # Approval gate
+    "ApprovalGate",
+    "ApprovalRequirement",
+    "ApprovalStore",
+    "InMemoryApprovalStore",
+    # Execution receipts
+    "ActionExecutionReceipt",
+    # Governed executor
+    "ExecutionBatchResult",
+    "ExecutionOptions",
+    "ExecutionRetryPolicy",
+    "GovernedExecutor",
+    "build_authorization",
+    "select_executable_reviews",
+    # Execution graph
+    "ExecutionGraphState",
+    "build_execution_graph",
+    # Execution evaluation
+    "ExecutionExpectedOutcome",
+    "ExecutionFixture",
+    "ExecutionMetrics",
+    "build_execution_fixtures",
+    "compute_execution_metrics",
 ]
