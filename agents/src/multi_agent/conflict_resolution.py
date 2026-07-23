@@ -25,6 +25,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
+from multi_agent.action_governance import get_action_governance_spec
 from multi_agent.contracts import ActionProposal
 from multi_agent.review_contracts import (
     CODE_CONFLICT_ACTIVATE_DEACTIVATE,
@@ -41,28 +42,37 @@ from multi_agent.serialization import canonicalize, content_hash
 
 
 # ---------------------------------------------------------------------------
-# Action-type families used by conflict heuristics.
+# R2.1 P0-7: conflict-family → conflict-type mapping.
+#
+# Local action-family sets (``_ACTIVATE_ACTIONS``, ``_CREATE_ACTIONS``,
+# ``_NOTIFICATION_ACTIONS``, ``_OWNER_ASSIGN_ACTIONS``) are REMOVED.
+# The sole source of truth for "which actions conflict with each other"
+# is :attr:`ActionGovernanceSpec.conflict_family`, read via
+# :func:`get_action_governance_spec`.
+#
+# Two Proposals conflict iff:
+#   1. They target the same resource (same tenant + target_entity + target_id)
+#   2. Both have the SAME non-None ``conflict_family``
+#   3. Their payloads differ in a way that is meaningful for that family
 # ---------------------------------------------------------------------------
 
-# Actions that activate / deactivate the same resource are mutually
-# exclusive if they target different states.
-_ACTIVATE_ACTIONS: frozenset[str] = frozenset(
-    {"crm.status.update", "permission.change", "crm.escalate"}
-)
+_CONFLICT_FAMILY_TYPES: dict[str, str] = {
+    "crm_field_update": "field_value",
+    "crm_status_activate": "activate_deactivate",
+    "crm_create": "create_delete",
+    "notification_mutex": "mutex_notification",
+    "crm_owner_reassign": "owner_reassign",
+}
 
-# Actions that create / delete the same resource are mutually exclusive.
-_CREATE_ACTIONS: frozenset[str] = frozenset({"crm.note.add", "notification.bulk_send"})
-_DELETE_ACTIONS: frozenset[str] = frozenset({"crm.record.delete", "account.delete"})
 
-# Notification actions that are mutually exclusive when targeting the
-# same customer within the same batch.
-_NOTIFICATION_ACTIONS: frozenset[str] = frozenset(
-    {"notification.bulk_send", "crm.escalate"}
-)
-
-# Owner-assign actions that conflict when the same customer is
-# assigned to different owners.
-_OWNER_ASSIGN_ACTIONS: frozenset[str] = frozenset({"crm.owner.assign"})
+def _get_conflict_family(action_type: str) -> str | None:
+    """R2.1 P0-7: return the ``conflict_family`` for *action_type* from
+    the governance registry, or ``None`` if the action is unknown or
+    has no conflict family."""
+    spec = get_action_governance_spec(action_type)
+    if spec is None:
+        return None
+    return spec.conflict_family
 
 
 # ---------------------------------------------------------------------------
@@ -259,49 +269,33 @@ def _payload_field_conflict(p1: ActionProposal, p2: ActionProposal) -> bool:
     return False
 
 
-def _is_activate_deactivate(p1: ActionProposal, p2: ActionProposal) -> bool:
-    """Return True iff p1 and p2 are activate/deactivate on the same
-    resource with different target states."""
-    if p1.action_type not in _ACTIVATE_ACTIONS:
-        return False
-    if p2.action_type not in _ACTIVATE_ACTIONS:
-        return False
-    if p1.action_type != p2.action_type:
-        return False
-    # Same action_type + same resource + different "state" payload
-    return _payload_field_conflict(p1, p2)
+def _same_conflict_family(p1: ActionProposal, p2: ActionProposal) -> str | None:
+    """R2.1 P0-7: return the shared ``conflict_family`` if both
+    Proposals belong to the same conflict family, else ``None``.
 
-
-def _is_create_delete(p1: ActionProposal, p2: ActionProposal) -> bool:
-    """Return True iff one of p1/p2 is a create and the other is a
-    delete on the same resource."""
-    if p1.action_type in _CREATE_ACTIONS and p2.action_type in _DELETE_ACTIONS:
-        return True
-    if p2.action_type in _CREATE_ACTIONS and p1.action_type in _DELETE_ACTIONS:
-        return True
-    return False
-
-
-def _is_mutex_notification(p1: ActionProposal, p2: ActionProposal) -> bool:
-    """Return True iff p1 and p2 are mutex notifications on the same
-    customer."""
-    if p1.action_type not in _NOTIFICATION_ACTIONS:
-        return False
-    if p2.action_type not in _NOTIFICATION_ACTIONS:
-        return False
-    if p1.action_type != p2.action_type:
-        return True  # different notification types on same resource
-    return _payload_field_conflict(p1, p2)
+    Reads :attr:`ActionGovernanceSpec.conflict_family` via
+    :func:`get_action_governance_spec` — no local action-type sets.
+    """
+    fam1 = _get_conflict_family(p1.action_type)
+    if fam1 is None:
+        return None
+    fam2 = _get_conflict_family(p2.action_type)
+    if fam2 is None:
+        return None
+    if fam1 != fam2:
+        return None
+    return fam1
 
 
 def _is_owner_reassign(p1: ActionProposal, p2: ActionProposal) -> bool:
     """Return True iff p1 and p2 both reassign owner of the same
-    customer to different owners."""
-    if p1.action_type not in _OWNER_ASSIGN_ACTIONS:
-        return False
-    if p2.action_type not in _OWNER_ASSIGN_ACTIONS:
-        return False
-    if p1.action_type != p2.action_type:
+    customer to different owners.
+
+    R2.1 P0-7: uses ``conflict_family == "crm_owner_reassign"`` from
+    the governance registry instead of a local action-type set.
+    """
+    family = _same_conflict_family(p1, p2)
+    if family != "crm_owner_reassign":
         return False
     # Both assign owner — conflict if the owner value differs.
     owner1 = p1.payload.get("owner_id") or p1.payload.get("owner")
@@ -472,48 +466,80 @@ def _classify_pair(
     """Return (conflict_type, detail) for a pair of Proposals.
 
     Returns (None, "") if the pair does not conflict.
+
+    R2.1 P0-7: conflict classification is driven SOLELY by
+    :attr:`ActionGovernanceSpec.conflict_family` (read via
+    :func:`get_action_governance_spec`).  Local action-type sets are
+    removed.  Two Proposals conflict iff they share the same non-None
+    ``conflict_family`` and their payloads differ meaningfully.
     """
     # 1. Idempotency-key mismatch on same canonical key is handled by
     #    detect_duplicates (treated as dedup, not conflict).  Here we
     #    only handle cross-canonical-key idempotency conflicts.
 
-    # 2. Different action_types on same resource
-    if p1.action_type != p2.action_type:
-        if _is_create_delete(p1, p2):
+    # 2. R2.1 P0-7: check shared conflict_family from the governance
+    #    registry.  No local action-type sets.
+    family = _same_conflict_family(p1, p2)
+    if family is None:
+        # No shared conflict family — not a conflict.  Different
+        # action_types without a shared family are not auto-conflicts.
+        return (None, "")
+
+    conflict_type = _CONFLICT_FAMILY_TYPES.get(family)
+    if conflict_type is None:
+        # Unknown conflict_family — not a conflict we recognise.
+        return (None, "")
+
+    # 3. Family-specific payload conflict checks.
+    if conflict_type == "owner_reassign":
+        if _is_owner_reassign(p1, p2):
             return (
-                "create_delete",
-                f"create {p1.action_type!r} vs delete {p2.action_type!r}",
+                "owner_reassign",
+                "same customer reassigned to different owners",
             )
-        if _is_mutex_notification(p1, p2):
+        return (None, "")
+
+    if conflict_type == "activate_deactivate":
+        # Same conflict_family on same resource with different payload
+        # field values → activate/deactivate conflict.
+        if _payload_field_conflict(p1, p2):
+            return (
+                "activate_deactivate",
+                "activate/deactivate on same resource with different states",
+            )
+        return (None, "")
+
+    if conflict_type == "mutex_notification":
+        # Mutex notifications: conflict if different action_types OR
+        # different payload field values on the same resource.
+        if p1.action_type != p2.action_type:
             return (
                 "mutex_notification",
                 f"mutex notifications {p1.action_type!r} vs {p2.action_type!r}",
             )
-        # Different action types on same resource without a specific
-        # heuristic — not automatically a conflict.
+        if _payload_field_conflict(p1, p2):
+            return (
+                "mutex_notification",
+                "mutex notifications on same customer with different payloads",
+            )
         return (None, "")
 
-    # 3. Same action_type on same resource
-    if _is_activate_deactivate(p1, p2):
-        return (
-            "activate_deactivate",
-            "activate/deactivate on same resource with different states",
-        )
-    if _is_owner_reassign(p1, p2):
-        return (
-            "owner_reassign",
-            "same customer reassigned to different owners",
-        )
-    if _is_mutex_notification(p1, p2):
-        return (
-            "mutex_notification",
-            "mutex notifications on same customer with different payloads",
-        )
-    # Same action_type + same resource + payload field conflict
+    if conflict_type == "create_delete":
+        # Same conflict_family (crm_create) on same resource — conflict
+        # if the payloads differ.
+        if _payload_field_conflict(p1, p2) or p1.action_type != p2.action_type:
+            return (
+                "create_delete",
+                f"create/delete conflict: {p1.action_type!r} vs {p2.action_type!r}",
+            )
+        return (None, "")
+
+    # field_value (crm_field_update): same resource + same family +
+    # different payload field values.
     if _payload_field_conflict(p1, p2):
         return (
             "field_value",
-            "same resource + same action + different payload field values",
+            "same resource + same conflict family + different payload field values",
         )
 
     return (None, "")

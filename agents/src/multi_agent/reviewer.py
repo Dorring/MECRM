@@ -40,6 +40,7 @@ from multi_agent.action_governance import (
     ACTION_GOVERNANCE_SPEC_HASH,
     ACTION_GOVERNANCE_SPEC_VERSION,
     get_action_governance_spec,
+    verify_governance_spec_integrity,
 )
 from multi_agent.contracts import (
     ActionProposal,
@@ -611,18 +612,29 @@ class ProposalReviewer:
                 f"verification: {e}"
             ) from e
 
-        # R2 S3: verify governance spec version/hash match the live
-        # registry so a Request built against an older spec is rejected.
+        # R2 S3 / R2.1 P0-7: verify governance spec version/hash match
+        # the live registry so a Request built against an older spec
+        # (or a tampered registry) is rejected.
         if request.governance_spec_version != ACTION_GOVERNANCE_SPEC_VERSION:
             raise InvalidReviewRequestError(
                 f"ReviewRequest {request.review_id!r}: governance_spec_version "
                 f"{request.governance_spec_version!r} != live "
                 f"{ACTION_GOVERNANCE_SPEC_VERSION!r}"
             )
-        if (
-            request.governance_spec_hash
-            and request.governance_spec_hash != ACTION_GOVERNANCE_SPEC_HASH
-        ):
+        # R2.1 P0-7: verify the live registry hash matches the module
+        # constant — detects a tampered ACTION_GOVERNANCE_REGISTRY even
+        # if the Request carries the old constant hash.
+        try:
+            verify_governance_spec_integrity(expected_hash=request.governance_spec_hash)
+        except RuntimeError as e:
+            raise InvalidReviewRequestError(
+                f"ReviewRequest {request.review_id!r}: governance spec "
+                f"integrity check failed: {e}"
+            ) from e
+        # R2.1 P0-7: unconditional comparison (both sides are required
+        # non-blank — the old ``if request.governance_spec_hash`` guard
+        # is removed).
+        if request.governance_spec_hash != ACTION_GOVERNANCE_SPEC_HASH:
             raise InvalidReviewRequestError(
                 f"ReviewRequest {request.review_id!r}: governance_spec_hash "
                 f"{request.governance_spec_hash[:12]!r} != live "
@@ -656,17 +668,31 @@ class ProposalReviewer:
         # 3. Detect duplicate Evidence (cross-Proposal)
         evidence_dup_findings = detect_duplicate_evidence(request.evidence)
 
+        # R2.1 P0-1: convert frozen ReviewProposalSnapshots to fresh
+        # ActionProposal copies ONCE for all Phase 2 helper functions
+        # (detect_duplicates / detect_conflicts / detect_dangling_evidence
+        # / _review_single_proposal).  These helpers were written against
+        # the mutable ActionProposal contract (dict ``payload``) and
+        # cannot operate on the snapshot's frozen tuple payload.  The
+        # snapshots themselves remain the audited objects; these copies
+        # are internal scratch space.
+        proposals_for_helpers: list[ActionProposal] = [
+            s.to_action_proposal() for s in request.proposals
+        ]
+
         # 4. Detect duplicate Proposals
-        dedup_result = detect_duplicates(request.proposals)
+        dedup_result = detect_duplicates(proposals_for_helpers)
 
         # 5. Detect conflicts (excluding deduped Proposals)
         conflict_result = detect_conflicts(
-            request.proposals,
+            proposals_for_helpers,
             excluded_proposal_ids=dedup_result.excluded_proposal_ids,
         )
 
         # 6. Dangling evidence (informational)
-        dangling_findings = detect_dangling_evidence(request.proposals, evidence_index)
+        dangling_findings = detect_dangling_evidence(
+            proposals_for_helpers, evidence_index
+        )
 
         # 7. Per-Proposal review — iterate over envelopes (R2 P0-1)
         per_proposal_reviews: list[ProposalReview] = []
@@ -676,8 +702,15 @@ class ProposalReviewer:
         all_findings.extend(conflict_result.findings)
         all_findings.extend(dangling_findings)
 
-        for proposal in sorted(request.proposals, key=lambda p: p.proposal_id):
-            envelope = envelope_by_pid.get(proposal.proposal_id)
+        for snapshot in sorted(request.proposals, key=lambda p: p.proposal_id):
+            # R2.1 P0-1: convert the frozen ReviewProposalSnapshot to a
+            # fresh ActionProposal copy for internal use by the Phase 2
+            # helper functions.  The snapshot itself is frozen and its
+            # ``snapshot_hash`` was verified at the Request boundary —
+            # this copy is NOT the audited object, so mutations to it
+            # do not affect the Request hash or the audit trail.
+            proposal = snapshot.to_action_proposal()
+            envelope = envelope_by_pid.get(snapshot.proposal_id)
             review = await self._review_single_proposal(
                 proposal=proposal,
                 envelope=envelope,
@@ -856,8 +889,12 @@ class ProposalReviewer:
         }
         matched_evidence_ids = sorted(set(proposal.evidence_ids) - flagged_ev_ids)
 
-        # 5. Authority validation — R2 P0-2: per-task capability lookup
-        # via envelope.task_id (NOT proposal.created_by_agent).
+        # 5. Authority validation — R2 P0-2 / R2.1 P0-3: per-task
+        # capability lookup via envelope.task_id (NOT
+        # proposal.created_by_agent).  The agent_id Legacy Fallback is
+        # REMOVED — if the exact-task capability binding is missing,
+        # ``cap_snapshot`` stays ``None`` and :func:`validate_authority`
+        # fails-closed with CODE_AUTHORITY_INSUFFICIENT.
         cap_snapshot: CapabilitySnapshot | None = None
         if envelope is not None:
             ec = cap_by_task.get(envelope.task_id)
@@ -865,9 +902,11 @@ class ProposalReviewer:
                 cap_snapshot = CapabilitySnapshot(
                     agent_id=ec.agent_id, capability=ec.capability
                 )
-        if cap_snapshot is None:
-            # Fallback for legacy requests without envelope/task binding
-            cap_snapshot = capability_snapshots.get(proposal.created_by_agent)
+        # R2.1 P0-3: NO agent_id fallback.  A missing exact-task
+        # binding means the Proposal's authority cannot be verified
+        # and must be rejected.  Previously the code fell back to
+        # ``capability_snapshots.get(proposal.created_by_agent)``
+        # which allowed cross-Task Capability Borrowing.
         findings.extend(validate_authority(proposal, cap_snapshot))
 
         # 6. Idempotency validation
@@ -926,10 +965,17 @@ class ProposalReviewer:
                 policy_version=request.policy_context.policy_version,
                 findings=(),
             )
+            # R2.1 P0-7: policy_request_hash for the skipped case uses
+            # the ReviewRequest hash (no actual PolicyEvaluationRequest
+            # was built).  This is still a non-blank hash that binds
+            # the audit to the Request.
             policy_audit = self._build_policy_audit(
                 policy_result,
                 evaluator_source_id="skipped-authority-failure",
                 evaluator_version="reviewer-skipped",
+                proposal_id=proposal.proposal_id,
+                request_hash=request.request_hash,
+                policy_request_hash=request.request_hash,
             )
         else:
             policy_req = PolicyEvaluationRequest(
@@ -947,6 +993,9 @@ class ProposalReviewer:
                 ),
                 policy_context=request.policy_context,
             )
+            # R2.1 P0-7: compute the policy_request_hash from the
+            # canonical PolicyEvaluationRequest content.
+            policy_request_hash = stable_hash(policy_req.model_dump(mode="python"))
             try:
                 policy_result = await policy_evaluator.evaluate(policy_req)
             except ReviewError:
@@ -956,13 +1005,16 @@ class ProposalReviewer:
                     f"Policy evaluator raised for proposal "
                     f"{proposal.proposal_id!r}: {e}"
                 ) from e
-            # R1 Section VI: validate policy result identity before
-            # consuming it — fail-closed on any mismatch.
+            # R1 Section VI / R2.1 P0-6: validate policy result identity
+            # before consuming it — fail-closed on any mismatch.
             self._validate_policy_result_identity(policy_result, proposal, request)
             policy_audit = self._build_policy_audit(
                 policy_result,
                 evaluator_source_id=policy_evaluator.__class__.__name__,
                 evaluator_version=request.policy_context.policy_version,
+                proposal_id=proposal.proposal_id,
+                request_hash=request.request_hash,
+                policy_request_hash=policy_request_hash,
             )
         findings.extend(policy_result.findings)
 
@@ -1084,11 +1136,31 @@ class ProposalReviewer:
         proposal: ActionProposal,
         request: ReviewRequest,
     ) -> None:
-        """Fail-closed validation that the policy result belongs to the
-        proposal it claims to be for.
+        """R2.1 P0-6: fail-closed validation that the policy result
+        belongs to the proposal it claims to be for AND that every
+        matched rule exists in the Request's frozen Policy Snapshot.
 
-        Raises :class:`PolicyEvaluationError` on any identity mismatch.
+        Checks (in order):
+
+        1. ``policy_result.verify_semantics()`` — decision ↔ finding
+           consistency (R2.1 P0-6: previously never called).
+        2. ``proposal_id`` matches.
+        3. ``policy_version`` matches the Request's PolicyContext.
+        4. Every finding belongs to this proposal.
+        5. Every matched rule's ``rule_id`` / ``rule_version`` /
+           ``effect`` exists in ``request.policy_context.rules`` —
+           prevents an external Policy Adapter from returning rules
+           that are not part of the current Policy Snapshot.
+
+        Raises :class:`PolicyEvaluationError` on any mismatch.
         """
+        # R2.1 P0-6: verify_semantics() MUST be called before the
+        # result is consumed.  Previously it was never invoked, so a
+        # Policy Adapter could return a semantically inconsistent
+        # result (e.g. decision=DENIED but no CODE_POLICY_DENIED
+        # finding) and the Reviewer would still process it.
+        policy_result.verify_semantics()
+
         if policy_result.proposal_id != proposal.proposal_id:
             raise PolicyEvaluationError(
                 f"Policy result proposal_id {policy_result.proposal_id!r} != "
@@ -1105,10 +1177,47 @@ class ProposalReviewer:
                     f"Policy finding proposal_id {finding.proposal_id!r} != "
                     f"expected {proposal.proposal_id!r}"
                 )
+
+        # R2.1 P0-6: every matched rule must exist in the Request's
+        # frozen Policy Snapshot.  Build a lookup from
+        # (rule_id, rule_version, effect) → exists.  Synthetic rules
+        # emitted by the DeterministicPolicyEvaluator
+        # (``governance-spec-allowlist``, ``authority-floor``,
+        # ``always-needs-approval``, ``high-risk-needs-approval``) are
+        # also accepted — they use ``policy_version`` as their
+        # ``rule_version`` and are generated by the evaluator itself,
+        # not by an external adapter.
+        request_rules: set[tuple[str, str, str]] = {
+            (r.rule_id, r.rule_version, r.effect.value)
+            for r in request.policy_context.rules
+        }
+        synthetic_rule_ids: frozenset[str] = frozenset(
+            {
+                "governance-spec-allowlist",
+                "authority-floor",
+                "always-needs-approval",
+                "high-risk-needs-approval",
+            }
+        )
         for rule in policy_result.matched_rules:
             if not rule.rule_version.strip():
                 raise PolicyEvaluationError(
                     f"Matched rule {rule.rule_id!r} has blank rule_version"
+                )
+            key = (rule.rule_id, rule.rule_version, rule.effect.value)
+            if key not in request_rules:
+                # Allow synthetic rules generated by the
+                # DeterministicPolicyEvaluator (they are not in
+                # PolicyContext.rules but are legitimate).
+                if (
+                    rule.rule_id in synthetic_rule_ids
+                    and rule.rule_version == request.policy_context.policy_version
+                ):
+                    continue
+                raise PolicyEvaluationError(
+                    f"Matched rule {rule.rule_id!r} (version="
+                    f"{rule.rule_version!r}, effect={rule.effect.value!r}) "
+                    f"does not exist in the Request's Policy Snapshot"
                 )
 
     # -----------------------------------------------------------------
@@ -1121,15 +1230,24 @@ class ProposalReviewer:
         *,
         evaluator_source_id: str,
         evaluator_version: str,
+        proposal_id: str,
+        request_hash: str,
+        policy_request_hash: str,
     ) -> PolicyDecisionAudit:
         """Build a :class:`PolicyDecisionAudit` from a
         :class:`PolicyEvaluationResult`.
 
-        R2 S5: every Proposal — including those that skipped external
-        Policy because Authority failed — MUST carry one audit.  The
-        ``evaluation_hash`` is computed over the same canonical fields
-        that :class:`PolicyDecisionAudit._verify_evaluation_hash`
-        checks, so a tampered audit is detectable at construction.
+        R2 S5 / R2.1 P0-7: every Proposal — including those that
+        skipped external Policy because Authority failed — MUST carry
+        one audit.  The ``proposal_id`` / ``request_hash`` /
+        ``policy_request_hash`` bind the audit to the exact Proposal
+        and Request it answers, so a tampered or replayed audit cannot
+        be attached to a different Proposal / Request.
+
+        The ``evaluation_hash`` is computed over the same canonical
+        fields that
+        :class:`PolicyDecisionAudit._verify_evaluation_hash` checks,
+        so a tampered audit is detectable at construction.
         """
         matched_rules = tuple(policy_result.matched_rules)
         evaluation_hash = stable_hash(
@@ -1139,6 +1257,9 @@ class ProposalReviewer:
                 "policy_version": policy_result.policy_version,
                 "decision": policy_result.decision.value,
                 "matched_rules": [r.model_dump(mode="python") for r in matched_rules],
+                "proposal_id": proposal_id,
+                "request_hash": request_hash,
+                "policy_request_hash": policy_request_hash,
             }
         )
         return PolicyDecisionAudit(
@@ -1147,6 +1268,9 @@ class ProposalReviewer:
             policy_version=policy_result.policy_version,
             decision=policy_result.decision,
             matched_rules=matched_rules,
+            proposal_id=proposal_id,
+            request_hash=request_hash,
+            policy_request_hash=policy_request_hash,
             evaluation_hash=evaluation_hash,
         )
 
@@ -1165,22 +1289,28 @@ class ProposalReviewer:
     ) -> ReviewDecisionStatus:
         """Classify the per-proposal decision by finding CODE priority.
 
-        Order (R1 Section VII):
-            conflict > deduplicated > rejected (rejection-class codes) >
-            needs_input (missing-evidence / policy-needs-input) >
-            needs_approval (high-risk / policy-needs-approval) > approved
+        R2.1 P1-2 order (safety errors cannot be masked by
+        Deduplication):
+
+            conflict > rejected > needs_input > needs_approval >
+            deduplicated > approved
+
+        Only a Proposal that has NO identity, tenant, evidence,
+        authority, policy, or idempotency errors is eligible for
+        DEDUPLICATED status.  Previously ``deduplicated`` took
+        priority over ``rejected``, which let a Proposal with an
+        authority violation be silently marked as DEDUPLICATED
+        instead of REJECTED — hiding the security violation from
+        the audit trail.
         """
         # 1. Conflict takes priority over everything
         if is_conflict:
             return ReviewDecisionStatus.CONFLICT
 
-        # 2. Exact duplicates are DEDUPLICATED (not CONFLICT, not REJECTED)
-        if is_duplicate:
-            return ReviewDecisionStatus.DEDUPLICATED
-
         finding_codes = {f.finding_code for f in findings}
 
-        # 3. Rejection-class findings (ERROR/CRITICAL severity) → REJECTED
+        # 2. Rejection-class findings (ERROR/CRITICAL severity) → REJECTED
+        #    R2.1 P1-2: REJECTED now takes priority over DEDUPLICATED.
         has_rejection = any(
             f.finding_code in REJECTION_FINDING_CODES
             and f.severity
@@ -1190,21 +1320,27 @@ class ProposalReviewer:
         if has_rejection:
             return ReviewDecisionStatus.REJECTED
 
-        # 4. Missing evidence or policy needs input → NEEDS_INPUT
+        # 3. Missing evidence or policy needs input → NEEDS_INPUT
         if finding_codes & {CODE_EVIDENCE_MISSING, CODE_POLICY_NEEDS_INPUT}:
             return ReviewDecisionStatus.NEEDS_INPUT
 
-        # 5. Policy needs input (fallback if finding missing)
+        # 4. Policy needs input (fallback if finding missing)
         if policy_decision == PolicyDecision.NEEDS_INPUT:
             return ReviewDecisionStatus.NEEDS_INPUT
 
-        # 6. High/critical risk → NEEDS_APPROVAL
+        # 5. High/critical risk → NEEDS_APPROVAL
         if risk_level in (ReviewRiskLevel.HIGH, ReviewRiskLevel.CRITICAL):
             return ReviewDecisionStatus.NEEDS_APPROVAL
 
-        # 7. Policy needs approval
+        # 6. Policy needs approval
         if policy_decision == PolicyDecision.NEEDS_APPROVAL:
             return ReviewDecisionStatus.NEEDS_APPROVAL
+
+        # 7. R2.1 P1-2: DEDUPLICATED is now AFTER all safety checks.
+        #    Only a Proposal that passed identity, tenant, evidence,
+        #    authority, policy, and idempotency validation is eligible.
+        if is_duplicate:
+            return ReviewDecisionStatus.DEDUPLICATED
 
         return ReviewDecisionStatus.APPROVED
 

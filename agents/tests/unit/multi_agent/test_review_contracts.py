@@ -20,9 +20,16 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from multi_agent.action_governance import (
+    ACTION_GOVERNANCE_SPEC_HASH,
+    ACTION_GOVERNANCE_SPEC_VERSION,
+)
 from multi_agent.contracts import ActionProposal
+from multi_agent.execution import ExecutionRunIdentity
 from multi_agent.review_contracts import (
     PolicyContext,
+    PolicyDecision,
+    PolicyDecisionAudit,
     ProposalReview,
     ReviewBatchResult,
     ReviewBatchStatus,
@@ -36,6 +43,7 @@ from multi_agent.review_contracts import (
     REVIEWER_VERSION,
 )
 from multi_agent.review_errors import ReviewIntegrityError
+from multi_agent.serialization import stable_hash
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +70,37 @@ def _make_finding(
     )
 
 
+def _make_policy_audit(
+    *,
+    proposal_id: str = "prop-test-001",
+    request_hash: str = "a" * 64,
+    policy_request_hash: str = "b" * 64,
+    decision: PolicyDecision = PolicyDecision.ALLOWED,
+) -> PolicyDecisionAudit:
+    """R2.1 P0-7: build a PolicyDecisionAudit with a valid evaluation_hash."""
+    payload = {
+        "evaluator_source_id": "deterministic",
+        "evaluator_version": "test-v1",
+        "policy_version": "test-v1",
+        "decision": decision.value,
+        "matched_rules": [],
+        "proposal_id": proposal_id,
+        "request_hash": request_hash,
+        "policy_request_hash": policy_request_hash,
+    }
+    return PolicyDecisionAudit(
+        evaluator_source_id="deterministic",
+        evaluator_version="test-v1",
+        policy_version="test-v1",
+        decision=decision,
+        matched_rules=(),
+        proposal_id=proposal_id,
+        request_hash=request_hash,
+        policy_request_hash=policy_request_hash,
+        evaluation_hash=stable_hash(payload),
+    )
+
+
 def _make_proposal_review(
     *,
     proposal_id: str = "prop-test-001",
@@ -77,6 +116,7 @@ def _make_proposal_review(
         authority_valid=True,
         policy_valid=True,
         idempotency_valid=True,
+        policy_audit=_make_policy_audit(proposal_id=proposal_id),
     )
 
 
@@ -85,6 +125,22 @@ def _make_request(
     review_id: str = "review-test-001",
     proposals: list[ActionProposal] | None = None,
 ) -> ReviewRequest:
+    # R2.1 P0-4: run_identity is REQUIRED.
+    identity_hash = stable_hash(
+        {
+            "run_id": "run-test-001",
+            "tenant_id": "tenant-test",
+            "plan_hash": "plan-test-hash",
+            "registry_version": "registry-test-v1",
+        }
+    )
+    run_identity = ExecutionRunIdentity(
+        run_id="run-test-001",
+        tenant_id="tenant-test",
+        plan_hash="plan-test-hash",
+        registry_version="registry-test-v1",
+        identity_hash=identity_hash,
+    )
     return ReviewRequest(
         review_id=review_id,
         run_id="run-test-001",
@@ -111,6 +167,9 @@ def _make_request(
             policy_version="test-v1",
             rules=[],
         ),
+        run_identity=run_identity,
+        governance_spec_version=ACTION_GOVERNANCE_SPEC_VERSION,
+        governance_spec_hash=ACTION_GOVERNANCE_SPEC_HASH,
         reviewer_version=REVIEWER_VERSION,
     )
 
@@ -252,6 +311,7 @@ class TestJsonRoundTrip:
             proposal_reviews=[review],
             batch_status=ReviewBatchStatus.APPROVED,
             approved_proposal_ids=["prop-test-001"],
+            governance_spec_hash=ACTION_GOVERNANCE_SPEC_HASH,
             reviewer_version=REVIEWER_VERSION,
         )
         rt = ReviewBatchResult.model_validate_json(result.model_dump_json())
@@ -289,6 +349,7 @@ class TestHashTamperDetection:
             request_hash="rh",
             proposal_reviews=[review],
             batch_status=ReviewBatchStatus.APPROVED,
+            governance_spec_hash=ACTION_GOVERNANCE_SPEC_HASH,
             reviewer_version=REVIEWER_VERSION,
         )
         tampered = result.model_copy(
@@ -302,6 +363,7 @@ class TestHashTamperDetection:
             ProposalReview(
                 proposal_id="p1",
                 status=ReviewDecisionStatus.APPROVED,
+                policy_audit=_make_policy_audit(proposal_id="p1"),
                 review_hash="deadbeef" * 8,  # wrong hash
             )
 
@@ -349,14 +411,27 @@ class TestCrossProcessHashStability:
         code = (
             "from multi_agent.review_contracts import ("
             "ProposalReview, ReviewDecisionStatus, ReviewFinding, "
-            "ReviewFindingSeverity, ReviewRiskLevel)\n"
+            "ReviewFindingSeverity, ReviewRiskLevel, PolicyDecision, "
+            "PolicyDecisionAudit)\n"
+            "from multi_agent.serialization import stable_hash\n"
             "f = ReviewFinding(finding_code='x.y', severity="
             "ReviewFindingSeverity.WARNING, message='m', proposal_id='p1')\n"
+            "pa = PolicyDecisionAudit(evaluator_source_id='deterministic', "
+            "evaluator_version='test-v1', policy_version='test-v1', "
+            "decision=PolicyDecision.ALLOWED, matched_rules=(), "
+            "proposal_id='p1', request_hash='a'*64, "
+            "policy_request_hash='b'*64, evaluation_hash=stable_hash({"
+            "'evaluator_source_id':'deterministic',"
+            "'evaluator_version':'test-v1',"
+            "'policy_version':'test-v1','decision':'allowed',"
+            "'matched_rules':[],'proposal_id':'p1',"
+            "'request_hash':'a'*64,"
+            "'policy_request_hash':'b'*64}))\n"
             "r = ProposalReview(proposal_id='p1', status="
             "ReviewDecisionStatus.APPROVED, findings=[f], "
             "matched_evidence_ids=['e1','e2'], risk_level="
             "ReviewRiskLevel.LOW, authority_valid=True, policy_valid=True, "
-            "idempotency_valid=True)\n"
+            "idempotency_valid=True, policy_audit=pa)\n"
             "print(r.review_hash)"
         )
         result = subprocess.run(
@@ -376,6 +451,7 @@ class TestCrossProcessHashStability:
             message="m",
             proposal_id="p1",
         )
+        pa = _make_policy_audit(proposal_id="p1")
         r = ProposalReview(
             proposal_id="p1",
             status=ReviewDecisionStatus.APPROVED,
@@ -385,6 +461,7 @@ class TestCrossProcessHashStability:
             authority_valid=True,
             policy_valid=True,
             idempotency_valid=True,
+            policy_audit=pa,
         )
         assert r.review_hash == child_hash, (
             f"hash mismatch: parent={r.review_hash!r} child={child_hash!r}"

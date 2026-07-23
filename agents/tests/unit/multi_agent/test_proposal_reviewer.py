@@ -33,7 +33,11 @@ from multi_agent.contracts import (
     EvidenceType,
 )
 from multi_agent.evidence_review import compute_review_evidence_hash
-from multi_agent.execution import ExecutionCapabilitySnapshot
+from multi_agent.execution import (
+    ExecutionCapabilitySnapshot,
+    ExecutionRunIdentity,
+    ResultOriginSnapshot,
+)
 from multi_agent.policy import (
     DeterministicPolicyEvaluator,
     FakePolicyEvaluator,
@@ -41,17 +45,23 @@ from multi_agent.policy import (
     PolicyEvaluationResult,
 )
 from multi_agent.review_contracts import (
+    CODE_POLICY_DENIED,
+    CODE_POLICY_NEEDS_INPUT,
     PolicyContext,
     ReviewBatchStatus,
     ReviewDecisionStatus,
     ReviewEvidenceSnapshot,
+    ReviewFinding,
+    ReviewFindingSeverity,
     ReviewProposalEnvelope,
+    ReviewProposalSnapshot,
     ReviewRequest,
     REVIEW_SCHEMA_VERSION,
     TaskRecordSummary,
     TraceSummary,
     REVIEWER_VERSION,
 )
+from multi_agent.review_errors import InvalidReviewRequestError
 from multi_agent.reviewer import ProposalReviewer
 from multi_agent.serialization import stable_hash
 
@@ -157,8 +167,12 @@ def _make_envelope(
     agent_version: str = "1.0.0",
 ) -> ReviewProposalEnvelope:
     aid = proposal.created_by_agent
+    # R2.1 P0-1: Envelope carries a deep-frozen ReviewProposalSnapshot.
+    snapshot = ReviewProposalSnapshot.from_proposal(proposal)
+    # R2.1 P0-1: origin_hash MUST match the envelope's validator which
+    # uses to_action_proposal().model_dump(mode="python").
     return ReviewProposalEnvelope(
-        proposal=proposal,
+        proposal=snapshot,
         run_id=run_id,
         result_id=result_id,
         task_id=task_id,
@@ -166,7 +180,7 @@ def _make_envelope(
         agent_version=agent_version,
         origin_hash=stable_hash(
             {
-                "proposal": proposal.model_dump(mode="python"),
+                "proposal": snapshot.to_action_proposal().model_dump(mode="python"),
                 "run_id": run_id,
                 "result_id": result_id,
                 "task_id": task_id,
@@ -174,6 +188,78 @@ def _make_envelope(
                 "agent_version": agent_version,
             }
         ),
+    )
+
+
+def _make_run_identity(
+    *,
+    run_id: str = "run-test-001",
+    tenant_id: str = "tenant-test",
+    plan_hash: str = "plan-test-hash",
+    registry_version: str = "registry-test-v1",
+) -> ExecutionRunIdentity:
+    identity_hash = stable_hash(
+        {
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "plan_hash": plan_hash,
+            "registry_version": registry_version,
+        }
+    )
+    return ExecutionRunIdentity(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        plan_hash=plan_hash,
+        registry_version=registry_version,
+        identity_hash=identity_hash,
+    )
+
+
+def _make_result_origin(
+    proposal: ActionProposal,
+    *,
+    run_id: str = "run-test-001",
+    tenant_id: str = "tenant-test",
+    result_id: str = "r-test-001",
+    task_id: str = "task-test",
+    agent_id: str = "agent_test",
+    agent_version: str = "1.0.0",
+    evidence: list[Evidence] | None = None,
+) -> ResultOriginSnapshot:
+    """R2.1 P0-4: build a ResultOriginSnapshot whose origin_hash is
+    verified on construction."""
+    proposal_hashes: tuple[tuple[str, str], ...] = (
+        (proposal.proposal_id, proposal.proposal_hash),
+    )
+    evidence_hashes_list: list[tuple[str, str]] = []
+    for ev in evidence or []:
+        if proposal.evidence_ids and ev.evidence_id in proposal.evidence_ids:
+            evidence_hashes_list.append(
+                (ev.evidence_id, compute_review_evidence_hash(ev))
+            )
+    evidence_hashes = tuple(evidence_hashes_list)
+    origin_hash = stable_hash(
+        {
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "result_id": result_id,
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "agent_version": agent_version,
+            "proposal_hashes": sorted(proposal_hashes),
+            "evidence_hashes": sorted(evidence_hashes),
+        }
+    )
+    return ResultOriginSnapshot(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        result_id=result_id,
+        task_id=task_id,
+        agent_id=agent_id,
+        agent_version=agent_version,
+        proposal_hashes=proposal_hashes,
+        evidence_hashes=evidence_hashes,
+        origin_hash=origin_hash,
     )
 
 
@@ -194,13 +280,36 @@ def _make_request(
         )
         for ev in raw_evidence
     ]
+    # R2.1 P0-1: convert ActionProposal → ReviewProposalSnapshot.
+    proposal_snapshots: tuple[ReviewProposalSnapshot, ...] = tuple(
+        ReviewProposalSnapshot.from_proposal(p) for p in proposals
+    )
+    # R2.1 P0-3: default capability_binding for task-test so the
+    # Reviewer's exact-task authority check passes.  Tests that need
+    # a different authority pass their own capability_bindings.
+    if capability_bindings is None:
+        default_cap = _make_capability()
+        capability_bindings = [_make_capability_binding(default_cap)]
+    # R2.1 P0-4: result_origins are REQUIRED.  Each proposal gets a
+    # unique result_id to avoid the duplicate-result_id rejection.
+    # The envelope's result_id MUST match the corresponding
+    # result_origin's result_id so the identity-uniqueness validator
+    # can bind Envelope → ResultOrigin.
+    result_ids = [f"r-test-{i:03d}" for i in range(len(proposals))]
+    origins = [
+        _make_result_origin(p, result_id=rid, evidence=raw_evidence)
+        for p, rid in zip(proposals, result_ids)
+    ]
+    envelopes = [
+        _make_envelope(p, result_id=rid) for p, rid in zip(proposals, result_ids)
+    ]
     return ReviewRequest(
         review_id=review_id,
         run_id="run-test-001",
         tenant_id="tenant-test",
         plan_hash="plan-test-hash",
         registry_version="registry-test-v1",
-        proposals=proposals,
+        proposals=proposal_snapshots,
         evidence=evidence_snapshots,
         task_records=[
             TaskRecordSummary(
@@ -210,13 +319,15 @@ def _make_request(
             )
         ],
         trace=[TraceSummary(sequence=0, event_type="run_started")],
-        capability_bindings=capability_bindings or [],
-        proposal_envelopes=[_make_envelope(p) for p in proposals],
+        capability_bindings=capability_bindings,
+        proposal_envelopes=envelopes,
+        result_origins=origins,
         policy_context=policy_context
         or PolicyContext(
             policy_version="test-v1",
             rules=[],
         ),
+        run_identity=_make_run_identity(),
         governance_spec_version=ACTION_GOVERNANCE_SPEC_VERSION,
         governance_spec_hash=ACTION_GOVERNANCE_SPEC_HASH,
         review_schema_version=REVIEW_SCHEMA_VERSION,
@@ -291,20 +402,18 @@ class TestAuthorityValidation:
 
     @pytest.mark.asyncio
     async def test_no_capability_snapshot_rejected(self):
+        """R2.1 P0-3: a Request whose envelope task_id has no matching
+        capability_binding is rejected at the Request boundary (not at
+        review time) — the exact-task capability check is a structural
+        invariant, not a per-Proposal decision."""
         prop = _make_proposal(evidence_ids=["ev-001"])
         ev = _make_evidence("ev-001")
-        req = _make_request(
-            [prop],
-            evidence=[ev],
-            capability_bindings=[],  # no snapshot
-        )
-        reviewer = ProposalReviewer()
-        result = await reviewer.review(
-            req, policy_evaluator=DeterministicPolicyEvaluator()
-        )
-        review = result.proposal_reviews[0]
-        assert review.status == ReviewDecisionStatus.REJECTED
-        assert not review.authority_valid
+        with pytest.raises(InvalidReviewRequestError):
+            _make_request(
+                [prop],
+                evidence=[ev],
+                capability_bindings=[],  # no snapshot
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +493,7 @@ class TestPolicyIntegration:
         cap = _make_capability_binding(
             _make_capability(authority=AgentAuthority.READ),
         )
-        # Fake evaluator returns DENIED
+        # Fake evaluator returns DENIED with the required finding.
         fake = FakePolicyEvaluator()
         fake.set(
             "prop-001",
@@ -392,6 +501,14 @@ class TestPolicyIntegration:
                 proposal_id="prop-001",
                 decision=PolicyDecision.DENIED,
                 policy_version="test-v1",
+                findings=(
+                    ReviewFinding(
+                        finding_code=CODE_POLICY_DENIED,
+                        severity=ReviewFindingSeverity.ERROR,
+                        message="policy denied",
+                        proposal_id="prop-001",
+                    ),
+                ),
             ),
         )
         req = _make_request([prop], evidence=[ev], capability_bindings=[cap])
@@ -415,6 +532,14 @@ class TestPolicyIntegration:
                 proposal_id="prop-001",
                 decision=PolicyDecision.NEEDS_INPUT,
                 policy_version="test-v1",
+                findings=(
+                    ReviewFinding(
+                        finding_code=CODE_POLICY_NEEDS_INPUT,
+                        severity=ReviewFindingSeverity.WARNING,
+                        message="policy needs input",
+                        proposal_id="prop-001",
+                    ),
+                ),
             ),
         )
         req = _make_request([prop], evidence=[ev], capability_bindings=[cap])

@@ -647,16 +647,39 @@ class OPAReviewAdapter:
                 f"{request.proposal_id!r}"
             )
         matched_rules: list[PolicyMatchedRule] = []
-        for r in matched_rules_raw:
+        for idx, r in enumerate(matched_rules_raw):
+            # R2.1 P0-6: any malformed matched_rule entry must cause
+            # the ENTIRE Policy Evaluation to Fail-Closed.  Previously
+            # these used ``continue`` which silently dropped invalid
+            # entries — allowing an OPA adapter to return rules that
+            # don't exist in the Request's Policy Snapshot.
             if not isinstance(r, dict):
-                continue
-            rule_id = str(r.get("rule_id", ""))
-            if not rule_id.strip():
-                continue
+                raise PolicyEvaluationError(
+                    f"OPA matched_rules[{idx}] is not a dict for proposal "
+                    f"{request.proposal_id!r}: {type(r).__name__}"
+                )
+            rule_id = str(r.get("rule_id", "")).strip()
+            if not rule_id:
+                raise PolicyEvaluationError(
+                    f"OPA matched_rules[{idx}] has blank rule_id for "
+                    f"proposal {request.proposal_id!r}"
+                )
+            raw_effect = r.get("effect")
+            if raw_effect is None:
+                # R2.1 P0-6: missing effect is NO LONGER defaulted to
+                # "allowed" — it is a Fail-Closed error.
+                raise PolicyEvaluationError(
+                    f"OPA matched_rules[{idx}] (rule_id={rule_id!r}) has "
+                    f"no 'effect' field for proposal {request.proposal_id!r}"
+                )
             try:
-                effect = PolicyDecision(str(r.get("effect", "allowed")))
+                effect = PolicyDecision(str(raw_effect))
             except ValueError:
-                continue
+                raise PolicyEvaluationError(
+                    f"OPA matched_rules[{idx}] (rule_id={rule_id!r}) has "
+                    f"illegal effect {raw_effect!r} for proposal "
+                    f"{request.proposal_id!r}"
+                )
             matched_rules.append(
                 PolicyMatchedRule(
                     rule_id=rule_id,

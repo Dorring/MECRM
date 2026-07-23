@@ -39,7 +39,9 @@ from multi_agent.contracts import (
 )
 from multi_agent.execution import (
     ExecutionCapabilitySnapshot,
+    ExecutionRunIdentity,
     ExecutionTraceEvent,
+    ResultOriginSnapshot,
     SupervisorRunResult,
     SupervisorRunStatus,
     TaskExecutionRecord,
@@ -59,6 +61,7 @@ from multi_agent.review_evaluation import (
     compute_review_metrics,
     default_policy_context,
 )
+from multi_agent.evidence_review import compute_review_evidence_hash
 from multi_agent.policy import DeterministicPolicyEvaluator
 from multi_agent.reviewer import ProposalReviewer
 from multi_agent.serialization import stable_hash
@@ -154,6 +157,42 @@ def _make_supervisor_result(
 ) -> SupervisorRunResult:
     proposals = proposals or [_make_proposal(tenant_id=tenant_id)]
     evidence = evidence or [_make_evidence(tenant_id=tenant_id)]
+    # R2.1 P0-3: every envelope's task_id MUST have a matching
+    # capability_binding.  Default to a READ-only capability so the
+    # Reviewer's exact-task authority check passes for report-style
+    # proposals.  Tests that need a different authority pass their
+    # own capability_bindings.
+    if capability_bindings is None:
+        default_cap = AgentCapability(
+            agent_id=agent_id,
+            version="1.0.0",
+            description="default test capability",
+            domains=frozenset({"test"}),
+            supported_tasks=frozenset({"test_task"}),
+            allowed_tools=frozenset({"crm_reader.get_customers"}),
+            authority=AgentAuthority.READ,
+            input_contract="in",
+            output_contract="out",
+            timeout_ms=300_000,
+            max_retries=0,
+            estimated_cost_class="low",
+        )
+        capability_bindings = [
+            ExecutionCapabilitySnapshot(
+                task_id=task_id,
+                agent_id=agent_id,
+                agent_version="1.0.0",
+                capability=default_cap,
+                binding_hash=stable_hash(
+                    {
+                        "task_id": task_id,
+                        "agent_id": agent_id,
+                        "agent_version": "1.0.0",
+                        "capability": default_cap.model_dump(mode="python"),
+                    }
+                ),
+            )
+        ]
     result = _make_agent_result(
         proposals=proposals,
         evidence=evidence,
@@ -167,6 +206,54 @@ def _make_supervisor_result(
         merged_proposals=proposals,
         conflicts=[],
         merged_at=_TS,
+    )
+    # R2.1 P0-4: SupervisorRunResult MUST carry run_identity and
+    # result_origins.  The Phase 5A Adapter copies them verbatim and
+    # refuses to regenerate them.
+    identity_hash = stable_hash(
+        {
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "plan_hash": "plan-hash-test",
+            "registry_version": "registry-v1",
+        }
+    )
+    run_identity = ExecutionRunIdentity(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        plan_hash="plan-hash-test",
+        registry_version="registry-v1",
+        identity_hash=identity_hash,
+    )
+    # Build a ResultOriginSnapshot whose origin_hash matches the
+    # Supervisor's canonical computation (run_id + tenant_id + result
+    # identity + proposal_hashes + evidence_hashes).
+    proposal_hashes = tuple((p.proposal_id, p.proposal_hash) for p in proposals)
+    evidence_hashes = tuple(
+        (ev.evidence_id, compute_review_evidence_hash(ev)) for ev in evidence
+    )
+    origin_hash = stable_hash(
+        {
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "result_id": result.result_id,
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "agent_version": "1.0.0",
+            "proposal_hashes": sorted(proposal_hashes),
+            "evidence_hashes": sorted(evidence_hashes),
+        }
+    )
+    result_origin = ResultOriginSnapshot(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        result_id=result.result_id,
+        task_id=task_id,
+        agent_id=agent_id,
+        agent_version="1.0.0",
+        proposal_hashes=proposal_hashes,
+        evidence_hashes=evidence_hashes,
+        origin_hash=origin_hash,
     )
     return SupervisorRunResult(
         run_id=run_id,
@@ -193,7 +280,9 @@ def _make_supervisor_result(
                 occurred_at=_TS,
             )
         ],
-        capability_bindings=capability_bindings or [],
+        capability_bindings=capability_bindings,
+        run_identity=run_identity,
+        result_origins=(result_origin,),
         started_at=_TS,
         completed_at=_TS,
         duration_ms=0,
@@ -215,7 +304,9 @@ class TestDefaultPolicyContext:
         assert ctx_a.policy_version == "ma-05a-default"
         # R2 P0-6: rules is a tuple[PolicyRule, ...]
         assert ctx_a.rules == ()
-        assert ctx_a.tenant_overrides == {}
+        # R2.1 P0-1: tenant_overrides is deep-frozen — empty dict {}
+        # freezes to empty tuple () (dict → tuple of (k, v) tuples).
+        assert ctx_a.tenant_overrides == ()
 
     def test_default_policy_context_is_frozen(self):
         ctx = default_policy_context()

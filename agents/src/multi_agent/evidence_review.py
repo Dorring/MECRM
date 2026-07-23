@@ -118,12 +118,15 @@ def compute_review_evidence_hash(evidence: Evidence) -> str:
     R2 P0-3: this function is called by
     :class:`ReviewEvidenceSnapshot._verify_snapshot_hash` to verify
     the snapshot at the Request boundary.
-    """
-    from multi_agent.serialization import stable_hash
 
-    payload = evidence.model_dump(mode="python")
-    payload.pop("content_hash", None)
-    return stable_hash(payload)
+    R2.1 P0-4: delegates to
+    :func:`multi_agent.integrity.compute_evidence_hash_from_payload`
+    so Phase 4 (``SupervisorRuntime._finalize``) and Phase 5A produce
+    identical Evidence hashes for ``ResultOriginSnapshot`` cross-checks.
+    """
+    from multi_agent.integrity import compute_evidence_hash_from_payload
+
+    return compute_evidence_hash_from_payload(evidence.model_dump(mode="python"))
 
 
 # ---------------------------------------------------------------------------

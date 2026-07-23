@@ -49,3 +49,20 @@ def compute_proposal_hash(
             "requires_approval": requires_approval,
         }
     )
+
+
+def compute_evidence_hash_from_payload(payload: dict[str, Any]) -> str:
+    """R2.1 P0-4: stable SHA-256 over canonical Evidence content.
+
+    Single source of truth for Evidence content integrity shared by
+    Phase 4 (``SupervisorRuntime._finalize`` building
+    ``ResultOriginSnapshot.evidence_hashes``) and Phase 5A
+    (:func:`multi_agent.evidence_review.compute_review_evidence_hash`
+    used by :class:`ReviewEvidenceSnapshot._verify_snapshot_hash`).
+
+    Excludes the self-referential ``content_hash`` field so a tampered
+    Evidence that keeps the old declared hash is still detected.
+    """
+    p = dict(payload)
+    p.pop("content_hash", None)
+    return content_hash(p)

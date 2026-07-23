@@ -48,6 +48,7 @@ from multi_agent.execution import (
     ExecutionRunIdentity,
     ExecutionTraceEvent,
     FakeExecutionCancellation,
+    ResultOriginSnapshot,
     SupervisorConfig,
     SupervisorRunResult,
     SupervisorRunStatus,
@@ -109,6 +110,7 @@ from multi_agent.scheduler import (
     PreDispatch,
     TaskOutcome,
 )
+from multi_agent.integrity import compute_evidence_hash_from_payload
 from multi_agent.state import merge_parallel_results
 from multi_agent.serialization import stable_hash
 
@@ -3038,6 +3040,54 @@ class SupervisorRuntime:
                 }
             ),
         )
+        # R2.1 P0-4: build ResultOriginSnapshot for every AgentResult
+        # produced during this Run.  Each snapshot's ``origin_hash`` is
+        # verified by ResultOriginSnapshot's model_validator and covers
+        # the Result identity (run_id / tenant_id / result_id / task_id
+        # / agent_id / agent_version) PLUS the Result's full Proposal
+        # Hash list and Evidence Snapshot Hash list.  The Phase 5A
+        # Adapter MUST copy this tuple verbatim — it MUST NOT regenerate
+        # ResultOriginSnapshot from ``merged_state.results``.
+        result_origins_list: list[ResultOriginSnapshot] = []
+        for res in valid_results:
+            proposal_pairs = tuple(
+                (ap.proposal_id, ap.proposal_hash)
+                for ap in sorted(res.action_proposals, key=lambda p: p.proposal_id)
+                if ap.proposal_hash
+            )
+            evidence_pairs = tuple(
+                (
+                    ev.evidence_id,
+                    compute_evidence_hash_from_payload(ev.model_dump(mode="python")),
+                )
+                for ev in sorted(res.evidence, key=lambda e: e.evidence_id)
+            )
+            origin_hash = stable_hash(
+                {
+                    "run_id": plan.run_id,
+                    "tenant_id": res.tenant_id,
+                    "result_id": res.result_id,
+                    "task_id": res.task_id,
+                    "agent_id": res.agent_id,
+                    "agent_version": res.agent_version,
+                    "proposal_hashes": sorted(proposal_pairs),
+                    "evidence_hashes": sorted(evidence_pairs),
+                }
+            )
+            result_origins_list.append(
+                ResultOriginSnapshot(
+                    run_id=plan.run_id,
+                    tenant_id=res.tenant_id,
+                    result_id=res.result_id,
+                    task_id=res.task_id,
+                    agent_id=res.agent_id,
+                    agent_version=res.agent_version,
+                    proposal_hashes=proposal_pairs,
+                    evidence_hashes=evidence_pairs,
+                    origin_hash=origin_hash,
+                )
+            )
+        result_origins = tuple(sorted(result_origins_list, key=lambda ro: ro.result_id))
         result = SupervisorRunResult(
             run_id=plan.run_id,
             plan_hash=plan.plan_hash,
@@ -3049,6 +3099,7 @@ class SupervisorRuntime:
             trace=trace.events,
             capability_bindings=capability_bindings,
             run_identity=run_identity,
+            result_origins=result_origins,
             started_at=started_at,
             completed_at=completed_at,
             duration_ms=duration_ms,

@@ -5,7 +5,8 @@ Covers (Phase 5A Section 17 — Graph Parity):
 * Happy path — the graph delegates to :meth:`ProposalReviewer.review`
   and returns the result in ``state.result``.
 * Error propagation — when the Reviewer raises a :class:`ReviewError`,
-  the graph captures it in ``state.error`` and does not crash.
+  the graph captures it in ``state.graph_error`` (a persistable
+  :class:`ReviewGraphError`) and does not crash.
 * Graph parity — direct reviewer output equals graph output byte-for-byte
   (verified by comparing ``result_hash``).
 * The graph does NOT re-implement Policy, Conflict, or Hash algorithms
@@ -13,6 +14,12 @@ Covers (Phase 5A Section 17 — Graph Parity):
   the graph routes correctly without performing real review work.
 * Validation error routing — a tampered :class:`ReviewRequest` (hash
   mismatch) routes the graph to END without invoking the Reviewer.
+
+R2.1 P1-1: the Graph State no longer carries a raw
+``error: Exception | None`` field.  All error-path assertions now read
+``state.graph_error`` (a frozen :class:`ReviewGraphError`) and verify
+its ``error_code``.  Direct/Graph Error Code parity is verified for
+each error boundary.
 """
 
 from __future__ import annotations
@@ -34,14 +41,20 @@ from multi_agent.contracts import (
     EvidenceType,
 )
 from multi_agent.evidence_review import compute_review_evidence_hash
-from multi_agent.execution import ExecutionCapabilitySnapshot
+from multi_agent.execution import (
+    ExecutionCapabilitySnapshot,
+    ExecutionRunIdentity,
+    ResultOriginSnapshot,
+)
 from multi_agent.policy import DeterministicPolicyEvaluator
 from multi_agent.review_contracts import (
     PolicyContext,
     ReviewBatchResult,
     ReviewBatchStatus,
     ReviewEvidenceSnapshot,
+    ReviewGraphError,
     ReviewProposalEnvelope,
+    ReviewProposalSnapshot,
     ReviewRequest,
     REVIEW_SCHEMA_VERSION,
     TaskRecordSummary,
@@ -50,7 +63,6 @@ from multi_agent.review_contracts import (
 )
 from multi_agent.review_errors import (
     ReviewError,
-    ReviewIntegrityError,
 )
 from multi_agent.review_evaluation import build_review_fixtures
 from multi_agent.review_graph import (
@@ -164,8 +176,12 @@ def _make_envelope(
     agent_version: str = "1.0.0",
 ) -> ReviewProposalEnvelope:
     aid = proposal.created_by_agent
+    # R2.1 P0-1: Envelope carries a deep-frozen ReviewProposalSnapshot.
+    snapshot = ReviewProposalSnapshot.from_proposal(proposal)
+    # R2.1 P0-1: origin_hash MUST match the envelope's validator which
+    # uses to_action_proposal().model_dump(mode="python").
     return ReviewProposalEnvelope(
-        proposal=proposal,
+        proposal=snapshot,
         run_id=run_id,
         result_id=result_id,
         task_id=task_id,
@@ -173,7 +189,7 @@ def _make_envelope(
         agent_version=agent_version,
         origin_hash=stable_hash(
             {
-                "proposal": proposal.model_dump(mode="python"),
+                "proposal": snapshot.to_action_proposal().model_dump(mode="python"),
                 "run_id": run_id,
                 "result_id": result_id,
                 "task_id": task_id,
@@ -181,6 +197,78 @@ def _make_envelope(
                 "agent_version": agent_version,
             }
         ),
+    )
+
+
+def _make_run_identity(
+    *,
+    run_id: str = "run-graph-001",
+    tenant_id: str = "tenant-graph",
+    plan_hash: str = "plan-graph-hash",
+    registry_version: str = "registry-graph-v1",
+) -> ExecutionRunIdentity:
+    identity_hash = stable_hash(
+        {
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "plan_hash": plan_hash,
+            "registry_version": registry_version,
+        }
+    )
+    return ExecutionRunIdentity(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        plan_hash=plan_hash,
+        registry_version=registry_version,
+        identity_hash=identity_hash,
+    )
+
+
+def _make_result_origin(
+    proposal: ActionProposal,
+    *,
+    run_id: str = "run-graph-001",
+    tenant_id: str = "tenant-graph",
+    result_id: str = "r-graph-001",
+    task_id: str = "task-graph-001",
+    agent_id: str = "agent_graph",
+    agent_version: str = "1.0.0",
+    evidence: list[Evidence] | None = None,
+) -> ResultOriginSnapshot:
+    """R2.1 P0-4: build a ResultOriginSnapshot whose origin_hash is
+    verified on construction."""
+    proposal_hashes: tuple[tuple[str, str], ...] = (
+        (proposal.proposal_id, proposal.proposal_hash),
+    )
+    evidence_hashes_list: list[tuple[str, str]] = []
+    for ev in evidence or []:
+        if proposal.evidence_ids and ev.evidence_id in proposal.evidence_ids:
+            evidence_hashes_list.append(
+                (ev.evidence_id, compute_review_evidence_hash(ev))
+            )
+    evidence_hashes = tuple(evidence_hashes_list)
+    origin_hash = stable_hash(
+        {
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "result_id": result_id,
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "agent_version": agent_version,
+            "proposal_hashes": sorted(proposal_hashes),
+            "evidence_hashes": sorted(evidence_hashes),
+        }
+    )
+    return ResultOriginSnapshot(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        result_id=result_id,
+        task_id=task_id,
+        agent_id=agent_id,
+        agent_version=agent_version,
+        proposal_hashes=proposal_hashes,
+        evidence_hashes=evidence_hashes,
+        origin_hash=origin_hash,
     )
 
 
@@ -201,13 +289,19 @@ def _make_request(
         )
         for ev in raw_evidence
     ]
+    # R2.1 P0-1: convert ActionProposal → ReviewProposalSnapshot.
+    proposal_snapshots: tuple[ReviewProposalSnapshot, ...] = tuple(
+        ReviewProposalSnapshot.from_proposal(p) for p in props
+    )
+    # R2.1 P0-4: result_origins are REQUIRED.
+    origins = [_make_result_origin(p, evidence=raw_evidence) for p in props]
     return ReviewRequest(
         review_id=review_id,
         run_id="run-graph-001",
         tenant_id="tenant-graph",
         plan_hash="plan-graph-hash",
         registry_version="registry-graph-v1",
-        proposals=props,
+        proposals=proposal_snapshots,
         evidence=evidence_snapshots,
         task_records=[
             TaskRecordSummary(
@@ -227,10 +321,12 @@ def _make_request(
         capability_bindings=capability_bindings
         or [_make_capability_binding(_make_capability())],
         proposal_envelopes=[_make_envelope(p) for p in props],
+        result_origins=origins,
         policy_context=PolicyContext(
             policy_version="graph-test-v1",
             rules=[],
         ),
+        run_identity=_make_run_identity(),
         governance_spec_version=ACTION_GOVERNANCE_SPEC_VERSION,
         governance_spec_hash=ACTION_GOVERNANCE_SPEC_HASH,
         review_schema_version=REVIEW_SCHEMA_VERSION,
@@ -260,6 +356,7 @@ def _make_batch_result(
         approval_required_proposal_ids=[],
         conflicted_proposal_ids=[],
         findings=[],
+        governance_spec_hash=ACTION_GOVERNANCE_SPEC_HASH,
         reviewer_version=REVIEWER_VERSION,
     )
 
@@ -286,7 +383,7 @@ class TestReviewGraphHappyPath:
 
         assert result_state["result"] is not None
         assert isinstance(result_state["result"], ReviewBatchResult)
-        assert result_state["error"] is None
+        assert result_state["graph_error"] is None
 
     @pytest.mark.asyncio
     async def test_graph_calls_reviewer_once(self):
@@ -310,7 +407,7 @@ class TestReviewGraphHappyPath:
 
 
 class TestReviewGraphErrorPropagation:
-    """Errors from the Reviewer are captured in state.error."""
+    """Errors from the Reviewer are captured in state.graph_error."""
 
     @pytest.mark.asyncio
     async def test_integrity_error_routes_to_end(self):
@@ -332,16 +429,22 @@ class TestReviewGraphErrorPropagation:
         )
         result_state = await graph.ainvoke(state)
 
-        # The graph should have captured the integrity error and NOT
-        # called the reviewer.
-        assert result_state["error"] is not None
-        assert isinstance(result_state["error"], ReviewIntegrityError)
+        # R2.1 P1-1: the graph captures the error as a persistable
+        # ReviewGraphError (NOT a raw Exception).  The error_code is
+        # stable across runs.
+        assert result_state["graph_error"] is not None
+        assert isinstance(result_state["graph_error"], ReviewGraphError)
+        assert (
+            result_state["graph_error"].error_code == "review.graph.request_integrity"
+        )
+        # No raw Exception in the State.
+        assert "error" not in result_state
         assert len(fake.calls) == 0
 
     @pytest.mark.asyncio
     async def test_reviewer_error_is_captured(self):
         """When the Reviewer raises, the graph captures the exception
-        in ``state.error`` and returns no result.
+        in ``state.graph_error`` and returns no result.
         """
         request = _make_request()
         fake = FakeProposalReviewer(
@@ -355,10 +458,14 @@ class TestReviewGraphErrorPropagation:
         )
         result_state = await graph.ainvoke(state)
 
-        assert result_state["error"] is not None
-        assert isinstance(result_state["error"], ReviewError)
-        assert "synthetic reviewer failure" in str(result_state["error"])
+        # R2.1 P1-1: only ReviewGraphError enters the State.
+        assert result_state["graph_error"] is not None
+        assert isinstance(result_state["graph_error"], ReviewGraphError)
+        assert result_state["graph_error"].error_code == "review.graph.review_failed"
+        assert "synthetic reviewer failure" in result_state["graph_error"].message
         assert result_state["result"] is None
+        # No raw Exception in the State.
+        assert "error" not in result_state
 
 
 # ===========================================================================
@@ -495,8 +602,11 @@ class TestReviewGraphRouting:
         )
         result_state = await graph.ainvoke(state)
 
-        assert result_state["error"] is not None
-        assert isinstance(result_state["error"], ReviewIntegrityError)
+        # R2.1 P1-1: only ReviewGraphError is in the State.
+        assert result_state["graph_error"] is not None
+        assert isinstance(result_state["graph_error"], ReviewGraphError)
+        assert result_state["graph_error"].error_code == "review.graph.finalize_failed"
+        assert "error" not in result_state
 
 
 # ===========================================================================
@@ -516,7 +626,9 @@ class TestReviewGraphState:
         assert state.request is request
         assert state.reviewer is None
         assert state.result is None
-        assert state.error is None
+        # R2.1 P1-1: only graph_error — no raw `error` field.
+        assert state.graph_error is None
+        assert not hasattr(state, "error")
 
     def test_state_accepts_fake_reviewer(self):
         request = _make_request()

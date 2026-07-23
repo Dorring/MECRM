@@ -47,17 +47,18 @@ R2 changes (P0-1 .. P0-9 + S1 .. S14):
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
 from hmac import compare_digest
-from typing import Any
+from typing import Any, cast
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from multi_agent.contracts import (
     ActionProposal,
+    ActionRiskLevel,
     AgentCapability,
     Evidence,
-    JsonValue,
     StrictContract,
 )
 from multi_agent.execution import (
@@ -71,6 +72,85 @@ from multi_agent.review_errors import (
     ReviewIntegrityError,
 )
 from multi_agent.serialization import canonicalize, content_hash, stable_hash
+
+
+# ---------------------------------------------------------------------------
+# R2.1 P0-1: Deep Frozen JSON — recursive immutable JSON-like value.
+# ---------------------------------------------------------------------------
+
+
+def freeze_json_value(value: Any) -> Any:
+    """Recursively convert a JSON-like value into a deeply immutable form.
+
+    R2.1 P0-1: ``frozen=True`` on a Pydantic model only blocks field
+    re-assignment — it does NOT block in-place mutation of ``dict`` /
+    ``list`` / ``set`` field values.  This converter produces a fully
+    immutable structure so a frozen Contract's nested payload cannot
+    be tampered with between ``verify_integrity()`` and decision use.
+
+    Conversion rules (recursive):
+
+    * ``dict`` → ``tuple`` of ``(str_key, frozen_value)`` tuples sorted
+      by key (canonical order so the frozen form is hash-stable).
+    * ``list`` / ``tuple`` → ``tuple`` of frozen values (order preserved).
+    * ``set`` / ``frozenset`` → ``frozenset`` of frozen values.
+    * ``None`` / ``bool`` / ``int`` / ``float`` / ``str`` → returned as-is.
+    * Anything else (Enum, datetime, Decimal, BaseModel, bytes) is
+      canonicalised via :func:`multi_agent.serialization.canonicalize`
+      first, then frozen — so the frozen form is always JSON-native.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return tuple(
+            (str(k), freeze_json_value(v))
+            for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(freeze_json_value(v) for v in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(freeze_json_value(v) for v in value)
+    # Non-JSON-native (Enum, datetime, Decimal, BaseModel, bytes) —
+    # canonicalise to JSON-native first, then freeze.
+    return freeze_json_value(canonicalize(value))
+
+
+def frozen_value_to_json(value: Any) -> Any:
+    """Inverse of :func:`freeze_json_value` — returns a JSON-native copy.
+
+    Used by ``model_dump()`` / hash computation so the frozen tuple-of-
+    tuples form round-trips back to a plain dict for serialisation.
+    The returned value is a fresh copy — mutating it does NOT affect
+    the frozen Contract.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, tuple):
+        # Distinguish dict-derived tuples (tuple of (str, v) tuples)
+        # from list-derived tuples (tuple of plain values).
+        if value and all(
+            isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str)
+            for item in value
+        ):
+            return {k: frozen_value_to_json(v) for k, v in value}
+        return [frozen_value_to_json(v) for v in value]
+    if isinstance(value, frozenset):
+        return sorted(
+            (frozen_value_to_json(v) for v in value),
+            key=lambda x: str(x),
+        )
+    return value
+
+
+# ``FrozenJsonValue`` is the type alias for the output of
+# :func:`freeze_json_value`.  It is declared as ``Any`` because the
+# actual recursive type (``Union[None, bool, int, float, str,
+# tuple[FrozenJsonValue, ...], frozenset[FrozenJsonValue],
+# tuple[tuple[str, FrozenJsonValue], ...]]``) is not directly
+# expressible as a Pydantic field type without a custom
+# ``__get_pydantic_core_schema__``.  Immutability is enforced by the
+# ``freeze_json_value`` validator, NOT by the type annotation.
+FrozenJsonValue = Any
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +364,221 @@ class CapabilitySnapshot(StrictContract):
     capability: AgentCapability
 
 
+class ReviewProposalSnapshot(StrictContract):
+    """R2.1 P0-1: Reviewer-owned deep-frozen snapshot of an ActionProposal.
+
+    Phase 2's :class:`ActionProposal` is NOT frozen (it uses
+    ``validate_assignment=True`` but not ``frozen=True``) and its
+    ``payload: dict`` / ``evidence_ids: list`` fields are mutable
+    in-place.  Carrying a raw :class:`ActionProposal` inside
+    :class:`ReviewRequest` left a TOCTOU window: the Reviewer called
+    ``verify_integrity()`` once at entry, then ``await policy_evaluator.evaluate(...)``
+    could yield control, during which ``request.proposals[0].payload["amount"] = 999999``
+    would silently mutate the audited content.
+
+    This snapshot deep-freezes every mutable field:
+
+    * ``payload`` → ``FrozenJsonValue`` (tuple-of-tuples, sorted by key).
+    * ``evidence_ids`` → ``tuple[str, ...]``.
+    * ``snapshot_hash`` is verified on construction so a tampered
+      snapshot is rejected at the boundary.
+
+    The Reviewer consumes ONLY :class:`ReviewProposalSnapshot` — it
+    never reads the original :class:`ActionProposal` from Phase 2.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    proposal_id: str
+    proposal_hash: str
+    tenant_id: str
+    created_by_agent: str
+    action_type: str
+    target_entity: str
+    target_id: str | None = None
+    payload: FrozenJsonValue = ()
+    priority: str
+    risk_level: str
+    justification: str | None = None
+    evidence_ids: tuple[str, ...] = ()
+    requires_approval: bool = False
+    idempotency_key: str = ""
+    created_at: datetime
+    snapshot_hash: str
+
+    @field_validator(
+        "proposal_id",
+        "proposal_hash",
+        "tenant_id",
+        "created_by_agent",
+        "action_type",
+        "target_entity",
+        "priority",
+        "risk_level",
+        "snapshot_hash",
+    )
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError(
+                "ReviewProposalSnapshot identity / hash fields must not be blank"
+            )
+        return v
+
+    @field_validator("payload")
+    @classmethod
+    def _freeze_payload(cls, v: Any) -> Any:
+        # R2.1 P0-1: deep-freeze the payload so nested dict / list
+        # values become immutable tuple / frozenset structures.
+        return freeze_json_value(v)
+
+    @field_validator("evidence_ids")
+    @classmethod
+    def _freeze_evidence_ids(cls, v: Any) -> tuple[str, ...]:
+        if isinstance(v, (list, tuple)):
+            return tuple(str(x).strip() for x in v if str(x).strip())
+        return tuple(v)
+
+    @model_validator(mode="after")
+    def _verify_snapshot_hash(self) -> "ReviewProposalSnapshot":
+        expected = self.compute_snapshot_hash()
+        if self.snapshot_hash != expected:
+            raise ValueError(
+                "ReviewProposalSnapshot.snapshot_hash mismatch — tamper detected"
+            )
+        return self
+
+    def compute_snapshot_hash(self) -> str:
+        """Stable SHA-256 over the canonical snapshot content.
+
+        Excludes ``snapshot_hash`` (self-referential).  Uses
+        ``self.payload`` directly (already frozen) so the hash matches
+        :meth:`from_proposal`'s ``snapshot_hash`` computation — both
+        paths feed the frozen payload through :func:`stable_hash`,
+        which canonicalises tuples to lists.  An earlier version used
+        :func:`frozen_value_to_json` here, which diverged from
+        ``from_proposal`` for empty dicts (``{}`` → ``()`` → ``[]``).
+        """
+        payload = {
+            "proposal_id": self.proposal_id,
+            "proposal_hash": self.proposal_hash,
+            "tenant_id": self.tenant_id,
+            "created_by_agent": self.created_by_agent,
+            "action_type": self.action_type,
+            "target_entity": self.target_entity,
+            "target_id": self.target_id,
+            "payload": self.payload,
+            "priority": self.priority,
+            "risk_level": self.risk_level,
+            "justification": self.justification,
+            "evidence_ids": sorted(self.evidence_ids),
+            "requires_approval": self.requires_approval,
+            "idempotency_key": self.idempotency_key,
+            "created_at": self.created_at,
+        }
+        return stable_hash(payload)
+
+    @classmethod
+    def from_proposal(cls, proposal: ActionProposal) -> "ReviewProposalSnapshot":
+        """Build a deep-frozen snapshot from a Phase 2 :class:`ActionProposal`.
+
+        Used by the Phase 5A Adapter when constructing
+        :class:`ReviewRequest`.  The snapshot's ``snapshot_hash`` is
+        computed from the proposal's canonical content so cross-checks
+        against ``ActionProposal.proposal_hash`` are stable.
+
+        R2.1 P0-1 note: ``snapshot_hash`` is computed over the
+        **frozen** payload (not the raw dict) so it matches what
+        :meth:`compute_snapshot_hash` produces when called on the
+        constructed snapshot.  Both paths feed the payload through
+        :func:`freeze_json_value` and then through :func:`stable_hash`
+        (which canonicalises tuples to lists).  An earlier version
+        computed ``snapshot_hash`` from the raw dict and
+        ``compute_snapshot_hash`` from ``frozen_value_to_json`` —
+        those two diverged for empty dicts (``{}`` → ``()`` → ``[]``)
+        and caused false tamper alerts.
+        """
+        payload = freeze_json_value(proposal.payload)
+        evidence_ids = tuple(proposal.evidence_ids or ())
+        # Compute snapshot_hash from the FROZEN payload so the value
+        # matches compute_snapshot_hash() after construction.
+        snapshot_hash = stable_hash(
+            {
+                "proposal_id": proposal.proposal_id,
+                "proposal_hash": proposal.proposal_hash,
+                "tenant_id": proposal.tenant_id,
+                "created_by_agent": proposal.created_by_agent,
+                "action_type": proposal.action_type,
+                "target_entity": proposal.target_entity,
+                "target_id": proposal.target_id,
+                "payload": payload,
+                "priority": proposal.priority,
+                "risk_level": proposal.risk_level,
+                "justification": proposal.justification,
+                "evidence_ids": sorted(proposal.evidence_ids or []),
+                "requires_approval": proposal.requires_approval,
+                "idempotency_key": proposal.idempotency_key,
+                "created_at": proposal.created_at,
+            }
+        )
+        return cls(
+            proposal_id=proposal.proposal_id,
+            proposal_hash=proposal.proposal_hash,
+            tenant_id=proposal.tenant_id,
+            created_by_agent=proposal.created_by_agent,
+            action_type=proposal.action_type,
+            target_entity=proposal.target_entity,
+            target_id=proposal.target_id,
+            payload=payload,
+            priority=proposal.priority,
+            risk_level=proposal.risk_level,
+            justification=proposal.justification,
+            evidence_ids=evidence_ids,
+            requires_approval=proposal.requires_approval,
+            idempotency_key=proposal.idempotency_key,
+            created_at=proposal.created_at,
+            snapshot_hash=snapshot_hash,
+        )
+
+    def to_action_proposal(self) -> ActionProposal:
+        """Return a fresh :class:`ActionProposal` copy of this snapshot.
+
+        Used when the Reviewer needs to delegate to Phase 2 helpers
+        (e.g. :func:`compute_proposal_hash`).  The returned proposal is
+        a independent copy — mutating it does NOT affect the snapshot.
+
+        R2.1 P0-1 note: ``payload`` is forced to a ``dict`` so it
+        satisfies :class:`ActionProposal`'s ``dict[str, JsonValue]``
+        field type even when the frozen payload is an empty tuple
+        (which ``frozen_value_to_json`` would otherwise convert to a
+        list).
+        """
+        raw_payload = frozen_value_to_json(self.payload)
+        # ActionProposal.payload is typed as dict[str, JsonValue].  An
+        # empty dict-derived frozen tuple round-trips to [] — coerce
+        # back to dict so the Phase 2 contract validates.
+        if not isinstance(raw_payload, dict):
+            raw_payload = dict(raw_payload) if raw_payload else {}
+        return ActionProposal(
+            proposal_id=self.proposal_id,
+            proposal_hash=self.proposal_hash,
+            tenant_id=self.tenant_id,
+            created_by_agent=self.created_by_agent,
+            action_type=self.action_type,
+            target_entity=self.target_entity,
+            target_id=self.target_id,
+            payload=raw_payload,
+            priority=cast(Any, self.priority),
+            risk_level=cast(ActionRiskLevel, self.risk_level),
+            justification=self.justification,
+            evidence_ids=list(self.evidence_ids),
+            requires_approval=self.requires_approval,
+            idempotency_key=self.idempotency_key,
+            created_at=self.created_at,
+        )
+
+
 class ReviewProposalEnvelope(StrictContract):
     """Frozen, strict-origin envelope binding a Proposal to the exact
     Phase 4 Task/Result that produced it.
@@ -292,11 +587,16 @@ class ReviewProposalEnvelope(StrictContract):
     to an arbitrary Task.  The Reviewer validates every field below
     against the ReviewRequest's task_records / capability_bindings /
     result_origins (R2 P0-1).
+
+    R2.1 P0-1: ``proposal`` is now a :class:`ReviewProposalSnapshot`
+    (deep-frozen) instead of a raw :class:`ActionProposal`.  This
+    closes the TOCTOU window where ``payload`` / ``evidence_ids``
+    could be mutated between ``verify_integrity()`` and decision use.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    proposal: ActionProposal
+    proposal: ReviewProposalSnapshot
     run_id: str
     result_id: str
     task_id: str
@@ -320,7 +620,9 @@ class ReviewProposalEnvelope(StrictContract):
 
         expected = stable_hash(
             {
-                "proposal": self.proposal.model_dump(mode="python"),
+                "proposal": self.proposal.to_action_proposal().model_dump(
+                    mode="python"
+                ),
                 "run_id": self.run_id,
                 "result_id": self.result_id,
                 "task_id": self.task_id,
@@ -353,12 +655,25 @@ class ReviewEvidenceSnapshot(StrictContract):
     The snapshot is constructed by the Phase 5A Adapter; the
     Reviewer verifies ``snapshot_hash`` matches the carried Evidence
     before consuming it.
+
+    R2.1 P0-1: ``metadata_frozen`` is the deep-frozen form of
+    :attr:`Evidence.metadata`.  The Reviewer reads ``metadata_frozen``
+    (not ``evidence.metadata``) so a TOCTOU mutation of the original
+    dict cannot affect the decision.  ``snapshot_hash`` is recomputed
+    from the frozen form so a tampered ``metadata`` field (which
+    would change the frozen form) is detected.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     evidence: Evidence
     snapshot_hash: str
+    # R2.1 P0-1: deep-frozen copy of ``evidence.metadata``.  Storing
+    # both the original Evidence (for backward compat with helpers
+    # that read ``evidence.metadata``) and the frozen form (for
+    # Reviewer decision logic) is intentional — the frozen form is
+    # what audit consumers should read.
+    metadata_frozen: FrozenJsonValue = None
 
     @field_validator("snapshot_hash")
     @classmethod
@@ -367,6 +682,11 @@ class ReviewEvidenceSnapshot(StrictContract):
         if not v:
             raise ValueError("ReviewEvidenceSnapshot.snapshot_hash must not be blank")
         return v
+
+    @field_validator("metadata_frozen")
+    @classmethod
+    def _freeze_metadata(cls, v: Any) -> Any:
+        return freeze_json_value(v)
 
     @model_validator(mode="after")
     def _verify_snapshot_hash(self) -> "ReviewEvidenceSnapshot":
@@ -441,13 +761,19 @@ class PolicyMatchedRule(StrictContract):
 
 
 class PolicyDecisionAudit(StrictContract):
-    """R2 S5: per-Proposal audit of the Policy decision.
+    """R2 S5 / R2.1 P0-7: per-Proposal audit of the Policy decision.
 
     Every Proposal — including those that skipped external Policy
     evaluation because Authority already failed — MUST carry one
     :class:`PolicyDecisionAudit`.  ``evaluator_source_id`` records
     which evaluator produced the decision
     (``deterministic-policy``, ``opa``, ``skipped-authority-failure``).
+
+    R2.1 P0-7: ``proposal_id`` / ``request_hash`` /
+    ``policy_request_hash`` bind the audit to the exact Proposal and
+    Request it answers, so a tampered or replayed audit cannot be
+    attached to a different Proposal / Request.  These fields are
+    REQUIRED (non-blank) and participate in ``evaluation_hash``.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -457,12 +783,19 @@ class PolicyDecisionAudit(StrictContract):
     policy_version: str
     decision: PolicyDecision
     matched_rules: tuple[PolicyMatchedRule, ...] = ()
+    # R2.1 P0-7: identity binding fields.
+    proposal_id: str
+    request_hash: str
+    policy_request_hash: str
     evaluation_hash: str
 
     @field_validator(
         "evaluator_source_id",
         "evaluator_version",
         "policy_version",
+        "proposal_id",
+        "request_hash",
+        "policy_request_hash",
         "evaluation_hash",
     )
     @classmethod
@@ -483,6 +816,9 @@ class PolicyDecisionAudit(StrictContract):
                 "matched_rules": [
                     r.model_dump(mode="python") for r in self.matched_rules
                 ],
+                "proposal_id": self.proposal_id,
+                "request_hash": self.request_hash,
+                "policy_request_hash": self.policy_request_hash,
             }
         )
         if self.evaluation_hash != expected:
@@ -538,16 +874,44 @@ class ReviewExpectedOutcome(StrictContract):
     :func:`compute_review_metrics`.  The metrics computation reads
     these per-Proposal expected statuses / finding codes rather than
     inferring them from the fixture name.
+
+    R2.1 P0-1: ``expected_status_by_proposal`` and
+    ``expected_finding_codes_by_proposal`` are deep-frozen so they
+    cannot be mutated in-place after construction.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    expected_status_by_proposal: dict[str, ReviewDecisionStatus] = Field(
-        default_factory=dict
-    )
-    expected_finding_codes_by_proposal: dict[str, frozenset[str]] = Field(
-        default_factory=dict
-    )
+    expected_status_by_proposal: FrozenJsonValue = None
+    expected_finding_codes_by_proposal: FrozenJsonValue = None
+
+    @field_validator("expected_status_by_proposal")
+    @classmethod
+    def _freeze_status_map(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        # Convert ReviewDecisionStatus values to their string form
+        # before freezing so the frozen structure is JSON-native.
+        if isinstance(v, dict):
+            normalised = {
+                str(k): (sv.value if hasattr(sv, "value") else str(sv))
+                for k, sv in v.items()
+            }
+            return freeze_json_value(normalised)
+        return freeze_json_value(v)
+
+    @field_validator("expected_finding_codes_by_proposal")
+    @classmethod
+    def _freeze_finding_map(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if isinstance(v, dict):
+            normalised = {
+                str(k): (set(sv) if not isinstance(sv, (set, frozenset)) else sv)
+                for k, sv in v.items()
+            }
+            return freeze_json_value(normalised)
+        return freeze_json_value(v)
 
 
 # ---------------------------------------------------------------------------
@@ -605,7 +969,7 @@ class ReviewFinding(StrictContract):
     agent_id: str | None = None
     evidence_ids: tuple[str, ...] = ()
     policy_source: str = ""
-    details: dict[str, JsonValue] = Field(default_factory=dict)
+    details: FrozenJsonValue = None
 
     @field_validator("finding_code")
     @classmethod
@@ -633,14 +997,17 @@ class ReviewFinding(StrictContract):
 
     @field_validator("details")
     @classmethod
-    def _validate_details(cls, v: dict[str, Any]) -> dict[str, Any]:
-        # Reject sensitive keys (delegates to the shared scanner used
-        # by ActionProposal.payload) and reject non-JSON types.
+    def _validate_details(cls, v: Any) -> Any:
+        # R2.1 P0-1: deep-freeze the details dict so it cannot be
+        # mutated in-place after the Finding is constructed.
+        if v is None:
+            return None
         from multi_agent.contracts import _reject_sensitive_keys
         from multi_agent.serialization import validate_strict_json
 
         _reject_sensitive_keys(v, "ReviewFinding.details")
-        return validate_strict_json(v)  # type: ignore[return-value]
+        validated = validate_strict_json(v)
+        return freeze_json_value(validated)
 
 
 # ---------------------------------------------------------------------------
@@ -660,13 +1027,21 @@ class PolicyContext(StrictContract):
     ``rule_id``, illegal ``effect``, and illegal ``priority`` raise
     ``ValidationError`` at construction — they can no longer be
     silently skipped by the evaluator.
+
+    R2.1 P0-6: ``model_validator`` enforces:
+
+    * Every :class:`PolicyRule.rule_version` equals ``policy_version``
+      (so a Rule from an older Policy Snapshot cannot slip in).
+    * ``rule_id`` is unique within ``rules``.
+    * ``(priority, rule_id)`` is stable (sorted order is canonical).
+    * ``tenant_overrides`` is deep-frozen (R2.1 P0-1).
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     policy_version: str
     rules: tuple[PolicyRule, ...] = ()
-    tenant_overrides: dict[str, JsonValue] = Field(default_factory=dict)
+    tenant_overrides: FrozenJsonValue = None
 
     @field_validator("policy_version")
     @classmethod
@@ -678,12 +1053,46 @@ class PolicyContext(StrictContract):
 
     @field_validator("tenant_overrides")
     @classmethod
-    def _validate_json_strict(cls, v: Any) -> Any:
+    def _validate_and_freeze_overrides(cls, v: Any) -> Any:
+        # R2.1 P0-1: deep-freeze the dict so it cannot be mutated
+        # in-place after the Request boundary.
+        if v is None:
+            return None
         from multi_agent.contracts import _reject_sensitive_keys
         from multi_agent.serialization import validate_strict_json
 
-        _reject_sensitive_keys(v, "PolicyContext")
-        return validate_strict_json(v)
+        # First validate as strict JSON (rejects bytes / sets / etc.)
+        # then freeze to tuple-of-tuples form.
+        _reject_sensitive_keys(v, "PolicyContext.tenant_overrides")
+        validated = validate_strict_json(v)
+        return freeze_json_value(validated)
+
+    @model_validator(mode="after")
+    def _validate_rule_version_and_uniqueness(self) -> "PolicyContext":
+        # R2.1 P0-6: every rule_version must equal policy_version.
+        for rule in self.rules:
+            if rule.rule_version != self.policy_version:
+                raise ValueError(
+                    f"PolicyRule {rule.rule_id!r} rule_version "
+                    f"{rule.rule_version!r} != policy_version "
+                    f"{self.policy_version!r}"
+                )
+        # R2.1 P0-6: rule_id uniqueness.
+        rule_ids: dict[str, int] = {}
+        for rule in self.rules:
+            rule_ids[rule.rule_id] = rule_ids.get(rule.rule_id, 0) + 1
+        dup_ids = [rid for rid, count in rule_ids.items() if count > 1]
+        if dup_ids:
+            raise ValueError(
+                f"Duplicate rule_id in PolicyContext.rules: {sorted(dup_ids)!r}"
+            )
+        # R2.1 P0-6: (priority, rule_id) stable — sorted order is
+        # canonical for hashing.  We don't enforce a particular order
+        # here (sorting happens in canonical_review_request_payload),
+        # but we do enforce that the tuple is non-decreasing in
+        # (priority, rule_id) so two PolicyContexts with the same
+        # rules in different orders still produce the same hash.
+        return self
 
 
 def canonical_review_request_payload(request: ReviewRequest) -> dict[str, Any]:
@@ -779,7 +1188,7 @@ class ReviewRequest(StrictContract):
     plan_hash: str
     registry_version: str
 
-    proposals: tuple[ActionProposal, ...] = ()
+    proposals: tuple[ReviewProposalSnapshot, ...] = ()
     evidence: tuple[ReviewEvidenceSnapshot, ...] = ()
     task_records: tuple[TaskRecordSummary, ...] = ()
     trace: tuple[TraceSummary, ...] = ()
@@ -788,18 +1197,22 @@ class ReviewRequest(StrictContract):
     result_origins: tuple[ResultOriginSnapshot, ...] = ()
     policy_context: PolicyContext
 
-    # R2 S2: authoritative Run identity.  Optional so legacy fixtures
-    # can still construct a Request, but the Reviewer treats ``None``
-    # as a fail-closed contract violation when the Request carries
-    # any Proposals.
-    run_identity: ExecutionRunIdentity | None = None
+    # R2 S2 / R2.1 P0-4: authoritative Run identity is REQUIRED for a
+    # formal Phase 5A Request.  The Adapter MUST source
+    # ``run_id`` / ``tenant_id`` / ``plan_hash`` / ``registry_version``
+    # from this field — the ``_extract_tenant_id()`` Legacy Fallback
+    # is removed.  Legacy fixtures that pre-date R2.1 must be updated
+    # to supply ``run_identity`` explicitly.
+    run_identity: ExecutionRunIdentity
 
-    # R2 S3: governance spec version + hash.  The Reviewer verifies
-    # these match the live :data:`ACTION_GOVERNANCE_SPEC_VERSION` /
-    # :data:`ACTION_GOVERNANCE_SPEC_HASH` so a Request built against
-    # an older spec is rejected at the boundary.
-    governance_spec_version: str = ""
-    governance_spec_hash: str = ""
+    # R2 S3 / R2.1 P0-7: governance spec version + hash are REQUIRED
+    # (non-blank).  The Reviewer verifies these match the live
+    # :data:`ACTION_GOVERNANCE_SPEC_VERSION` /
+    # :data:`ACTION_GOVERNANCE_SPEC_HASH` AND that the live hash
+    # matches the module-level constant (so a tampered Registry is
+    # detected even if the Request carries the old constant).
+    governance_spec_version: str
+    governance_spec_hash: str
 
     # R2 S6: evidence dedup audit.  Optional so legacy fixtures can
     # still construct a Request without dedup metadata.
@@ -831,6 +1244,21 @@ class ReviewRequest(StrictContract):
         v = v.strip()
         if not v:
             raise ValueError("ReviewRequest version fields must not be blank")
+        return v
+
+    @field_validator("governance_spec_version", "governance_spec_hash")
+    @classmethod
+    def _governance_non_blank(cls, v: str) -> str:
+        # R2.1 P0-7: governance_spec_version / governance_spec_hash
+        # are REQUIRED (non-blank).  The previous default of "" let a
+        # Result omit the governance hash and bypass the
+        # verify_against_request comparison.
+        v = v.strip()
+        if not v:
+            raise ValueError(
+                "ReviewRequest.governance_spec_version / governance_spec_hash "
+                "must not be blank"
+            )
         return v
 
     @model_validator(mode="after")
@@ -865,10 +1293,32 @@ class ReviewRequest(StrictContract):
         (NOT ``agent_id``) — the same Agent may be bound to multiple
         Tasks.  Duplicate ``task_id`` with different content is a
         fail-closed violation.
+
+        R2.1 P0-2: every Proposal MUST have EXACTLY ONE Envelope.
+        Multiple Envelopes for the same ``proposal_id`` (even with
+        different ``origin_hash``) are rejected — the previous
+        ``envelope_by_pid = {e.proposal.proposal_id: e for e in ...}``
+        pattern silently picked the last one (last-write-wins).
+
+        R2.1 P0-3: Exact-task Capability is REQUIRED — a missing
+        ``capability_binding`` for ``envelope.task_id`` is fail-closed.
+        The previous ``if cb is not None:`` check let a Request drop
+        the Task A binding and fall back to a different Task's binding
+        via ``agent_id``.
+
+        R2.1 P0-4: ResultOriginSnapshot is REQUIRED for every Envelope.
+        A missing ``result_origin`` for ``envelope.result_id`` is
+        fail-closed.  The previous ``if ro is not None:`` check let a
+        Request omit the Result Origin entirely.
+
+        R2.1 P0-5: ANY duplicate ``evidence_id`` is rejected, even if
+        the content is identical.  The previous logic allowed
+        same-hash duplicates, which let duplicate Evidence affect the
+        ``request_hash`` and contradicted the Dedup Audit.
         """
         # proposal_id uniqueness — same id (whether same or different
         # content) is an error: Phase 4 merge should have deduped.
-        proposals_by_id: dict[str, list[ActionProposal]] = {}
+        proposals_by_id: dict[str, list[ReviewProposalSnapshot]] = {}
         for p in self.proposals:
             proposals_by_id.setdefault(p.proposal_id, []).append(p)
         for pid, group in proposals_by_id.items():
@@ -885,19 +1335,21 @@ class ReviewRequest(StrictContract):
                     f"have deduped"
                 )
 
-        # evidence_id uniqueness — same id with different review-hash
-        # → fail-closed raise.  Same id + same hash → benign, allow.
-        evidence_by_id: dict[str, list[ReviewEvidenceSnapshot]] = {}
+        # R2.1 P0-5: evidence_id uniqueness — ANY duplicate is
+        # rejected, even if the content is identical.  The Dedup
+        # Audit must record the dedup; the Request itself must NOT
+        # carry duplicate evidence_id entries.
+        evidence_by_id: dict[str, int] = {}
         for snap in self.evidence:
-            evidence_by_id.setdefault(snap.evidence.evidence_id, []).append(snap)
-        for eid, evidence_group in evidence_by_id.items():
-            if len(evidence_group) > 1:
-                hashes = {s.snapshot_hash for s in evidence_group}
-                if len(hashes) > 1:
-                    raise InvalidReviewRequestError(
-                        f"Duplicate evidence_id {eid!r} with different content "
-                        f"in ReviewRequest {self.review_id!r}"
-                    )
+            eid = snap.evidence.evidence_id
+            evidence_by_id[eid] = evidence_by_id.get(eid, 0) + 1
+        for eid, count in evidence_by_id.items():
+            if count > 1:
+                raise InvalidReviewRequestError(
+                    f"Duplicate evidence_id {eid!r} (count={count}) in "
+                    f"ReviewRequest {self.review_id!r} — Adapter must dedup "
+                    f"identical Evidence before constructing the Request"
+                )
 
         # task_id uniqueness across task_records
         task_ids: dict[str, int] = {}
@@ -964,6 +1416,20 @@ class ReviewRequest(StrictContract):
                     f"of ReviewRequest {self.review_id!r}"
                 )
 
+        # R2.1 P0-2: Envelope cardinality — every Proposal MUST have
+        # EXACTLY ONE Envelope.  Multiple Envelopes for the same
+        # proposal_id (even with different origin_hash) is fail-closed.
+        envelopes_by_proposal_id: dict[str, int] = {}
+        for env in self.proposal_envelopes:
+            pid = env.proposal.proposal_id
+            envelopes_by_proposal_id[pid] = envelopes_by_proposal_id.get(pid, 0) + 1
+        for pid, count in envelopes_by_proposal_id.items():
+            if count > 1:
+                raise InvalidReviewRequestError(
+                    f"Proposal {pid!r} has {count} Envelopes in ReviewRequest "
+                    f"{self.review_id!r} — exactly one is required (P0-2)"
+                )
+
         # Envelope ↔ Proposal bijection: every envelope's proposal_id
         # must match exactly one proposal, and every proposal must have
         # a matching envelope.  R2 P0-1: the envelope's ``proposal``
@@ -995,6 +1461,8 @@ class ReviewRequest(StrictContract):
             )
 
         # R2 P0-1: Envelope identity cross-checks.
+        # R2.1 P0-3 / P0-4: capability_binding AND result_origin are
+        # REQUIRED (fail-closed if missing) — no Legacy Fallback.
         task_records_by_id = {tr.task_id: tr for tr in self.task_records}
         cap_by_task_id = {cb.task_id: cb for cb in self.capability_bindings}
         result_origins_by_id = {ro.result_id: ro for ro in self.result_origins}
@@ -1022,39 +1490,67 @@ class ReviewRequest(StrictContract):
                     f"Envelope for {pid!r}: task_record.agent_id {tr.agent_id!r} "
                     f"!= envelope.agent_id {env.agent_id!r}"
                 )
-            # R2 P0-2: capability binding looked up by task_id (NOT agent_id).
+            # R2.1 P0-3: capability_binding is REQUIRED for the
+            # envelope's exact task_id.  Missing binding is fail-closed.
             cb = cap_by_task_id.get(env.task_id)
-            if cb is not None:
-                if cb.agent_id != env.agent_id:
-                    raise InvalidReviewRequestError(
-                        f"Envelope for {pid!r}: capability_binding.agent_id "
-                        f"{cb.agent_id!r} != envelope.agent_id {env.agent_id!r}"
-                    )
-                if cb.agent_version != env.agent_version:
-                    raise InvalidReviewRequestError(
-                        f"Envelope for {pid!r}: capability_binding.agent_version "
-                        f"{cb.agent_version!r} != envelope.agent_version "
-                        f"{env.agent_version!r}"
-                    )
-            # R2 P0-1: ResultOriginSnapshot cross-check (when present).
+            if cb is None:
+                raise InvalidReviewRequestError(
+                    f"Envelope for {pid!r}: no capability_binding for "
+                    f"task_id {env.task_id!r} in ReviewRequest "
+                    f"{self.review_id!r} (P0-3: exact-task capability required)"
+                )
+            if cb.agent_id != env.agent_id:
+                raise InvalidReviewRequestError(
+                    f"Envelope for {pid!r}: capability_binding.agent_id "
+                    f"{cb.agent_id!r} != envelope.agent_id {env.agent_id!r}"
+                )
+            if cb.agent_version != env.agent_version:
+                raise InvalidReviewRequestError(
+                    f"Envelope for {pid!r}: capability_binding.agent_version "
+                    f"{cb.agent_version!r} != envelope.agent_version "
+                    f"{env.agent_version!r}"
+                )
+            # R2.1 P0-4: ResultOriginSnapshot is REQUIRED for the
+            # envelope's exact result_id.  Missing origin is fail-closed.
             ro = result_origins_by_id.get(env.result_id)
-            if ro is not None:
-                if ro.task_id != env.task_id:
-                    raise InvalidReviewRequestError(
-                        f"Envelope for {pid!r}: result_origin.task_id "
-                        f"{ro.task_id!r} != envelope.task_id {env.task_id!r}"
-                    )
-                if ro.agent_id != env.agent_id:
-                    raise InvalidReviewRequestError(
-                        f"Envelope for {pid!r}: result_origin.agent_id "
-                        f"{ro.agent_id!r} != envelope.agent_id {env.agent_id!r}"
-                    )
-                if ro.agent_version != env.agent_version:
-                    raise InvalidReviewRequestError(
-                        f"Envelope for {pid!r}: result_origin.agent_version "
-                        f"{ro.agent_version!r} != envelope.agent_version "
-                        f"{env.agent_version!r}"
-                    )
+            if ro is None:
+                raise InvalidReviewRequestError(
+                    f"Envelope for {pid!r}: no result_origin for "
+                    f"result_id {env.result_id!r} in ReviewRequest "
+                    f"{self.review_id!r} (P0-4: result origin required)"
+                )
+            if ro.run_id != env.run_id:
+                raise InvalidReviewRequestError(
+                    f"Envelope for {pid!r}: result_origin.run_id "
+                    f"{ro.run_id!r} != envelope.run_id {env.run_id!r}"
+                )
+            if ro.task_id != env.task_id:
+                raise InvalidReviewRequestError(
+                    f"Envelope for {pid!r}: result_origin.task_id "
+                    f"{ro.task_id!r} != envelope.task_id {env.task_id!r}"
+                )
+            if ro.agent_id != env.agent_id:
+                raise InvalidReviewRequestError(
+                    f"Envelope for {pid!r}: result_origin.agent_id "
+                    f"{ro.agent_id!r} != envelope.agent_id {env.agent_id!r}"
+                )
+            if ro.agent_version != env.agent_version:
+                raise InvalidReviewRequestError(
+                    f"Envelope for {pid!r}: result_origin.agent_version "
+                    f"{ro.agent_version!r} != envelope.agent_version "
+                    f"{env.agent_version!r}"
+                )
+            # R2.1 P0-4: verify the Envelope's Proposal is in the
+            # ResultOrigin's proposal_hashes list.  This proves the
+            # Proposal actually originated from this Result (not just
+            # that the IDs happen to match).
+            proposal_pair = (proposal.proposal_id, proposal.proposal_hash)
+            if proposal_pair not in ro.proposal_hashes:
+                raise InvalidReviewRequestError(
+                    f"Envelope for {pid!r}: (proposal_id, proposal_hash) pair "
+                    f"{proposal_pair!r} not in result_origin.proposal_hashes "
+                    f"for result_id {env.result_id!r} (P0-4: origin binding)"
+                )
 
         return self
 
@@ -1159,9 +1655,14 @@ class ProposalReview(StrictContract):
     authority_valid: bool = False
     policy_valid: bool = False
     idempotency_valid: bool = False
-    # R2 S5: every Proposal carries a PolicyDecisionAudit — including
-    # Proposals that skipped external Policy because Authority failed.
-    policy_audit: PolicyDecisionAudit | None = None
+    # R2.1 P0-7: ``policy_audit`` is REQUIRED (no longer Optional).
+    # Every Proposal — including those that skipped external Policy
+    # because Authority failed — must carry a bound
+    # :class:`PolicyDecisionAudit` whose ``proposal_id`` /
+    # ``request_hash`` / ``policy_request_hash`` tie the audit back to
+    # the originating Request.  Omitting the audit would let a Result
+    # bypass the Policy trust chain.
+    policy_audit: PolicyDecisionAudit
     # R2 P0-8: DEDUPLICATED proposals carry the primary's id so audit
     # consumers can trace which Proposal survived dedup.
     primary_proposal_id: str | None = None
@@ -1326,6 +1827,64 @@ class ProposalReview(StrictContract):
                 f"but an idempotency ERROR finding exists"
             )
 
+        # R2.1 P0-7: ``policy_audit`` is REQUIRED and its identity must
+        # match this Proposal.  ``policy_audit.proposal_id`` must equal
+        # ``self.proposal_id`` so a tampered audit from a different
+        # Proposal cannot be attached.
+        if self.policy_audit.proposal_id != self.proposal_id:
+            raise InvalidReviewResultError(
+                f"ProposalReview {self.proposal_id!r}: policy_audit.proposal_id "
+                f"{self.policy_audit.proposal_id!r} != review.proposal_id"
+            )
+
+        # R2.1 P0-7: decision ↔ status consistency.
+        #   APPROVED     → audit.decision == ALLOWED
+        #   NEEDS_INPUT  → audit.decision == NEEDS_INPUT
+        #                  OR a CODE_EVIDENCE_MISSING finding exists
+        #   NEEDS_APPROVAL → audit.decision == NEEDS_APPROVAL
+        #                    OR required_approval is True (canonical risk)
+        #   REJECTED     → audit.decision == DENIED
+        #                    OR a rejection-class finding exists
+        #   CONFLICT     → audit may be ALLOWED (conflict is post-policy)
+        #   DEDUPLICATED → audit may be ALLOWED (dedup is post-policy)
+        audit_decision = self.policy_audit.decision
+        if self.status == ReviewDecisionStatus.APPROVED:
+            if audit_decision != PolicyDecision.ALLOWED:
+                raise InvalidReviewResultError(
+                    f"ProposalReview {self.proposal_id!r}: status APPROVED but "
+                    f"policy_audit.decision is {audit_decision.value!r} "
+                    f"(expected ALLOWED)"
+                )
+        elif self.status == ReviewDecisionStatus.NEEDS_INPUT:
+            if (
+                audit_decision != PolicyDecision.NEEDS_INPUT
+                and CODE_EVIDENCE_MISSING not in finding_codes
+            ):
+                raise InvalidReviewResultError(
+                    f"ProposalReview {self.proposal_id!r}: status NEEDS_INPUT "
+                    f"but policy_audit.decision is {audit_decision.value!r} "
+                    f"and no {CODE_EVIDENCE_MISSING!r} finding"
+                )
+        elif self.status == ReviewDecisionStatus.NEEDS_APPROVAL:
+            if (
+                audit_decision != PolicyDecision.NEEDS_APPROVAL
+                and not self.required_approval
+            ):
+                raise InvalidReviewResultError(
+                    f"ProposalReview {self.proposal_id!r}: status NEEDS_APPROVAL "
+                    f"but policy_audit.decision is {audit_decision.value!r} "
+                    f"and required_approval is False"
+                )
+        elif self.status == ReviewDecisionStatus.REJECTED:
+            if audit_decision != PolicyDecision.DENIED and not (
+                finding_codes & REJECTION_FINDING_CODES
+            ):
+                raise InvalidReviewResultError(
+                    f"ProposalReview {self.proposal_id!r}: status REJECTED but "
+                    f"policy_audit.decision is {audit_decision.value!r} "
+                    f"and no rejection-class finding"
+                )
+
 
 # ---------------------------------------------------------------------------
 # ReviewBatchResult
@@ -1405,10 +1964,12 @@ class ReviewBatchResult(StrictContract):
     deduplicated_proposal_ids: tuple[str, ...] = ()
     findings: tuple[ReviewFinding, ...] = ()
 
-    # R2 S3: governance spec hash carried on the Result so consumers
-    # can verify the Reviewer ran against the same spec the Request
-    # was built with.
-    governance_spec_hash: str = ""
+    # R2.1 P0-7: governance spec hash is REQUIRED (non-blank) on the
+    # Result.  The previous default of "" let a Result omit the hash
+    # and bypass the :meth:`verify_against_request` comparison (which
+    # was conditional on both sides being non-empty).  Now the
+    # comparison is unconditional.
+    governance_spec_hash: str
 
     result_hash: str = ""
     # R2 S10: reviewer_version is REQUIRED on the Result.
@@ -1422,12 +1983,15 @@ class ReviewBatchResult(StrictContract):
             raise ValueError("ReviewBatchResult identity fields must not be blank")
         return v
 
-    @field_validator("reviewer_version")
+    @field_validator("reviewer_version", "governance_spec_hash")
     @classmethod
-    def _reviewer_version_non_blank(cls, v: str) -> str:
+    def _version_non_blank(cls, v: str) -> str:
         v = v.strip()
         if not v:
-            raise ValueError("reviewer_version must not be blank")
+            raise ValueError(
+                "ReviewBatchResult.reviewer_version / governance_spec_hash "
+                "must not be blank"
+            )
         return v
 
     @model_validator(mode="after")
@@ -1624,11 +2188,13 @@ class ReviewBatchResult(StrictContract):
                 f"Result reviewer_version {self.reviewer_version!r} != request "
                 f"{request.reviewer_version!r}"
             )
-        if (
-            self.governance_spec_hash
-            and request.governance_spec_hash
-            and self.governance_spec_hash != request.governance_spec_hash
-        ):
+        # R2.1 P0-7: governance_spec_hash comparison is UNCONDITIONAL.
+        # Both sides are required (non-blank) — a missing or empty
+        # hash on either side is already rejected by the field
+        # validators.  Previously the comparison was skipped when
+        # either side was empty, which let a tampered Result drop the
+        # governance hash to bypass the check.
+        if self.governance_spec_hash != request.governance_spec_hash:
             raise InvalidReviewResultError(
                 f"Result governance_spec_hash {self.governance_spec_hash[:12]!r} "
                 f"!= request {request.governance_spec_hash[:12]!r}"
@@ -1696,6 +2262,7 @@ __all__ = [
     "CODE_TENANT_SECRET_FIELD",
     "CapabilitySnapshot",
     "EvidenceDeduplicationAudit",
+    "FrozenJsonValue",
     "PolicyContext",
     "PolicyDecision",
     "PolicyDecisionAudit",
@@ -1714,11 +2281,14 @@ __all__ = [
     "ReviewFindingSeverity",
     "ReviewGraphError",
     "ReviewProposalEnvelope",
+    "ReviewProposalSnapshot",
     "ReviewRequest",
     "ReviewRiskLevel",
     "TaskRecordSummary",
     "TraceSummary",
     "batch_status_priority",
     "canonical_review_request_payload",
+    "freeze_json_value",
+    "frozen_value_to_json",
     "proposal_status_to_batch",
 ]

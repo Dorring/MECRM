@@ -38,10 +38,16 @@ from multi_agent.contracts import (
     EvidenceType,
 )
 from multi_agent.evidence_review import compute_review_evidence_hash
-from multi_agent.execution import ExecutionCapabilitySnapshot
+from multi_agent.execution import (
+    ExecutionCapabilitySnapshot,
+    ExecutionRunIdentity,
+    ResultOriginSnapshot,
+)
 from multi_agent.review_contracts import (
     CODE_EVIDENCE_DANGLING,
     PolicyContext,
+    PolicyDecision,
+    PolicyDecisionAudit,
     ProposalReview,
     ReviewBatchResult,
     ReviewBatchStatus,
@@ -50,6 +56,7 @@ from multi_agent.review_contracts import (
     ReviewFinding,
     ReviewFindingSeverity,
     ReviewProposalEnvelope,
+    ReviewProposalSnapshot,
     ReviewRequest,
     REVIEW_SCHEMA_VERSION,
     TaskRecordSummary,
@@ -174,8 +181,12 @@ def _make_envelope(
     agent_version: str = "1.0.0",
 ) -> ReviewProposalEnvelope:
     aid = proposal.created_by_agent
+    # R2.1 P0-1: Envelope carries a deep-frozen ReviewProposalSnapshot.
+    snapshot = ReviewProposalSnapshot.from_proposal(proposal)
+    # R2.1 P0-1: origin_hash MUST match the envelope's validator which
+    # uses to_action_proposal().model_dump(mode="python").
     return ReviewProposalEnvelope(
-        proposal=proposal,
+        proposal=snapshot,
         run_id=run_id,
         result_id=result_id,
         task_id=task_id,
@@ -183,7 +194,7 @@ def _make_envelope(
         agent_version=agent_version,
         origin_hash=stable_hash(
             {
-                "proposal": proposal.model_dump(mode="python"),
+                "proposal": snapshot.to_action_proposal().model_dump(mode="python"),
                 "run_id": run_id,
                 "result_id": result_id,
                 "task_id": task_id,
@@ -191,6 +202,109 @@ def _make_envelope(
                 "agent_version": agent_version,
             }
         ),
+    )
+
+
+def _make_run_identity(
+    *,
+    run_id: str = "run-tc",
+    tenant_id: str = "tenant-tc",
+    plan_hash: str = "plan-tc-hash",
+    registry_version: str = "registry-tc-v1",
+) -> ExecutionRunIdentity:
+    identity_hash = stable_hash(
+        {
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "plan_hash": plan_hash,
+            "registry_version": registry_version,
+        }
+    )
+    return ExecutionRunIdentity(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        plan_hash=plan_hash,
+        registry_version=registry_version,
+        identity_hash=identity_hash,
+    )
+
+
+def _make_result_origin(
+    proposal: ActionProposal,
+    *,
+    run_id: str = "run-tc",
+    tenant_id: str = "tenant-tc",
+    result_id: str = "r-tc",
+    task_id: str = "task-tc",
+    agent_id: str = "agent_tc",
+    agent_version: str = "1.0.0",
+    evidence: list[Evidence] | None = None,
+) -> ResultOriginSnapshot:
+    """R2.1 P0-4: build a ResultOriginSnapshot whose origin_hash is
+    verified on construction."""
+    proposal_hashes: tuple[tuple[str, str], ...] = (
+        (proposal.proposal_id, proposal.proposal_hash),
+    )
+    evidence_hashes_list: list[tuple[str, str]] = []
+    for ev in evidence or []:
+        if proposal.evidence_ids and ev.evidence_id in proposal.evidence_ids:
+            evidence_hashes_list.append(
+                (ev.evidence_id, compute_review_evidence_hash(ev))
+            )
+    evidence_hashes = tuple(evidence_hashes_list)
+    origin_hash = stable_hash(
+        {
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "result_id": result_id,
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "agent_version": agent_version,
+            "proposal_hashes": sorted(proposal_hashes),
+            "evidence_hashes": sorted(evidence_hashes),
+        }
+    )
+    return ResultOriginSnapshot(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        result_id=result_id,
+        task_id=task_id,
+        agent_id=agent_id,
+        agent_version=agent_version,
+        proposal_hashes=proposal_hashes,
+        evidence_hashes=evidence_hashes,
+        origin_hash=origin_hash,
+    )
+
+
+def _make_policy_audit(
+    *,
+    proposal_id: str = "prop-001",
+    request_hash: str = "a" * 64,
+    policy_request_hash: str = "b" * 64,
+    decision: PolicyDecision = PolicyDecision.ALLOWED,
+) -> PolicyDecisionAudit:
+    """R2.1 P0-7: build a PolicyDecisionAudit with a valid evaluation_hash."""
+    payload = {
+        "evaluator_source_id": "deterministic",
+        "evaluator_version": "tc-v1",
+        "policy_version": "tc-v1",
+        "decision": decision.value,
+        "matched_rules": [],
+        "proposal_id": proposal_id,
+        "request_hash": request_hash,
+        "policy_request_hash": policy_request_hash,
+    }
+    return PolicyDecisionAudit(
+        evaluator_source_id="deterministic",
+        evaluator_version="tc-v1",
+        policy_version="tc-v1",
+        decision=decision,
+        matched_rules=(),
+        proposal_id=proposal_id,
+        request_hash=request_hash,
+        policy_request_hash=policy_request_hash,
+        evaluation_hash=stable_hash(payload),
     )
 
 
@@ -215,29 +329,64 @@ def _make_request(
         )
         for ev in raw_evidence
     ]
+    # R2.1 P0-1: convert ActionProposal → ReviewProposalSnapshot.
+    proposal_snapshots: tuple[ReviewProposalSnapshot, ...] = tuple(
+        ReviewProposalSnapshot.from_proposal(p) for p in proposals
+    )
+    # R2.1 P0-3: default capability_binding for task-tc.
+    if capability_bindings is None:
+        capability_bindings = [_make_capability_binding(_make_capability())]
+    # R2.1 P0-3: envelope task_id MUST match a capability_binding's
+    # task_id (exact-task capability required).  Use the first binding
+    # as the envelope's task_id when callers pass custom bindings.
+    envelope_task_id = capability_bindings[0].task_id
+    # R2.1 P0-4 + R1 P0-4: result_origins are REQUIRED and MUST be
+    # order-invariant.  Assign result_id by sorted proposal_id so
+    # reordering the input proposals does not change request_hash.
+    sorted_ids = sorted(p.proposal_id for p in proposals)
+    result_id_map = {pid: f"r-tc-{i:03d}" for i, pid in enumerate(sorted_ids)}
+    result_ids = [result_id_map[p.proposal_id] for p in proposals]
+    origins = [
+        _make_result_origin(
+            p,
+            result_id=rid,
+            task_id=envelope_task_id,
+            evidence=raw_evidence,
+        )
+        for p, rid in zip(proposals, result_ids)
+    ]
+    envelopes = (
+        proposal_envelopes
+        if proposal_envelopes is not None
+        else [
+            _make_envelope(p, result_id=rid, task_id=envelope_task_id)
+            for p, rid in zip(proposals, result_ids)
+        ]
+    )
     return ReviewRequest(
         review_id=review_id,
         run_id="run-tc",
         tenant_id="tenant-tc",
         plan_hash="plan-tc-hash",
         registry_version="registry-tc-v1",
-        proposals=proposals,
+        proposals=proposal_snapshots,
         evidence=evidence_snapshots,
         task_records=task_records
         or [
             TaskRecordSummary(
-                task_id="task-tc", agent_id="agent_tc", status="completed"
+                task_id=b.task_id,
+                agent_id=b.agent_id,
+                status="completed",
             )
+            for b in capability_bindings
         ],
         trace=trace or [TraceSummary(sequence=0, event_type="run_started")],
-        capability_bindings=capability_bindings or [],
-        proposal_envelopes=(
-            proposal_envelopes
-            if proposal_envelopes is not None
-            else [_make_envelope(p) for p in proposals]
-        ),
+        capability_bindings=capability_bindings,
+        proposal_envelopes=envelopes,
+        result_origins=origins,
         policy_context=policy_context
         or PolicyContext(policy_version="tc-v1", rules=[]),
+        run_identity=_make_run_identity(),
         governance_spec_version=ACTION_GOVERNANCE_SPEC_VERSION,
         governance_spec_hash=ACTION_GOVERNANCE_SPEC_HASH,
         review_schema_version=REVIEW_SCHEMA_VERSION,
@@ -572,6 +721,7 @@ class TestSemanticValidation:
             authority_valid=True,
             policy_valid=True,
             idempotency_valid=True,
+            policy_audit=_make_policy_audit(proposal_id="prop-sem-001"),
         )
         with pytest.raises(InvalidReviewResultError):
             review.verify_semantics()
@@ -584,6 +734,7 @@ class TestSemanticValidation:
             authority_valid=False,
             policy_valid=True,
             idempotency_valid=True,
+            policy_audit=_make_policy_audit(proposal_id="prop-sem-002"),
         )
         with pytest.raises(InvalidReviewResultError):
             review.verify_semantics()
@@ -596,6 +747,7 @@ class TestSemanticValidation:
             authority_valid=True,
             policy_valid=True,
             idempotency_valid=True,
+            policy_audit=_make_policy_audit(proposal_id="prop-sem-003"),
         )
         with pytest.raises(InvalidReviewResultError):
             review.verify_semantics()
@@ -608,6 +760,7 @@ class TestSemanticValidation:
             authority_valid=True,
             policy_valid=True,
             idempotency_valid=True,
+            policy_audit=_make_policy_audit(proposal_id="prop-sem-004"),
         )
         with pytest.raises(InvalidReviewResultError):
             review.verify_semantics()

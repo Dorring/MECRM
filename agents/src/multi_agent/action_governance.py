@@ -30,6 +30,8 @@ this registry — local lookup tables are forbidden (R2 S14).
 
 from __future__ import annotations
 
+from types import MappingProxyType
+
 from pydantic import ConfigDict, field_validator
 
 from multi_agent.contracts import AgentAuthority, EvidenceType, StrictContract
@@ -264,7 +266,20 @@ def _build_registry() -> dict[str, ActionGovernanceSpec]:
     return {s.action_type: s for s in specs}
 
 
-ACTION_GOVERNANCE_REGISTRY: dict[str, ActionGovernanceSpec] = _build_registry()
+# R2.1 P0-7: the registry is an IMMUTABLE private mapping.  External
+# code receives a read-only :class:`types.MappingProxyType` wrapper —
+# attempts to mutate it (``ACTION_GOVERNANCE_REGISTRY["x"] = y``) raise
+# ``TypeError`` at runtime.  The underlying ``dict`` is private
+# (``_ACTION_GOVERNANCE_REGISTRY``) so it cannot be imported and
+# mutated directly.
+_ACTION_GOVERNANCE_REGISTRY: dict[str, ActionGovernanceSpec] = _build_registry()
+
+#: Public read-only view of the canonical registry.  External code
+#: MUST use this or :func:`get_action_governance_spec` — never the
+#: private ``_ACTION_GOVERNANCE_REGISTRY``.
+ACTION_GOVERNANCE_REGISTRY: MappingProxyType[str, ActionGovernanceSpec] = (
+    MappingProxyType(_ACTION_GOVERNANCE_REGISTRY)
+)
 
 
 # ---------------------------------------------------------------------------
@@ -272,17 +287,58 @@ ACTION_GOVERNANCE_REGISTRY: dict[str, ActionGovernanceSpec] = _build_registry()
 # ---------------------------------------------------------------------------
 
 
-def _compute_spec_hash() -> str:
+def _compute_spec_hash_from(
+    registry: MappingProxyType[str, ActionGovernanceSpec]
+    | dict[str, ActionGovernanceSpec],
+) -> str:
     """Return a stable SHA-256 over the canonical spec registry."""
     # Sort by action_type so the hash is order-invariant.
-    payload = [
-        ACTION_GOVERNANCE_REGISTRY[k].model_dump(mode="python")
-        for k in sorted(ACTION_GOVERNANCE_REGISTRY)
-    ]
+    payload = [registry[k].model_dump(mode="python") for k in sorted(registry)]
     return stable_hash(payload)
 
 
+def _compute_spec_hash() -> str:
+    """Return a stable SHA-256 over the canonical spec registry."""
+    return _compute_spec_hash_from(_ACTION_GOVERNANCE_REGISTRY)
+
+
 ACTION_GOVERNANCE_SPEC_HASH: str = _compute_spec_hash()
+
+
+def compute_live_governance_spec_hash() -> str:
+    """R2.1 P0-7: recompute the governance spec hash from the LIVE
+    registry at call time.
+
+    The Reviewer calls this on every Review to detect tampering: if
+    external code has replaced ``_ACTION_GOVERNANCE_REGISTRY`` (which
+    is private and should never happen) or if the module constant
+    ``ACTION_GOVERNANCE_SPEC_HASH`` has been patched, the live hash
+    will differ from the constant, and the Reviewer fails-closed.
+    """
+    return _compute_spec_hash_from(_ACTION_GOVERNANCE_REGISTRY)
+
+
+def verify_governance_spec_integrity(*, expected_hash: str | None = None) -> None:
+    """R2.1 P0-7: verify the live registry hash matches the module
+    constant (and optionally a caller-supplied expected hash).
+
+    Called by the Reviewer at the start of every Review so a tampered
+    registry is detected before any Proposal is evaluated.
+
+    Raises :class:`RuntimeError` on mismatch.
+    """
+    live = compute_live_governance_spec_hash()
+    if live != ACTION_GOVERNANCE_SPEC_HASH:
+        raise RuntimeError(
+            "ACTION_GOVERNANCE_REGISTRY has been tampered with: live spec "
+            f"hash {live[:12]!r} != module constant "
+            f"{ACTION_GOVERNANCE_SPEC_HASH[:12]!r}"
+        )
+    if expected_hash is not None and live != expected_hash:
+        raise RuntimeError(
+            f"Live governance spec hash {live[:12]!r} != expected "
+            f"{expected_hash[:12]!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +354,7 @@ def get_action_governance_spec(action_type: str) -> ActionGovernanceSpec | None:
     (e.g. emit ``CODE_ACTION_UNKNOWN_TYPE``) — never as "low-risk
     default".
     """
-    return ACTION_GOVERNANCE_REGISTRY.get(action_type)
+    return _ACTION_GOVERNANCE_REGISTRY.get(action_type)
 
 
 __all__ = [
@@ -306,5 +362,7 @@ __all__ = [
     "ACTION_GOVERNANCE_SPEC_HASH",
     "ACTION_GOVERNANCE_SPEC_VERSION",
     "ActionGovernanceSpec",
+    "compute_live_governance_spec_hash",
     "get_action_governance_spec",
+    "verify_governance_spec_integrity",
 ]

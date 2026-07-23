@@ -42,7 +42,9 @@ from multi_agent.contracts import (
 )
 from multi_agent.execution import (
     ExecutionCapabilitySnapshot,
+    ExecutionRunIdentity,
     ExecutionTraceEvent,
+    ResultOriginSnapshot,
     SupervisorRunResult,
     SupervisorRunStatus,
     TaskAttemptRecord,
@@ -58,6 +60,7 @@ from multi_agent.review_contracts import (
     ReviewDecisionStatus,
 )
 from multi_agent.review_evaluation import build_review_request
+from multi_agent.evidence_review import compute_review_evidence_hash
 from multi_agent.policy import DeterministicPolicyEvaluator
 from multi_agent.reviewer import ProposalReviewer
 from multi_agent.serialization import stable_hash
@@ -276,6 +279,51 @@ def _build_customer_recovery_supervisor_result() -> SupervisorRunResult:
         merged_at=_TS,
     )
 
+    # R2.1 P0-4: SupervisorRunResult MUST carry run_identity and
+    # result_origins.  The Phase 5A Adapter copies them verbatim.
+    identity_hash = stable_hash(
+        {
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "plan_hash": "plan-recovery-hash",
+            "registry_version": "registry-recovery-v1",
+        }
+    )
+    run_identity = ExecutionRunIdentity(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        plan_hash="plan-recovery-hash",
+        registry_version="registry-recovery-v1",
+        identity_hash=identity_hash,
+    )
+    proposal_hashes = tuple((p.proposal_id, p.proposal_hash) for p in proposals)
+    evidence_hashes = tuple(
+        (ev.evidence_id, compute_review_evidence_hash(ev)) for ev in evidence
+    )
+    origin_hash = stable_hash(
+        {
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "result_id": agent_result.result_id,
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "agent_version": "1.0.0",
+            "proposal_hashes": sorted(proposal_hashes),
+            "evidence_hashes": sorted(evidence_hashes),
+        }
+    )
+    result_origin = ResultOriginSnapshot(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        result_id=agent_result.result_id,
+        task_id=task_id,
+        agent_id=agent_id,
+        agent_version="1.0.0",
+        proposal_hashes=proposal_hashes,
+        evidence_hashes=evidence_hashes,
+        origin_hash=origin_hash,
+    )
+
     return SupervisorRunResult(
         run_id=run_id,
         plan_hash="plan-recovery-hash",
@@ -326,6 +374,8 @@ def _build_customer_recovery_supervisor_result() -> SupervisorRunResult:
             ),
         ],
         capability_bindings=_recovery_capability_bindings(),
+        run_identity=run_identity,
+        result_origins=(result_origin,),
         started_at=_TS,
         completed_at=_TS,
         duration_ms=100,

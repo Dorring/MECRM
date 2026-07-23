@@ -68,6 +68,7 @@ from multi_agent.review_contracts import (
     ReviewFindingSeverity,
     ReviewGraphError,
     ReviewProposalEnvelope,
+    ReviewProposalSnapshot,
     ReviewRequest,
     REVIEW_SCHEMA_VERSION,
     REVIEWER_VERSION,
@@ -192,8 +193,18 @@ def _make_envelope(
     agent_version: str = "1.0.0",
 ) -> ReviewProposalEnvelope:
     aid = proposal.created_by_agent
+    # R2.1 P0-1: Envelope carries a deep-frozen ReviewProposalSnapshot,
+    # not a raw mutable ActionProposal.
+    snapshot = ReviewProposalSnapshot.from_proposal(proposal)
+    # R2.1 P0-1: origin_hash MUST match
+    # ReviewProposalEnvelope._verify_origin_hash, which computes it
+    # from ``self.proposal.to_action_proposal().model_dump(mode="python")``
+    # (NOT from the snapshot's own model_dump).  Using the snapshot's
+    # model_dump here would produce a different hash because the
+    # snapshot's payload is a frozen tuple, while the ActionProposal's
+    # payload is a plain dict.
     return ReviewProposalEnvelope(
-        proposal=proposal,
+        proposal=snapshot,
         run_id=run_id,
         result_id=result_id,
         task_id=task_id,
@@ -201,7 +212,7 @@ def _make_envelope(
         agent_version=agent_version,
         origin_hash=stable_hash(
             {
-                "proposal": proposal.model_dump(mode="python"),
+                "proposal": snapshot.to_action_proposal().model_dump(mode="python"),
                 "run_id": run_id,
                 "result_id": result_id,
                 "task_id": task_id,
@@ -212,12 +223,87 @@ def _make_envelope(
     )
 
 
+def _make_run_identity(
+    *,
+    run_id: str = "run-r2",
+    tenant_id: str = "tenant-r2",
+    plan_hash: str = "plan-r2-hash",
+    registry_version: str = "registry-r2-v1",
+) -> ExecutionRunIdentity:
+    identity_hash = stable_hash(
+        {
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "plan_hash": plan_hash,
+            "registry_version": registry_version,
+        }
+    )
+    return ExecutionRunIdentity(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        plan_hash=plan_hash,
+        registry_version=registry_version,
+        identity_hash=identity_hash,
+    )
+
+
+def _make_result_origin(
+    proposal: ActionProposal,
+    *,
+    run_id: str = "run-r2",
+    tenant_id: str = "tenant-r2",
+    result_id: str = "r-r2",
+    task_id: str = "task-r2",
+    agent_id: str = "agent_r2",
+    agent_version: str = "1.0.0",
+    evidence: list[Evidence] | None = None,
+) -> ResultOriginSnapshot:
+    """R2.1 P0-4: build a ResultOriginSnapshot whose origin_hash is
+    verified on construction and whose proposal_hashes / evidence_hashes
+    bind the Result to its concrete content."""
+    proposal_hashes: tuple[tuple[str, str], ...] = (
+        (proposal.proposal_id, proposal.proposal_hash),
+    )
+    evidence_hashes_list: list[tuple[str, str]] = []
+    for ev in evidence or []:
+        if proposal.evidence_ids and ev.evidence_id in proposal.evidence_ids:
+            evidence_hashes_list.append(
+                (ev.evidence_id, compute_review_evidence_hash(ev))
+            )
+    evidence_hashes = tuple(evidence_hashes_list)
+    origin_hash = stable_hash(
+        {
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "result_id": result_id,
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "agent_version": agent_version,
+            "proposal_hashes": sorted(proposal_hashes),
+            "evidence_hashes": sorted(evidence_hashes),
+        }
+    )
+    return ResultOriginSnapshot(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        result_id=result_id,
+        task_id=task_id,
+        agent_id=agent_id,
+        agent_version=agent_version,
+        proposal_hashes=proposal_hashes,
+        evidence_hashes=evidence_hashes,
+        origin_hash=origin_hash,
+    )
+
+
 def _make_request(
     proposals: list[ActionProposal] | None = None,
     *,
     evidence: list[Evidence] | None = None,
     capability_bindings: list[ExecutionCapabilitySnapshot] | None = None,
     proposal_envelopes: list[ReviewProposalEnvelope] | None = None,
+    result_origins: list[ResultOriginSnapshot] | None = None,
+    run_identity: ExecutionRunIdentity | None = None,
     governance_spec_version: str = ACTION_GOVERNANCE_SPEC_VERSION,
     governance_spec_hash: str = ACTION_GOVERNANCE_SPEC_HASH,
     review_id: str = "review-r2-001",
@@ -237,13 +323,30 @@ def _make_request(
         )
         for ev in raw_evidence
     ]
+    # R2.1 P0-1: convert ActionProposal → ReviewProposalSnapshot so the
+    # Request carries deep-frozen snapshots (not mutable Phase 2 objects).
+    proposal_snapshots: tuple[ReviewProposalSnapshot, ...] = tuple(
+        ReviewProposalSnapshot.from_proposal(p) for p in props
+    )
+    envelopes = (
+        proposal_envelopes
+        if proposal_envelopes is not None
+        else [_make_envelope(p) for p in props]
+    )
+    # R2.1 P0-4: result_origins are REQUIRED.  Build one per proposal
+    # if the caller did not supply them.
+    origins: list[ResultOriginSnapshot] = (
+        result_origins
+        if result_origins is not None
+        else [_make_result_origin(p, evidence=raw_evidence) for p in props]
+    )
     return ReviewRequest(
         review_id=review_id,
         run_id="run-r2",
         tenant_id="tenant-r2",
         plan_hash="plan-r2-hash",
         registry_version="registry-r2-v1",
-        proposals=props,
+        proposals=proposal_snapshots,
         evidence=evidence_snapshots,
         task_records=[
             TaskRecordSummary(
@@ -252,15 +355,13 @@ def _make_request(
         ],
         trace=[TraceSummary(sequence=0, event_type="run_started")],
         capability_bindings=capability_bindings or [_make_capability_binding()],
-        proposal_envelopes=(
-            proposal_envelopes
-            if proposal_envelopes is not None
-            else [_make_envelope(p) for p in props]
-        ),
+        proposal_envelopes=envelopes,
+        result_origins=origins,
         policy_context=PolicyContext(
             policy_version="r2-v1",
             rules=(),
         ),
+        run_identity=run_identity or _make_run_identity(),
         governance_spec_version=governance_spec_version,
         governance_spec_hash=governance_spec_hash,
         review_schema_version=REVIEW_SCHEMA_VERSION,
@@ -374,20 +475,30 @@ class TestResultOriginSnapshot:
     def _make_origin(
         self,
         *,
+        run_id: str = "run-r2",
+        tenant_id: str = "tenant-r2",
         result_id: str = "r-r2",
         task_id: str = "task-r2",
         agent_id: str = "agent_r2",
         agent_version: str = "1.0.0",
     ) -> ResultOriginSnapshot:
+        # R2.1 P0-4: origin_hash includes run_id + tenant_id + result
+        # identity + proposal_hashes + evidence_hashes.
         origin_hash = stable_hash(
             {
+                "run_id": run_id,
+                "tenant_id": tenant_id,
                 "result_id": result_id,
                 "task_id": task_id,
                 "agent_id": agent_id,
                 "agent_version": agent_version,
+                "proposal_hashes": [],
+                "evidence_hashes": [],
             }
         )
         return ResultOriginSnapshot(
+            run_id=run_id,
+            tenant_id=tenant_id,
             result_id=result_id,
             task_id=task_id,
             agent_id=agent_id,
@@ -402,6 +513,8 @@ class TestResultOriginSnapshot:
     def test_blank_origin_hash_rejected(self):
         with pytest.raises(ValidationError):
             ResultOriginSnapshot(
+                run_id="run",
+                tenant_id="t",
                 result_id="r",
                 task_id="t",
                 agent_id="a",
@@ -453,16 +566,12 @@ class TestGovernanceSpecVerification:
                 )
             )
 
-    def test_empty_spec_hash_allowed(self):
-        """An empty governance_spec_hash is allowed (legacy fixtures)."""
-        req = _make_request(governance_spec_hash="")
-        # Should NOT raise — empty hash skips the check.
-        result = asyncio.run(
-            ProposalReviewer().review(
-                req, policy_evaluator=DeterministicPolicyEvaluator()
-            )
-        )
-        assert result.review_id == req.review_id
+    def test_empty_spec_hash_rejected(self):
+        """R2.1 P0-7: an empty governance_spec_hash is rejected — the
+        previous behaviour of skipping the check when empty let a
+        Result omit the hash and bypass verify_against_request."""
+        with pytest.raises(ValidationError):
+            _make_request(governance_spec_hash="")
 
 
 # ===========================================================================
@@ -474,12 +583,17 @@ class TestPolicyDecisionAudit:
     """R2 S5: per-Proposal policy audit, including skipped-authority."""
 
     def test_audit_hash_verified_on_construction(self):
+        # R2.1 P0-7: proposal_id / request_hash / policy_request_hash
+        # are REQUIRED identity fields and participate in evaluation_hash.
         audit = PolicyDecisionAudit(
             evaluator_source_id="deterministic",
             evaluator_version="r2-v1",
             policy_version="r2-v1",
             decision=PolicyDecision.ALLOWED,
             matched_rules=(),
+            proposal_id="prop-r2-001",
+            request_hash="a" * 64,
+            policy_request_hash="b" * 64,
             evaluation_hash=stable_hash(
                 {
                     "evaluator_source_id": "deterministic",
@@ -487,6 +601,9 @@ class TestPolicyDecisionAudit:
                     "policy_version": "r2-v1",
                     "decision": "allowed",
                     "matched_rules": [],
+                    "proposal_id": "prop-r2-001",
+                    "request_hash": "a" * 64,
+                    "policy_request_hash": "b" * 64,
                 }
             ),
         )
@@ -700,6 +817,9 @@ class TestVerifyAgainstRequest:
                 policy_version="v1",
                 decision=PolicyDecision.ALLOWED,
                 matched_rules=(),
+                proposal_id="prop-nonexistent",
+                request_hash="a" * 64,
+                policy_request_hash="b" * 64,
                 evaluation_hash=stable_hash(
                     {
                         "evaluator_source_id": "test",
@@ -707,6 +827,9 @@ class TestVerifyAgainstRequest:
                         "policy_version": "v1",
                         "decision": "allowed",
                         "matched_rules": [],
+                        "proposal_id": "prop-nonexistent",
+                        "request_hash": "a" * 64,
+                        "policy_request_hash": "b" * 64,
                     }
                 ),
             ),
@@ -742,8 +865,11 @@ class TestReviewExpectedOutcome:
 
     def test_empty_outcome_accepted(self):
         outcome = ReviewExpectedOutcome()
-        assert outcome.expected_status_by_proposal == {}
-        assert outcome.expected_finding_codes_by_proposal == {}
+        # R2.1 P0-1: defaults are None (not {}) — the frozen form of
+        # an empty dict is () but None is preserved as-is when no
+        # value is supplied.
+        assert outcome.expected_status_by_proposal is None
+        assert outcome.expected_finding_codes_by_proposal is None
 
     def test_outcome_with_statuses_accepted(self):
         outcome = ReviewExpectedOutcome(
@@ -752,9 +878,13 @@ class TestReviewExpectedOutcome:
                 "p2": ReviewDecisionStatus.REJECTED,
             }
         )
-        assert (
-            outcome.expected_status_by_proposal["p1"] == ReviewDecisionStatus.APPROVED
-        )
+        # R2.1 P0-1: the map is deep-frozen to a tuple of (str, str)
+        # tuples.  Convert back to a dict for ergonomic lookup.
+        from multi_agent.review_contracts import frozen_value_to_json
+
+        status_map = dict(frozen_value_to_json(outcome.expected_status_by_proposal))
+        assert status_map["p1"] == "approved"
+        assert status_map["p2"] == "rejected"
 
     def test_outcome_is_frozen(self):
         outcome = ReviewExpectedOutcome()
@@ -781,6 +911,7 @@ class TestReviewerVersionRequired:
                 run_id="run1",
                 tenant_id="t1",
                 request_hash="h" * 64,
+                governance_spec_hash="g" * 64,
                 reviewer_version="",
             )
 
@@ -790,6 +921,7 @@ class TestReviewerVersionRequired:
             run_id="run1",
             tenant_id="t1",
             request_hash="h" * 64,
+            governance_spec_hash="g" * 64,
             reviewer_version=REVIEWER_VERSION,
         )
         assert result.reviewer_version == REVIEWER_VERSION

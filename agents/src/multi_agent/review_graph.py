@@ -34,6 +34,17 @@ R2 changes (S8, S12):
 * ``_ReviewerLike`` is a strict :class:`typing.Protocol` (not ``Any``)
   so static type checkers catch signature drift between
   :class:`ProposalReviewer` and :class:`FakeProposalReviewer`.
+
+R2.1 P1-1 changes:
+
+* :class:`ReviewGraphState` no longer carries a raw
+  ``error: Exception | None`` field.  The raw exception is caught at
+  the node boundary and converted to a persistable
+  :class:`ReviewGraphError` — only that frozen record enters the
+  State.  This aligns the State with the documented "only persistable
+  ReviewGraphError" contract and makes the State JSON-round-trippable.
+* Routing functions read ``state.graph_error`` instead of
+  ``state.error``.
 """
 
 from __future__ import annotations
@@ -50,8 +61,6 @@ from multi_agent.review_contracts import (
     ReviewRequest,
 )
 from multi_agent.review_errors import (
-    InvalidReviewRequestError,
-    InvalidReviewResultError,
     ReviewError,
 )
 from multi_agent.reviewer import ProposalReviewer
@@ -73,13 +82,20 @@ class ReviewGraphState:
     R2 S12: ``graph_error`` carries a persistable
     :class:`ReviewGraphError` when a node fails, so downstream
     consumers can replay or persist the failure deterministically.
+
+    R2.1 P1-1: the raw ``error: Exception | None`` field is REMOVED.
+    A raw :class:`Exception` is not JSON-serialisable and would couple
+    the audit trail to a non-persistable Python object.  Nodes now
+    catch the exception at the boundary, convert it to a
+    :class:`ReviewGraphError`, and only the frozen record enters the
+    State.  The exception is raised (or re-raised) within the current
+    call stack if the caller needs it — it does NOT enter the State.
     """
 
     request: ReviewRequest
     policy_evaluator: PolicyEvaluator
     reviewer: ProposalReviewer | None = None
     result: ReviewBatchResult | None = None
-    error: Exception | None = None
     graph_error: ReviewGraphError | None = None
 
 
@@ -159,28 +175,29 @@ def build_review_graph(reviewer: _ReviewerLike | None = None):
         # validation here — we only surface integrity errors as
         # graph-state errors so the graph can route to END cleanly.
         if state.request is None:
-            state.error = InvalidReviewRequestError(
-                "ReviewGraphState.request must not be None"
-            )
+            # R2.1 P1-1: only a persistable ReviewGraphError enters
+            # the State — no raw Exception field.
             state.graph_error = ReviewGraphError(
                 error_code="review.graph.missing_request",
                 message="ReviewGraphState.request must not be None",
             )
-            return {"error": state.error, "graph_error": state.graph_error}
+            return {"graph_error": state.graph_error}
         try:
             state.request.verify_integrity()
         except ReviewError as e:
-            state.error = e
+            # R2.1 P1-1: the raw exception is converted at the node
+            # boundary — only the frozen ReviewGraphError enters the
+            # State and is used for routing.
             state.graph_error = ReviewGraphError(
                 error_code="review.graph.request_integrity",
                 message=str(e),
             )
-            return {"error": e, "graph_error": state.graph_error}
+            return {"graph_error": state.graph_error}
         return {}
 
     async def review_proposals(state: ReviewGraphState) -> dict[str, Any]:
-        if state.error is not None:
-            return {"error": state.error}
+        if state.graph_error is not None:
+            return {"graph_error": state.graph_error}
         # Use the per-invocation state.reviewer if set, else fall back
         # to the graph-level reviewer captured at build time, else
         # create a fresh ProposalReviewer.
@@ -191,12 +208,12 @@ def build_review_graph(reviewer: _ReviewerLike | None = None):
                 policy_evaluator=state.policy_evaluator,
             )
         except ReviewError as e:
-            state.error = e
+            # R2.1 P1-1: convert to persistable ReviewGraphError.
             state.graph_error = ReviewGraphError(
                 error_code="review.graph.review_failed",
                 message=str(e),
             )
-            return {"error": e, "graph_error": state.graph_error}
+            return {"graph_error": state.graph_error}
         state.result = result
         return {"result": result}
 
@@ -205,23 +222,22 @@ def build_review_graph(reviewer: _ReviewerLike | None = None):
         # :class:`ProposalReviewer` (see :mod:`multi_agent.conflict_resolution`).
         # This node exists for trace clarity and as a future extension
         # point (e.g. a human-in-the-loop escalation hook in Phase 5B).
-        if state.error is not None:
-            return {"error": state.error}
+        if state.graph_error is not None:
+            return {"graph_error": state.graph_error}
         # The result is already final — no additional conflict work.
         return {}
 
     async def finalize_review(state: ReviewGraphState) -> dict[str, Any]:
-        if state.error is not None:
-            return {"error": state.error}
+        if state.graph_error is not None:
+            return {"graph_error": state.graph_error}
         if state.result is None:
-            state.error = InvalidReviewResultError(
-                "ReviewGraphState.result is None at finalize_review"
-            )
+            # R2.1 P1-1: only a persistable ReviewGraphError enters
+            # the State.
             state.graph_error = ReviewGraphError(
                 error_code="review.graph.missing_result",
                 message="ReviewGraphState.result is None at finalize_review",
             )
-            return {"error": state.error, "graph_error": state.graph_error}
+            return {"graph_error": state.graph_error}
         try:
             state.result.verify_integrity()
             # R1: also enforce semantic invariants (decision ↔ findings,
@@ -233,26 +249,26 @@ def build_review_graph(reviewer: _ReviewerLike | None = None):
             # or mis-routed Result is detected at the graph boundary.
             state.result.verify_against_request(state.request)
         except ReviewError as e:
-            state.error = e
+            # R2.1 P1-1: convert to persistable ReviewGraphError.
             state.graph_error = ReviewGraphError(
                 error_code="review.graph.finalize_failed",
                 message=str(e),
             )
-            return {"error": e, "graph_error": state.graph_error}
+            return {"graph_error": state.graph_error}
         return {"result": state.result}
 
     def _should_continue_after_validate(state: ReviewGraphState) -> str:
-        if state.error is not None:
+        if state.graph_error is not None:
             return END
         return "review_proposals"
 
     def _should_continue_after_review(state: ReviewGraphState) -> str:
-        if state.error is not None:
+        if state.graph_error is not None:
             return END
         return "resolve_conflicts"
 
     def _should_continue_after_resolve(state: ReviewGraphState) -> str:
-        if state.error is not None:
+        if state.graph_error is not None:
             return END
         return "finalize_review"
 
